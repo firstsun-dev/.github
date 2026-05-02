@@ -1,12 +1,12 @@
-# 🛠️ Firstsun's Digital Forge
+# Firstsun's Digital Forge
 
 Welcome to my central configuration and automation hub. This repository serves as the backbone for my cross-project standards, agent skills, and workflow automations.
 
-## 🚀 Core Ecosystem
+## Core Ecosystem
 
 I build and maintain highly automated workflows for content creation, spiritual study, and modern web development.
 
-### 📽️ Content & Knowledge Management
+### Content & Knowledge Management
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
 | **[heaven-video-summary](https://github.com/firstsun-dev/heaven-video-summary)** | YouTube Dharma talk transcription & automation pipeline. | Python, Whisper, Bash |
@@ -14,14 +14,14 @@ I build and maintain highly automated workflows for content creation, spiritual 
 | **[heaven-monorepo](https://github.com/firstsun-dev/heaven-monorepo)** | Integrated workspace for Heaven-related projects (Private). | Turborepo, pnpm |
 | **[my-apple-health](https://github.com/firstsun-dev/my-apple-health)** | Personal health data tracking and analysis (Private). | Python, HealthKit |
 
-### 🤖 AI Agent & Automation
+### AI Agent & Automation
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
 | **[yao-agent-skills](https://github.com/firstsun-dev/yao-agent-skills)** | A curated arsenal of AI agent skills (Yao Skill Arsenal). | YAML, Markdown, Shell |
 | **[general-workflows](https://github.com/firstsun-dev/general-workflows)** | Reusable GitHub Actions and automation scripts. | GitHub Actions |
 | **[git-files-sync](https://github.com/firstsun-dev/git-files-sync)** | Automated file synchronization across repositories. | Shell, Git |
 
-### 🔧 Utility Tools
+### Utility Tools
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
 | **[watermark-s3-uploader](https://github.com/firstsun-dev/watermark-s3-uploader)** | Image processing and S3 storage automation. | Node.js, AWS S3 |
@@ -29,18 +29,18 @@ I build and maintain highly automated workflows for content creation, spiritual 
 
 ---
 
-## 🤖 AI Agent Strategy
+## AI Agent Strategy
 
 I leverage a **Skill-First** approach to AI collaboration. My agents are equipped with domain-specific knowledge "Gems" and modular skills to ensure consistency and precision across all tasks.
 
-### 💎 Featured Gems (Gemini Optimized)
+### Featured Gems (Gemini Optimized)
 *   **Lifestyle Architect**: Integrated health (HealthKit), learning, and thinking frameworks.
 *   **DevOps Engineer**: Production-grade CI/CD and Cloudflare deployment patterns.
 *   **Content Alchemist**: Multi-language transcription (Whisper) and Diátaxis-compliant documentation.
 
 ---
 
-## 🏗️ Standards & Guardrails
+## Standards & Guardrails
 
 *   **Documentation**: Guided by the [Diátaxis framework](https://diataxis.fr/).
 *   **Development**: Strict adherence to [Conventional Commits](https://www.conventionalcommits.org/).
@@ -48,7 +48,7 @@ I leverage a **Skill-First** approach to AI collaboration. My agents are equippe
 
 ---
 
-## 📬 Connectivity
+## Connectivity
 
 *   **GitHub**: [@firstsun-dev](https://github.com/firstsun-dev)
 *   **Purpose**: To build tools that bridge the gap between ancient wisdom and modern technology.
