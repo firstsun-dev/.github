@@ -1,0 +1,51 @@
+name: 'Setup rclone'
+description: 'Install and configure rclone with Google Drive'
+inputs:
+  gdrive_client_id:
+    description: 'Google Drive Client ID'
+    required: true
+  gdrive_client_secret:
+    description: 'Google Drive Client Secret'
+    required: true
+  gdrive_token:
+    description: 'Google Drive Token'
+    required: true
+  gdrive_folder_id:
+    description: 'Google Drive Root Folder ID'
+    required: false
+  remote_name:
+    description: 'Rclone remote name'
+    required: false
+    default: 'gdrive'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install rclone (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        if ! command -v rclone &> /dev/null; then
+          sudo apt-get update && sudo apt-get install -y rclone
+        fi
+
+    - name: Install rclone (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        if ! command -v rclone &> /dev/null; then
+          brew install rclone
+        fi
+
+    - name: Configure rclone
+      shell: bash
+      run: |
+        mkdir -p ~/.config/rclone
+        cat > ~/.config/rclone/rclone.conf << EOF
+        [${{ inputs.remote_name }}]
+        type = drive
+        client_id = ${{ inputs.gdrive_client_id }}
+        client_secret = ${{ inputs.gdrive_client_secret }}
+        token = ${{ inputs.gdrive_token }}
+        root_folder_id = ${{ inputs.gdrive_folder_id }}
+        EOF

@@ -1,0 +1,56 @@
+name: Shared Rclone Sync
+
+on:
+  workflow_call:
+    inputs:
+      source_path:
+        description: 'Source directory to sync'
+        required: true
+        type: string
+      dest_path:
+        description: 'Destination directory on remote'
+        required: true
+        type: string
+      remote_name:
+        description: 'Rclone remote name'
+        required: false
+        type: string
+        default: 'gdrive'
+      sync_args:
+        description: 'Additional rclone sync arguments'
+        required: false
+        type: string
+        default: '--progress --delete-after'
+      runs_on:
+        description: 'Runner OS'
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+    secrets:
+      GDRIVE_CLIENT_ID:
+        required: true
+      GDRIVE_CLIENT_SECRET:
+        required: true
+      GDRIVE_TOKEN:
+        required: true
+      GDRIVE_FOLDER_ID:
+        required: false
+
+jobs:
+  sync:
+    runs-on: ${{ inputs.runs_on }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup rclone
+        uses: firstsun-dev/.github/actions/setup-rclone@main
+        with:
+          gdrive_client_id: ${{ secrets.GDRIVE_CLIENT_ID }}
+          gdrive_client_secret: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          gdrive_token: ${{ secrets.GDRIVE_TOKEN }}
+          gdrive_folder_id: ${{ secrets.GDRIVE_FOLDER_ID }}
+          remote_name: ${{ inputs.remote_name }}
+
+      - name: Rclone Sync
+        run: rclone sync ${{ inputs.source_path }} "${{ inputs.remote_name }}:${{ inputs.dest_path }}" ${{ inputs.sync_args }}
