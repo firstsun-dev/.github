@@ -26,6 +26,11 @@ on:
         required: false
         type: string
         default: 'ubuntu-latest'
+      run_check:
+        description: 'Whether to run rclone check after sync'
+        required: false
+        type: boolean
+        default: false
     secrets:
       GDRIVE_CLIENT_ID:
         required: true
@@ -54,3 +59,7 @@ jobs:
 
       - name: Rclone Sync
         run: rclone sync ${{ inputs.source_path }} "${{ inputs.remote_name }}:${{ inputs.dest_path }}" ${{ inputs.sync_args }}
+
+      - name: Rclone Check
+        if: ${{ inputs.run_check }}
+        run: rclone check ${{ inputs.source_path }} "${{ inputs.remote_name }}:${{ inputs.dest_path }}" --size-only
