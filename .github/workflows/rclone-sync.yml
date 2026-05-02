@@ -30,7 +30,7 @@ on:
         description: 'Whether to run rclone check after sync'
         required: false
         type: boolean
-        default: false
+        default: true
     secrets:
       GDRIVE_CLIENT_ID:
         required: true
