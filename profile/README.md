@@ -1,6 +1,6 @@
 # Firstsun's Digital Forge
 
-![GitHub followers](https://img.shields.io/github/followers/firstsun-dev?style=flat-square) ![GitHub repos](https://img.shields.io/github/repos-count/firstsun-dev?style=flat-square) ![License](https://img.shields.io/github/license/firstsun-dev/.github?style=flat-square)
+![GitHub followers](https://img.shields.io/github/followers/firstsun-dev?style=flat-square) ![GitHub repos](https://img.shields.io/badge/Repos-10-blue?style=flat-square) ![License](https://img.shields.io/github/license/firstsun-dev/.github?style=flat-square)
 ![Standards: Conventional Commits](https://img.shields.io/badge/Standards-Conventional%20Commits-FE5196?style=flat-square&logo=git) ![Documentation: Diátaxis](https://img.shields.io/badge/Docs-Di%C3%A1taxis-339933?style=flat-square)
 ![Tech: TypeScript](https://img.shields.io/badge/Tech-TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white) ![Tech: Python](https://img.shields.io/badge/Tech-Python-3776AB?style=flat-square&logo=python&logoColor=white) ![Tech: Obsidian](https://img.shields.io/badge/Tech-Obsidian-7C3AED?style=flat-square&logo=obsidian&logoColor=white) ![Tech: Astro](https://img.shields.io/badge/Tech-Astro-BC52EE?style=flat-square&logo=astro&logoColor=white)
 
