@@ -9,6 +9,7 @@ I build and maintain highly automated workflows for content creation, spiritual 
 ### Obsidian Plugin Development & Ecosystem
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
+| **[watermark-s3-uploader](https://github.com/firstsun-dev/watermark-s3-uploader)** | Obsidian plugin for image processing and automated S3 storage integration. | TypeScript, Node.js, AWS S3 |
 | **[obsidian-releases](https://github.com/firstsun-dev/obsidian-releases)** | Customized Obsidian ecosystem with optimized plugin configurations and themes. | TypeScript, Obsidian API |
 | **[heaven-monorepo](https://github.com/firstsun-dev/heaven-monorepo)** | Centralized workspace potentially hosting Obsidian-integrated tools and workflows. | TypeScript, Turborepo |
 | **[yao-agent-skills](https://github.com/firstsun-dev/yao-agent-skills)** | Includes specialized skills for Obsidian development and Markdown automation. | YAML, Markdown |
@@ -23,13 +24,8 @@ I build and maintain highly automated workflows for content creation, spiritual 
 ### AI Agent & Automation
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
-| **[general-workflows](https://github.com/firstsun-dev/general-workflows)** | Reusable GitHub Actions and automation scripts for CI/CD. | GitHub Actions |
+| **[.github](https://github.com/firstsun-dev/.github)** | Centralized governance, shared workflows, and issue templates. | GitHub Actions |
 | **[git-files-sync](https://github.com/firstsun-dev/git-files-sync)** | Automated file synchronization across repositories. | Shell, Git |
-
-### Utility Tools
-| Repository | Purpose | Tech Stack |
-| :--- | :--- | :--- |
-| **[watermark-s3-uploader](https://github.com/firstsun-dev/watermark-s3-uploader)** | Image processing and S3 storage automation. | Node.js, AWS S3 |
 
 ---
 
