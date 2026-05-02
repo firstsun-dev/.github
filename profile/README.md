@@ -6,26 +6,30 @@ Welcome to my central configuration and automation hub. This repository serves a
 
 I build and maintain highly automated workflows for content creation, spiritual study, and modern web development.
 
+### Obsidian Plugin Development & Ecosystem
+| Repository | Purpose | Tech Stack |
+| :--- | :--- | :--- |
+| **[obsidian-releases](https://github.com/firstsun-dev/obsidian-releases)** | Customized Obsidian ecosystem with optimized plugin configurations and themes. | TypeScript, Obsidian API |
+| **[heaven-monorepo](https://github.com/firstsun-dev/heaven-monorepo)** | Centralized workspace potentially hosting Obsidian-integrated tools and workflows. | TypeScript, Turborepo |
+| **[yao-agent-skills](https://github.com/firstsun-dev/yao-agent-skills)** | Includes specialized skills for Obsidian development and Markdown automation. | YAML, Markdown |
+
 ### Content & Knowledge Management
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
 | **[heaven-video-summary](https://github.com/firstsun-dev/heaven-video-summary)** | YouTube Dharma talk transcription & automation pipeline. | Python, Whisper, Bash |
 | **[blog](https://github.com/firstsun-dev/blog)** | Personal technical blog (Private). | Astro, Cloudflare |
-| **[heaven-monorepo](https://github.com/firstsun-dev/heaven-monorepo)** | Integrated workspace for Heaven-related projects (Private). | Turborepo, pnpm |
 | **[my-apple-health](https://github.com/firstsun-dev/my-apple-health)** | Personal health data tracking and analysis (Private). | Python, HealthKit |
 
 ### AI Agent & Automation
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
-| **[yao-agent-skills](https://github.com/firstsun-dev/yao-agent-skills)** | A curated arsenal of AI agent skills (Yao Skill Arsenal). | YAML, Markdown, Shell |
-| **[general-workflows](https://github.com/firstsun-dev/general-workflows)** | Reusable GitHub Actions and automation scripts. | GitHub Actions |
+| **[general-workflows](https://github.com/firstsun-dev/general-workflows)** | Reusable GitHub Actions and automation scripts for CI/CD. | GitHub Actions |
 | **[git-files-sync](https://github.com/firstsun-dev/git-files-sync)** | Automated file synchronization across repositories. | Shell, Git |
 
 ### Utility Tools
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
 | **[watermark-s3-uploader](https://github.com/firstsun-dev/watermark-s3-uploader)** | Image processing and S3 storage automation. | Node.js, AWS S3 |
-| **[obsidian-releases](https://github.com/firstsun-dev/obsidian-releases)** | Fork of community plugins for customized knowledge management. | TypeScript, Obsidian |
 
 ---
 
