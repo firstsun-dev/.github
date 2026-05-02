@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 部落格網站
+    url: https://firstsun.heavenfortress.com
+    about: 訪問部落格網站
+  - name: 文件
+    url: https://github.com/firstsun-dev/blog/blob/main/CONTRIBUTING.md
+    about: 查看貢獻指南
