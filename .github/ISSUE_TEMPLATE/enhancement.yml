@@ -1,0 +1,45 @@
+name: Enhancement
+description: Improve or refine an existing feature
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template to suggest improvements to existing functionality.
+  - type: input
+    id: target
+    attributes:
+      label: Target Feature / Component
+      description: Which existing feature or component would you like to improve?
+      placeholder: e.g. watermark positioning, sync dashboard UI
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: Current Behavior
+      description: Describe how it works today and what falls short.
+    validations:
+      required: true
+  - type: textarea
+    id: improved
+    attributes:
+      label: Desired Improvement
+      description: Describe the improved behavior or experience you envision.
+    validations:
+      required: true
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      options:
+        - Low — minor polish
+        - Medium — noticeable UX improvement
+        - High — significantly improves workflow
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Screenshots, logs, or references that support this enhancement.
