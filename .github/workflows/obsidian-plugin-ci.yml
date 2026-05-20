@@ -35,6 +35,7 @@ jobs:
             code:
               - 'src/**'
               - 'package.json'
+              - 'package-lock.json'
               - 'manifest.json'
               - 'tsconfig.json'
               - 'esbuild.config.mjs'
