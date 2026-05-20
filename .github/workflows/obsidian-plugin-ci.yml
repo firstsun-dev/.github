@@ -27,8 +27,8 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           filters: |
@@ -49,8 +49,8 @@ jobs:
     if: needs.filter.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
           cache: 'npm'
@@ -67,8 +67,8 @@ jobs:
         node-version: [20, 22, 24]
       fail-fast: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
@@ -79,7 +79,7 @@ jobs:
         run: npm run test -- --coverage
       - name: Upload coverage
         if: matrix.node-version == inputs.node-version
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: coverage/
@@ -91,8 +91,8 @@ jobs:
     needs: [filter, test]
     if: needs.filter.outputs.code == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
           cache: 'npm'
@@ -106,7 +106,7 @@ jobs:
           ZIP_NAME="${{ inputs.plugin-id }}-${VERSION}-${BRANCH_NAME_SAFE}.zip"
           zip -j "$ZIP_NAME" main.js manifest.json styles.css || zip -j "$ZIP_NAME" main.js manifest.json 
           echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: plugin-build-artifact-${{ github.sha }}
           path: ${{ env.ZIP_NAME }}
@@ -119,11 +119,11 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Download coverage
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: coverage-report
           path: coverage/
@@ -139,11 +139,11 @@ jobs:
     needs: [filter, lint, test]
     if: needs.filter.outputs.code == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
           cache: 'npm'
