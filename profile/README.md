@@ -22,7 +22,7 @@ I build and maintain highly automated workflows for content creation, spiritual 
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
 | **[heaven-video-summary](https://github.com/firstsun-dev/heaven-video-summary)** | 天界之舟 YouTube lecture transcription pipeline: playlist → Whisper → Markdown → Google Drive. | Python, Whisper, Bash |
-| **[news-getter](https://github.com/firstsun-dev/news-getter)** | Personalized AI news digest: RSS feeds → Gemini CLI summary → e-ink friendly RSS feed. | Python, Bash |
+| **[news-getter](https://github.com/firstsun-dev/news-getter)** | Personalized AI news digest: RSS feeds → Gemini CLI summary → e-ink friendly RSS feed. [[Pages](https://firstsun-dev.github.io/news-getter/)] | Python, Bash |
 | **[books-mgmt](https://github.com/firstsun-dev/books-mgmt)** | Kavita book server automation: sync collections by directory structure and export to Google Drive as TXT. | Python, uv, rclone |
 | **[blog](https://github.com/firstsun-dev/blog)** | Personal tech blog with multi-language support, dark mode, article likes, and view stats (Private). | Astro, Cloudflare Pages, D1 |
 | **[my-apple-health](https://github.com/firstsun-dev/my-apple-health)** | Apple Health XML export pipeline → CSV/Markdown for AI agents like NotebookLM (Private). | Python, uv |
