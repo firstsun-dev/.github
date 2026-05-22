@@ -46,7 +46,7 @@ I leverage a **Skill-First** approach to AI collaboration. My agents are equippe
 ### Repositories
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
-| **[yao-agent-skills](https://github.com/firstsun-dev/yao-agent-skills)** | Centralized skill arsenal for AI agents (Gemini CLI, Claude Code) — custom and community skills. | YAML, Markdown |
+| **[skills](https://github.com/firstsun-dev/skills)** | Centralized skill arsenal for AI agents (Gemini CLI, Claude Code) — custom and community skills. | YAML, Markdown |
 
 ### Featured Gems (Gemini Optimized)
 *   **Lifestyle Architect**: Integrated health (HealthKit), learning, and thinking frameworks.
