@@ -6,9 +6,9 @@ inputs:
     required: false
     default: '24'
   pnpm-version:
-    description: pnpm version
+    description: pnpm version override (leave empty to read from packageManager field in package.json)
     required: false
-    default: '10'
+    default: ''
   install:
     description: Whether to run pnpm install
     required: false
@@ -35,3 +35,4 @@ runs:
       run: |
         pnpm config set store-dir /cache/pnpm-store
         pnpm install --frozen-lockfile
+
