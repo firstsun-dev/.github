@@ -1,0 +1,12 @@
+name: Start Mailpit
+description: Start a Mailpit SMTP server and export SMTP_HOST / MAILPIT_API_URL
+runs:
+  using: composite
+  steps:
+    - run: |
+        curl -sL https://github.com/axllent/mailpit/releases/latest/download/mailpit-linux-amd64.tar.gz \
+          | tar xz -C /tmp mailpit
+        /tmp/mailpit &
+        echo "SMTP_HOST=127.0.0.1" >> $GITHUB_ENV
+        echo "MAILPIT_API_URL=http://127.0.0.1:8025" >> $GITHUB_ENV
+      shell: bash

@@ -1,0 +1,15 @@
+name: Parse env vars
+description: Parse KEY=VALUE lines into GITHUB_ENV (skips blank lines and comments)
+inputs:
+  vars:
+    description: Multiline string of KEY=VALUE pairs, one per line
+    required: true
+runs:
+  using: composite
+  steps:
+    - run: |
+        while IFS= read -r line; do
+          [[ -z "$line" || "$line" == \#* ]] && continue
+          echo "$line" >> $GITHUB_ENV
+        done <<< "${{ inputs.vars }}"
+      shell: bash
