@@ -39,7 +39,6 @@ on:
 permissions:
   contents: read
   checks: write
-  issues: write
   security-events: write
 
 jobs:
@@ -77,6 +76,7 @@ jobs:
           target: ${{ inputs.target_url }}
           token: ${{ secrets.GITHUB_TOKEN }}
           fail_action: false
+          allow_issue_writing: false
           artifact_name: zap-baseline-${{ inputs.app_name }}
 
       - name: ZAP Full Scan
@@ -86,6 +86,7 @@ jobs:
           target: ${{ inputs.target_url }}
           token: ${{ secrets.GITHUB_TOKEN }}
           fail_action: false
+          allow_issue_writing: false
           artifact_name: zap-full-${{ inputs.app_name }}
 
       - name: ZAP API Scan
@@ -96,4 +97,5 @@ jobs:
           format: openapi
           token: ${{ secrets.GITHUB_TOKEN }}
           fail_action: false
+          allow_issue_writing: false
           artifact_name: zap-api-${{ inputs.app_name }}
