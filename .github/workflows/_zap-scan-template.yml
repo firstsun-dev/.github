@@ -47,9 +47,19 @@ jobs:
       matrix:
         type: ${{ fromJson(inputs.openapi_path != '' && '["baseline","api"]' || '["baseline"]') }}
     steps:
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '24'
+      - name: Prepare API target URL
+        if: matrix.type == 'api'
+        id: api
+        run: |
+          CREDS=$(echo "$ZAP_BASIC_AUTH" | base64 -d)
+          echo "::add-mask::$CREDS"
+          PROTO=$(echo "${{ inputs.target_url }}" | grep -oP '^https?://')
+          HOST=$(echo "${{ inputs.target_url }}" | sed 's|^https\?://||')
+          API_URL="${PROTO}${CREDS}@${HOST}${{ inputs.openapi_path }}"
+          echo "::add-mask::$API_URL"
+          echo "url=$API_URL" >> $GITHUB_OUTPUT
+        env:
+          ZAP_BASIC_AUTH: ${{ secrets.ZAP_DOC_BASIC_AUTH }}
 
       - name: ZAP Baseline Scan
         if: matrix.type == 'baseline' && inputs.scan_mode == 'baseline'
@@ -73,25 +83,8 @@ jobs:
         if: matrix.type == 'api'
         uses: zaproxy/action-api-scan@v0.9.0
         with:
-          target: ${{ inputs.target_url }}${{ inputs.openapi_path }}
+          target: ${{ steps.api.outputs.url }}
           format: openapi
           token: ${{ secrets.GITHUB_TOKEN }}
           fail_action: false
           artifact_name: zap-api-${{ inputs.app_name }}
-          cmd_options: >-
-            -config replacer.full_list(0).description=auth
-            -config replacer.full_list(0).enabled=true
-            -config replacer.full_list(0).matchtype=REQ_HEADER
-            -config replacer.full_list(0).matchstring=Authorization
-            -config replacer.full_list(0).replacement=Basic\ ${{ secrets.ZAP_DOC_BASIC_AUTH }}
-
-      - name: Convert to SARIF
-        if: always()
-        run: npx --yes @continuous-security/zap-to-sarif report_json.json zap-${{ matrix.type }}.sarif
-
-      - name: Upload SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: zap-${{ matrix.type }}.sarif
-          category: zap-${{ inputs.scan_mode }}-${{ matrix.type }}-${{ inputs.app_name }}
