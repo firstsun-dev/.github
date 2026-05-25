@@ -372,56 +372,14 @@ jobs:
     name: ZAP Scan
     needs: deploy
     if: needs.deploy.result == 'success'
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
-    steps:
-      - name: ZAP Baseline Scan (Frontend)
-        uses: zaproxy/action-baseline@v0.12.0
-        with:
-          target: ${{ github.ref == 'refs/heads/main' && inputs.app_url_prod || inputs.app_url_dev }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fail_action: false
-          artifact_name: zap-baseline-${{ inputs.app_name }}
-          cmd_options: '-J zap-frontend-report.json'
-
-      - name: Convert Frontend to SARIF
-        if: always()
-        run: npx --yes @continuous-security/zap-to-sarif zap-frontend-report.json zap-frontend.sarif
-
-      - name: Upload Frontend SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: zap-frontend.sarif
-          category: zap-baseline-${{ inputs.app_name }}
-
-      - name: ZAP API Scan
-        if: inputs.zap_openapi_path != ''
-        uses: zaproxy/action-api-scan@v0.9.0
-        with:
-          target: ${{ github.ref == 'refs/heads/main' && inputs.app_url_prod || inputs.app_url_dev }}${{ inputs.zap_openapi_path }}
-          format: openapi
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fail_action: false
-          artifact_name: zap-api-${{ inputs.app_name }}
-          cmd_options: >-
-            -J zap-api-report.json
-            -config replacer.full_list(0).description=auth
-            -config replacer.full_list(0).enabled=true
-            -config replacer.full_list(0).matchtype=REQ_HEADER
-            -config replacer.full_list(0).matchstring=Authorization
-            -config replacer.full_list(0).replacement=Basic\ ${{ secrets.ZAP_DOC_BASIC_AUTH }}
-
-      - name: Convert API to SARIF
-        if: always() && inputs.zap_openapi_path != ''
-        run: npx --yes @continuous-security/zap-to-sarif zap-api-report.json zap-api.sarif
-
-      - name: Upload API SARIF
-        if: always() && inputs.zap_openapi_path != ''
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: zap-api.sarif
-          category: zap-api-${{ inputs.app_name }}
+    uses: firstsun-dev/.github/.github/workflows/_zap-scan-template.yml@main
+    with:
+      app_name: ${{ inputs.app_name }}
+      target_url: ${{ github.ref == 'refs/heads/main' && inputs.app_url_prod || inputs.app_url_dev }}
+      openapi_path: ${{ inputs.zap_openapi_path }}
+      runner: ${{ inputs.runner }}
+      scan_mode: baseline
+    secrets: inherit
 
   revert:
     name: Revert on Verify Failure
