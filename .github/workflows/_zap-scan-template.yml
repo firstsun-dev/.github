@@ -102,10 +102,13 @@ jobs:
 
       - name: Annotate findings
         if: always()
+        env:
+          APP: ${{ inputs.app_name }}
+          SCAN: ${{ matrix.type }}
         run: |
           [ -f report_json.json ] || exit 0
-          jq -r '
+          jq -r --arg prefix "[$APP|$SCAN]" '
             .site[].alerts[] |
             select(.riskcode | tonumber >= 1) |
-            "::warning title=ZAP [\(.riskdesc)]::[\(.name)] \(.desc | gsub("<[^>]+>";"") | .[0:150])"
+            "::warning title=\($prefix) \(.riskdesc) — \(.name)::\(.desc | gsub("<[^>]+>";"") | .[0:200])"
           ' report_json.json 2>/dev/null || true
