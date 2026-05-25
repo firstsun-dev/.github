@@ -44,6 +44,10 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 90
     steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
       - name: ZAP Baseline Scan (Frontend)
         if: inputs.scan_mode == 'baseline'
         uses: zaproxy/action-baseline@v0.12.0
@@ -52,7 +56,6 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fail_action: false
           artifact_name: zap-baseline-${{ inputs.app_name }}
-          cmd_options: '-J zap-frontend-report.json'
 
       - name: ZAP Full Scan (Frontend)
         if: inputs.scan_mode == 'full'
@@ -62,11 +65,10 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fail_action: false
           artifact_name: zap-full-${{ inputs.app_name }}
-          cmd_options: '-J zap-frontend-report.json'
 
       - name: Convert Frontend to SARIF
         if: always()
-        run: npx --yes @continuous-security/zap-to-sarif zap-frontend-report.json zap-frontend.sarif
+        run: npx --yes @continuous-security/zap-to-sarif report_json.json zap-frontend.sarif
 
       - name: Upload Frontend SARIF
         if: always()
@@ -85,7 +87,6 @@ jobs:
           fail_action: false
           artifact_name: zap-api-${{ inputs.app_name }}
           cmd_options: >-
-            -J zap-api-report.json
             -config replacer.full_list(0).description=auth
             -config replacer.full_list(0).enabled=true
             -config replacer.full_list(0).matchtype=REQ_HEADER
@@ -94,7 +95,7 @@ jobs:
 
       - name: Convert API to SARIF
         if: always() && inputs.openapi_path != ''
-        run: npx --yes @continuous-security/zap-to-sarif zap-api-report.json zap-api.sarif
+        run: npx --yes @continuous-security/zap-to-sarif report_json.json zap-api.sarif
 
       - name: Upload API SARIF
         if: always() && inputs.openapi_path != ''
