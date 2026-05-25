@@ -108,21 +108,35 @@ jobs:
         run: |
           [ -f report_json.json ] || exit 0
 
-          # Step Summary — full markdown table
-          echo "## ZAP [$APP|$SCAN]" >> $GITHUB_STEP_SUMMARY
-          echo "| Risk | Name | Solution |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|------|----------|" >> $GITHUB_STEP_SUMMARY
-          jq -r '
-            .site[].alerts[] |
-            "| \(.riskdesc) | \(.name) | \(.solution | gsub("<[^>]+>";"") | .[0:120]) |"
-          ' report_json.json >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+          HIGH=$(jq '[.site[].alerts[] | select(.riskcode=="3")] | length' report_json.json 2>/dev/null || echo 0)
+          MED=$(jq  '[.site[].alerts[] | select(.riskcode=="2")] | length' report_json.json 2>/dev/null || echo 0)
+          LOW=$(jq  '[.site[].alerts[] | select(.riskcode=="1")] | length' report_json.json 2>/dev/null || echo 0)
+          INFO=$(jq '[.site[].alerts[] | select(.riskcode=="0")] | length' report_json.json 2>/dev/null || echo 0)
 
-          # Single annotation per job: count by level + names
-          SUMMARY=$(jq -r '
-            [.site[].alerts[]] |
-            group_by(.riskdesc) |
-            map("\(length) \(.[0].riskdesc)") |
-            join(", ")
-          ' report_json.json 2>/dev/null)
+          HIGH_COLOR=$( [ "$HIGH" -gt 0 ] && echo "critical"   || echo "brightgreen" )
+          MED_COLOR=$(  [ "$MED"  -gt 0 ] && echo "important"  || echo "brightgreen" )
+          LOW_COLOR=$(  [ "$LOW"  -gt 0 ] && echo "yellow"     || echo "brightgreen" )
+
+          {
+            echo "## ZAP \`${APP}\` — ${SCAN}"
+            echo ""
+            echo "![High](https://img.shields.io/badge/High-${HIGH}-${HIGH_COLOR}?style=flat-square) ![Medium](https://img.shields.io/badge/Medium-${MED}-${MED_COLOR}?style=flat-square) ![Low](https://img.shields.io/badge/Low-${LOW}-yellow?style=flat-square) ![Info](https://img.shields.io/badge/Info-${INFO}-informational?style=flat-square)"
+            echo ""
+          } >> $GITHUB_STEP_SUMMARY
+
+          if [ $((HIGH + MED + LOW + INFO)) -gt 0 ]; then
+            {
+              echo "| Risk | Alert | Solution |"
+              echo "|------|-------|----------|"
+              jq -r '
+                .site[].alerts[] |
+                "| \(.riskdesc) | \(.name) | \(.solution | gsub("<[^>]+>";"") | .[0:120]) |"
+              ' report_json.json
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+
+          SUMMARY="${HIGH} High, ${MED} Medium, ${LOW} Low, ${INFO} Info"
           NAMES=$(jq -r '[.site[].alerts[].name] | unique | join(" | ")' report_json.json 2>/dev/null)
-          [ -n "$SUMMARY" ] && echo "::warning title=[$APP|$SCAN] $SUMMARY::$NAMES" || true
+          [ $((HIGH + MED + LOW + INFO)) -gt 0 ] \
+            && echo "::warning title=[${APP}|${SCAN}] ${SUMMARY}::${NAMES}" \
+            || echo "::notice title=[${APP}|${SCAN}]::No alerts found"
