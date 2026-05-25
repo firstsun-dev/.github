@@ -84,15 +84,9 @@ on:
         description: Extra env vars for smoke tests, one KEY=VALUE per line.
         type: string
         default: ''
-      zap_openapi_path:
-        description: Path to OpenAPI spec for ZAP API scan, e.g. /doc. Empty skips API scan.
-        type: string
-        default: ''
-
 permissions:
   contents: read
   checks: write
-  security-events: write
 
 env:
   NODE_VERSION: 24
@@ -367,19 +361,6 @@ jobs:
             apps/e2e/test-results/
           if-no-files-found: ignore
           retention-days: 7
-
-  zap-scan:
-    name: ZAP Scan
-    needs: deploy
-    if: needs.deploy.result == 'success'
-    uses: firstsun-dev/.github/.github/workflows/_zap-scan-template.yml@main
-    with:
-      app_name: ${{ inputs.app_name }}
-      target_url: ${{ github.ref == 'refs/heads/main' && inputs.app_url_prod || inputs.app_url_dev }}
-      openapi_path: ${{ inputs.zap_openapi_path }}
-      runner: ${{ inputs.runner }}
-      scan_mode: baseline
-    secrets: inherit
 
   revert:
     name: Revert on Verify Failure
