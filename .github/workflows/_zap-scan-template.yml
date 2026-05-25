@@ -39,6 +39,7 @@ on:
 permissions:
   contents: read
   checks: write
+  issues: write
   security-events: write
 
 jobs:
@@ -54,17 +55,18 @@ jobs:
       matrix:
         type: ${{ fromJson(inputs.openapi_path != '' && '["baseline","api"]' || '["baseline"]') }}
     steps:
-      - name: Prepare API target URL
+      - name: Prepare API spec
         if: matrix.type == 'api'
         id: api
         run: |
           CREDS=$(echo "$ZAP_BASIC_AUTH" | base64 -d)
           echo "::add-mask::$CREDS"
-          PROTO=$(echo "${{ inputs.target_url }}" | grep -oP '^https?://')
-          HOST=$(echo "${{ inputs.target_url }}" | sed 's|^https\?://||')
-          API_URL="${PROTO}${CREDS}@${HOST}${{ inputs.openapi_path }}"
-          echo "::add-mask::$API_URL"
-          echo "url=$API_URL" >> $GITHUB_OUTPUT
+          # ZAP's HTTP client rejects URL-embedded credentials (RFC 9110 deprecated).
+          # Download spec via curl and pass the local file to the action instead.
+          SPEC_FILE="openapi-spec-${{ inputs.app_name }}.json"
+          curl -fsSL -u "$CREDS" "${{ inputs.target_url }}${{ inputs.openapi_path }}" -o "$SPEC_FILE"
+          # ZAP mounts $PWD as /zap/wrk inside the container
+          echo "spec=/zap/wrk/$SPEC_FILE" >> $GITHUB_OUTPUT
         env:
           ZAP_BASIC_AUTH: ${{ secrets.ZAP_DOC_BASIC_AUTH }}
 
@@ -90,7 +92,7 @@ jobs:
         if: matrix.type == 'api'
         uses: zaproxy/action-api-scan@v0.9.0
         with:
-          target: ${{ steps.api.outputs.url }}
+          target: ${{ steps.api.outputs.spec }}
           format: openapi
           token: ${{ secrets.GITHUB_TOKEN }}
           fail_action: false
