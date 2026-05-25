@@ -99,3 +99,13 @@ jobs:
           fail_action: false
           allow_issue_writing: false
           artifact_name: zap-api-${{ inputs.app_name }}
+
+      - name: Annotate findings
+        if: always()
+        run: |
+          [ -f report_json.json ] || exit 0
+          jq -r '
+            .site[].alerts[] |
+            select(.riskcode | tonumber >= 1) |
+            "::warning title=ZAP [\(.riskdesc)]::[\(.name)] \(.desc | gsub("<[^>]+>";"") | .[0:150])"
+          ' report_json.json 2>/dev/null || true
