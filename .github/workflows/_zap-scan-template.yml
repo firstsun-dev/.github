@@ -28,6 +28,10 @@ on:
         description: baseline or full
         type: string
         default: baseline
+      run_label:
+        description: Short label shown in job name to identify trigger source
+        type: string
+        default: ''
     secrets:
       ZAP_DOC_BASIC_AUTH:
         required: false
@@ -39,7 +43,10 @@ permissions:
 
 jobs:
   zap-scan:
-    name: ZAP ${{ inputs.scan_mode }} ${{ matrix.type }} - ${{ inputs.app_name }}
+    name: >-
+      ZAP ${{ inputs.scan_mode }} ${{ matrix.type }}
+      ${{ inputs.run_label != '' && format('[{0}]', inputs.run_label) || '' }}
+      - ${{ inputs.app_name }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 90
     strategy:
