@@ -91,7 +91,7 @@ jobs:
 
       - name: ZAP API Scan
         if: matrix.type == 'api'
-        uses: zaproxy/action-api-scan@v0.13.0
+        uses: zaproxy/action-api-scan@v0.10.0
         with:
           target: ${{ steps.api.outputs.spec }}
           format: openapi
