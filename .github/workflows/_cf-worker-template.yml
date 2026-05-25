@@ -1,0 +1,411 @@
+name: CF Worker Pipeline Template
+
+# ---------------------------------------------------------------------------
+# Reusable Cloudflare Worker pipeline template.
+# Mirrors .gitlab/ci/templates/cf-worker-pipeline.yml
+#
+# Branch push:  Test → Migrate → Deploy (prod if main, dev otherwise)
+# PR:           Test only (migrate/deploy skipped)
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        type: string
+        required: true
+      app_path:
+        type: string
+        required: true
+      app_version:
+        type: string
+        required: true
+      build_cmd:
+        description: Build command, run from app_path
+        type: string
+        required: true
+      migrate_cmd_prod:
+        type: string
+        default: ''
+      migrate_cmd_dev:
+        type: string
+        default: ''
+      test_unit_cmd:
+        description: Empty string skips this job
+        type: string
+        default: ''
+      test_integration_cmd:
+        description: Empty string skips this job
+        type: string
+        default: ''
+      test_e2e_setup_cmd:
+        description: Optional setup command run before test_e2e_cmd, from app_path
+        type: string
+        default: ''
+      test_e2e_cmd:
+        description: Empty string skips this job
+        type: string
+        default: ''
+      verify_cmd:
+        description: Smoke test command run after prod deploy, from app_path. Empty string skips verify/revert.
+        type: string
+        default: ''
+      app_url_prod:
+        type: string
+        default: ''
+      app_url_dev:
+        type: string
+        default: ''
+      runner:
+        description: Runner label for all jobs in this pipeline
+        type: string
+        default: linux
+      use_mailpit:
+        description: Start a Mailpit SMTP server for integration/E2E tests
+        type: boolean
+        default: false
+      vite_env_prod:
+        description: |
+          VITE_* env vars for production build, one KEY=VALUE per line.
+          VITE_APP_ENV and VITE_APP_VERSION are set automatically.
+        type: string
+        default: ''
+      vite_env_dev:
+        description: |
+          VITE_* env vars for development build, one KEY=VALUE per line.
+          VITE_APP_ENV and VITE_APP_VERSION are set automatically.
+        type: string
+        default: ''
+      test_e2e_env:
+        description: Extra env vars for E2E tests, one KEY=VALUE per line.
+        type: string
+        default: ''
+      verify_env:
+        description: Extra env vars for smoke tests, one KEY=VALUE per line.
+        type: string
+        default: ''
+      zap_openapi_path:
+        description: Path to OpenAPI spec for ZAP API scan, e.g. /doc. Empty skips API scan.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  checks: write
+
+env:
+  NODE_VERSION: 24
+  PNPM_STORE_PATH: /cache/pnpm-store
+  PLAYWRIGHT_BROWSERS_PATH: /opt/playwright-browsers
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Test Phase — parallel, runs on all branches and PRs
+  # ---------------------------------------------------------------------------
+  test-unit:
+    name: Unit Tests
+    if: inputs.test_unit_cmd != ''
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup
+        uses: firstsun-dev/.github/actions/setup@main
+      - name: Run unit tests
+        working-directory: ${{ inputs.app_path }}
+        run: ${{ inputs.test_unit_cmd }}
+      - name: Test Report
+        uses: dorny/test-reporter@v3
+        if: always()
+        with:
+          name: ${{ inputs.app_name }} - Unit Tests
+          path: ${{ inputs.app_path }}/junit-*.xml
+          reporter: java-junit
+          fail-on-error: false
+
+  test-integration:
+    name: Integration Tests
+    if: inputs.test_integration_cmd != ''
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup
+        uses: firstsun-dev/.github/actions/setup@main
+      - name: Start Mailpit
+        if: inputs.use_mailpit
+        uses: firstsun-dev/.github/actions/mailpit@main
+      - name: Run integration tests
+        working-directory: ${{ inputs.app_path }}
+        run: ${{ inputs.test_integration_cmd }}
+      - name: Test Report
+        uses: dorny/test-reporter@v3
+        if: always()
+        with:
+          name: ${{ inputs.app_name }} - Integration Tests
+          path: ${{ inputs.app_path }}/junit-*.xml
+          reporter: java-junit
+          fail-on-error: false
+
+  test-e2e:
+    name: E2E Tests
+    if: inputs.test_e2e_cmd != ''
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup
+        uses: firstsun-dev/.github/actions/setup@main
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps
+      - name: Start Mailpit
+        if: inputs.use_mailpit
+        uses: firstsun-dev/.github/actions/mailpit@main
+      - name: Set E2E environment
+        if: inputs.test_e2e_env != ''
+        uses: firstsun-dev/.github/actions/parse-env@main
+        with:
+          vars: ${{ inputs.test_e2e_env }}
+      - name: E2E setup
+        if: inputs.test_e2e_setup_cmd != ''
+        working-directory: ${{ inputs.app_path }}
+        run: ${{ inputs.test_e2e_setup_cmd }}
+      - name: Run E2E tests
+        working-directory: ${{ inputs.app_path }}
+        run: ${{ inputs.test_e2e_cmd }}
+      - name: Upload E2E report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: e2e-report-${{ inputs.app_name }}-${{ github.run_id }}
+          path: |
+            apps/e2e/playwright-report/
+            apps/e2e/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Migrate — branch push only, skipped on PRs
+  # Prod (main): migrate_cmd_prod / Dev (other): migrate_cmd_dev
+  # ---------------------------------------------------------------------------
+  migrate:
+    name: Database Migration
+    needs: [test-unit, test-integration, test-e2e]
+    if: |
+      always() &&
+      github.event_name != 'pull_request' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled') &&
+      (inputs.migrate_cmd_prod != '' || inputs.migrate_cmd_dev != '')
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup
+        uses: firstsun-dev/.github/actions/setup@main
+      - name: Run migrations
+        working-directory: ${{ inputs.app_path }}
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            ${{ inputs.migrate_cmd_prod }}
+          else
+            ${{ inputs.migrate_cmd_dev }}
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  # ---------------------------------------------------------------------------
+  # Deploy — branch push only, 100% traffic
+  # Prod (main): wrangler versions upload + deploy — tracks version ID for revert
+  # Dev (other): wrangler deploy --env dev
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy
+    needs: [test-unit, test-integration, test-e2e, migrate]
+    if: |
+      always() &&
+      github.event_name != 'pull_request' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    runs-on: ${{ inputs.runner }}
+    environment:
+      name: ${{ inputs.app_name }}/${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
+      url: ${{ github.ref == 'refs/heads/main' && inputs.app_url_prod || inputs.app_url_dev }}
+    timeout-minutes: 20
+    outputs:
+      version_id: ${{ steps.deploy.outputs.version_id }}
+      previous_version_id: ${{ steps.deploy.outputs.previous_version_id }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Setup
+        uses: firstsun-dev/.github/actions/setup@main
+      - name: Set build environment
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            DEPLOY_ENV=prod
+            VITE_VARS="${{ inputs.vite_env_prod }}"
+          else
+            DEPLOY_ENV=dev
+            VITE_VARS="${{ inputs.vite_env_dev }}"
+          fi
+
+          VERSION="${{ inputs.app_version }}"
+          echo "VITE_APP_ENV=$DEPLOY_ENV" >> $GITHUB_ENV
+          echo "VITE_APP_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "APP_VERSION=$VERSION" >> $GITHUB_ENV
+
+          # 🚀 Sync local package.json version before build
+          CLEAN_VERSION=$(echo "$VERSION" | sed -E 's/^v//' | cut -d'(' -f1)
+          pnpm -r version "$CLEAN_VERSION" --no-git-tag-version --allow-same-version || true
+
+          while IFS= read -r line; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            echo "$line" >> $GITHUB_ENV
+          done <<< "$VITE_VARS"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        working-directory: ${{ inputs.app_path }}
+        run: ${{ inputs.build_cmd }}
+      - name: Deploy
+        id: deploy
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          RAW_COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          # Safely extract first line of commit message from env var
+          COMMIT_MSG=$(echo "$RAW_COMMIT_MSG" | head -1 | cut -c1-80)
+          COMMIT_MSG="${COMMIT_MSG:-Manual deploy}"
+          DEPLOY_MSG="[$SHORT_SHA] $COMMIT_MSG"
+
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            WRANGLER_ENV=""
+          else
+            WRANGLER_ENV="--env dev"
+          fi
+
+          # Get previous version ID for potential revert
+          PREV_ID=$(pnpm exec wrangler deployments list $WRANGLER_ENV --json 2>/dev/null \
+            | jq -r 'sort_by(.created_on) | reverse | .[0].versions | max_by(.percentage // 0) | .version_id // empty' \
+            2>/dev/null || echo "")
+
+          # Upload new version with metadata
+          UPLOAD_OUT=$(pnpm exec wrangler versions upload $WRANGLER_ENV \
+            --message "$DEPLOY_MSG" \
+            --var COMMIT_HASH:"$SHORT_SHA" \
+            --var VERSION:"$APP_VERSION")
+          echo "$UPLOAD_OUT"
+          
+          # Extract the new Version ID from output
+          VERSION_ID=$(echo "$UPLOAD_OUT" | grep "Worker Version ID:" | awk '{print $NF}')
+          if [ -z "$VERSION_ID" ]; then
+            echo "❌ Failed to extract Worker Version ID from wrangler output"
+            exit 1
+          fi
+
+          # Deploy the version to 100% traffic
+          pnpm exec wrangler versions deploy $WRANGLER_ENV "$VERSION_ID@100" --message "$DEPLOY_MSG" --yes
+
+          echo "version_id=$VERSION_ID" >> $GITHUB_OUTPUT
+          echo "previous_version_id=$PREV_ID" >> $GITHUB_OUTPUT
+
+  # ---------------------------------------------------------------------------
+  # Verify — prod (main) and dev (other branches)
+  # Revert — prod only
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Smoke Tests
+    needs: deploy
+    if: |
+      needs.deploy.result == 'success' &&
+      inputs.verify_cmd != ''
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup
+        uses: firstsun-dev/.github/actions/setup@main
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps
+      - name: Debug Environment
+        run: |
+          echo "Target URL: ${{ github.ref == 'refs/heads/main' && inputs.app_url_prod || inputs.app_url_dev }}"
+          echo "Smoke User: $SMOKE_USERNAME"
+          if [ -n "$SMOKE_PASSWORD" ]; then
+            echo "Smoke Pass: ****${SMOKE_PASSWORD: -4}"
+          else
+            echo "Smoke Pass: MISSING"
+          fi
+      - name: Set smoke test environment
+        if: inputs.verify_env != ''
+        uses: firstsun-dev/.github/actions/parse-env@main
+        with:
+          vars: ${{ inputs.verify_env }}
+      - name: Run smoke tests
+        working-directory: ${{ inputs.app_path }}
+        run: ${{ inputs.verify_cmd }}
+        env:
+          SMOKE_USERNAME: ${{ secrets.CI_PROD_TEST_USER }}
+          SMOKE_PASSWORD: ${{ secrets.CI_PROD_TEST_PASS }}
+          TEST_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
+          TARGET_URL: ${{ github.ref == 'refs/heads/main' && inputs.app_url_prod || inputs.app_url_dev }}
+          NO_PROXY: "*"
+      - name: Upload Smoke Test Report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: smoke-report-${{ inputs.app_name }}-${{ github.run_id }}
+          path: |
+            apps/e2e/playwright-report/
+            apps/e2e/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  zap-scan:
+    name: ZAP Scan
+    needs: deploy
+    if: needs.deploy.result == 'success'
+    uses: firstsun-dev/.github/.github/workflows/_zap-scan-template.yml@main
+    with:
+      app_name: ${{ inputs.app_name }}
+      target_url: ${{ github.ref == 'refs/heads/main' && inputs.app_url_prod || inputs.app_url_dev }}
+      openapi_path: ${{ inputs.zap_openapi_path }}
+      runner: ${{ inputs.runner }}
+      scan_mode: baseline
+    secrets: inherit
+
+  revert:
+    name: Revert on Verify Failure
+    needs: [deploy, verify]
+    if: |
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      needs.deploy.result == 'success' &&
+      needs.verify.result == 'failure'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup
+        uses: firstsun-dev/.github/actions/setup@main
+      - name: Revert to previous version
+        working-directory: ${{ inputs.app_path }}
+        run: |
+          PREV_ID="${{ needs.deploy.outputs.previous_version_id }}"
+          if [ -z "$PREV_ID" ]; then
+            echo "No previous version recorded, skipping revert."
+            exit 0
+          fi
+          echo "Reverting to $PREV_ID..."
+          pnpm exec wrangler versions deploy "$PREV_ID@100" \
+            --message "Revert: smoke tests failed on ${{ github.sha }}" \
+            --yes
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

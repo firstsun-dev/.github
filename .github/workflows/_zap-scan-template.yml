@@ -1,0 +1,104 @@
+name: ZAP Scan Template
+
+# ---------------------------------------------------------------------------
+# Reusable ZAP security scan template.
+# Runs baseline (passive) or full (active) scan on frontend, plus API scan
+# if openapi_path is provided.
+#
+# scan_mode: baseline — fast, passive, safe for prod
+#            full     — active attack payloads, dev only
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        type: string
+        required: true
+      target_url:
+        type: string
+        required: true
+      openapi_path:
+        description: Path to OpenAPI spec, e.g. /doc. Empty skips API scan.
+        type: string
+        default: ''
+      runner:
+        type: string
+        default: linux
+      scan_mode:
+        description: baseline or full
+        type: string
+        default: baseline
+    secrets:
+      ZAP_DOC_BASIC_AUTH:
+        required: false
+
+permissions:
+  contents: read
+  checks: write
+  security-events: write
+
+jobs:
+  zap-scan:
+    name: ZAP ${{ inputs.scan_mode }} - ${{ inputs.app_name }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+    steps:
+      - name: ZAP Baseline Scan (Frontend)
+        if: inputs.scan_mode == 'baseline'
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ inputs.target_url }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fail_action: false
+          artifact_name: zap-baseline-${{ inputs.app_name }}
+          cmd_options: '-J zap-frontend-report.json'
+
+      - name: ZAP Full Scan (Frontend)
+        if: inputs.scan_mode == 'full'
+        uses: zaproxy/action-full-scan@v0.12.0
+        with:
+          target: ${{ inputs.target_url }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fail_action: false
+          artifact_name: zap-full-${{ inputs.app_name }}
+          cmd_options: '-J zap-frontend-report.json'
+
+      - name: Convert Frontend to SARIF
+        if: always()
+        run: npx --yes @continuous-security/zap-to-sarif zap-frontend-report.json zap-frontend.sarif
+
+      - name: Upload Frontend SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: zap-frontend.sarif
+          category: zap-${{ inputs.scan_mode }}-${{ inputs.app_name }}
+
+      - name: ZAP API Scan
+        if: inputs.openapi_path != ''
+        uses: zaproxy/action-api-scan@v0.9.0
+        with:
+          target: ${{ inputs.target_url }}${{ inputs.openapi_path }}
+          format: openapi
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fail_action: false
+          artifact_name: zap-api-${{ inputs.app_name }}
+          cmd_options: >-
+            -J zap-api-report.json
+            -config replacer.full_list(0).description=auth
+            -config replacer.full_list(0).enabled=true
+            -config replacer.full_list(0).matchtype=REQ_HEADER
+            -config replacer.full_list(0).matchstring=Authorization
+            -config replacer.full_list(0).replacement=Basic\ ${{ secrets.ZAP_DOC_BASIC_AUTH }}
+
+      - name: Convert API to SARIF
+        if: always() && inputs.openapi_path != ''
+        run: npx --yes @continuous-security/zap-to-sarif zap-api-report.json zap-api.sarif
+
+      - name: Upload API SARIF
+        if: always() && inputs.openapi_path != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: zap-api.sarif
+          category: zap-${{ inputs.scan_mode }}-api-${{ inputs.app_name }}

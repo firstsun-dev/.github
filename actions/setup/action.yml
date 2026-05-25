@@ -1,0 +1,37 @@
+name: Setup
+description: Common setup for workflows (Node, pnpm, install dependencies)
+inputs:
+  node-version:
+    description: Node.js version
+    required: false
+    default: '24'
+  pnpm-version:
+    description: pnpm version
+    required: false
+    default: '10'
+  install:
+    description: Whether to run pnpm install
+    required: false
+    default: 'true'
+  fetch-depth:
+    description: Git fetch depth
+    required: false
+    default: '1'
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v6
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - uses: pnpm/action-setup@v6
+      with:
+        version: ${{ inputs.pnpm-version }}
+
+    - name: Install dependencies
+      if: inputs.install == 'true'
+      shell: bash
+      run: |
+        pnpm config set store-dir /cache/pnpm-store
+        pnpm install --frozen-lockfile
