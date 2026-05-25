@@ -107,8 +107,22 @@ jobs:
           SCAN: ${{ matrix.type }}
         run: |
           [ -f report_json.json ] || exit 0
-          jq -r --arg prefix "[$APP|$SCAN]" '
+
+          # Step Summary — full markdown table
+          echo "## ZAP [$APP|$SCAN]" >> $GITHUB_STEP_SUMMARY
+          echo "| Risk | Name | Solution |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|----------|" >> $GITHUB_STEP_SUMMARY
+          jq -r '
             .site[].alerts[] |
-            select(.riskcode | tonumber >= 1) |
-            "::warning title=\($prefix) \(.riskdesc) — \(.name)::\(.desc | gsub("<[^>]+>";"") | .[0:200])"
-          ' report_json.json 2>/dev/null || true
+            "| \(.riskdesc) | \(.name) | \(.solution | gsub("<[^>]+>";"") | .[0:120]) |"
+          ' report_json.json >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+
+          # Single annotation per job: count by level + names
+          SUMMARY=$(jq -r '
+            [.site[].alerts[]] |
+            group_by(.riskdesc) |
+            map("\(length) \(.[0].riskdesc)") |
+            join(", ")
+          ' report_json.json 2>/dev/null)
+          NAMES=$(jq -r '[.site[].alerts[].name] | unique | join(" | ")' report_json.json 2>/dev/null)
+          [ -n "$SUMMARY" ] && echo "::warning title=[$APP|$SCAN] $SUMMARY::$NAMES" || true
