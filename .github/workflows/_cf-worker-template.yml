@@ -91,7 +91,7 @@ permissions:
 env:
   NODE_VERSION: 24
   PNPM_STORE_PATH: /cache/pnpm-store
-  PLAYWRIGHT_BROWSERS_PATH: /opt/playwright-browsers
+  PLAYWRIGHT_BROWSERS_PATH: /cache/playwright-browsers
 
 jobs:
   # ---------------------------------------------------------------------------
