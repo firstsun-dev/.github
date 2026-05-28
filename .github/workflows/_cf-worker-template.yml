@@ -151,10 +151,6 @@ jobs:
       - uses: actions/checkout@v6
       - name: Setup
         uses: firstsun-dev/.github/actions/setup@main
-      - name: Install Playwright browsers
-        run: |
-          rm -rf /opt/playwright-browsers/__dirlock
-          pnpm exec playwright install chromium
       - name: Start Mailpit
         if: inputs.use_mailpit
         uses: firstsun-dev/.github/actions/mailpit@main
