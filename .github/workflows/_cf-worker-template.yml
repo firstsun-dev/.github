@@ -152,7 +152,7 @@ jobs:
       - name: Setup
         uses: firstsun-dev/.github/actions/setup@main
       - name: Install Playwright browsers
-        run: pnpm exec playwright install --with-deps
+        run: pnpm exec playwright install chromium --with-deps
       - name: Start Mailpit
         if: inputs.use_mailpit
         uses: firstsun-dev/.github/actions/mailpit@main
@@ -327,7 +327,7 @@ jobs:
       - name: Setup
         uses: firstsun-dev/.github/actions/setup@main
       - name: Install Playwright browsers
-        run: pnpm exec playwright install --with-deps
+        run: pnpm exec playwright install chromium --with-deps
       - name: Debug Environment
         run: |
           echo "Target URL: ${{ github.ref == 'refs/heads/main' && inputs.app_url_prod || inputs.app_url_dev }}"
