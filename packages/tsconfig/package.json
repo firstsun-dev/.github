@@ -1,0 +1,6 @@
+{
+  "name": "@firstsun/tsconfig",
+  "version": "1.0.0",
+  "description": "Shared TypeScript base configs for Firstsun monorepos",
+  "files": ["base.json", "worker.json", "react.json"]
+}
