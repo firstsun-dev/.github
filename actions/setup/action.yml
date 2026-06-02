@@ -21,6 +21,10 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Configure git safe directory
+      shell: bash
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
     - uses: actions/setup-node@v6
       with:
         node-version: ${{ inputs.node-version }}
