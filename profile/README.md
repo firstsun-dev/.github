@@ -32,6 +32,11 @@ I build and maintain highly automated workflows for content creation, spiritual 
 | :--- | :--- | :--- |
 | **[heaven-monorepo](https://github.com/firstsun-dev/heaven-monorepo)** | Core system for Heaven (天界之舟): Heaven ID (OIDC on Cloudflare Workers), Check-in app, shared packages (Private). | TypeScript, Turborepo |
 
+### Personal Apps
+| Repository | Purpose | Tech Stack |
+| :--- | :--- | :--- |
+| **[innovation-apps](https://github.com/firstsun-dev/innovation-apps)** | Personal tools monorepo. Includes **Diet Manager** (飲食管理) — AI-assisted food logging with photo analysis, nutritional tracking, daily stats, and Google OAuth (Private). | TypeScript, React, Hono, Cloudflare Workers, D1, R2, Gemini |
+
 ### DevOps & Automation
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
