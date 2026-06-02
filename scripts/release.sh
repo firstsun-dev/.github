@@ -30,7 +30,11 @@ read -rp "Commit, tag $VERSION, and move $MAJOR? [y/N] " confirm
 [[ "$confirm" == "y" || "$confirm" == "Y" ]] || { echo "Aborted."; exit 1; }
 
 git add packages/eslint-config/package.json packages/tsconfig/package.json
-git commit -m "chore: release $VERSION"
+if git diff --cached --quiet; then
+  echo "(package versions unchanged, skipping commit)"
+else
+  git commit -m "chore: release $VERSION"
+fi
 
 # Exact tag — for npm package pinning (immutable)
 git tag "$VERSION"
