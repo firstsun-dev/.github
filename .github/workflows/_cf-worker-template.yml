@@ -272,10 +272,12 @@ jobs:
           RAW_COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          BRANCH="${{ github.ref_name }}"
+          ACTOR="${{ github.actor }}"
           # Safely extract first line of commit message from env var
           COMMIT_MSG=$(echo "$RAW_COMMIT_MSG" | head -1 | cut -c1-80)
           COMMIT_MSG="${COMMIT_MSG:-Manual deploy}"
-          DEPLOY_MSG="[$SHORT_SHA] $COMMIT_MSG"
+          DEPLOY_MSG="[$SHORT_SHA] $COMMIT_MSG | $BRANCH | by $ACTOR"
 
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
             WRANGLER_ENV=""
