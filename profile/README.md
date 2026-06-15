@@ -6,13 +6,27 @@
   <img src="https://img.shields.io/github/followers/firstsun-dev?style=for-the-badge&color=green&labelColor=333" alt="Followers" />
 </p>
 
-### 🌐 Infrastructure & Automation
+### 🌐 Cloud & Core Infrastructure
 ![Cloudflare](https://img.shields.io/badge/Cloudflare-F38020?style=flat-square&logo=Cloudflare&logoColor=white)
 ![Oracle Cloud](https://img.shields.io/badge/Oracle-F80000?style=flat-square&logo=oracle&logoColor=white)
+![Proxmox](https://img.shields.io/badge/Proxmox-E57000?style=flat-square&logo=proxmox&logoColor=white)
+![GCP](https://img.shields.io/badge/GCP-4285F4?style=flat-square&logo=google-cloud&logoColor=white)
+![Ubuntu](https://img.shields.io/badge/Ubuntu-E9433F?style=flat-square&logo=ubuntu&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat-square&logo=docker&logoColor=white)
+
+### 🤖 Automation & Orchestration
 ![Terraform](https://img.shields.io/badge/Terraform-7B42BC?style=flat-square&logo=terraform&logoColor=white)
 ![Ansible](https://img.shields.io/badge/Ansible-EE0000?style=flat-square&logo=ansible&logoColor=white)
 ![Windmill](https://img.shields.io/badge/Windmill-222222?style=flat-square)
+![Kestra](https://img.shields.io/badge/Kestra-00B2FF?style=flat-square)
 ![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-2088FF?style=flat-square&logo=github-actions&logoColor=white)
+
+### 📊 Data & Monitoring
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=flat-square&logo=postgresql&logoColor=white)
+![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?style=flat-square&logo=prometheus&logoColor=white)
+![Grafana](https://img.shields.io/badge/Grafana-F46800?style=flat-square&logo=grafana&logoColor=white)
+![Uptime Kuma](https://img.shields.io/badge/Uptime_Kuma-63E6BE?style=flat-square)
+![Harbor](https://img.shields.io/badge/Harbor-60B932?style=flat-square&logo=harbor&logoColor=white)
 
 ### 🚀 Application Stack
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white)
@@ -20,11 +34,6 @@
 ![Astro](https://img.shields.io/badge/Astro-BC52EE?style=flat-square&logo=astro&logoColor=white)
 ![React](https://img.shields.io/badge/React-61DAFB?style=flat-square&logo=react&logoColor=black)
 ![Hono](https://img.shields.io/badge/Hono-E36002?style=flat-square&logo=hono&logoColor=white)
-![SQLite/D1](https://img.shields.io/badge/SQLite/D1-003B57?style=flat-square&logo=sqlite&logoColor=white)
-
-### 🎨 Standards & Documentation
-![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-FE5196?style=flat-square&logo=conventionalcommits&logoColor=white)
-![Diataxis](https://img.shields.io/badge/Docs-Di%C3%A1taxis-339933?style=flat-square)
 ![Obsidian](https://img.shields.io/badge/Obsidian-7C3AED?style=flat-square&logo=obsidian&logoColor=white)
 
 ---
