@@ -42,6 +42,7 @@ I build and maintain highly automated workflows for content creation, spiritual 
 | :--- | :--- | :--- |
 | **[.github](https://github.com/firstsun-dev/.github)** | Centralized governance, shared workflows, and issue templates. | GitHub Actions |
 | **[status-page](https://github.com/firstsun-dev/status-page)** | Open-source uptime monitor and status page for Firstsun services. [[Live](https://firstsun-dev.github.io/status-page/)] | Upptime, GitHub Actions |
+| **[infra-config](https://github.com/firstsun-dev/infra-config)** | Multi-Cloud IaC for Oracle Cloud, Cloudflare, and Proxmox. | Terraform, Ansible |
 
 ---
 
