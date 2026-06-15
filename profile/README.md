@@ -1,7 +1,7 @@
 # Firstsun's Digital Forge 🛠️
 
 <p align="left">
-  <img src="https://img.shields.io/github/stars/firstsun-dev/blog?style=for-the-badge&color=gold&labelColor=333&label=TOTAL%20STARS" alt="Total Stars" />
+  <img src="https://img.shields.io/github/stars/firstsun-dev?style=for-the-badge&color=gold&labelColor=333" alt="Total Stars" />
   <img src="https://img.shields.io/badge/Repos-18-blue?style=for-the-badge&labelColor=333" alt="Total Repos" />
   <img src="https://img.shields.io/github/followers/firstsun-dev?style=for-the-badge&color=green&labelColor=333" alt="Followers" />
 </p>
