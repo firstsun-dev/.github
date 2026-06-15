@@ -1,0 +1,11 @@
+name: "⚡ Quick Task"
+description: "A simple task or reminder"
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: task
+    attributes:
+      label: "Task Details"
+      placeholder: "Short and sweet..."
+    validations:
+      required: true
