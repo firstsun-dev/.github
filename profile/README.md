@@ -47,8 +47,8 @@ I build and maintain highly automated workflows for content creation, spiritual 
 ### Obsidian Plugin Development & Ecosystem
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
+| **[git-files-sync](https://github.com/firstsun-dev/git-files-sync)** | Obsidian plugin for selective note sync with GitHub/GitLab. <br> 🚀 **[Official Community Plugin](https://community.obsidian.md/plugins/git-file-sync)** | TypeScript, Obsidian API, Git |
 | **[watermark-s3-uploader](https://github.com/firstsun-dev/watermark-s3-uploader)** | Obsidian plugin that watermarks images and uploads to Cloudflare R2 / S3 on paste or drop. | TypeScript, Node.js, AWS S3 |
-| **[git-files-sync](https://github.com/firstsun-dev/git-files-sync)** | Obsidian plugin for selective note sync with GitHub/GitLab — granular push/pull with visual dashboard. | TypeScript, Obsidian API, Git |
 | **[obsidian-releases](https://github.com/firstsun-dev/obsidian-releases)** | Community plugins list, theme list, and releases of Obsidian. | TypeScript, Obsidian API |
 | **[obsidian-plugin-template](https://github.com/firstsun-dev/obsidian-plugin-template)** | Standardized template for Obsidian plugin development with shared CI/CD and semantic-release. | TypeScript, Obsidian API |
 
