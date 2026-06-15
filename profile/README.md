@@ -11,22 +11,9 @@
 ![Oracle Cloud](https://img.shields.io/badge/Oracle-F80000?style=flat-square&logo=oracle&logoColor=white)
 ![Proxmox](https://img.shields.io/badge/Proxmox-E57000?style=flat-square&logo=proxmox&logoColor=white)
 ![GCP](https://img.shields.io/badge/GCP-4285F4?style=flat-square&logo=google-cloud&logoColor=white)
-![Ubuntu](https://img.shields.io/badge/Ubuntu-E9433F?style=flat-square&logo=ubuntu&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat-square&logo=docker&logoColor=white)
-
-### 🤖 Automation & Orchestration
 ![Terraform](https://img.shields.io/badge/Terraform-7B42BC?style=flat-square&logo=terraform&logoColor=white)
 ![Ansible](https://img.shields.io/badge/Ansible-EE0000?style=flat-square&logo=ansible&logoColor=white)
-![Windmill](https://img.shields.io/badge/Windmill-222222?style=flat-square)
-![Kestra](https://img.shields.io/badge/Kestra-00B2FF?style=flat-square)
-![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-2088FF?style=flat-square&logo=github-actions&logoColor=white)
-
-### 📊 Data & Monitoring
-![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=flat-square&logo=postgresql&logoColor=white)
-![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?style=flat-square&logo=prometheus&logoColor=white)
-![Grafana](https://img.shields.io/badge/Grafana-F46800?style=flat-square&logo=grafana&logoColor=white)
-![Uptime Kuma](https://img.shields.io/badge/Uptime_Kuma-63E6BE?style=flat-square)
-![Harbor](https://img.shields.io/badge/Harbor-60B932?style=flat-square&logo=harbor&logoColor=white)
 
 ### 🚀 Application Stack
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white)
@@ -38,45 +25,43 @@
 
 ---
 
-Welcome to my central configuration and automation hub. This repository serves as the backbone for my cross-project standards, agent skills, and workflow automations.
+## ⭐ Featured Projects
 
-## 🏗️ Core Ecosystem
+### 📝 [git-files-sync](https://github.com/firstsun-dev/git-files-sync)
+> **Official Obsidian Community Plugin**
+> Selective note sync with GitHub/GitLab. Features a granular dashboard for visual push/pull operations.
+> 🚀 **[View on Obsidian Community](https://community.obsidian.md/plugins/git-file-sync)**
 
-I build and maintain highly automated workflows for content creation, spiritual study, and modern web development.
+### 🏗️ [infra-config](https://github.com/firstsun-dev/infra-config)
+> **Multi-Cloud IaC & GitOps Backbone**
+> Centralized management of Oracle Cloud, GCP, Cloudflare, and Proxmox using **Terraform** & **Ansible**. Powering all Firstsun-Dev services with high availability.
 
-### Obsidian Plugin Development & Ecosystem
+### 🍎 [innovation-apps](https://github.com/firstsun-dev/innovation-apps)
+> **AI-Powered Lifestyle Tools**
+> Home of **Diet Manager**: AI photo analysis for food logging, nutritional tracking, and health data integration with Gemini & FatSecret.
+
+---
+
+## 🏗️ Full Ecosystem Inventory
+
+### Obsidian & Knowledge Management
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
-| **[git-files-sync](https://github.com/firstsun-dev/git-files-sync)** | Obsidian plugin for selective note sync with GitHub/GitLab. <br> 🚀 **[Official Community Plugin](https://community.obsidian.md/plugins/git-file-sync)** | TypeScript, Obsidian API, Git |
-| **[watermark-s3-uploader](https://github.com/firstsun-dev/watermark-s3-uploader)** | Obsidian plugin that watermarks images and uploads to Cloudflare R2 / S3 on paste or drop. | TypeScript, Node.js, AWS S3 |
-| **[obsidian-releases](https://github.com/firstsun-dev/obsidian-releases)** | Community plugins list, theme list, and releases of Obsidian. | TypeScript, Obsidian API |
-| **[obsidian-plugin-template](https://github.com/firstsun-dev/obsidian-plugin-template)** | Standardized template for Obsidian plugin development with shared CI/CD and semantic-release. | TypeScript, Obsidian API |
+| **[watermark-s3-uploader](https://github.com/firstsun-dev/watermark-s3-uploader)** | Auto watermark & upload images to R2/S3. | TS, S3 |
+| **[obsidian-plugin-template](https://github.com/firstsun-dev/obsidian-plugin-template)** | Standardized CI/CD for plugins. | TS, Release-it |
+| **[books-mgmt](https://github.com/firstsun-dev/books-mgmt)** | Kavita automation & Google Drive sync. | Python, Rclone |
 
-### Content & Knowledge Management
+### Automation & AI Pipelines
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
-| **[heaven-video-summary](https://github.com/firstsun-dev/heaven-video-summary)** | 天界之舟 YouTube lecture transcription pipeline: playlist → Whisper → Markdown → Google Drive. | Python, Whisper, Bash |
-| **[news-getter](https://github.com/firstsun-dev/news-getter)** | Personalized AI news digest: RSS feeds → Gemini CLI summary → e-ink friendly RSS feed. [[Pages](https://firstsun-dev.github.io/news-getter/)] | Python, Bash |
-| **[books-mgmt](https://github.com/firstsun-dev/books-mgmt)** | Kavita book server automation: sync collections by directory structure and export to Google Drive as TXT. | Python, uv, rclone |
-| **[blog](https://github.com/firstsun-dev/blog)** | Personal tech blog with multi-language support, dark mode, article likes, and view stats (Private). | Astro, Cloudflare Pages, D1 |
-| **[my-apple-health](https://github.com/firstsun-dev/my-apple-health)** | Apple Health XML export pipeline → CSV/Markdown for AI agents like NotebookLM (Private). | Python, uv |
+| **[heaven-video-summary](https://github.com/firstsun-dev/heaven-video-summary)** | YouTube → Whisper → Markdown pipeline. | Python, Whisper |
+| **[news-getter](https://github.com/firstsun-dev/news-getter)** | RSS → Gemini Summary → E-Ink feed. | Python, Gemini |
+| **[kestra-flows](https://github.com/firstsun-dev/kestra-flows)** | Workflow orchestration. | YAML, Docker |
 
-### 天界之舟 Ecosystem
+### Identity & Core Apps
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
-| **[heaven-monorepo](https://github.com/firstsun-dev/heaven-monorepo)** | Core system for Heaven (天界之舟): Heaven ID (OIDC on Cloudflare Workers), Check-in app, shared packages (Private). | TypeScript, Turborepo |
-
-### Personal Apps
-| Repository | Purpose | Tech Stack |
-| :--- | :--- | :--- |
-| **[innovation-apps](https://github.com/firstsun-dev/innovation-apps)** | Personal tools monorepo. Includes **Diet Manager** (飲食管理) — AI-assisted food logging with photo analysis, nutritional tracking, daily stats, and Google OAuth (Private). | TypeScript, React, Hono, Cloudflare Workers, D1, R2, Gemini |
-
-### DevOps & Automation
-| Repository | Purpose | Tech Stack |
-| :--- | :--- | :--- |
-| **[infra-config](https://github.com/firstsun-dev/infra-config)** | Multi-Cloud IaC and Configuration Management (Terraform, Ansible) for Oracle Cloud, Cloudflare, and Proxmox. | Terraform, Ansible, Cloudflare R2 |
-| **[skills](https://github.com/firstsun-dev/skills)** | Modular AI agent skill arsenal for Gemini CLI and Claude Code. | Markdown, Bash |
-| **[kestra-flows](https://github.com/firstsun-dev/kestra-flows)** | Automated data pipelines and workflow orchestration using Kestra. | YAML, Docker |
-| **[status-page](https://github.com/firstsun-dev/status-page)** | Uptime monitor and status page powered by Upptime. | GitHub Actions |
+| **[heaven-monorepo](https://github.com/firstsun-dev/heaven-monorepo)** | Heaven ID (OIDC) & Check-in system. | TS, Turborepo |
+| **[blog](https://github.com/firstsun-dev/blog)** | Astro-based personal hub & tech blog. | Astro, D1, R2 |
 
 ---
