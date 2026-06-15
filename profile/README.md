@@ -1,12 +1,9 @@
 # Firstsun's Digital Forge 🛠️
 
 <p align="left">
-  <a href="https://github.com/firstsun-dev">
-    <img src="https://github-readme-stats.vercel.app/api?username=firstsun-dev&show_icons=true&theme=transparent&hide_border=true" alt="Firstsun's GitHub stats" height="180" />
-  </a>
-  <a href="https://github.com/firstsun-dev">
-    <img src="https://github-readme-stats.vercel.app/api/top-langs/?username=firstsun-dev&layout=compact&theme=transparent&hide_border=true" alt="Top Languages" height="180" />
-  </a>
+  <img src="https://img.shields.io/github/stars/firstsun-dev?style=for-the-badge&color=gold&labelColor=333" alt="Total Stars" />
+  <img src="https://img.shields.io/github/repos-all/firstsun-dev?style=for-the-badge&color=blue&labelColor=333" alt="Total Repos" />
+  <img src="https://img.shields.io/github/followers/firstsun-dev?style=for-the-badge&color=green&labelColor=333" alt="Followers" />
 </p>
 
 ### 🌐 Infrastructure & Automation
