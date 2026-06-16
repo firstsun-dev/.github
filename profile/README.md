@@ -47,7 +47,7 @@
 ### Obsidian & Knowledge Management
 | Repository | Purpose | Tech Stack |
 | :--- | :--- | :--- |
-| **[watermark-s3-uploader](https://github.com/firstsun-dev/watermark-s3-uploader)** | Auto watermark & upload images to R2/S3. | TS, S3 |
+| **[watermark-bucket-uploader](https://github.com/firstsun-dev/watermark-bucket-uploader)** | Auto watermark & upload images to R2/S3. | TS, S3 |
 | **[obsidian-plugin-template](https://github.com/firstsun-dev/obsidian-plugin-template)** | Standardized CI/CD for plugins. | TS, Release-it |
 | **[books-mgmt](https://github.com/firstsun-dev/books-mgmt)** | Kavita automation & Google Drive sync. | Python, Rclone |
 
