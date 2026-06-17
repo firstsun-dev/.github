@@ -10,14 +10,8 @@ on:
         required: false
         type: string
         default: "22"
-      skip-sonar:
-        required: false
-        type: boolean
-        default: true
     secrets:
       RELEASE_TOKEN:
-        required: false
-      SONAR_TOKEN:
         required: false
 
 jobs:
@@ -64,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [20, 22, 24]
+        node-version: [22, 24]
       fail-fast: false
     steps:
       - uses: actions/checkout@v6
@@ -104,34 +98,24 @@ jobs:
           BRANCH_NAME=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}
           BRANCH_NAME_SAFE=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9._-]/-/g')
           ZIP_NAME="${{ inputs.plugin-id }}-${VERSION}-${BRANCH_NAME_SAFE}.zip"
-          zip -j "$ZIP_NAME" main.js manifest.json styles.css || zip -j "$ZIP_NAME" main.js manifest.json 
+          zip -j "$ZIP_NAME" main.js manifest.json styles.css || zip -j "$ZIP_NAME" main.js manifest.json
           echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+          echo "PLUGIN_VERSION=$VERSION" >> $GITHUB_ENV
       - uses: actions/upload-artifact@v7
         with:
           name: plugin-build-artifact-${{ github.sha }}
           path: ${{ env.ZIP_NAME }}
           retention-days: 7
-
-  sonar:
-    name: SonarQube
-    needs: [filter, test]
-    if: needs.filter.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - name: Download coverage
-        uses: actions/download-artifact@v8
-        with:
-          name: coverage-report
-          path: coverage/
-      - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@v3
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: https://sonarcloud.io
+      - name: Annotate build summary
+        run: |
+          echo "::notice title=Obsidian Plugin Build::${{ inputs.plugin-id }} v${{ env.PLUGIN_VERSION }} built (${{ env.ZIP_NAME }})"
+          {
+            echo "### Obsidian Plugin Build"
+            echo ""
+            echo "- Plugin: \`${{ inputs.plugin-id }}\`"
+            echo "- Version: \`${{ env.PLUGIN_VERSION }}\`"
+            echo "- Artifact: \`${{ env.ZIP_NAME }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   release:
     name: Build and Release
@@ -142,6 +126,8 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v6
         with:
@@ -154,12 +140,12 @@ jobs:
       - run: npm ci
       - run: npm run build
       - name: Attest main.js
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: main.js
       - name: Attest styles.css
         if: hashFiles('styles.css') != ''
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: styles.css
       - env:
