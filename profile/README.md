@@ -21,10 +21,6 @@
 > **AI-Powered Lifestyle Tools**
 > Home of **Diet Manager**: AI photo analysis for food logging, nutritional tracking, and health data integration with Gemini & FaTsecret.
 
-### 🧠 [ai-governance](https://github.com/firstsun-dev/ai-governance)
-> **Centralized AI Infrastructure Hub**
-> Manages MCP servers, API credentials, permissions, and cross-platform configurations (Azure DevOps, GitLab, Confluence, Elasticsearch).
-
 ---
 
 ## 🧩 Full Ecosystem Inventory
@@ -48,5 +44,11 @@
 | :--- | :--- | :--- |
 | **[heaven-monorepo](https://github.com/firstsun-dev/heaven-monorepo)** | Heaven ID (OIDC) & Check-in system. | TS, Turborepo |
 | **[blog](https://github.com/firstsun-dev/blog)** | Astro-based personal hub & tech blog. | Astro, D1, R2 |
+
+### Internal Tools & Infrastructure
+| Repository | Purpose | Tech Stack |
+| :--- | :--- | :--- |
+| **[ai-governance](https://github.com/firstsun-dev/ai-governance)** | Private AI infra config (MCP, APIs, permissions). | Python, MCP |
+| **[status-page](https://github.com/firstsun-dev/status-page)** | Uptime monitor & status page. | Upptime |
 
 ---
