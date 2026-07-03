@@ -44,6 +44,7 @@
 | :--- | :--- | :--- |
 | **[heaven-monorepo](https://github.com/firstsun-dev/heaven-monorepo)** | Heaven ID (OIDC) & Check-in system. | TS, Turborepo |
 | **[blog](https://github.com/firstsun-dev/blog)** | Astro-based personal hub & tech blog. | Astro, D1, R2 |
+| **[heaven-www](https://github.com/firstsun-dev/heaven-www)** | 天界之舟官網 — marketing/info site. | Astro, Cloudflare |
 
 ### Internal Tools & Infrastructure
 | Repository | Purpose | Tech Stack |
