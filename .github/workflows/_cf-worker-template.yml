@@ -283,18 +283,35 @@ jobs:
             WRANGLER_ENV="--env dev"
           fi
 
+          # Frameworks like @astrojs/cloudflare write a build-output config
+          # (dist/server/wrangler.json) plus a .wrangler/deploy/config.json
+          # redirect. Wrangler prefers that redirect over the real config,
+          # but the generated file is flattened and drops named [env.*]
+          # blocks — so `--env dev` silently no-ops and every branch
+          # deploys to production. Remove the redirect and pass the real
+          # config explicitly so named environments resolve correctly.
+          rm -f .wrangler/deploy/config.json
+
+          WRANGLER_CONFIG=""
+          for candidate in wrangler.toml wrangler.jsonc wrangler.json; do
+            if [ -f "$candidate" ]; then
+              WRANGLER_CONFIG="--config $candidate"
+              break
+            fi
+          done
+
           # Get previous version ID for potential revert
-          PREV_ID=$(pnpm exec wrangler deployments list $WRANGLER_ENV --json 2>/dev/null \
+          PREV_ID=$(pnpm exec wrangler deployments list $WRANGLER_CONFIG $WRANGLER_ENV --json 2>/dev/null \
             | jq -r 'sort_by(.created_on) | reverse | .[0].versions | max_by(.percentage // 0) | .version_id // empty' \
             2>/dev/null || echo "")
 
           # Upload new version with metadata
-          UPLOAD_OUT=$(pnpm exec wrangler versions upload $WRANGLER_ENV \
+          UPLOAD_OUT=$(pnpm exec wrangler versions upload $WRANGLER_CONFIG $WRANGLER_ENV \
             --message "$DEPLOY_MSG" \
             --var COMMIT_HASH:"$SHORT_SHA" \
             --var VERSION:"$APP_VERSION")
           echo "$UPLOAD_OUT"
-          
+
           # Extract the new Version ID from output
           VERSION_ID=$(echo "$UPLOAD_OUT" | grep "Worker Version ID:" | awk '{print $NF}')
           if [ -z "$VERSION_ID" ]; then
@@ -303,7 +320,7 @@ jobs:
           fi
 
           # Deploy the version to 100% traffic
-          pnpm exec wrangler versions deploy $WRANGLER_ENV "$VERSION_ID@100" --message "$DEPLOY_MSG" --yes
+          pnpm exec wrangler versions deploy $WRANGLER_CONFIG $WRANGLER_ENV "$VERSION_ID@100" --message "$DEPLOY_MSG" --yes
 
           echo "version_id=$VERSION_ID" >> $GITHUB_OUTPUT
           echo "previous_version_id=$PREV_ID" >> $GITHUB_OUTPUT
