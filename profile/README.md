@@ -111,6 +111,7 @@ Developer tooling, reusable foundations, and experiments.
 
 - ai-governance — centralized AI tooling and configuration management
 - [skills](https://github.com/firstsun-dev/skills) — reusable skills for coding agents
+- [firstsun-bot](https://github.com/firstsun-dev/firstsun-bot) — provider-agnostic bot that turns approved GitHub issues into AI-agent-implemented PRs
 - [obsidian-plugin-template](https://github.com/firstsun-dev/obsidian-plugin-template) — shared plugin CI/CD template
 - my-apple-health — Apple Health-related personal tooling
 - kestra-flows — workflow orchestration experiments
