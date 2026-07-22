@@ -22,7 +22,7 @@ A visual dashboard for controlled note-level push and pull operations with GitHu
 - Published in the [Obsidian community plugin directory](https://obsidian.md/plugins?id=git-file-sync)
 - Released through shared CI and release workflows
 
-### [heaven-monorepo](https://github.com/firstsun-dev/heaven-monorepo)
+### heaven-monorepo
 
 **Identity and application platform on Cloudflare's edge.**
 
@@ -38,7 +38,7 @@ Provides OAuth and check-in services, serving approximately 80 daily visits.
 
 Adds watermarks and uploads pasted or dropped images to S3-compatible storage, including Cloudflare R2.
 
-### [blog](https://github.com/firstsun-dev/blog)
+### blog
 
 **Public technical blog and personal knowledge hub.**
 
@@ -50,6 +50,12 @@ A multilingual Astro site deployed on Cloudflare Pages, with D1-backed features.
 ### Public website
 
 - [heavenfortress.com](https://heavenfortress.com) — continuously operated public WordPress website
+
+## Private repositories, public services
+
+Some production services are publicly accessible, while their source code and infrastructure repositories remain private by design for security.
+
+Where appropriate, we provide public product links, documentation, and operational status—without exposing implementation details or privileged access.
 
 ## Open-source extensions
 
@@ -64,7 +70,7 @@ Adds Kilo Code support, multi-home analysis, personality insights, and work-log 
 
 ## Platform and operations
 
-### [infra-config](https://github.com/firstsun-dev/infra-config)
+### infra-config
 
 **Multi-cloud infrastructure and operations backbone for Firstsun services.**
 
@@ -81,7 +87,7 @@ Public-facing repositories use shared workflows from [`.github`](https://github.
 
 ## AI-assisted personal systems
 
-### [innovation-apps](https://github.com/firstsun-dev/innovation-apps)
+### innovation-apps
 
 **Personal applications deployed on Cloudflare.**
 
@@ -95,19 +101,19 @@ Collects RSS sources, applies deterministic scoring and Gemini analysis, then pu
 
 ### Knowledge and automation workflows
 
-- [heaven-video-summary](https://github.com/firstsun-dev/heaven-video-summary) — YouTube → Whisper → Markdown → Google Drive knowledge pipeline
-- [windmill-flows](https://github.com/firstsun-dev/windmill-flows) — scheduled automation for books, health, backups, and notifications
+- heaven-video-summary — YouTube → Whisper → Markdown → Google Drive knowledge pipeline
+- windmill-flows — scheduled automation for books, health, backups, and notifications
 - [books-mgmt](https://github.com/firstsun-dev/books-mgmt) — Kavita collection automation and Google Drive export
 
 ## Additional work
 
 Developer tooling, reusable foundations, and experiments.
 
-- [ai-governance](https://github.com/firstsun-dev/ai-governance) — centralized AI tooling and configuration management
+- ai-governance — centralized AI tooling and configuration management
 - [skills](https://github.com/firstsun-dev/skills) — reusable skills for coding agents
 - [obsidian-plugin-template](https://github.com/firstsun-dev/obsidian-plugin-template) — shared plugin CI/CD template
-- [my-apple-health](https://github.com/firstsun-dev/my-apple-health) — Apple Health-related personal tooling
-- [kestra-flows](https://github.com/firstsun-dev/kestra-flows) — workflow orchestration experiments
+- my-apple-health — Apple Health-related personal tooling
+- kestra-flows — workflow orchestration experiments
 
 
 ## System map
