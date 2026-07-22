@@ -1,6 +1,6 @@
 # Firstsun Dev
 
-> We build and operate software people can rely on—from community developer tools and public services to the cloud infrastructure and AI workflows that power them.
+> We build and operate reliable software, cloud infrastructure, and AI workflows.
 
 [Live service status](https://uptime.firstsun.org/status) · [GitHub organization](https://github.com/firstsun-dev)
 
