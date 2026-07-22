@@ -21,6 +21,10 @@
 > **AI-Powered Lifestyle Tools**
 > Home of **Diet Manager**: AI photo analysis for food logging, nutritional tracking, and health data integration with Gemini & FaTsecret.
 
+### 🔎 [code-insights](https://github.com/firstsun-dev/code-insights)
+> **AI Coding Session Analytics (fork)**
+> Local-first analytics that turns AI coding sessions into actionable knowledge. Forked with added **Kilo Code support**, **personality analysis**, **multiple home directory** support, and **work-log generation**.
+
 ---
 
 ## 🧩 Full Ecosystem Inventory
@@ -38,6 +42,7 @@
 | **[heaven-video-summary](https://github.com/firstsun-dev/heaven-video-summary)** | YouTube → Whisper → Markdown pipeline. | Python, Whisper |
 | **[news-getter](https://github.com/firstsun-dev/news-getter)** | RSS → Gemini Summary → E-ink feed. | Python, Gemini |
 | **[kestra-flows](https://github.com/firstsun-dev/kestra-flows)** | Workflow orchestration. | YAML, Docker |
+| **[code-insights](https://github.com/firstsun-dev/code-insights)** | AI coding session analytics — fork w/ Kilo support, personality analysis, multi-home-dir, work-log generation. | TS, SQLite |
 
 ### Identity & Core Apps
 | Repository | Purpose | Tech Stack |
