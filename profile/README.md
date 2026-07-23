@@ -63,7 +63,7 @@ Where appropriate, we provide public product links, documentation, and operation
 
 **Open-source fork with maintained product extensions.**
 
-Adds Kilo Code support, multi-home analysis, personality insights, and work-log generation to a local-first AI coding-session analytics tool.
+Adds Kilo Code support, multi-home analysis, personality insights, OpenAI-compatible API analysis, and work-log generation to a local-first AI coding-session analytics tool.
 
 - [Open the app](https://code-insights.app)
 - Upstream: [melagiri/code-insights](https://github.com/melagiri/code-insights) · Firstsun extensions are maintained in this fork
