@@ -172,8 +172,8 @@ jobs:
         with:
           name: e2e-report-${{ inputs.app_name }}-${{ github.run_id }}
           path: |
-            apps/e2e/playwright-report/
-            apps/e2e/test-results/
+            ${{ inputs.app_path }}/playwright-report/
+            ${{ inputs.app_path }}/test-results/
           if-no-files-found: ignore
           retention-days: 7
 
@@ -367,8 +367,8 @@ jobs:
         with:
           name: smoke-report-${{ inputs.app_name }}-${{ github.run_id }}
           path: |
-            apps/e2e/playwright-report/
-            apps/e2e/test-results/
+            ${{ inputs.app_path }}/playwright-report/
+            ${{ inputs.app_path }}/test-results/
           if-no-files-found: ignore
           retention-days: 7
 
