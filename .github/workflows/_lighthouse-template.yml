@@ -1,0 +1,77 @@
+name: Lighthouse CI Template
+
+# ---------------------------------------------------------------------------
+# Reusable post-deploy Lighthouse CI audit.
+# Runs lhci autorun against a live URL and publishes scores to the job summary.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      site_url:
+        description: URL to audit
+        type: string
+        required: true
+      runner:
+        type: string
+        default: ubuntu-latest
+
+jobs:
+  lighthouse:
+    name: "Verify: Lighthouse"
+    runs-on: ${{ inputs.runner }}
+    continue-on-error: true
+    env:
+      LHCI_URL: ${{ inputs.site_url }}
+      LHCI_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install Lighthouse CI
+        run: npm install -g @lhci/cli
+
+      - name: Run Lighthouse CI
+        run: |
+          lhci autorun --upload.target=temporary-public-storage 2>&1 | tee lhci-output.log
+
+      - name: Extract and display report URL
+        if: always()
+        run: |
+          REPORT_URL=$(grep -oP 'https://storage\.googleapis\.com/lighthouse-infrastructure\.appspot\.com/reports/[^\s]+' lhci-output.log | head -1)
+          if [ -n "$REPORT_URL" ]; then
+            echo "## Lighthouse CI Report" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "[View Full Report]($REPORT_URL)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Report URL: $REPORT_URL" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          LHR=$(ls -t .lighthouseci/lhr-*.json 2>/dev/null | head -1)
+          if [ -n "$LHR" ]; then
+            HEADLINE=$(jq -r '[.categories[] | "\(.title) \(.score*100|round)"] | join(" / ")' "$LHR")
+            echo "::notice title=Lighthouse::$HEADLINE"
+            {
+              echo "### Lighthouse Scores"
+              echo ""
+              echo "| Category | Score |"
+              echo "|---|---:|"
+              jq -r '.categories[] | "| \(.title) | \(.score*100|round) |"' "$LHR"
+              echo ""
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Lighthouse reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: lighthouse-report
+          path: |
+            .lighthouseci/
+            lhci-output.log
+          retention-days: 5
+          if-no-files-found: warn

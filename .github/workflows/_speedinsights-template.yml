@@ -1,0 +1,90 @@
+name: SpeedInsights Template
+
+# ---------------------------------------------------------------------------
+# Reusable post-deploy PageSpeed Insights audit (mobile + desktop).
+# Report formatting is delegated to a script in the calling repo (report_script),
+# since output format/thresholds are project-specific.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      site_url:
+        description: URL to audit
+        type: string
+        required: true
+      runner:
+        type: string
+        default: self-hosted
+      report_script:
+        description: Path (in the calling repo) to the Node script that formats the PSI JSON response
+        type: string
+        default: .gitlab/scripts/psi-report.js
+    secrets:
+      PSI_API_KEY:
+        required: false
+
+jobs:
+  speedinsights:
+    name: "Verify: SpeedInsights"
+    runs-on: ${{ inputs.runner }}
+    continue-on-error: true
+    env:
+      SITE_URL: ${{ inputs.site_url }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Run PageSpeed Insights
+        run: |
+          CATEGORIES="&category=performance&category=accessibility&category=best-practices&category=seo"
+
+          psi_fetch() {
+            local strategy=$1
+            local base_url="https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${SITE_URL}&strategy=${strategy}${CATEGORIES}"
+            local api_url="${PSI_API_KEY:+${base_url}&key=${PSI_API_KEY}}"
+            api_url="${api_url:-${base_url}}"
+            local response=""
+
+            for attempt in 1 2 3; do
+              echo "[PSI:${strategy}] Attempt $attempt/3..."
+              local http_code
+              http_code=$(curl -s -o /tmp/psi_response.json -w "%{http_code}" "$api_url")
+
+              if [ "$http_code" = "200" ]; then
+                response=$(cat /tmp/psi_response.json)
+                echo "[PSI:${strategy}] Success (HTTP $http_code)"
+                break
+              fi
+
+              echo "[PSI:${strategy}] Failed (HTTP $http_code): $(cat /tmp/psi_response.json)"
+              [ "$attempt" -lt 3 ] && sleep $((attempt * 10))
+            done
+
+            if [ -z "$response" ]; then
+              echo "[PSI:${strategy}] All retries exhausted — skipping"
+              return 1
+            fi
+
+            echo "$response" | STRATEGY="$strategy" node "${{ inputs.report_script }}"
+          }
+
+          psi_fetch mobile
+          psi_fetch desktop
+        env:
+          PSI_API_KEY: ${{ secrets.PSI_API_KEY }}
+
+      - name: Upload speed insights report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: speedinsights-report
+          path: |
+            speedinsights-report.html
+            speedinsights-metrics.txt
+          retention-days: 5
+          if-no-files-found: ignore
