@@ -46,6 +46,12 @@ on:
         description: Empty string skips this job
         type: string
         default: ''
+      test_e2e_variants:
+        description: >
+          JSON array of E2E variants. Each item may define name, args, and
+          artifact_suffix. The default preserves the existing single-job command.
+        type: string
+        default: '[{"name":"","args":"","artifact_suffix":""}]'
       verify_cmd:
         description: Smoke test command run after prod deploy, from app_path. Empty string skips verify/revert.
         type: string
@@ -143,8 +149,12 @@ jobs:
           fail-on-error: false
 
   test-e2e:
-    name: E2E Tests
+    name: ${{ matrix.e2e.name != '' && format('E2E Tests ({0})', matrix.e2e.name) || 'E2E Tests' }}
     if: inputs.test_e2e_cmd != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        e2e: ${{ fromJSON(inputs.test_e2e_variants) }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     steps:
@@ -165,13 +175,13 @@ jobs:
         run: ${{ inputs.test_e2e_setup_cmd }}
       - name: Run E2E tests
         working-directory: ${{ inputs.app_path }}
-        run: ${{ inputs.test_e2e_cmd }}
+        run: ${{ inputs.test_e2e_cmd }} ${{ matrix.e2e.args }}
       - name: Upload E2E report
         uses: actions/upload-artifact@v7
         if: always()
         continue-on-error: true
         with:
-          name: e2e-report-${{ inputs.app_name }}-${{ github.run_id }}
+          name: ${{ matrix.e2e.artifact_suffix != '' && format('e2e-report-{0}-{1}-{2}', inputs.app_name, matrix.e2e.artifact_suffix, github.run_id) || format('e2e-report-{0}-{1}', inputs.app_name, github.run_id) }}
           path: |
             ${{ inputs.app_path }}/playwright-report/
             ${{ inputs.app_path }}/test-results/
