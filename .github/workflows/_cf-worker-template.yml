@@ -221,7 +221,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Deploy — branch push only, 100% traffic
-  # Prod (main): migrate_cmd_prod / Dev (other): migrate_cmd_dev
+  # Prod (main): wrangler versions upload + deploy — tracks version ID for revert
+  # Dev (other): wrangler deploy --env dev
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy
