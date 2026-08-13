@@ -20,6 +20,8 @@ Firstsun Dev is the engineering side of Firstsun: open-source plugins, public to
 
 Sync individual notes or batches with GitHub, GitLab, and Gitea without requiring a local Git installation. The plugin includes status review, conflict handling, `.gitignore` support, and mobile-ready workflows.
 
+[![Obsidian plugin downloads](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fobsidianmd%2Fobsidian-releases%2Fmaster%2Fcommunity-plugin-stats.json&query=%24%5B%22git-file-sync%22%5D.downloads&label=downloads&style=flat-square&color=007acc)](https://obsidian.md/plugins?id=git-file-sync)
+
 [Obsidian Community Plugin](https://obsidian.md/plugins?id=git-file-sync) · [Read the guide](https://firstsun.heavenfortress.com/en/blog/git-file-sync-obsidian-github-gitlab-gitea/)
 
 #### [Watermark Bucket Uploader](https://github.com/firstsun-dev/watermark-bucket-uploader)
@@ -44,6 +46,16 @@ Firstsun extensions add Kilo Code support, multi-home analysis, personality and 
 
 [Open the app](https://code-insights.app) · [Upstream](https://github.com/melagiri/code-insights)
 
+### Production systems
+
+#### Heaven Platform
+
+**Cloudflare-native identity and application platform.**
+
+A privately implemented, publicly operated system built around a shared OIDC identity boundary, auth client SDK, consumer applications, and centralized Playwright E2E testing. The service carries recurring real-world traffic and is continuously monitored, so availability, deployments, and regressions have real operational consequences.
+
+[Architecture case study](https://github.com/firstsun-dev/.github/blob/main/docs/case-studies/heaven-platform.md) · [Service status](https://uptime.firstsun.org/status)
+
 ### Automation & knowledge systems
 
 - [news-getter](https://github.com/firstsun-dev/news-getter) — RSS collection, deterministic scoring, AI-assisted analysis, and a published news digest
@@ -53,7 +65,7 @@ Firstsun extensions add Kilo Code support, multi-home analysis, personality and 
 
 ## How we operate
 
-Firstsun projects share the same engineering backbone instead of treating deployment and operations as afterthoughts.
+Firstsun projects share the same engineering backbone instead of treating deployment and operations as afterthoughts. Real consumers make that operational discipline necessary: plugin downloads and recurring production traffic mean compatibility, availability, deployments, and regressions affect people outside the development environment.
 
 - **Shared delivery** — reusable GitHub Actions for test, release, and deployment live in [`.github`](https://github.com/firstsun-dev/.github)
 - **Infrastructure as code** — production and self-hosted services are managed with Terraform and Ansible
