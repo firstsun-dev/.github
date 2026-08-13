@@ -86,7 +86,7 @@ The goal is to validate the system at the same boundary consumers use: applicati
 
 ## Operational model
 
-The platform runs primarily on Cloudflare's edge stack:
+The platform runs primarily on Cloudflare's edge stack. It carries recurring real-world traffic; that is relevant not as a vanity metric, but because releases, regressions, and outages affect a real running service. Service continuity and public health monitoring are therefore part of the engineering responsibility.
 
 - Cloudflare Workers for application / API execution
 - D1 for application data
