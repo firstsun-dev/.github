@@ -67,10 +67,18 @@ A privately implemented, publicly operated system built around a shared OIDC ide
 
 Firstsun projects share the same engineering backbone instead of treating deployment and operations as afterthoughts. Real consumers make that operational discipline necessary: plugin downloads and recurring production traffic mean compatibility, availability, deployments, and regressions affect people outside the development environment.
 
+### Operational backbone
+
+`infra-config` is the private multi-cloud infrastructure and service-operations monorepo behind Firstsun services. It goes beyond resource provisioning: Terraform manages Cloudflare, Oracle Cloud, and Proxmox infrastructure, while Ansible configures hosts and deploys shared operational services.
+
+The repository includes infrastructure and service automation for VM lifecycle, storage and backups, Cloudflare Tunnel connectivity, self-hosted GitHub Actions runners, PostgreSQL, Prometheus monitoring, uptime monitoring, workflow automation, and container-service operations.
+
+[Public infrastructure overview](https://github.com/firstsun-dev/.github/blob/main/docs/infrastructure-overview.md) · [Service status](https://uptime.firstsun.org/status)
+
 - **Shared delivery** — reusable GitHub Actions for test, release, and deployment live in [`.github`](https://github.com/firstsun-dev/.github)
-- **Infrastructure as code** — production and self-hosted services are managed with Terraform and Ansible
-- **Observable services** — public service health is exposed through the [Firstsun status page](https://uptime.firstsun.org/status)
-- **Private where appropriate** — some production source and infrastructure repositories remain private while their public products, documentation, and operational status stay visible
+- **Infrastructure as code** — production and self-hosted infrastructure is provisioned with Terraform and configured with Ansible
+- **Observable services** — monitoring and public service-health visibility are part of the operating model, not an afterthought
+- **Private where appropriate** — production source, infrastructure code, credentials, and privileged configuration remain private while architecture and operational evidence stay public
 
 ## Firstsun / 首陽問路
 
