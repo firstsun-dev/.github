@@ -42,7 +42,7 @@ Adds watermarks and uploads pasted or dropped images to S3-compatible storage, i
 
 **Public technical blog and personal knowledge hub.**
 
-A multilingual Astro site deployed on Cloudflare Pages, with D1-backed features.
+A multilingual Astro site deployed on Cloudflare Workers, with D1-backed features.
 
 - [Visit the blog](https://firstsun.heavenfortress.com)
 - Built and deployed through shared delivery workflows
