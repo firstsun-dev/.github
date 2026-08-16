@@ -123,6 +123,7 @@ jobs:
           path: ${{ inputs.app_path }}/junit-*.xml
           reporter: java-junit
           fail-on-error: false
+          fail-on-empty: false
 
   test-integration:
     name: Integration Tests
@@ -147,6 +148,7 @@ jobs:
           path: ${{ inputs.app_path }}/junit-*.xml
           reporter: java-junit
           fail-on-error: false
+          fail-on-empty: false
 
   test-e2e:
     name: ${{ matrix.e2e.name != '' && format('E2E Tests ({0})', matrix.e2e.name) || 'E2E Tests' }}
@@ -176,9 +178,18 @@ jobs:
       - name: Run E2E tests
         working-directory: ${{ inputs.app_path }}
         run: ${{ inputs.test_e2e_cmd }} ${{ matrix.e2e.args }}
+      - name: Test Report
+        uses: dorny/test-reporter@v3
+        if: always()
+        with:
+          name: ${{ inputs.app_name }} - ${{ matrix.e2e.name != '' && format('E2E Tests ({0})', matrix.e2e.name) || 'E2E Tests' }}
+          path: ${{ inputs.app_path }}/playwright-report/*.xml
+          reporter: java-junit
+          fail-on-error: false
+          fail-on-empty: false
       - name: Upload E2E report
         uses: actions/upload-artifact@v7
-        if: always()
+        if: failure()
         continue-on-error: true
         with:
           name: ${{ matrix.e2e.artifact_suffix != '' && format('e2e-report-{0}-{1}-{2}', inputs.app_name, matrix.e2e.artifact_suffix, github.run_id) || format('e2e-report-{0}-{1}', inputs.app_name, github.run_id) }}
@@ -372,9 +383,18 @@ jobs:
           TEST_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
           TARGET_URL: ${{ github.ref == 'refs/heads/main' && inputs.app_url_prod || inputs.app_url_dev }}
           NO_PROXY: "*"
+      - name: Test Report
+        uses: dorny/test-reporter@v3
+        if: always()
+        with:
+          name: ${{ inputs.app_name }} - Smoke Tests
+          path: ${{ inputs.app_path }}/playwright-report/*.xml
+          reporter: java-junit
+          fail-on-error: false
+          fail-on-empty: false
       - name: Upload Smoke Test Report
         uses: actions/upload-artifact@v7
-        if: always()
+        if: failure()
         continue-on-error: true
         with:
           name: smoke-report-${{ inputs.app_name }}-${{ github.run_id }}
