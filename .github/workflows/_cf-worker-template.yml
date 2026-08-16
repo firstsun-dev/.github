@@ -121,11 +121,22 @@ jobs:
       - name: Test Report
         uses: dorny/test-reporter@v3
         if: always()
+        continue-on-error: true
         with:
           name: ${{ inputs.app_name }} - Unit Tests
           path: ${{ inputs.app_path }}/junit-*.xml
           reporter: java-junit
           fail-on-error: false
+          fail-on-empty: false
+      - name: Upload JUnit report
+        uses: actions/upload-artifact@v7
+        if: always()
+        continue-on-error: true
+        with:
+          name: junit-report-${{ inputs.app_name }}-unit-${{ github.run_id }}
+          path: ${{ inputs.app_path }}/junit-*.xml
+          if-no-files-found: ignore
+          retention-days: 7
 
   test-integration:
     name: Integration Tests
@@ -148,11 +159,22 @@ jobs:
       - name: Test Report
         uses: dorny/test-reporter@v3
         if: always()
+        continue-on-error: true
         with:
           name: ${{ inputs.app_name }} - Integration Tests
           path: ${{ inputs.app_path }}/junit-*.xml
           reporter: java-junit
           fail-on-error: false
+          fail-on-empty: false
+      - name: Upload JUnit report
+        uses: actions/upload-artifact@v7
+        if: always()
+        continue-on-error: true
+        with:
+          name: junit-report-${{ inputs.app_name }}-integration-${{ github.run_id }}
+          path: ${{ inputs.app_path }}/junit-*.xml
+          if-no-files-found: ignore
+          retention-days: 7
 
   test-e2e:
     # `jobs.<job_id>.if` is evaluated before `strategy.matrix`. When this job is
