@@ -151,7 +151,7 @@ jobs:
           fail-on-empty: false
 
   test-e2e:
-    name: ${{ matrix.e2e.name != '' && format('E2E Tests ({0})', matrix.e2e.name) || 'E2E Tests' }}
+    name: E2E Tests
     if: inputs.test_e2e_cmd != ''
     strategy:
       fail-fast: false
