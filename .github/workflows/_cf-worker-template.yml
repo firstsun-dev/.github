@@ -149,7 +149,11 @@ jobs:
           fail-on-error: false
 
   test-e2e:
-    name: ${{ matrix.e2e.name != '' && format('E2E Tests ({0})', matrix.e2e.name) || 'E2E Tests' }}
+    # `jobs.<job_id>.if` is evaluated before `strategy.matrix`. When this job is
+    # skipped, matrix values are unavailable and GitHub can expose the raw name
+    # expression in the UI. Keep the job name static; variant details remain in
+    # the matrix inputs and artifact names.
+    name: E2E Tests
     if: inputs.test_e2e_cmd != ''
     strategy:
       fail-fast: false
