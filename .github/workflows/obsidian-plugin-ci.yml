@@ -82,7 +82,7 @@ jobs:
   artifact:
     name: Package Artifact
     runs-on: ubuntu-latest
-    needs: [filter, test]
+    needs: [filter]
     if: needs.filter.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v6
