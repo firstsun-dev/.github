@@ -17,6 +17,14 @@ inputs:
     description: Git fetch depth
     required: false
     default: '1'
+  setup-node:
+    description: Whether to install Node via actions/setup-node (skip on runners that bake Node into the image)
+    required: false
+    default: 'true'
+  setup-pnpm:
+    description: Whether to install pnpm via pnpm/action-setup (skip on runners that bake pnpm into the image)
+    required: false
+    default: 'true'
 
 runs:
   using: composite
@@ -25,11 +33,13 @@ runs:
       shell: bash
       run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-    - uses: actions/setup-node@v6
+    - if: inputs.setup-node == 'true'
+      uses: actions/setup-node@v6
       with:
         node-version: ${{ inputs.node-version }}
 
-    - uses: pnpm/action-setup@v6
+    - if: inputs.setup-pnpm == 'true'
+      uses: pnpm/action-setup@v6
       with:
         version: ${{ inputs.pnpm-version }}
 
