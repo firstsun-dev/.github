@@ -1,0 +1,95 @@
+name: Shared Obsidian Plugin Release Build
+
+# Call this from a workflow triggered by `on: release: types: [published]` in
+# the plugin repo. It checks out the exact published tag, builds ONCE, attests
+# those exact bytes, uploads those exact bytes as release assets, then
+# verifies the uploaded bytes match what was attested. Never rebuilds between
+# attest and upload — build once, attest the same bytes, upload the same bytes.
+
+on:
+  workflow_call:
+    inputs:
+      plugin-id:
+        required: true
+        type: string
+      node-version:
+        required: false
+        type: string
+        default: "22"
+    secrets:
+      RELEASE_TOKEN:
+        required: false
+
+jobs:
+  build-attest-upload:
+    name: Build, Attest, and Upload Release Assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Verify expected files exist
+        run: |
+          test -f main.js
+          test -f manifest.json
+
+      - name: Checksums of the exact files about to be attested/uploaded
+        run: |
+          sha256sum main.js
+          sha256sum manifest.json
+          [ -f styles.css ] && sha256sum styles.css || true
+
+      - name: Attest main.js
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: main.js
+
+      - name: Attest styles.css
+        if: hashFiles('styles.css') != ''
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: styles.css
+
+      - name: Upload release assets (same bytes just built and attested)
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+        run: |
+          ASSETS=(main.js manifest.json)
+          [ -f styles.css ] && ASSETS+=(styles.css)
+          gh release upload "$TAG" "${ASSETS[@]}" --clobber --repo "${{ github.repository }}"
+
+      - name: Verify uploaded bytes match the attested build output
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+        run: |
+          mkdir -p /tmp/release-verify
+          gh release download "$TAG" -p main.js -D /tmp/release-verify --clobber --repo "${{ github.repository }}"
+          LOCAL=$(sha256sum main.js | awk '{print $1}')
+          REMOTE=$(sha256sum /tmp/release-verify/main.js | awk '{print $1}')
+          echo "local:  $LOCAL"
+          echo "remote: $REMOTE"
+          if [ "$LOCAL" != "$REMOTE" ]; then
+            echo "::error::Uploaded main.js digest does not match the attested build output"
+            exit 1
+          fi
+
+      - name: Annotate build summary
+        run: |
+          echo "::notice title=Obsidian Plugin Release::${{ inputs.plugin-id }} ${TAG} built from exact tag, attested, and uploaded"
