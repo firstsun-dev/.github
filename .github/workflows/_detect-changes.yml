@@ -1,0 +1,115 @@
+name: Detect Changed Paths
+
+# ---------------------------------------------------------------------------
+# Reusable path-detection workflow.
+# Diffs base-sha..head-sha and matches changed files (added/modified/deleted)
+# against caller-supplied newline-separated glob patterns for three
+# independent categories: db, app, config.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      db-paths:
+        description: Newline-separated glob patterns for DB migration paths
+        type: string
+        required: true
+      app-paths:
+        description: Newline-separated glob patterns for application paths
+        type: string
+        required: true
+      config-paths:
+        description: Newline-separated glob patterns for config paths
+        type: string
+        required: true
+      base-sha:
+        description: Base commit SHA to diff from
+        type: string
+        required: true
+      head-sha:
+        description: Head commit SHA to diff to
+        type: string
+        required: true
+      runner:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+    outputs:
+      db_changed:
+        description: "'true' if any changed file matches db-paths"
+        value: ${{ jobs.detect.outputs.db_changed }}
+      app_changed:
+        description: "'true' if any changed file matches app-paths"
+        value: ${{ jobs.detect.outputs.app_changed }}
+      config_changed:
+        description: "'true' if any changed file matches config-paths"
+        value: ${{ jobs.detect.outputs.config_changed }}
+
+jobs:
+  detect:
+    name: Detect Changes
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    outputs:
+      db_changed: ${{ steps.match.outputs.db_changed }}
+      app_changed: ${{ steps.match.outputs.app_changed }}
+      config_changed: ${{ steps.match.outputs.config_changed }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Match changed files against path patterns
+        id: match
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          DB_PATTERNS: ${{ inputs.db-paths }}
+          APP_PATTERNS: ${{ inputs.app-paths }}
+          CONFIG_PATTERNS: ${{ inputs.config-paths }}
+        run: |
+          set -euo pipefail
+
+          # Diff includes added/modified/deleted files.
+          mapfile -t CHANGED_FILES < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+
+          match_any() {
+            local patterns_str="$1"
+            local file pattern
+            local -a patterns=()
+            while IFS= read -r pattern; do
+              [ -z "$pattern" ] && continue
+              patterns+=("$pattern")
+            done <<< "$patterns_str"
+
+            for file in "${CHANGED_FILES[@]}"; do
+              [ -z "$file" ] && continue
+              for pattern in "${patterns[@]}"; do
+                # shellcheck disable=SC2053
+                if [[ "$file" == $pattern ]]; then
+                  return 0
+                fi
+              done
+            done
+            return 1
+          }
+
+          shopt -s globstar nullglob extglob
+
+          if match_any "$DB_PATTERNS"; then
+            echo "db_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "db_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if match_any "$APP_PATTERNS"; then
+            echo "app_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "app_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if match_any "$CONFIG_PATTERNS"; then
+            echo "config_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "config_changed=false" >> "$GITHUB_OUTPUT"
+          fi

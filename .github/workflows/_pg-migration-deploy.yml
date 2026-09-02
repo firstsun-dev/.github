@@ -1,0 +1,53 @@
+name: Postgres Migration Deploy
+
+# ---------------------------------------------------------------------------
+# Reusable workflow: applies Atlas-managed Postgres migrations to a real
+# target database. Fully generic — no app name baked in. Concurrency-guarded
+# so two runs targeting the same ref can never race against the same DB.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      migrations-path:
+        description: Path to the Atlas migrations directory
+        type: string
+        default: 'db/migrations'
+      atlas-config:
+        description: Path to the Atlas config file (atlas.hcl)
+        type: string
+        default: 'db/atlas.hcl'
+      runner:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+    secrets:
+      database-url:
+        required: true
+
+concurrency:
+  group: pg-migration-deploy-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Apply Migrations
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    env:
+      ATLAS_VERSION: v1.3.0
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Atlas CLI
+        run: |
+          curl -sSf https://atlasgo.sh | sh -s -- --community --yes --version "$ATLAS_VERSION"
+          atlas version
+
+      - name: Apply migrations
+        env:
+          DATABASE_URL: ${{ secrets.database-url }}
+        run: |
+          atlas migrate apply \
+            --dir "file://${{ inputs.migrations-path }}" \
+            --url "$DATABASE_URL"
