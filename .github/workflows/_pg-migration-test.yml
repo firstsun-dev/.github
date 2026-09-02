@@ -1,0 +1,80 @@
+name: Postgres Migration Test
+
+# ---------------------------------------------------------------------------
+# Reusable workflow: validates and applies Atlas-managed Postgres migrations
+# against an ephemeral, disposable database. No production secrets involved.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      migrations-path:
+        description: Path to the Atlas migrations directory
+        type: string
+        default: 'db/migrations'
+      atlas-config:
+        description: Path to the Atlas config file (atlas.hcl)
+        type: string
+        default: 'db/atlas.hcl'
+      postgres-version:
+        description: Postgres major version to test against
+        type: string
+        default: '16'
+      runner:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+
+jobs:
+  test:
+    name: Validate & Apply Migrations
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:${{ inputs.postgres-version }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ATLAS_VERSION: v1.3.0
+      DATABASE_URL: postgres://postgres:test@localhost:5432/test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Atlas CLI
+        run: |
+          curl -sSf https://atlasgo.sh | sh -s -- --community --yes --version "$ATLAS_VERSION"
+          atlas version
+
+      - name: Validate migration directory
+        run: atlas migrate validate --dir "file://${{ inputs.migrations-path }}"
+
+      - name: Apply migrations to ephemeral database
+        run: |
+          atlas migrate apply \
+            --dir "file://${{ inputs.migrations-path }}" \
+            --url "$DATABASE_URL"
+
+      - name: Verify clean migration state
+        run: |
+          STATUS=$(atlas migrate status \
+            --dir "file://${{ inputs.migrations-path }}" \
+            --url "$DATABASE_URL")
+          echo "$STATUS"
+          if ! echo "$STATUS" | grep -q "Migration Status: OK"; then
+            echo "::error::Migration status is not clean after apply (expected 'Migration Status: OK')"
+            exit 1
+          fi
+          if echo "$STATUS" | grep -qE "Pending Files:[[:space:]]*[1-9]"; then
+            echo "::error::Migration status shows pending migrations after apply"
+            exit 1
+          fi
