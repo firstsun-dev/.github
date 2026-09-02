@@ -4,17 +4,17 @@
 
 > Build useful things. Operate them well. Share what we learn.
 
-Firstsun Dev is the engineering side of Firstsun: open-source plugins, public tools, production services, shared infrastructure, and practical automation built from real needs.
+Firstsun Dev turns real needs into software, operates the systems that matter, and publishes what survives contact with reality.
 
 [Firstsun Journal](https://firstsun.org/en) · [Tools](https://firstsun.heavenfortress.com/en/tools/) · [Service status](https://uptime.firstsun.org/status)
 
 ![Firstsun Dev — build, operate, share](./firstsun-operating-loop.svg)
 
-## What we build
+## Selected work
 
-### Open tools & plugins
+The projects below are selected because they show different parts of the engineering loop rather than simply being the newest or largest repositories.
 
-#### [Git File Sync](https://github.com/firstsun-dev/git-files-sync)
+### Build — [Git File Sync](https://github.com/firstsun-dev/git-files-sync)
 
 **Selective Git synchronization for Obsidian.**
 
@@ -24,31 +24,15 @@ Sync individual notes or batches with GitHub, GitLab, and Gitea without requirin
 
 [Obsidian Community Plugin](https://obsidian.md/plugins?id=git-file-sync) · [Read the guide](https://firstsun.heavenfortress.com/en/blog/git-file-sync-obsidian-github-gitlab-gitea/)
 
-#### [Watermark Bucket Uploader](https://github.com/firstsun-dev/watermark-bucket-uploader)
-
-**Image processing and object-storage delivery inside Obsidian.**
-
-Adds text or logo watermarks, converts and compresses images, uploads them to S3-compatible storage such as Cloudflare R2, and writes the resulting URL back into the note.
-
-#### [Firstsun Tools](https://firstsun.heavenfortress.com/en/tools/)
-
-**Small tools for practice, everyday life, design, and development.**
-
-The collection includes practice timers and calendars, image utilities, converters, text/data tools, and developer helpers. The goal is simple: solve one concrete problem well and keep the tool easy to use.
-
-### Open-source extensions
-
-#### [Code Insights](https://github.com/firstsun-dev/code-insights)
+### Extend — [Code Insights](https://github.com/firstsun-dev/code-insights)
 
 **A maintained fork for turning AI coding sessions into reusable knowledge.**
 
-Firstsun extensions add Kilo Code support, multi-home analysis, personality and recurring-insight views, OpenAI-compatible analysis, and work-log workflows while preserving the upstream local-first model.
+Firstsun-maintained additions include Kilo Code support, multi-home analysis, personality and recurring-insight views, OpenAI-compatible analysis, reporting workflows, reliability fixes, and deployment operations while preserving upstream attribution and the local-first foundation.
 
 [Open the app](https://code-insights.app) · [Upstream](https://github.com/melagiri/code-insights)
 
-### Production systems
-
-#### Heaven Platform
+### Operate — Heaven Platform
 
 **Cloudflare-native identity and application platform.**
 
@@ -56,32 +40,42 @@ A privately implemented, publicly operated system built around a shared OIDC ide
 
 [Architecture case study](https://github.com/firstsun-dev/.github/blob/main/docs/case-studies/heaven-platform.md) · [Service status](https://uptime.firstsun.org/status)
 
-### Automation & knowledge systems
+## Emerging
 
-- [news-getter](https://github.com/firstsun-dev/news-getter) — RSS collection, deterministic scoring, AI-assisted analysis, and a published news digest
-- [skills](https://github.com/firstsun-dev/skills) — reusable skills for coding agents
-- [firstsun-bot](https://github.com/firstsun-dev/firstsun-bot) — issue → plan → coding agent → pull request workflow across providers
-- [books-mgmt](https://github.com/firstsun-dev/books-mgmt) — Kavita collection automation and Google Drive export
+### [Firstsun Bot](https://github.com/firstsun-dev/firstsun-bot)
 
-## How we operate
+**Provider-agnostic issue-to-PR engineering automation.**
 
-Firstsun projects share the same engineering backbone instead of treating deployment and operations as afterthoughts. Real consumers make that operational discipline necessary: plugin downloads and recurring production traffic mean compatibility, availability, deployments, and regressions affect people outside the development environment.
+Firstsun Bot is being developed around a human-approved workflow: issue readiness → plan → approval → implementation → pull request → review and merge reconciliation. Tracker and coding-agent providers are isolated behind interfaces so orchestration is not tied to one platform or model.
 
-### Operational backbone
+It is treated as an emerging project until its public documentation, working demo, and real dogfooding evidence justify stronger placement.
 
-`infra-config` is the private multi-cloud infrastructure and service-operations monorepo behind Firstsun services. It goes beyond resource provisioning: Terraform manages Cloudflare, Oracle Cloud, and Proxmox infrastructure, while Ansible configures hosts and deploys shared operational services.
+## Engineering backbone
 
-The repository includes infrastructure and service automation for VM lifecycle, storage and backups, Cloudflare Tunnel connectivity, self-hosted GitHub Actions runners, PostgreSQL, Prometheus monitoring, uptime monitoring, workflow automation, and container-service operations.
-
-[Public infrastructure overview](https://github.com/firstsun-dev/.github/blob/main/docs/infrastructure-overview.md) · [Service status](https://uptime.firstsun.org/status)
+Firstsun projects share an operational backbone instead of treating deployment and reliability as an afterthought.
 
 - **Shared delivery** — reusable GitHub Actions for test, release, and deployment live in [`.github`](https://github.com/firstsun-dev/.github)
 - **Infrastructure as code** — production and self-hosted infrastructure is provisioned with Terraform and configured with Ansible
-- **Observable services** — monitoring and public service-health visibility are part of the operating model, not an afterthought
-- **Private where appropriate** — production source, infrastructure code, credentials, and privileged configuration remain private while architecture and operational evidence stay public
+- **Verification** — unit, integration, E2E, compatibility, lint, and build checks are applied where they materially reduce risk
+- **Observable services** — monitoring and public service-health visibility are part of the operating model
+- **Private where appropriate** — privileged production source and infrastructure remain private while architecture and operational evidence stay public
+
+`infra-config` is the private multi-cloud infrastructure and service-operations monorepo behind Firstsun services. It covers Cloudflare, Oracle Cloud, Proxmox, VM lifecycle, storage and backups, tunnels, self-hosted GitHub Actions runners, PostgreSQL, Prometheus monitoring, workflow automation, and container-service operations.
+
+[Public infrastructure overview](https://github.com/firstsun-dev/.github/blob/main/docs/infrastructure-overview.md) · [Service status](https://uptime.firstsun.org/status)
+
+## More projects
+
+- [Watermark Bucket Uploader](https://github.com/firstsun-dev/watermark-bucket-uploader) — image processing and S3-compatible object-storage delivery inside Obsidian
+- [Firstsun Skills](https://github.com/firstsun-dev/skills) — reusable agent skills for engineering workflows
+- [news-getter](https://github.com/firstsun-dev/news-getter) — deterministic news scoring, AI-assisted analysis, and a published digest pipeline
+- [books-mgmt](https://github.com/firstsun-dev/books-mgmt) — Kavita collection automation and Google Drive export
+- [Firstsun Tools](https://firstsun.heavenfortress.com/en/tools/) — small tools for practice, everyday life, design, and development
+
+The organization profile is intentionally curated rather than a complete repository index. Browse [all repositories](https://github.com/firstsun-dev?tab=repositories) for workshop and supporting projects.
 
 ## Firstsun / 首陽問路
 
-Firstsun is broader than a software organization. The journal connects engineering, practice, everyday life, and the things learned along the way; Firstsun Dev is the part that turns those needs into software and keeps the systems running.
+Firstsun is broader than software. The journal connects engineering, practice, everyday life, and lessons learned along the way; Firstsun Dev is the engineering arm that turns those needs into software and keeps the systems running.
 
-[Visit Firstsun](https://firstsun.org/en) · [Explore tools](https://firstsun.heavenfortress.com/en/tools/) · [Browse repositories](https://github.com/firstsun-dev?tab=repositories)
+[Visit Firstsun](https://firstsun.org/en) · [Explore tools](https://firstsun.heavenfortress.com/en/tools/) · [Brand system](https://github.com/firstsun-dev/.github/blob/main/docs/brand-system.md)
