@@ -79,7 +79,7 @@ jobs:
           PSI_API_KEY: ${{ secrets.PSI_API_KEY }}
 
       - name: Upload speed insights report
-        if: always()
+        if: failure()
         continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
