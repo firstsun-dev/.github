@@ -50,4 +50,5 @@ jobs:
         run: |
           atlas migrate apply \
             --dir "file://${{ inputs.migrations-path }}" \
+            --config "file://${{ inputs.atlas-config }}" \
             --url "$DATABASE_URL"
