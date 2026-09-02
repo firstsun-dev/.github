@@ -1,0 +1,30 @@
+name: Self CI
+
+# ---------------------------------------------------------------------------
+# Validates this repo's own reusable workflows (.github/workflows/*.yml)
+# before they reach consumers: catches YAML/syntax/expression errors via
+# actionlint. Not a full test harness — just a fast lint pass.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    paths:
+      - '.github/workflows/**'
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+
+concurrency:
+  group: >-
+    self-ci-${{ github.repository }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: reviewdog/action-actionlint@v1
+        with:
+          fail_level: error
