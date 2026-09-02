@@ -56,18 +56,23 @@ jobs:
           atlas version
 
       - name: Validate migration directory
-        run: atlas migrate validate --dir "file://${{ inputs.migrations-path }}"
+        run: |
+          atlas migrate validate \
+            --dir "file://${{ inputs.migrations-path }}" \
+            --config "file://${{ inputs.atlas-config }}"
 
       - name: Apply migrations to ephemeral database
         run: |
           atlas migrate apply \
             --dir "file://${{ inputs.migrations-path }}" \
+            --config "file://${{ inputs.atlas-config }}" \
             --url "$DATABASE_URL"
 
       - name: Verify clean migration state
         run: |
           STATUS=$(atlas migrate status \
             --dir "file://${{ inputs.migrations-path }}" \
+            --config "file://${{ inputs.atlas-config }}" \
             --url "$DATABASE_URL")
           echo "$STATUS"
           if ! echo "$STATUS" | grep -q "Migration Status: OK"; then
