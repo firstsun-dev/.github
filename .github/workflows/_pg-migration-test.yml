@@ -38,15 +38,20 @@ jobs:
           POSTGRES_PASSWORD: test
           POSTGRES_DB: test
         ports:
-          - 5432:5432
+          # Let Actions allocate an available host port. Self-hosted runners
+          # commonly already have (or reserve) 5432, so a fixed mapping is
+          # not a reliable way for the job process to reach this service.
+          - 5432/tcp
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U postgres -d test"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
     env:
       ATLAS_VERSION: v1.3.0
-      DATABASE_URL: postgres://postgres:test@localhost:5432/test?sslmode=disable
+      # Use the Actions-assigned service port and IPv4 loopback explicitly:
+      # localhost may resolve to ::1 while Docker only exposes the IPv4 map.
+      DATABASE_URL: postgres://postgres:test@127.0.0.1:${{ job.services.postgres.ports[5432] }}/test?sslmode=disable
     steps:
       - uses: actions/checkout@v6
 
