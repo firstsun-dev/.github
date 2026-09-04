@@ -38,17 +38,31 @@ jobs:
           POSTGRES_PASSWORD: test
           POSTGRES_DB: test
         ports:
-          - 5432:5432
+          # Let Actions allocate an available host port. Self-hosted runners
+          # commonly already have (or reserve) 5432, so a fixed mapping is
+          # not a reliable way for the job process to reach this service.
+          - 5432/tcp
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U postgres -d test"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
     env:
       ATLAS_VERSION: v1.3.0
-      DATABASE_URL: postgres://postgres:test@localhost:5432/test?sslmode=disable
     steps:
       - uses: actions/checkout@v6
+
+      # The job.services context is only available inside steps, not in the
+      # job-level env block. On the self-hosted fleet, this job executes in a
+      # runner container while service ports are published on the Docker host;
+      # the bridge gateway reaches that host (127.0.0.1 would be the runner).
+      - name: Configure ephemeral Postgres URL
+        env:
+          POSTGRES_PORT: ${{ job.services.postgres.ports[5432] }}
+        run: |
+          set -euo pipefail
+          DOCKER_HOST_GATEWAY=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
+          echo "DATABASE_URL=postgres://postgres:test@${DOCKER_HOST_GATEWAY}:${POSTGRES_PORT}/test?sslmode=disable" >> "$GITHUB_ENV"
 
       - name: Install Atlas CLI
         run: |

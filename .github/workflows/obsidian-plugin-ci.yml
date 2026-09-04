@@ -14,6 +14,15 @@ on:
       RELEASE_TOKEN:
         required: false
 
+# No consumer of this shared template previously had any concurrency dedup,
+# so rapid pushes to the same branch queued/ran independently with no
+# cancellation. Scoped per calling repo (multiple repos share this template)
+# and per event type so push and PR runs don't collide.
+concurrency:
+  group: >-
+    ${{ github.repository }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   filter:
     name: Check for Code Changes

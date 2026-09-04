@@ -70,6 +70,17 @@ jobs:
         run: |
           set -euo pipefail
 
+          # workflow_dispatch has no before SHA. Callers deliberately pass an
+          # empty base for that event, which means "run every category" rather
+          # than attempting an invalid/empty git diff.
+          if [ -z "$BASE_SHA" ]; then
+            echo "No base SHA supplied; treating manual dispatch as all paths changed."
+            echo "db_changed=true" >> "$GITHUB_OUTPUT"
+            echo "app_changed=true" >> "$GITHUB_OUTPUT"
+            echo "config_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # Diff includes added/modified/deleted files.
           mapfile -t CHANGED_FILES < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
 
