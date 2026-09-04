@@ -49,11 +49,15 @@ jobs:
           --health-retries 5
     env:
       ATLAS_VERSION: v1.3.0
-      # Use the Actions-assigned service port and IPv4 loopback explicitly:
-      # localhost may resolve to ::1 while Docker only exposes the IPv4 map.
-      DATABASE_URL: postgres://postgres:test@127.0.0.1:${{ job.services.postgres.ports[5432] }}/test?sslmode=disable
     steps:
       - uses: actions/checkout@v6
+
+      # The job.services context is only available inside steps, not in the
+      # job-level env block. Export it here for the later Atlas commands.
+      - name: Configure ephemeral Postgres URL
+        run: >-
+          echo "DATABASE_URL=postgres://postgres:test@127.0.0.1:${{ job.services.postgres.ports[5432] }}/test?sslmode=disable"
+          >> "$GITHUB_ENV"
 
       - name: Install Atlas CLI
         run: |
