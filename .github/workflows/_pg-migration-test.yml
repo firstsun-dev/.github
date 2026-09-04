@@ -53,11 +53,16 @@ jobs:
       - uses: actions/checkout@v6
 
       # The job.services context is only available inside steps, not in the
-      # job-level env block. Export it here for the later Atlas commands.
+      # job-level env block. On the self-hosted fleet, this job executes in a
+      # runner container while service ports are published on the Docker host;
+      # the bridge gateway reaches that host (127.0.0.1 would be the runner).
       - name: Configure ephemeral Postgres URL
-        run: >-
-          echo "DATABASE_URL=postgres://postgres:test@127.0.0.1:${{ job.services.postgres.ports[5432] }}/test?sslmode=disable"
-          >> "$GITHUB_ENV"
+        env:
+          POSTGRES_PORT: ${{ job.services.postgres.ports[5432] }}
+        run: |
+          set -euo pipefail
+          DOCKER_HOST_GATEWAY=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
+          echo "DATABASE_URL=postgres://postgres:test@${DOCKER_HOST_GATEWAY}:${POSTGRES_PORT}/test?sslmode=disable" >> "$GITHUB_ENV"
 
       - name: Install Atlas CLI
         run: |
