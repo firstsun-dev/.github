@@ -3,7 +3,7 @@
 ## `.github` (this change)
 
 - [x] Add `enable_preview_alias` input (default `false`) to `_cf-worker-template.yml`.
-- [x] Add `.github/actions/normalize-branch-alias` composite action + `normalize.sh`.
+- [x] Add `actions/normalize-branch-alias` composite action + `normalize.sh`.
 - [x] Wire alias computation into the `deploy` job, gated on
       `enable_preview_alias && github.ref != 'refs/heads/main'`.
 - [x] Pass `--preview-alias` into the existing `wrangler versions upload`
@@ -35,10 +35,22 @@
         <alias>"` and still runs the unchanged `versions deploy
         $WRANGLER_ENV "$VERSION_ID@100"` afterward — new alias, existing
         shared dev deploy both happen from one upload.
-- [ ] Open PR, get it merged to `main`.
-- [ ] Cut release `v1.4.0` via `scripts/release.sh v1.4.0`; move floating
-      `v1` to the same commit; verify older exact tags (`v1.0.0`–`v1.3.0`)
-      are untouched.
+- [x] Open PR (#21), merged to `main`.
+- [x] Cut release `v1.4.0` via `scripts/release.sh v1.4.0`; moved floating
+      `v1` to the same commit; verified older exact tags (`v1.0.0`–`v1.3.0`)
+      untouched.
+- [x] **Incident**: `v1.4.0`/`v1` shipped with the composite action placed at
+      `.github/actions/normalize-branch-alias/` while the `uses:` reference
+      (and this repo's existing convention — `actions/setup`,
+      `actions/mailpit`, `actions/parse-env` all live at repo-root
+      `actions/`) resolves to root-level `actions/normalize-branch-alias/`.
+      First live Blog deploy failed with `Can't find 'action.yml' ... for
+      action 'firstsun-dev/.github/actions/normalize-branch-alias@v1'`.
+      Fixed by moving the action to `actions/normalize-branch-alias/`
+      (matching convention) and released as `v1.4.1` (see below) rather than
+      rewriting the immutable `v1.4.0` tag.
+- [ ] Cut patch release `v1.4.1` with the path fix; move floating `v1` to
+      `v1.4.1`.
 
 ## `firstsun-dev/blog` (separate cross-repo change)
 

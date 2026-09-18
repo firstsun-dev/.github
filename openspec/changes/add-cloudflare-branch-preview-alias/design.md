@@ -50,7 +50,7 @@ enable_preview_alias:
   default: false
 ```
 
-### `.github/actions/normalize-branch-alias` (composite action)
+### `actions/normalize-branch-alias` (composite action)
 
 - Input: `branch-name` (string, required) — raw branch name, e.g. `github.ref_name`.
 - Output: `alias` (string) — normalized, ≤32-char, Cloudflare-safe alias.

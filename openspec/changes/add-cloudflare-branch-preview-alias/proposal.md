@@ -18,7 +18,7 @@ changing how that version is otherwise deployed.
 
 - Add an opt-in `enable_preview_alias` boolean input (default `false`) to
   `_cf-worker-template.yml`.
-- Add a composite action, `.github/actions/normalize-branch-alias`, that
+- Add a composite action, `actions/normalize-branch-alias`, that
   deterministically normalizes a branch name into a Cloudflare-safe alias
   (lowercase `a-z0-9-`, starts with a letter, ≤32 chars, collision-safe
   truncation via a hash of the original branch name).
