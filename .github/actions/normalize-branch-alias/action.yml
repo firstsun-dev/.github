@@ -1,0 +1,23 @@
+name: Normalize branch alias
+description: >-
+  Derives a deterministic, Cloudflare Aliased-Preview-URL-safe alias from a
+  git branch name.
+
+inputs:
+  branch-name:
+    description: Raw git branch name (e.g. github.ref_name)
+    required: true
+
+outputs:
+  alias:
+    description: Normalized, length-bounded alias safe for a Cloudflare preview URL
+    value: ${{ steps.normalize.outputs.alias }}
+
+runs:
+  using: composite
+  steps:
+    - id: normalize
+      shell: bash
+      run: |
+        ALIAS=$(bash "${{ github.action_path }}/normalize.sh" "${{ inputs.branch-name }}")
+        echo "alias=$ALIAS" >> "$GITHUB_OUTPUT"

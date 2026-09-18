@@ -90,6 +90,10 @@ on:
         description: Extra env vars for smoke tests, one KEY=VALUE per line.
         type: string
         default: ''
+      enable_preview_alias:
+        description: Create a branch-specific Cloudflare Aliased Preview URL for non-main deployments
+        type: boolean
+        default: false
 permissions:
   contents: read
   checks: write
@@ -278,6 +282,12 @@ jobs:
         with:
           setup-node: 'false'
           setup-pnpm: 'false'
+      - name: Compute preview alias
+        id: preview-alias
+        if: inputs.enable_preview_alias && github.ref != 'refs/heads/main'
+        uses: firstsun-dev/.github/actions/normalize-branch-alias@v1
+        with:
+          branch-name: ${{ github.ref_name }}
       - name: Set build environment
         run: |
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
@@ -332,8 +342,17 @@ jobs:
 
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
             WRANGLER_ENV=""
+            PREVIEW_ALIAS_ARGS=""
           else
             WRANGLER_ENV="--env dev"
+            PREVIEW_ALIAS="${{ steps.preview-alias.outputs.alias }}"
+            if [ "${{ inputs.enable_preview_alias }}" = "true" ] && [ -n "$PREVIEW_ALIAS" ]; then
+              PREVIEW_ALIAS_ARGS="--preview-alias $PREVIEW_ALIAS"
+              echo "Branch: ${{ github.ref_name }}"
+              echo "Preview alias: $PREVIEW_ALIAS"
+            else
+              PREVIEW_ALIAS_ARGS=""
+            fi
           fi
 
           # Get previous version ID for potential revert
@@ -342,7 +361,7 @@ jobs:
             2>/dev/null || echo "")
 
           # Upload new version with metadata
-          UPLOAD_OUT=$(pnpm exec wrangler versions upload $WRANGLER_ENV \
+          UPLOAD_OUT=$(pnpm exec wrangler versions upload $WRANGLER_ENV $PREVIEW_ALIAS_ARGS \
             --message "$DEPLOY_MSG" \
             --var COMMIT_HASH:"$SHORT_SHA" \
             --var VERSION:"$APP_VERSION")
@@ -353,6 +372,23 @@ jobs:
           if [ -z "$VERSION_ID" ]; then
             echo "❌ Failed to extract Worker Version ID from wrangler output"
             exit 1
+          fi
+
+          # Best-effort: surface the Aliased Preview URL in the job summary if
+          # Wrangler's stdout contains a recognizable workers.dev URL. Wrangler
+          # has no --json output for `versions upload`, so this is intentionally
+          # soft — a missing match is not an error, upload success is what matters.
+          if [ -n "$PREVIEW_ALIAS_ARGS" ]; then
+            PREVIEW_URL=$(echo "$UPLOAD_OUT" | grep -oE 'https://[^ ]+\.workers\.dev[^ ]*' | head -1 || true)
+            {
+              echo "### Branch preview alias"
+              echo ""
+              echo "- Branch: \`${{ github.ref_name }}\`"
+              echo "- Preview alias: \`$PREVIEW_ALIAS\`"
+              if [ -n "$PREVIEW_URL" ]; then
+                echo "- Preview URL: $PREVIEW_URL"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
           # Deploy the version to 100% traffic
