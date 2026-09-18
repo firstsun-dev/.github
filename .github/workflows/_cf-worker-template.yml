@@ -94,6 +94,10 @@ on:
         description: Create a branch-specific Cloudflare Aliased Preview URL for non-main deployments
         type: boolean
         default: false
+      worker_name_dev:
+        description: Cloudflare Worker script name for the development environment; used to construct Aliased Preview URLs
+        type: string
+        default: ''
 permissions:
   contents: read
   checks: write
@@ -268,7 +272,11 @@ jobs:
     runs-on: ${{ inputs.runner }}
     environment:
       name: ${{ inputs.app_name }}/${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
-      url: ${{ github.ref == 'refs/heads/main' && inputs.app_url_prod || inputs.app_url_dev }}
+      url: >-
+        ${{ github.ref == 'refs/heads/main'
+            && inputs.app_url_prod
+            || steps.deploy.outputs.preview_url
+            || inputs.app_url_dev }}
     timeout-minutes: 20
     outputs:
       version_id: ${{ steps.deploy.outputs.version_id }}
@@ -333,12 +341,15 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           RAW_COMMIT_MSG: ${{ github.event.head_commit.message }}
+          WORKER_NAME_DEV: ${{ inputs.worker_name_dev }}
         run: |
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           # Safely extract first line of commit message from env var
           COMMIT_MSG=$(echo "$RAW_COMMIT_MSG" | head -1 | cut -c1-80)
           COMMIT_MSG="${COMMIT_MSG:-Manual deploy}"
           DEPLOY_MSG="[$SHORT_SHA] $COMMIT_MSG"
+
+          PREVIEW_URL=""
 
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
             WRANGLER_ENV=""
@@ -350,6 +361,24 @@ jobs:
               PREVIEW_ALIAS_ARGS="--preview-alias $PREVIEW_ALIAS"
               echo "Branch: ${{ github.ref_name }}"
               echo "Preview alias: $PREVIEW_ALIAS"
+
+              # Deterministically construct the Aliased Preview URL from the
+              # account's Workers subdomain instead of parsing Wrangler's
+              # human-readable stdout, which does not reliably contain the
+              # final *.workers.dev URL. A failed lookup must not fail an
+              # otherwise successful deployment — it only affects the
+              # display URL, so we fall back to app_url_dev below.
+              if [ -n "$WORKER_NAME_DEV" ]; then
+                SUBDOMAIN=$(curl -sS -f \
+                  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                  "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain" \
+                  2>/dev/null | jq -r '.result.subdomain // empty' 2>/dev/null || echo "")
+                if [ -n "$SUBDOMAIN" ]; then
+                  PREVIEW_URL="https://${PREVIEW_ALIAS}-${WORKER_NAME_DEV}.${SUBDOMAIN}.workers.dev"
+                else
+                  echo "::warning::Could not resolve the Cloudflare Workers subdomain; branch preview URL unavailable, falling back to app_url_dev"
+                fi
+              fi
             else
               PREVIEW_ALIAS_ARGS=""
             fi
@@ -374,28 +403,30 @@ jobs:
             exit 1
           fi
 
-          # Best-effort: surface the Aliased Preview URL in the job summary if
-          # Wrangler's stdout contains a recognizable workers.dev URL. Wrangler
-          # has no --json output for `versions upload`, so this is intentionally
-          # soft — a missing match is not an error, upload success is what matters.
-          if [ -n "$PREVIEW_ALIAS_ARGS" ]; then
-            PREVIEW_URL=$(echo "$UPLOAD_OUT" | grep -oE 'https://[^ ]+\.workers\.dev[^ ]*' | head -1 || true)
-            {
-              echo "### Branch preview alias"
-              echo ""
+          {
+            echo "### Deployment"
+            echo ""
+            if [ -n "$PREVIEW_ALIAS_ARGS" ]; then
               echo "- Branch: \`${{ github.ref_name }}\`"
               echo "- Preview alias: \`$PREVIEW_ALIAS\`"
               if [ -n "$PREVIEW_URL" ]; then
-                echo "- Preview URL: $PREVIEW_URL"
+                echo "- Branch preview: $PREVIEW_URL"
+              else
+                echo "- Branch preview: _unavailable (subdomain lookup failed)_"
               fi
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+              if [ -n "${{ inputs.app_url_dev }}" ]; then
+                echo "- Shared preview: ${{ inputs.app_url_dev }}"
+              fi
+            fi
+            echo "- Worker version: \`$VERSION_ID\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
           # Deploy the version to 100% traffic
           pnpm exec wrangler versions deploy $WRANGLER_ENV "$VERSION_ID@100" --message "$DEPLOY_MSG" --yes
 
           echo "version_id=$VERSION_ID" >> $GITHUB_OUTPUT
           echo "previous_version_id=$PREV_ID" >> $GITHUB_OUTPUT
+          echo "preview_url=$PREVIEW_URL" >> $GITHUB_OUTPUT
 
   # ---------------------------------------------------------------------------
   # Verify — prod (main) and dev (other branches)
