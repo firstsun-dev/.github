@@ -49,21 +49,42 @@
       Fixed by moving the action to `actions/normalize-branch-alias/`
       (matching convention) and released as `v1.4.1` (see below) rather than
       rewriting the immutable `v1.4.0` tag.
-- [ ] Cut patch release `v1.4.1` with the path fix; move floating `v1` to
-      `v1.4.1`.
+- [x] Cut patch release `v1.4.1` with the path fix; moved floating `v1` to
+      `v1.4.1`; `v1.4.0` left immutable/untouched.
 
 ## `firstsun-dev/blog` (separate cross-repo change)
 
 Tracked in that repository's own `openspec/changes/enable-cloudflare-branch-previews/`.
 
-- [ ] `wrangler.toml`: `preview_urls = true` under `[env.dev]`.
-- [ ] `.github/workflows/cicd.yml`: pin shared workflow to `@v1.4.0`,
-      set `enable_preview_alias: true`.
-- [ ] Local quality gate green before push.
-- [ ] Push a real non-main branch and confirm both the shared dev URL and
-      the branch-specific alias serve the expected version; push a second
-      branch and confirm the first branch's alias is unaffected; push again
-      to the first branch and confirm its alias now serves the new version.
+- [x] `wrangler.toml`: `preview_urls = true` under `[env.dev]`.
+- [x] `.github/workflows/cicd.yml`: pinned shared workflow to `@v1.4.1`
+      (bumped from `@v1.4.0` after the incident above), set
+      `enable_preview_alias: true`.
+- [x] Local quality gate green before push.
+- [x] Pushed a real non-main branch (PR #403); full CI pipeline succeeded
+      on the second run (after the `v1.4.1` fix). Live-verified: the
+      branch's alias (`feat-enable-cloudflare-dea1ad76-blog-preview.<account>.workers.dev`)
+      served the branch's exact commit via `PUBLIC_COMMIT_SHA`, and kept
+      serving it even after an unrelated concurrent rollback moved the
+      shared `blog-preview.firstsun.org` URL back to an older commit —
+      demonstrating alias independence from the shared dev URL under real
+      interference. A same-branch redeploy also confirmed the alias
+      hostname stays stable while the served version updates.
+- [x] **Second incident found + fixed** (Blog-side, not `.github`):
+      `wrangler versions upload`/`versions deploy` never sync the
+      `workers_dev`/`preview_urls` subdomain-enablement flags to Cloudflare
+      — confirmed via the Workers API that `blog-preview`'s subdomain
+      settings stayed `{"enabled": false, "previews_enabled": false}` even
+      after a successful aliased upload. Fixed with a one-time
+      `POST .../workers/scripts/blog-preview/subdomain
+      {"enabled": false, "previews_enabled": true}` (persistent Cloudflare
+      script setting, not reset by future CI runs; production `blog`
+      script's subdomain settings confirmed untouched). Documented in
+      Blog's `design.md` as a caveat for anyone recreating the script from
+      scratch.
+- [ ] Two-simultaneous-branches scenario (a second throwaway branch) — not
+      yet exercised; the alias-independence property was already
+      demonstrated live via the concurrent-rollback observation above.
 
 ## Explicitly not done in this phase
 
