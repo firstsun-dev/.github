@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Validates .github/actions/normalize-branch-alias/normalize.sh against the
+# Validates actions/normalize-branch-alias/normalize.sh against the
 # Cloudflare Aliased Preview URL constraints.
 #
 # Usage: ./scripts/test-normalize-branch-alias.sh
@@ -7,7 +7,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NORMALIZE="$REPO_ROOT/.github/actions/normalize-branch-alias/normalize.sh"
+NORMALIZE="$REPO_ROOT/actions/normalize-branch-alias/normalize.sh"
 
 fail=0
 
