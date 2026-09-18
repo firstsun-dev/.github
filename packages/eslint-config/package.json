@@ -1,6 +1,6 @@
 {
   "name": "@firstsun/eslint-config",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Shared ESLint flat config for Firstsun monorepos (Cloudflare Workers + React)",
   "type": "module",
   "main": "index.js",
