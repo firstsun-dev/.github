@@ -1,0 +1,151 @@
+name: CodeGraph Index
+
+# ---------------------------------------------------------------------------
+# Reusable CodeGraph index maintenance workflow (Phase 1).
+# Keeps a CI-side .codegraph index for the default branch: restore the previous
+# index from cache, incrementally sync it (or clean-init when none is usable),
+# verify health, and save the refreshed index under a per-commit key.
+#
+# The index is ephemeral CI state: never committed, never uploaded as an
+# artifact, and unrelated to developers' local/worktree indexes.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Runner label
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+env:
+  # Single source of truth for the CodeGraph version. It is part of the cache
+  # key, so bumping it starts from a cold cache instead of restoring an index
+  # built by another version.
+  CODEGRAPH_VERSION: 1.6.0
+
+jobs:
+  codegraph:
+    name: CodeGraph Index
+    # Only the default branch maintains the shared index.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    concurrency:
+      group: codegraph-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      CODEGRAPH_TELEMETRY: '0'
+      DO_NOT_TRACK: '1'
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: firstsun-dev/.github/actions/setup@v1
+        with:
+          install: 'false'
+          setup-pnpm: 'false'
+
+      - name: Install CodeGraph ${{ env.CODEGRAPH_VERSION }}
+        run: |
+          set -euo pipefail
+          npm install --global "@colbymchenry/codegraph@${CODEGRAPH_VERSION}"
+          installed="$(codegraph --version)"
+          echo "Installed CodeGraph: ${installed}"
+          if [ "${installed}" != "${CODEGRAPH_VERSION}" ]; then
+            echo "::error::Expected CodeGraph ${CODEGRAPH_VERSION}, got ${installed}"
+            exit 1
+          fi
+
+      # The version, OS/arch, repository id, and branch are all part of the key
+      # and of the restore prefix, so an index can never cross any of them.
+      - name: Restore CodeGraph index cache
+        id: cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .codegraph
+          key: codegraph-${{ env.CODEGRAPH_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ github.repository_id }}-${{ github.event.repository.default_branch }}-${{ github.sha }}
+          restore-keys: |
+            codegraph-${{ env.CODEGRAPH_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ github.repository_id }}-${{ github.event.repository.default_branch }}-
+
+      # codegraph exits 0 even on failure, so health is judged from its output.
+      - name: Inspect restored index
+        id: inspect
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          CACHE_MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
+        run: |
+          set -euo pipefail
+          if [ "${CACHE_HIT}" = "true" ]; then
+            echo "Cache restored: exact match (${CACHE_MATCHED_KEY})"
+          elif [ -n "${CACHE_MATCHED_KEY}" ]; then
+            echo "Cache restored: previous index (${CACHE_MATCHED_KEY})"
+          else
+            echo "Cache miss: no previous index"
+          fi
+
+          usable=false
+          if [ -d .codegraph ]; then
+            out="$(codegraph status 2>&1 || true)"
+            echo "${out}"
+            if printf '%s' "${out}" | grep -q 'Index Statistics' \
+              && ! printf '%s' "${out}" | grep -Eq '✗|Not initialized|Failed'; then
+              usable=true
+            else
+              echo "::warning::Restored .codegraph is not a usable index; it will be rebuilt"
+            fi
+          fi
+          echo "usable=${usable}" >> "$GITHUB_OUTPUT"
+
+      - name: Incremental sync
+        id: sync
+        if: steps.inspect.outputs.usable == 'true'
+        run: |
+          set -euo pipefail
+          echo "Mode: incremental sync"
+          out="$(codegraph sync 2>&1 || true)"
+          echo "${out}"
+          if printf '%s' "${out}" | grep -Eq '✗|Failed'; then
+            echo "::warning::Incremental sync failed; falling back to fresh initialization"
+            echo "synced=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "synced=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fresh initialization
+        if: steps.inspect.outputs.usable != 'true' || steps.sync.outputs.synced != 'true'
+        run: |
+          set -euo pipefail
+          echo "Mode: fresh initialization"
+          rm -rf .codegraph
+          out="$(codegraph init --yes 2>&1 || true)"
+          echo "${out}"
+          if printf '%s' "${out}" | grep -Eq '✗|Failed'; then
+            echo "::error::codegraph init failed"
+            exit 1
+          fi
+
+      - name: Verify index health
+        run: |
+          set -euo pipefail
+          out="$(codegraph status 2>&1 || true)"
+          echo "${out}"
+          if ! printf '%s' "${out}" | grep -q 'Index Statistics' \
+            || printf '%s' "${out}" | grep -Eq '✗|Not initialized|Failed'; then
+            echo "::error::CodeGraph index is not healthy"
+            exit 1
+          fi
+          echo "Health verification passed"
+
+      # Reached only when every step above succeeded, so an unhealthy index is
+      # never cached. An exact-key hit already holds this commit's index.
+      - name: Save CodeGraph index cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .codegraph
+          key: codegraph-${{ env.CODEGRAPH_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ github.repository_id }}-${{ github.event.repository.default_branch }}-${{ github.sha }}

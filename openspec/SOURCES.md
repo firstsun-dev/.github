@@ -61,6 +61,10 @@ The split between release metadata and release-asset build/provenance is part of
 - `actions/setup-rclone/README.md`
 - `.github/workflows/rclone-sync.yml`
 
+### CodeGraph index CI
+
+- `.github/workflows/_codegraph.yml`
+
 ### Shared engineering configuration
 
 - `packages/eslint-config/index.js`
