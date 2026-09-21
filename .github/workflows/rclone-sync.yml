@@ -46,7 +46,7 @@ jobs:
     runs-on: ${{ inputs.runs_on }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup rclone
         uses: firstsun-dev/.github/actions/setup-rclone@v1
