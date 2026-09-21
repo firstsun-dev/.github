@@ -42,6 +42,7 @@ The current platform is divided into these capabilities:
 6. `post-deploy-verification` — reusable Lighthouse, PageSpeed Insights, and ZAP verification workflows.
 7. `rclone-sync` — reusable Google Drive-backed rclone setup and synchronization.
 8. `shared-engineering-config` — shared ESLint and TypeScript configuration packages.
+9. `codegraph-index-ci` — reusable CodeGraph index maintenance (restore/sync/init/verify/cache) for consumer default branches.
 
 A new spec SHOULD extend an existing capability unless the behavior has a distinct consumer contract, lifecycle, or failure domain.
 
