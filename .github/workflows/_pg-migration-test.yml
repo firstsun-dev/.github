@@ -30,6 +30,11 @@ jobs:
     name: Validate & Apply Migrations
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
+    # Run steps in a job container so they share the service network with `postgres` and can reach
+    # it by hostname. Self-hosted runners are themselves containers, so 127.0.0.1 never reaches the
+    # service. No published ports => no host-port collisions between concurrent runners.
+    container:
+      image: node:22-bookworm
     services:
       postgres:
         image: postgres:${{ inputs.postgres-version }}
@@ -37,8 +42,6 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: test
           POSTGRES_DB: test
-        ports:
-          - 5432:5432
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -46,9 +49,8 @@ jobs:
           --health-retries 5
     env:
       ATLAS_VERSION: v1.3.0
-      # 127.0.0.1, not localhost: on self-hosted runners localhost resolves to ::1 first and Atlas (community)
-      # does not fall back to IPv4, failing with "dial tcp [::1]:5432: connection refused".
-      DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/test?sslmode=disable
+      # Service hostname on the job network (job container + service share a user-defined network).
+      DATABASE_URL: postgres://postgres:test@postgres:5432/test?sslmode=disable
     steps:
       - uses: actions/checkout@v6
 
