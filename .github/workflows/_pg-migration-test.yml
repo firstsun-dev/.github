@@ -46,7 +46,9 @@ jobs:
           --health-retries 5
     env:
       ATLAS_VERSION: v1.3.0
-      DATABASE_URL: postgres://postgres:test@localhost:5432/test?sslmode=disable
+      # 127.0.0.1, not localhost: on self-hosted runners localhost resolves to ::1 first and Atlas (community)
+      # does not fall back to IPv4, failing with "dial tcp [::1]:5432: connection refused".
+      DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/test?sslmode=disable
     steps:
       - uses: actions/checkout@v6
 
