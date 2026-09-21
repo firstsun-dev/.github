@@ -233,3 +233,27 @@ The pipeline SHALL NOT attempt to delete, expire, or reassign aliases when a bra
 - **WHEN** the source branch for a previously created alias no longer exists
 - **THEN** the pipeline takes no automatic action against that alias
 - **AND** cleanup remains a manual or future-phase operation
+
+### Requirement: Opted-in branch deployments can surface the Aliased Preview URL as the GitHub deployment environment URL
+
+The pipeline SHALL accept an optional `worker_name_dev` string input, defaulting to `''`, naming the Cloudflare Worker script for the development environment. When `enable_preview_alias` is `true`, the ref is not `refs/heads/main`, and `worker_name_dev` is non-empty, the deploy job SHALL attempt to construct the branch's Aliased Preview URL and expose it as a `preview_url` output of the Deploy step. GitHub's deployment `environment.url` for that job SHALL prefer this value, falling back to `app_url_dev` when it is unavailable. This changes only which URL GitHub surfaces as the deployment link — it SHALL NOT change where the Worker version is deployed.
+
+#### Scenario: Branch deployment URL
+
+- **WHEN** `enable_preview_alias` is `true`, the ref is not `refs/heads/main`, `worker_name_dev` is supplied, and the account's Workers subdomain can be resolved via `GET /accounts/{account_id}/workers/subdomain`
+- **THEN** `preview_url` is constructed as `https://<alias>-<worker_name_dev>.<subdomain>.workers.dev`, using the same normalized alias produced by `actions/normalize-branch-alias`
+- **AND** the job's `environment.url` resolves to `preview_url`
+- **AND** `app_url_dev` continues to receive the same deployed Worker version as the shared development deployment, unaffected by this display-URL change
+
+#### Scenario: Preview URL metadata cannot be resolved
+
+- **WHEN** `worker_name_dev` is empty, `enable_preview_alias` is `false`, or the Cloudflare Workers subdomain lookup fails
+- **THEN** the Worker deployment still proceeds and `versions deploy ... @100` still runs unchanged
+- **AND** `preview_url` is empty and a warning is emitted for a failed lookup
+- **AND** the job's `environment.url` falls back to `app_url_dev`
+
+#### Scenario: Production deployment
+
+- **WHEN** `github.ref` is `refs/heads/main`
+- **THEN** `environment.url` remains `app_url_prod`
+- **AND** preview alias and preview URL behavior are not involved
