@@ -52,9 +52,7 @@ jobs:
       # Service hostname on the job network (job container + service share a user-defined network).
       DATABASE_URL: postgres://postgres:test@postgres:5432/test?sslmode=disable
     steps:
-      # v4 (node20) not v6 (node24): our self-hosted runners' externals don't yet include
-      # node24, and job containers need the action's node runtime present at /__e on the host.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Atlas CLI
         run: |
