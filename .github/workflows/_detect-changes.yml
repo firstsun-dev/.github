@@ -2,9 +2,19 @@ name: Detect Changed Paths
 
 # ---------------------------------------------------------------------------
 # Reusable path-detection workflow.
-# Diffs base-sha..head-sha and matches changed files (added/modified/deleted)
-# against caller-supplied newline-separated glob patterns for three
+# Diffs base-sha..head-sha and matches changed files (added/modified/deleted/
+# renamed) against caller-supplied newline-separated glob patterns for three
 # independent categories: db, app, config.
+#
+# Fail-safe base handling: if base-sha is empty, all-zero (new branch / first
+# push), or not present in the checkout (force-push, pruned history), the diff
+# range cannot be trusted. Rather than erroring or guessing, ALL three
+# categories report 'true' (and `base_resolved` is 'false'). A missing
+# base never produces a false negative. head-sha must always resolve.
+#
+# Callers that must not treat "no diff" as "deploy everything" (e.g. manual
+# workflow_dispatch deploys) should skip this workflow and select categories
+# from their own inputs.
 # ---------------------------------------------------------------------------
 
 on:
@@ -23,7 +33,9 @@ on:
         type: string
         required: true
       base-sha:
-        description: Base commit SHA to diff from
+        description: >-
+          Base commit SHA to diff from. May be empty, all zeros, or unknown to
+          the checkout; in that case every category is reported as changed.
         type: string
         required: true
       head-sha:
@@ -44,6 +56,9 @@ on:
       config_changed:
         description: "'true' if any changed file matches config-paths"
         value: ${{ jobs.detect.outputs.config_changed }}
+      base_resolved:
+        description: "'false' if base-sha was unusable and all categories were forced to 'true'"
+        value: ${{ jobs.detect.outputs.base_resolved }}
 
 jobs:
   detect:
@@ -54,6 +69,7 @@ jobs:
       db_changed: ${{ steps.match.outputs.db_changed }}
       app_changed: ${{ steps.match.outputs.app_changed }}
       config_changed: ${{ steps.match.outputs.config_changed }}
+      base_resolved: ${{ steps.match.outputs.base_resolved }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -70,8 +86,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Diff includes added/modified/deleted files.
-          mapfile -t CHANGED_FILES < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          if [ -z "$HEAD_SHA" ] || ! git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
+            echo "::error::head-sha '${HEAD_SHA}' is empty or not a commit in this checkout"
+            exit 1
+          fi
+
+          ZERO_SHA=0000000000000000000000000000000000000000
+          BASE_RESOLVED=true
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "$ZERO_SHA" ] \
+             || ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            BASE_RESOLVED=false
+            echo "::notice::base-sha '${BASE_SHA}' is empty/zero/unavailable; treating all categories as changed (fail-safe)."
+            CHANGED_FILES=()
+          else
+            # --no-renames lists both sides of a rename so moving a file out of
+            # a matched path is still detected. Includes added/modified/deleted.
+            mapfile -t CHANGED_FILES < <(git diff --name-only --no-renames "$BASE_SHA" "$HEAD_SHA")
+          fi
+          echo "base_resolved=$BASE_RESOLVED" >> "$GITHUB_OUTPUT"
 
           match_any() {
             local patterns_str="$1"
@@ -82,6 +114,7 @@ jobs:
               patterns+=("$pattern")
             done <<< "$patterns_str"
 
+            [ "$BASE_RESOLVED" = "false" ] && return 0
             for file in "${CHANGED_FILES[@]}"; do
               [ -z "$file" ] && continue
               for pattern in "${patterns[@]}"; do
