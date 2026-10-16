@@ -2,10 +2,26 @@ name: ZAP Scan Template
 
 # ---------------------------------------------------------------------------
 # Reusable ZAP security scan template.
-# baseline and api scans run in parallel via matrix.
 #
-# scan_mode: baseline — fast, passive, safe for prod
-#            full     — active attack payloads, dev only
+# Safety policy (enforced by the "Enforce scan policy" step):
+#   environment: production (DEFAULT)
+#       -> scan_mode must be `baseline` (passive: spider + passive rules only).
+#          Active full scans and OpenAPI/API fuzzing are refused/skipped.
+#   environment: staging | development
+#       -> scan_mode `baseline` (passive) or `full` (active).
+#          The API (OpenAPI) scan is an ACTIVE scan and only runs when
+#          scan_mode is `full` and an openapi_path is supplied.
+#   protected_hosts: optional comma-separated host globs (e.g. *.example.com)
+#       that must never receive active scans, regardless of `environment`.
+#
+# Reliability: ZAP is run directly (docker) instead of through the
+# zaproxy/action-* wrappers, because those wrappers always upload their raw
+# reports as artifacts and fail the step when the account artifact quota is
+# exhausted. Here, findings are always written to the job summary (redacted);
+# the redacted JSON report is uploaded best-effort and an upload failure is
+# reported as an infrastructure warning, never as a security finding.
+# Scan-engine failures (ZAP exit code > 2 / no report) fail the job.
+# Findings alone never fail the job.
 # ---------------------------------------------------------------------------
 
 on:
@@ -18,16 +34,32 @@ on:
         type: string
         required: true
       openapi_path:
-        description: Path to OpenAPI spec, e.g. /doc. Empty skips API scan.
+        description: Path to OpenAPI spec, e.g. /doc. Empty skips API scan. API scan only runs for non-production `full` scans.
         type: string
         default: ''
       runner:
         type: string
         default: linux
       scan_mode:
-        description: baseline or full
+        description: baseline (passive) or full (active; never allowed for production)
         type: string
         default: baseline
+      environment:
+        description: production, staging or development. Defaults to production (most restrictive).
+        type: string
+        default: production
+      protected_hosts:
+        description: Comma-separated host globs that must never receive active scans.
+        type: string
+        default: ''
+      zap_image:
+        description: ZAP container image.
+        type: string
+        default: ghcr.io/zaproxy/zaproxy:stable
+      report_retention_days:
+        description: Retention for the redacted report artifact (kept small to protect artifact quota).
+        type: number
+        default: 7
       run_label:
         description: Short label shown in job name to identify trigger source
         type: string
@@ -38,8 +70,6 @@ on:
 
 permissions:
   contents: read
-  checks: write
-  security-events: write
 
 jobs:
   zap-scan:
@@ -52,91 +82,168 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        type: ${{ fromJson(inputs.openapi_path != '' && '["baseline","api"]' || '["baseline"]') }}
+        # The API scan is active; only include it for explicit non-production full scans.
+        type: ${{ fromJson(inputs.openapi_path != '' && inputs.scan_mode == 'full' && inputs.environment != 'production' && '["baseline","api"]' || '["baseline"]') }}
+    env:
+      APP: ${{ inputs.app_name }}
+      SCAN: ${{ matrix.type }}
+      TARGET_URL: ${{ inputs.target_url }}
+      SCAN_MODE: ${{ inputs.scan_mode }}
+      TARGET_ENV: ${{ inputs.environment }}
+      PROTECTED_HOSTS: ${{ inputs.protected_hosts }}
+      ZAP_IMAGE: ${{ inputs.zap_image }}
     steps:
+      - name: Enforce scan policy
+        id: policy
+        run: |
+          set -euo pipefail
+          case "$TARGET_ENV" in production|staging|development) ;; *)
+            echo "::error title=ZAP policy::environment must be production, staging or development (got '$TARGET_ENV')"; exit 1;; esac
+          case "$SCAN_MODE" in baseline|full) ;; *)
+            echo "::error title=ZAP policy::scan_mode must be baseline or full (got '$SCAN_MODE')"; exit 1;; esac
+          ACTIVE=false
+          if [ "$SCAN_MODE" = "full" ] || [ "$SCAN" = "api" ]; then ACTIVE=true; fi
+          if [ "$ACTIVE" = true ] && [ "$TARGET_ENV" = "production" ]; then
+            echo "::error title=ZAP policy::Active scans (scan_mode=full / API scan) are refused for environment=production"; exit 1
+          fi
+          HOST=$(printf '%s' "$TARGET_URL" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#[/?\#].*$##; s#^[^@]*@##; s#:[0-9]+$##' | tr 'A-Z' 'a-z')
+          if [ -z "$HOST" ]; then echo "::error title=ZAP policy::cannot parse host from target_url"; exit 1; fi
+          if [ "$ACTIVE" = true ] && [ -n "$PROTECTED_HOSTS" ]; then
+            IFS=',' read -ra PATS <<< "$PROTECTED_HOSTS"
+            for p in "${PATS[@]}"; do
+              p=$(printf '%s' "$p" | tr -d ' ' | tr 'A-Z' 'a-z')
+              # shellcheck disable=SC2254
+              case "$HOST" in $p) echo "::error title=ZAP policy::Active scan refused: host '$HOST' matches protected_hosts"; exit 1;; esac
+            done
+          fi
+          echo "host=$HOST" >> "$GITHUB_OUTPUT"
+          echo "ZAP policy OK: env=$TARGET_ENV mode=$SCAN_MODE type=$SCAN host=$HOST active=$ACTIVE"
+
       - name: Prepare API spec
         if: matrix.type == 'api'
         id: api
         run: |
+          set -euo pipefail
           CREDS=$(echo "$ZAP_BASIC_AUTH" | base64 -d)
           echo "::add-mask::$CREDS"
           # ZAP's HTTP client rejects URL-embedded credentials (RFC 9110 deprecated).
-          # Download spec via curl and pass the local file to the action instead.
-          SPEC_FILE="openapi-spec-${{ inputs.app_name }}.json"
-          curl -fsSL -u "$CREDS" "${{ inputs.target_url }}${{ inputs.openapi_path }}" -o "$SPEC_FILE"
-          # ZAP mounts $PWD as /zap/wrk inside the container
-          echo "spec=/zap/wrk/$SPEC_FILE" >> $GITHUB_OUTPUT
+          # Download spec via curl and pass the local file to ZAP instead.
+          SPEC_FILE="openapi-spec-${APP}.json"
+          mkdir -p zap-out && chmod 777 zap-out
+          curl -fsSL -u "$CREDS" "${TARGET_URL}${OPENAPI_PATH}" -o "zap-out/$SPEC_FILE"
+          # Refuse if the spec itself points at a protected host (ZAP would attack its `servers`).
+          if [ -n "$PROTECTED_HOSTS" ]; then
+            for s in $(jq -r '.servers[]?.url // empty' "zap-out/$SPEC_FILE"); do
+              SH=$(printf '%s' "$s" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#[/?\#].*$##; s#:[0-9]+$##' | tr 'A-Z' 'a-z')
+              IFS=',' read -ra PATS <<< "$PROTECTED_HOSTS"
+              for p in "${PATS[@]}"; do
+                p=$(printf '%s' "$p" | tr -d ' ' | tr 'A-Z' 'a-z')
+                # shellcheck disable=SC2254
+                case "$SH" in $p) echo "::error title=ZAP policy::OpenAPI servers entry targets protected host '$SH'"; exit 1;; esac
+              done
+            done
+          fi
+          # ZAP mounts zap-out as /zap/wrk inside the container
+          echo "spec=/zap/wrk/$SPEC_FILE" >> "$GITHUB_OUTPUT"
         env:
           ZAP_BASIC_AUTH: ${{ secrets.ZAP_DOC_BASIC_AUTH }}
+          OPENAPI_PATH: ${{ inputs.openapi_path }}
 
-      - name: ZAP Baseline Scan
-        if: matrix.type == 'baseline' && inputs.scan_mode == 'baseline'
-        uses: zaproxy/action-baseline@v0.15.0
-        with:
-          target: ${{ inputs.target_url }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fail_action: false
-          allow_issue_writing: false
-          artifact_name: zap-baseline-${{ inputs.app_name }}
-
-      - name: ZAP Full Scan
-        if: matrix.type == 'baseline' && inputs.scan_mode == 'full'
-        uses: zaproxy/action-full-scan@v0.13.0
-        with:
-          target: ${{ inputs.target_url }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fail_action: false
-          allow_issue_writing: false
-          artifact_name: zap-full-${{ inputs.app_name }}
-
-      - name: ZAP API Scan
-        if: matrix.type == 'api'
-        uses: zaproxy/action-api-scan@v0.10.0
-        with:
-          target: ${{ steps.api.outputs.spec }}
-          format: openapi
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fail_action: false
-          allow_issue_writing: false
-          artifact_name: zap-api-${{ inputs.app_name }}
-
-      - name: Annotate findings
-        if: always()
+      - name: Run ZAP
+        id: zap
         env:
-          APP: ${{ inputs.app_name }}
-          SCAN: ${{ matrix.type }}
+          API_SPEC: ${{ steps.api.outputs.spec }}
+          TARGET_HOST: ${{ steps.policy.outputs.host }}
         run: |
-          [ -f report_json.json ] || exit 0
+          set +e
+          mkdir -p zap-out && chmod 777 zap-out
+          if [ "$SCAN" = "api" ]; then
+            SCRIPT=(zap-api-scan.py -t "$API_SPEC" -f openapi -O "$TARGET_HOST")
+          elif [ "$SCAN_MODE" = "full" ]; then
+            SCRIPT=(zap-full-scan.py -t "$TARGET_URL")
+          else
+            SCRIPT=(zap-baseline.py -t "$TARGET_URL")
+          fi
+          docker run --rm -v "$PWD/zap-out:/zap/wrk/:rw" -t "$ZAP_IMAGE" \
+            "${SCRIPT[@]}" -J report_json.json -w report.md
+          RC=$?
+          echo "exit_code=$RC" >> "$GITHUB_OUTPUT"
+          # ZAP exit codes: 0 clean, 1 failures, 2 warnings (scan completed); anything else is an engine error.
+          if [ "$RC" -le 2 ] && [ -s zap-out/report_json.json ]; then
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "completed=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
 
-          HIGH=$(jq '[.site[].alerts[] | select(.riskcode=="3")] | length' report_json.json 2>/dev/null || echo 0)
-          MED=$(jq  '[.site[].alerts[] | select(.riskcode=="2")] | length' report_json.json 2>/dev/null || echo 0)
-          LOW=$(jq  '[.site[].alerts[] | select(.riskcode=="1")] | length' report_json.json 2>/dev/null || echo 0)
-          INFO=$(jq '[.site[].alerts[] | select(.riskcode=="0")] | length' report_json.json 2>/dev/null || echo 0)
+      - name: Summarize findings (redacted)
+        id: summarize
+        if: always() && steps.zap.outputs.completed == 'true'
+        env:
+          ZAP_EXIT: ${{ steps.zap.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          RAW=zap-out/report_json.json
+          # Redact: query values and userinfo in URLs; bound evidence/attack length; scrub credential-like tokens.
+          jq --arg app "$APP" --arg scan "$SCAN" --arg mode "$SCAN_MODE" --arg env "$TARGET_ENV" '
+            def scrub: gsub("(?i)(authorization|cookie|set-cookie|token|secret|password|passwd|apikey|api[-_]key|bearer|session)[=:\\s\"]+((bearer|basic)\\s+)?[^\\s\"&;,]+"; "[REDACTED]");
+            def clean: (. // "") | gsub("//[^/@]*@"; "//") | gsub("(?<k>[?&][^=&#]*)=[^&#]*"; "\(.k)=*");
+            { app: $app, scan: $scan, scan_mode: $mode, environment: $env,
+              alerts: [ .site[]? | .alerts[]? | {
+                pluginid, name, riskcode, riskdesc, confidence,
+                count: (.count // ((.instances // []) | length)),
+                solution: ((.solution // "") | gsub("<[^>]+>"; "") | .[0:300]),
+                instances: [ (.instances // [])[0:10][] | {
+                  method, uri: (.uri | clean), param,
+                  attack: ((.attack // "") | scrub | .[0:100]),
+                  evidence: ((.evidence // "") | scrub | .[0:100]) } ] } ] }
+          ' "$RAW" > zap-out/report-redacted.json
 
-          HIGH_COLOR=$( [ "$HIGH" -gt 0 ] && echo "critical"   || echo "brightgreen" )
-          MED_COLOR=$(  [ "$MED"  -gt 0 ] && echo "important"  || echo "brightgreen" )
-          LOW_COLOR=$(  [ "$LOW"  -gt 0 ] && echo "yellow"     || echo "brightgreen" )
-
+          cnt() { jq "[.alerts[] | select(.riskcode==\"$1\")] | length" zap-out/report-redacted.json; }
+          HIGH=$(cnt 3); MED=$(cnt 2); LOW=$(cnt 1); INFO=$(cnt 0)
           {
-            echo "## ZAP \`${APP}\` — ${SCAN}"
+            echo "## ZAP \`${APP}\` — ${SCAN} (${SCAN_MODE}, ${TARGET_ENV})"
             echo ""
-            echo "![High](https://img.shields.io/badge/High-${HIGH}-${HIGH_COLOR}?style=flat-square) ![Medium](https://img.shields.io/badge/Medium-${MED}-${MED_COLOR}?style=flat-square) ![Low](https://img.shields.io/badge/Low-${LOW}-yellow?style=flat-square) ![Info](https://img.shields.io/badge/Info-${INFO}-informational?style=flat-square)"
+            echo "**${HIGH} High · ${MED} Medium · ${LOW} Low · ${INFO} Info** — scan engine exit code ${ZAP_EXIT}"
             echo ""
-          } >> $GITHUB_STEP_SUMMARY
-
+            if [ $((HIGH + MED + LOW + INFO)) -gt 0 ]; then
+              echo "| Risk | Rule | Alert | Count | Sample instances (query values redacted) |"
+              echo "|------|------|-------|-------|--------------------------------------------|"
+              jq -r '.alerts | sort_by(-(.riskcode|tonumber))[] |
+                "| \(.riskdesc) | \(.pluginid) | \(.name) | \(.count) | \([.instances[0:3][] | "`\(.method) \(.uri)`" + (if .param != "" and .param != null then " param=`\(.param)`" else "" end)] | join("<br>")) |"' zap-out/report-redacted.json
+            fi
+          } | head -c 400000 >> "$GITHUB_STEP_SUMMARY"
+          NAMES=$(jq -r '[.alerts[].name] | unique | join(" | ")' zap-out/report-redacted.json)
           if [ $((HIGH + MED + LOW + INFO)) -gt 0 ]; then
-            {
-              echo "| Risk | Alert | Solution |"
-              echo "|------|-------|----------|"
-              jq -r '
-                .site[].alerts[] |
-                "| \(.riskdesc) | \(.name) | \(.solution | gsub("<[^>]+>";"") | .[0:120]) |"
-              ' report_json.json
-            } >> $GITHUB_STEP_SUMMARY
+            echo "::warning title=[${APP}|${SCAN}] ${HIGH} High, ${MED} Medium, ${LOW} Low, ${INFO} Info::${NAMES}"
+          else
+            echo "::notice title=[${APP}|${SCAN}]::No alerts found"
           fi
 
-          SUMMARY="${HIGH} High, ${MED} Medium, ${LOW} Low, ${INFO} Info"
-          NAMES=$(jq -r '[.site[].alerts[].name] | unique | join(" | ")' report_json.json 2>/dev/null)
-          [ $((HIGH + MED + LOW + INFO)) -gt 0 ] \
-            && echo "::warning title=[${APP}|${SCAN}] ${SUMMARY}::${NAMES}" \
-            || echo "::notice title=[${APP}|${SCAN}]::No alerts found"
+      - name: Upload redacted report (best-effort)
+        id: upload
+        if: always() && steps.summarize.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-${{ inputs.app_name }}-${{ matrix.type }}
+          path: zap-out/report-redacted.json
+          retention-days: ${{ inputs.report_retention_days }}
+          if-no-files-found: warn
+
+      - name: Report upload / engine status
+        if: always()
+        env:
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+          ZAP_COMPLETED: ${{ steps.zap.outputs.completed }}
+          ZAP_EXIT: ${{ steps.zap.outputs.exit_code }}
+          POLICY_OUTCOME: ${{ steps.policy.outcome }}
+        run: |
+          if [ "$UPLOAD_OUTCOME" = "failure" ]; then
+            echo "::warning title=[${APP}|${SCAN}] report upload failed (infrastructure)::Artifact upload failed (e.g. storage quota). This is NOT a security finding; redacted findings are in the job summary."
+            echo "> ⚠️ Report artifact upload failed (infrastructure, not a security finding). Findings above are the authoritative record." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$POLICY_OUTCOME" = "success" ] && [ "$ZAP_COMPLETED" != "true" ]; then
+            echo "::error title=[${APP}|${SCAN}] ZAP engine failure::ZAP exited with code '${ZAP_EXIT}' or produced no report. This is a scan failure, not a clean result."
+            exit 1
+          fi
