@@ -69,6 +69,26 @@ The `_detect-changes.yml` reusable workflow SHALL diff the caller-provided `base
 - **WHEN** no changed path matches that category's supplied patterns
 - **THEN** the corresponding output is the string `false`
 
+### Requirement: Unusable base commits fail safe
+
+The `_detect-changes.yml` workflow SHALL never produce a false negative because `base-sha` is unusable.
+
+#### Scenario: Base is empty, all zeros, or absent from the checkout
+
+- **WHEN** `base-sha` is empty, `0000000000000000000000000000000000000000` (new branch), or not a commit in the checkout (force-push)
+- **THEN** `db_changed`, `app_changed`, and `config_changed` are all `true`
+- **AND** the `base_resolved` output is `false`
+
+#### Scenario: Head is unusable
+
+- **WHEN** `head-sha` is empty or not a commit in the checkout
+- **THEN** the job fails
+
+#### Scenario: A file is renamed out of a matched path
+
+- **WHEN** a file moves from a matched path to an unmatched path
+- **THEN** the category of the old path is reported as changed (`--no-renames`)
+
 ### Requirement: Path detection operates on full Git history
 
 The changed-path workflow SHALL check out the repository with full history before diffing arbitrary caller-provided SHAs.
