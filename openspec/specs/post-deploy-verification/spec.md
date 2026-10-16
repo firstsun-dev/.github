@@ -81,36 +81,33 @@ The SpeedInsights job SHALL use `continue-on-error: true` and SHALL upload gener
 - **THEN** available report files may be retained as failure artifacts
 - **AND** the reusable job does not become a hard deployment gate by itself
 
-### Requirement: ZAP supports passive production-safe and active development scan modes
+### Requirement: ZAP supports passive production-safe and active non-production scan modes
 
-`_zap-scan-template.yml` SHALL expose `baseline` and `full` scan modes, where baseline uses the passive baseline action and full uses the active full-scan action.
+`_zap-scan-template.yml` SHALL expose `baseline` (passive) and `full` (active) scan modes and an `environment` input (`production`, `staging`, `development`) that defaults to `production`. The template SHALL refuse any active scan (`full` mode or the API scan) when `environment` is `production` or when the target host matches `protected_hosts`.
 
-#### Scenario: `scan_mode` is `baseline`
+#### Scenario: Production baseline
+- **WHEN** `environment` is `production` and `scan_mode` is `baseline`
+- **THEN** only the passive baseline scan runs and no OpenAPI/API scan is scheduled
 
-- **WHEN** the baseline matrix entry runs
-- **THEN** ZAP baseline scanning is used
-- **AND** the action is configured not to fail the workflow solely from findings
+#### Scenario: Active scan requested for production
+- **WHEN** `environment` is `production` and `scan_mode` is `full`
+- **THEN** the policy step fails the job before any ZAP traffic is sent
 
-#### Scenario: `scan_mode` is `full`
+#### Scenario: Active scan against a protected host
+- **WHEN** an active scan targets a host (or an OpenAPI `servers` entry) matching `protected_hosts`
+- **THEN** the policy step fails the job before any ZAP traffic is sent
 
-- **WHEN** the baseline matrix entry runs
-- **THEN** ZAP full scanning is used
-- **AND** callers are responsible for limiting this active mode to appropriate non-production targets
+### Requirement: ZAP API scanning is enabled only for non-production full scans with an OpenAPI path
 
-### Requirement: ZAP API scanning is enabled only when an OpenAPI path is supplied
+The ZAP workflow SHALL add an API matrix entry only when `openapi_path` is non-empty, `scan_mode` is `full` and `environment` is not `production`.
 
-The ZAP workflow SHALL add an API matrix entry when `openapi_path` is non-empty.
+#### Scenario: Conditions met
+- **WHEN** the scan matrix is constructed for a non-production full scan with an OpenAPI path
+- **THEN** a baseline/full entry and an API entry are created and the spec is downloaded locally before ZAP runs
 
-#### Scenario: The caller supplies an OpenAPI path
-
-- **WHEN** the scan matrix is constructed
-- **THEN** baseline/full web scanning and an API scan entry are created
-- **AND** the API specification is downloaded locally before the ZAP API action runs
-
-#### Scenario: No OpenAPI path is supplied
-
-- **WHEN** the scan matrix is constructed
-- **THEN** only the web/baseline matrix entry runs
+#### Scenario: Otherwise
+- **WHEN** any condition is not met
+- **THEN** only the web entry runs
 
 ### Requirement: Protected API specifications may use caller-supplied Basic Auth
 
@@ -123,13 +120,19 @@ The ZAP API preparation step SHALL accept the optional encoded `ZAP_DOC_BASIC_AU
 - **AND** curl Basic Auth is used for the download
 - **AND** ZAP receives the resulting local file path
 
-### Requirement: ZAP findings are summarized without opening issues automatically
+### Requirement: ZAP findings are summarized without opening issues and survive artifact failures
 
-The shared ZAP workflow SHALL publish available risk counts/details to the job summary and SHALL disable automatic GitHub issue creation in the ZAP actions.
+The shared ZAP workflow SHALL run ZAP directly, SHALL publish redacted risk counts and alert details (URL query values, userinfo and credential-like evidence removed) to the job summary, SHALL NOT open GitHub issues automatically, and SHALL upload only a small redacted JSON report as a best-effort artifact with bounded retention.
 
 #### Scenario: Findings exist
+- **WHEN** ZAP completes with exit code 0, 1 or 2
+- **THEN** counts and a per-alert table appear in the job summary and a warning annotation lists the alert names
+- **AND** findings alone do not fail the job
 
-- **WHEN** `report_json.json` contains alerts
-- **THEN** high, medium, low, and informational counts are summarized
-- **AND** alert names/solutions may be included in the job summary
-- **AND** the reusable workflow does not automatically create repository issues
+#### Scenario: Artifact upload fails
+- **WHEN** artifact upload fails (e.g. storage quota)
+- **THEN** the job emits an infrastructure warning distinct from security findings and the summary remains intact
+
+#### Scenario: Scan engine failure
+- **WHEN** ZAP exits with a code above 2 or produces no report
+- **THEN** the job fails and is not reported as a clean scan
