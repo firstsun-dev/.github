@@ -24,8 +24,8 @@ The shared test job SHALL run the plugin build and test suite across Node 22 and
 #### Scenario: Compatibility matrix runs
 
 - **WHEN** plugin code changed
-- **THEN** each matrix entry installs dependencies with `npm ci`
-- **AND** runs `npm run build`
+- **THEN** each matrix entry installs dependencies with `pnpm install --frozen-lockfile` when the consumer has a `pnpm-lock.yaml` (pnpm version from its `packageManager` field), otherwise with `npm ci`
+- **AND** runs the `build` script with the detected package manager
 - **AND** runs tests with coverage
 - **AND** one failing Node version does not cancel the other matrix entry
 
@@ -36,7 +36,7 @@ The test matrix SHALL upload the coverage directory only from the matrix entry w
 #### Scenario: The default configuration is used
 
 - **WHEN** Node 22 and 24 test entries complete
-- **THEN** only the Node 22 entry attempts to publish the `coverage-report` artifact
+- **THEN** only the entry matching the `node-version` input (default 24) attempts to publish the `coverage-report` artifact
 
 ### Requirement: Pull-request/plugin-build artifacts are built and packaged independently
 

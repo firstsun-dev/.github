@@ -9,7 +9,7 @@ on:
       node-version:
         required: false
         type: string
-        default: "22"
+        default: "24"
     secrets:
       RELEASE_TOKEN:
         required: false
@@ -30,6 +30,8 @@ jobs:
               - 'src/**'
               - 'package.json'
               - 'package-lock.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
               - 'manifest.json'
               - 'tsconfig.json'
               - 'esbuild.config.mjs'
@@ -44,12 +46,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      # pnpm is installed before setup-node so `cache: pnpm` can find it. The
+      # version comes from the consumer's `packageManager` field (exact pin).
+      - uses: pnpm/action-setup@v6
+        if: hashFiles('pnpm-lock.yaml') != ''
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
-          cache: 'npm'
-      - run: npm ci
-      - run: npm run lint
+          cache: ${{ hashFiles('pnpm-lock.yaml') != '' && 'pnpm' || 'npm' }}
+      - name: Install dependencies
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "PM=pnpm" >> "$GITHUB_ENV"
+            pnpm install --frozen-lockfile
+          else
+            echo "PM=npm" >> "$GITHUB_ENV"
+            npm ci
+          fi
+      - run: $PM run lint
 
   test:
     name: Test (Node ${{ matrix.node-version }})
@@ -62,15 +76,28 @@ jobs:
       fail-fast: false
     steps:
       - uses: actions/checkout@v6
+      # pnpm is installed before setup-node so `cache: pnpm` can find it. The
+      # version comes from the consumer's `packageManager` field (exact pin).
+      - uses: pnpm/action-setup@v6
+        if: hashFiles('pnpm-lock.yaml') != ''
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
-          cache: 'npm'
-      - run: npm ci
+          cache: ${{ hashFiles('pnpm-lock.yaml') != '' && 'pnpm' || 'npm' }}
+      - name: Install dependencies
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "PM=pnpm" >> "$GITHUB_ENV"
+            pnpm install --frozen-lockfile
+          else
+            echo "PM=npm" >> "$GITHUB_ENV"
+            npm ci
+          fi
       - name: Build (Compatibility Check)
-        run: npm run build
+        run: $PM run build
       - name: Run tests with coverage
-        run: npm run test -- --coverage
+        run: |
+          if [ "$PM" = pnpm ]; then pnpm run test --coverage; else npm run test -- --coverage; fi
       - name: Upload coverage
         if: matrix.node-version == inputs.node-version
         uses: actions/upload-artifact@v7
@@ -86,12 +113,24 @@ jobs:
     if: needs.filter.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v6
+      # pnpm is installed before setup-node so `cache: pnpm` can find it. The
+      # version comes from the consumer's `packageManager` field (exact pin).
+      - uses: pnpm/action-setup@v6
+        if: hashFiles('pnpm-lock.yaml') != ''
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
-          cache: 'npm'
-      - run: npm ci
-      - run: npm run build
+          cache: ${{ hashFiles('pnpm-lock.yaml') != '' && 'pnpm' || 'npm' }}
+      - name: Install dependencies
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "PM=pnpm" >> "$GITHUB_ENV"
+            pnpm install --frozen-lockfile
+          else
+            echo "PM=npm" >> "$GITHUB_ENV"
+            npm ci
+          fi
+      - run: $PM run build
       - name: Create plugin package
         run: |
           VERSION=$(node -p "require('./manifest.json').version")
@@ -139,11 +178,24 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # pnpm is installed before setup-node so `cache: pnpm` can find it. The
+      # version comes from the consumer's `packageManager` field (exact pin).
+      - uses: pnpm/action-setup@v6
+        if: hashFiles('pnpm-lock.yaml') != ''
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
-          cache: 'npm'
-      - run: npm ci
+          cache: ${{ hashFiles('pnpm-lock.yaml') != '' && 'pnpm' || 'npm' }}
+      - name: Install dependencies
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "PM=pnpm" >> "$GITHUB_ENV"
+            pnpm install --frozen-lockfile
+          else
+            echo "PM=npm" >> "$GITHUB_ENV"
+            npm ci
+          fi
       - env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
-        run: npx semantic-release
+        run: |
+          if [ "$PM" = pnpm ]; then pnpm exec semantic-release; else npx semantic-release; fi

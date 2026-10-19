@@ -15,7 +15,7 @@ on:
       node-version:
         required: false
         type: string
-        default: "22"
+        default: "24"
     secrets:
       RELEASE_TOKEN:
         required: false
@@ -37,13 +37,25 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
           persist-credentials: false
 
+      # pnpm is installed before setup-node so `cache: pnpm` can find it. The
+      # version comes from the consumer's `packageManager` field (exact pin).
+      - uses: pnpm/action-setup@v6
+        if: hashFiles('pnpm-lock.yaml') != ''
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
-          cache: 'npm'
+          cache: ${{ hashFiles('pnpm-lock.yaml') != '' && 'pnpm' || 'npm' }}
 
-      - run: npm ci
-      - run: npm run build
+      - name: Install dependencies
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "PM=pnpm" >> "$GITHUB_ENV"
+            pnpm install --frozen-lockfile
+          else
+            echo "PM=npm" >> "$GITHUB_ENV"
+            npm ci
+          fi
+      - run: $PM run build
 
       - name: Verify expected files exist
         run: |
