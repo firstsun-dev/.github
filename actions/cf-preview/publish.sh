@@ -22,6 +22,13 @@ if [ -f .wrangler/deploy/config.json ]; then
   node "$TOOLS_DIR/cli.mjs" preflight --config "$EFFECTIVE" --allow "${PREVIEW_ALLOW:-}" --deny "${PREVIEW_DENY:-}" >&2
 fi
 
+# Optional: host the Preview under another existing Worker (production Worker keeps Preview URLs off).
+WORKER_ARGS=()
+if [ -n "${WORKER_NAME:-}" ]; then
+  [[ "$WORKER_NAME" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "::error::bad preview_worker_name: $WORKER_NAME"; exit 1; }
+  WORKER_ARGS=(--worker-name "$WORKER_NAME")
+fi
+
 # Stderr (progress logs) must not pollute the JSON on stdout.
-pnpm exec wrangler preview --name "$PREVIEW_NAME" --json > "$OUT_FILE"
+pnpm exec wrangler preview --name "$PREVIEW_NAME" "${WORKER_ARGS[@]}" --json > "$OUT_FILE"
 node "$TOOLS_DIR/cli.mjs" extract-url --file "$OUT_FILE"

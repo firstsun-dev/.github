@@ -24,4 +24,12 @@ grep -q 'preview' "$T/log" && bad "preview ran after failed build" || ok "failed
 
 PREVIEW_NAME=br-feat-a-0123456789 BUILD_CMD=true STUB_FAIL=1 "$ROOT/actions/cf-preview/publish.sh" >/dev/null 2>&1 && bad "wrangler failure must fail" || ok "wrangler failure fails"
 PREVIEW_NAME='feat/a;rm -rf' BUILD_CMD=true "$ROOT/actions/cf-preview/publish.sh" >/dev/null 2>&1 && bad "unsafe name accepted" || ok "unsafe name rejected"
+
+: > "$T/log"
+PREVIEW_NAME=br-feat-a-0123456789 BUILD_CMD=true WORKER_NAME=blog-preview "$ROOT/actions/cf-preview/publish.sh" >/dev/null 2>&1
+grep -q 'preview --name br-feat-a-0123456789 --worker-name blog-preview --json' "$T/log" && ok "passes --worker-name when set" || bad "worker-name passthrough"
+: > "$T/log"
+PREVIEW_NAME=br-feat-a-0123456789 BUILD_CMD=true "$ROOT/actions/cf-preview/publish.sh" >/dev/null 2>&1
+grep -q -- '--worker-name' "$T/log" && bad "worker-name leaked when unset" || ok "no --worker-name when unset"
+PREVIEW_NAME=br-feat-a-0123456789 BUILD_CMD=true WORKER_NAME='x; rm -rf /' "$ROOT/actions/cf-preview/publish.sh" >/dev/null 2>&1 && bad "unsafe worker name accepted" || ok "unsafe worker name rejected"
 exit $fail
