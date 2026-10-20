@@ -23,8 +23,8 @@ test('name is Cloudflare-safe and bounded', () => {
   assert.match(id('refs/heads/!!!').name, /^br-branch-[0-9a-f]{10}$/);
 });
 test('hostname label limit (63) enforced', () => {
-  assert.doesNotThrow(() => id('refs/heads/x', 'w'.repeat(20)));
-  assert.throws(() => id('refs/heads/x', 'w'.repeat(30)));
+  assert.doesNotThrow(() => id('refs/heads/x', 'w'.repeat(40)));
+  assert.throws(() => id('refs/heads/x', 'w'.repeat(48)));
 });
 test('main and non-branch refs rejected', () => {
   assert.throws(() => id('refs/heads/main'));
