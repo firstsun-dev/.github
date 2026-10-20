@@ -117,7 +117,9 @@ V2 SHALL safely identify, update and delete Previews by repository + Worker + fu
 
 #### Scenario: Branch deletion
 - **WHEN** GitHub reports deletion of a non-main branch
-- **THEN** cleanup SHALL target only Previews/resources owned by that repo, Worker and branch identity
+- **THEN** the Native Preview, its stable URL and its resources SHALL be retained (owner decision; the stable URL cannot be removed independently of the Preview)
+- **AND** only the GitHub deployment ledger for that repo, Worker and branch identity SHALL be marked inactive, never deleted
+- **AND** any later deletion SHALL be an explicit, manual or separately approved sweep action targeting only that identity
 - **AND** it SHALL NOT delete an unrelated branch Preview, persistent Dev or Production
 
 #### Scenario: Older and newer runs complete out of order
@@ -155,4 +157,4 @@ V2 SHALL keep production version traceability and smoke tests with per-app recov
 #### Scenario: Delete event handling
 - **WHEN** GitHub emits a branch `delete` event
 - **THEN** only the default branch's workflow definition runs; the caller workflow MUST therefore be merged to the default branch before cleanup works
-- **AND** deleting an already-deleted Preview (Cloudflare code 10025) SHALL be treated as success
+- **AND** deleting an already-deleted Preview (Cloudflare code 10025) SHALL be treated as success when a manual or approved sweep deletes it

@@ -10,7 +10,7 @@ Spec: `openspec/changes/redesign-cloudflare-worker-cicd-v2` (PR #44), tracking #
 | push, non-main | tests → **branch Native Preview** | same; never touches persistent Dev | tests only |
 | pull_request | tests; attach existing Preview URL (never deploys) | same | tests |
 | fork PR | tests, no secrets | same | same |
-| delete (branch) | delete that Preview + owned resources | same | – |
+| delete (branch) | **Preview is kept** (stable URL stays); GitHub ledger retired | same | – |
 | PR closed/merged | Preview kept | same | – |
 | workflow_dispatch `target=persistent-dev` on `persistent_dev_ref` | – | protected Dev deploy | – |
 | push main | Production | Production | Production |
@@ -65,7 +65,7 @@ Native Preview URLs need the **Worker-level** `previews_enabled` setting (verifi
 `{enabled:false, previews_enabled:false}` gets `preview.urls: []`; `{enabled:false, previews_enabled:true}`
 gets a URL). If the production Worker deliberately keeps workers.dev/Preview URLs off (public URLs bound to
 production resources), set `preview_worker_name` to an existing dev Worker that has `previews_enabled`;
-`wrangler preview --worker-name` / `preview delete --worker-name` are used for publish, recovery and cleanup.
+`wrangler preview --worker-name` is used for publish and recovery (manual deletion: `wrangler preview delete --name <n> --worker-name <w>`).
 
 ## Wrangler config requirements
 
@@ -73,6 +73,14 @@ production resources), set `preview_worker_name` to an existing dev Worker that 
 * Every Production storage/queue/service binding needs a Preview counterpart on a different resource (enforced by `preflight`).
 * `services`, `hyperdrive`, `secrets_store_secrets` in `previews` require an explicit `preview_binding_allow` entry (e.g. `services:ID`) — Preview service bindings hit the target's **Production** deployment.
 * No `routes`, `triggers`, queue consumers in `previews`; `assets`/`compatibility_*` stay top-level.
+
+## Branch deletion keeps the Preview (owner decision)
+
+Deleting a branch does **not** delete its Native Preview or resources. Cloudflare cannot remove only the
+stable URL (Preview `urls` is read-only; `wrangler preview delete` removes the Preview with all deployments),
+so the options were "keep everything" or "delete everything"; the owner chose to keep. The `delete` run only
+marks the GitHub Deployments `inactive` and prints the manual delete command. There is no automatic reclaim:
+Previews accumulate until removed manually (or by a future scheduled sweep driven by the ledger).
 
 ## Smoke semantics
 
@@ -97,7 +105,7 @@ skip content checks or use Access service-token headers.
 
 ## State ledger
 
-GitHub Deployments, environment `<app_name>/preview/<preview-name>`, payload `{branch_ref, preview_name, worker}`. Used for last-good recovery, PR URL lookup and orphan reconciliation. Per-branch resources (D1 etc.) created by `preview_provision_cmd` must be named from `PREVIEW_NAME`, carry ownership metadata, and be removed by `preview_cleanup_cmd`.
+GitHub Deployments, environment `<app_name>/preview/<preview-name>`, payload `{branch_ref, preview_name, worker}`. Used for last-good recovery, PR URL lookup and (future) orphan reconciliation. On branch deletion the entries are marked `inactive`, never deleted. `preview_provision_cmd`/`preview_cleanup_cmd` are legacy hooks (`preview_cleanup_cmd` is ignored): the supported model is shared durable Preview resources.
 
 ## Not yet implemented / needs real Cloudflare validation
 
