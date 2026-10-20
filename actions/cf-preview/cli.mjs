@@ -17,8 +17,8 @@ const out = (o) => { for (const [k, v] of Object.entries(o)) console.log(`${k}=$
 try {
   switch (cmd) {
     case 'identity': {
-      const id = previewIdentity({ repo: opt('repo'), worker: opt('worker'), ref: opt('ref') });
-      out({ preview_name: id.name, preview_slug: id.slug, preview_hash: id.hash });
+      const id = previewIdentity({ repo: opt('repo'), worker: opt('worker'), ref: opt('ref'), hostWorker: opt('host-worker') });
+      out({ preview_name: id.name, preview_slug: id.slug });
       break;
     }
     case 'wrangler-check':

@@ -5,7 +5,7 @@
 # `wrangler preview` runs if build fails, so the existing Preview is untouched.
 set -euo pipefail
 : "${APP_DIR:?}" "${PREVIEW_NAME:?}" "${BUILD_CMD:?}" "${TOOLS_DIR:?}" "${OUT_FILE:?}"
-[[ "$PREVIEW_NAME" =~ ^br-[a-z0-9-]+-[0-9a-f]{10}$ ]] || { echo "::error::refusing unsafe preview name: $PREVIEW_NAME"; exit 1; }
+[[ "$PREVIEW_NAME" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "::error::refusing unsafe preview name: $PREVIEW_NAME"; exit 1; }
 
 cd "$APP_DIR"
 if [ -n "${PREVIEW_ENV_FILE:-}" ] && [ -f "$PREVIEW_ENV_FILE" ]; then

@@ -1,6 +1,5 @@
 // Pure helpers for Cloudflare Worker CI/CD v2 (branch-owned Native Previews).
 // No I/O except readConfig(); everything else is deterministic and unit-tested.
-import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { parse as parseToml } from 'smol-toml';
 import { parse as parseJsonc } from 'jsonc-parser';
@@ -29,28 +28,37 @@ export function assertWranglerSupported(version) {
 }
 
 /**
- * Stable Preview identity: br-<slug>-<hash10>.
- * Hash covers repo + worker + FULL ref so case/punctuation normalisation can
- * never collide ("Feat/A" vs "feat-a") and same branch in two Workers differ.
+ * Stable Preview identity: <slug>  (just the branch name: no prefix, no hash, no commit SHA).
+ * URL: https://<slug>-<worker>.<subdomain>.workers.dev  — one stable URL per branch, forever.
+ *
+ * The slug is the normalised branch name, truncated so `<name>-<hostWorker>` fits one 63-char DNS
+ * label (Preview hostname = <name>-<worker>.<subdomain>.workers.dev). Because normalisation and
+ * truncation are lossy ("Feat/A" and "feat-a" both give `feat-a`), uniqueness is enforced by the
+ * GitHub Deployment ledger (see gh.sh `owner`): a name already owned by a different full branch ref
+ * fails closed instead of overwriting that Preview.
+ * `hostWorker` is the Worker that hosts the Preview (preview_worker_name, else app_name).
  */
-export function previewIdentity({ repo, worker, ref }) {
+export function previewIdentity({ repo, worker, ref, hostWorker }) {
   if (!repo || !worker || !ref) throw new Error('repo, worker and ref are required');
   if (!ref.startsWith('refs/heads/')) throw new Error(`Not a branch ref: ${ref}`);
   const branch = ref.slice('refs/heads/'.length);
   if (branch === 'main') throw new Error('main is Production; it never gets a Preview identity');
+  const host = hostWorker || worker;
+  const max = Math.min(40, 63 - 1 - host.length);
+  if (max < 8) throw new Error(`Worker name too long for a Preview hostname label: ${host}`);
   const slug =
     branch
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-+|-+$/g, '')
-      .slice(0, 24)
+      .slice(0, max)
       .replace(/-+$/g, '') || 'branch';
-  const hash = createHash('sha256').update(`${repo}\n${worker}\n${ref}`).digest('hex').slice(0, 10);
-  const name = `br-${slug}-${hash}`;
-  // The Preview hostname is <name>-<worker>.<subdomain>.workers.dev; a DNS label is max 63 chars.
-  if (`${name}-${worker}`.length > 63) throw new Error(`Worker name too long for Preview hostname label: ${name}-${worker}`);
-  return { name, slug, hash, branch };
+  // An 8-hex slug would look like a per-deployment URL prefix (<8hex>-<worker>); keep them distinct.
+  const name = /^[0-9a-f]{8}$/.test(slug) ? `b-${slug}` : slug;
+  return { name, slug, branch };
 }
+
+export const PREVIEW_NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 /** Validate `wrangler preview --json` output and return the stable URL. */
 export function extractPreviewUrl(json) {

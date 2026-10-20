@@ -10,7 +10,7 @@ The published `_cf-worker-template.yml` v1/v1.5.0 uploads a version and then dep
 
 - Introduce opt-in `production-preview`, `hybrid`, and `production-only` strategies.
 - Route eligible trusted `push` events on **any non-main branch** to branch-scoped Native Previews, not to persistent/shared Dev. Preserve build/test gates.
-- Build a deterministic, collision-checked Preview identity from **repository + Worker + full original branch ref**, using a sanitized human-readable slug and a hash; no PR-number dependency.
+- Build a deterministic Preview identity equal to the **sanitized branch-name slug** (owner decision: simple `feat-xxx-<worker>` URLs, no prefix/hash/SHA). Uniqueness is enforced by the GitHub Deployment ledger (name → owning full branch ref, fail closed); no PR-number dependency.
 - Publish the real URL reported by Wrangler in workflow output / GitHub Deployment / step summary even without an open PR. If a matching PR exists, surface the same URL there idempotently.
 - Remove a branch's Preview only through an explicitly approved expiry/cleanup policy (branch deletion alone keeps it). Merging or closing a PR alone SHALL NOT delete a still-existing branch Preview.
 - Audit per-Worker Preview configuration, bindings, secrets, authentication, outbound side effects, resources, migrations and retention. Protect persistent Dev (Hybrid) independently.

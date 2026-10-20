@@ -1,30 +1,40 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  assertWranglerSupported, auditPreviewConfig, classifyEvent, extractPreviewUrl, isStale, previewIdentity,
+  assertWranglerSupported, auditPreviewConfig, PREVIEW_NAME_RE, classifyEvent, extractPreviewUrl, isStale, previewIdentity,
 } from '../../actions/cf-preview/lib.mjs';
 
 const id = (ref, worker = 'www', repo = 'o/r') => previewIdentity({ repo, worker, ref });
 
-test('identity is stable and branch-scoped', () => {
+test('identity is stable, hashless and has no commit SHA', () => {
   assert.equal(id('refs/heads/feat/x').name, id('refs/heads/feat/x').name);
+  assert.equal(id('refs/heads/feat/x').name, 'feat-x');
   assert.notEqual(id('refs/heads/feat/x').name, id('refs/heads/feat/y').name);
-  assert.notEqual(id('refs/heads/feat/x', 'a').name, id('refs/heads/feat/x', 'b').name);
+  assert.doesNotMatch(id('refs/heads/feat/x').name, /[0-9a-f]{7,}/);
+  assert.equal(id('refs/heads/solar-term-hub', 'blog').name, 'solar-term-hub');
 });
-test('look-alike branches never collide', () => {
+test('look-alike branches share a name; the ledger (gh.sh owner) is what stops the overwrite', () => {
   const a = id('refs/heads/Feat/A'), b = id('refs/heads/feat-a'), c = id('refs/heads/feat/a');
-  assert.equal(a.slug, b.slug);
-  assert.equal(new Set([a.name, b.name, c.name]).size, 3);
+  assert.equal(a.name, 'feat-a');
+  assert.deepEqual([a.name, b.name, c.name], ['feat-a', 'feat-a', 'feat-a']);
 });
-test('name is Cloudflare-safe and bounded', () => {
+test('name is Cloudflare-safe and the hostname label stays <= 63 chars', () => {
   const n = id('refs/heads/' + 'Ünï/ÇØDE_!!!'.repeat(20)).name;
-  assert.match(n, /^br-[a-z0-9-]+-[0-9a-f]{10}$/);
-  assert.ok(n.length <= 40);
-  assert.match(id('refs/heads/!!!').name, /^br-branch-[0-9a-f]{10}$/);
+  assert.match(n, PREVIEW_NAME_RE);
+  assert.ok(`${n}-www`.length <= 63);
+  assert.equal(id('refs/heads/!!!').name, 'branch');
+  assert.equal(id('refs/heads/DEADBEEF').name, 'b-deadbeef'); // never looks like a <8hex>-<worker> deployment URL
+  const long = previewIdentity({ repo: 'o/r', worker: 'blog', hostWorker: 'blog-preview', ref: 'refs/heads/' + 'a-'.repeat(60) }).name;
+  assert.ok(`${long}-blog-preview`.length <= 63, long);
+  assert.doesNotMatch(long, /-$/);
+});
+test('PREVIEW_NAME_RE rejects unsafe names', () => {
+  for (const bad of ['', '-x', 'x-', 'a--b', 'X', 'a;b', 'a b', 'a/b']) assert.doesNotMatch(bad, PREVIEW_NAME_RE, bad);
+  for (const ok of ['a', 'feat-x', 'a1-b2']) assert.match(ok, PREVIEW_NAME_RE, ok);
 });
 test('hostname label limit (63) enforced', () => {
   assert.doesNotThrow(() => id('refs/heads/x', 'w'.repeat(40)));
-  assert.throws(() => id('refs/heads/x', 'w'.repeat(48)));
+  assert.throws(() => id('refs/heads/x', 'w'.repeat(56)));
 });
 test('main and non-branch refs rejected', () => {
   assert.throws(() => id('refs/heads/main'));

@@ -12,7 +12,7 @@
 ## Phase 1 — .github shared v2 (implementation PR; no existing v1 changes)
 
 - [x] Add new v2 reusable workflow/entrypoint (released as `v2.0.0`) with event routing; v1 callers untouched.
-- [ ] Add branch-identity normalization + unconditional short hash, deterministic Worker-scoped Preview name, safe collision handling.
+- [x] Branch-identity normalization to a plain slug (owner decision: no prefix/hash), ledger-based collision handling (fail closed in Plan).
 - [ ] Trigger trusted same-repo non-main **push** Preview after tests; PR required=false; fork PR tests-only, no credentials.
 - [ ] Implement Native Preview binding preflight, Preview-safe resource provisioning/migrations, build, create/update, JSON URL extraction and URL-specific smoke.
 - [ ] Publish Deployment/summary for branches without PR; if a PR exists, update one idempotent bot-owned URL/status, guarding older runs.
