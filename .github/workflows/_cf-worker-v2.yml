@@ -15,7 +15,7 @@ name: CF Worker Pipeline v2
 #                     `wrangler preview --name br-<slug>-<hash> --json` ->
 #                     exact-URL smoke -> GitHub Deployment (+ PR comment if any)
 #   smoke failure  -> red status + recovery (redeploy last good SHA)
-#   branch delete  -> delete that branch's Preview + owned resources
+#   branch delete  -> Preview is KEPT (stable URL stays); only the GitHub ledger is retired
 #   main push      -> tests -> migrate -> versions upload/deploy -> verify -> policy
 # ---------------------------------------------------------------------------
 
@@ -114,7 +114,7 @@ on:
         type: string
         default: ''
       preview_cleanup_cmd:
-        description: Deletes resources exclusively owned by this branch Preview (runs on branch delete).
+        description: DEPRECATED and ignored — branch deletion no longer deletes Previews or resources (retained by policy).
         type: string
         default: ''
       preview_binding_allow:
@@ -716,11 +716,11 @@ jobs:
   # checks out the deleted branch. PR close does NOT trigger this.
   # -------------------------------------------------------------------------
   cleanup:
-    name: Delete branch Preview
+    name: Retire branch Preview (kept)
     needs: plan
     if: needs.plan.outputs.action == 'cleanup'
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 15
+    timeout-minutes: 10
     concurrency:
       group: cfv2-preview-${{ github.repository }}-${{ inputs.app_name }}-${{ needs.plan.outputs.preview_name }}
       cancel-in-progress: false
@@ -730,12 +730,13 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       PREVIEW_NAME: ${{ needs.plan.outputs.preview_name }}
-      PREVIEW_SLUG: ${{ needs.plan.outputs.preview_slug }}
       BRANCH_REF: ${{ needs.plan.outputs.branch_ref }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PREVIEW_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID }}
+      WORKER_NAME: ${{ inputs.preview_worker_name != '' && inputs.preview_worker_name || inputs.app_name }}
     steps:
-      - uses: actions/checkout@v6   # default branch (the delete event runs there)
+      # Policy (owner decision): deleting a branch does NOT delete its Native Preview. The Preview and
+      # its stable URL are kept (Cloudflare cannot remove only the stable URL: Preview `urls` is
+      # read-only and `wrangler preview delete` removes the Preview with all deployments). Only the
+      # GitHub ledger is retired so the branch no longer looks active. No Cloudflare credentials here.
       - name: Fetch v2 tooling
         uses: actions/checkout@v6
         with:
@@ -743,11 +744,9 @@ jobs:
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
           sparse-checkout: actions/cf-preview
-      - name: Setup
-        uses: firstsun-dev/.github/actions/setup@v1
+      - uses: actions/setup-node@v6
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
+          node-version: 24
       - run: cd "$TOOLS_DIR" && npm ci --ignore-scripts --no-audit --no-fund
       - name: Validate target identity
         run: |
@@ -756,37 +755,18 @@ jobs:
           [[ "$PREVIEW_NAME" =~ ^br-[a-z0-9-]+-[0-9a-f]{10}$ ]] || { echo "::error::unsafe name"; exit 1; }
           # A new branch with the same name may already exist again (delete/recreate race): do nothing.
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/${{ needs.plan.outputs.branch }}" >/dev/null 2>&1; then
-            echo "::notice::Branch exists again; skipping cleanup."; echo "SKIP=true" >> "$GITHUB_ENV"
+            echo "::notice::Branch exists again; leaving the ledger alone."; echo "SKIP=true" >> "$GITHUB_ENV"
           fi
-      - name: Delete Native Preview (idempotent)
-        if: env.SKIP != 'true'
-        working-directory: ${{ inputs.app_path }}
-        env:
-          WORKER_NAME: ${{ inputs.preview_worker_name }}
-        run: |
-          [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "::error::no Preview token"; exit 1; }
-          pnpm install --frozen-lockfile >/dev/null 2>&1 || true
-          WORKER_ARGS=()
-          if [ -n "$WORKER_NAME" ]; then
-            [[ "$WORKER_NAME" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "::error::bad preview_worker_name"; exit 1; }
-            WORKER_ARGS=(--worker-name "$WORKER_NAME")
-          fi
-          if ! OUT="$(pnpm exec wrangler preview delete --name "$PREVIEW_NAME" "${WORKER_ARGS[@]}" --skip-confirmation 2>&1)"; then
-            echo "$OUT"
-            echo "$OUT" | grep -Eqi 'not found|10025|does not exist|no such' || exit 1
-            echo "Preview already gone."
-          fi
-      - name: Delete exclusively-owned branch resources
-        if: env.SKIP != 'true' && inputs.preview_cleanup_cmd != ''
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.preview_cleanup_cmd }}
-        run: bash -c "$CMD"
-      - name: Retire Deployments
+      - name: Retire GitHub ledger (Preview is kept)
         if: env.SKIP != 'true'
         run: |
-          "$TOOLS_DIR/gh.sh" purge "${{ needs.plan.outputs.env_name }}"
-          echo "### 🧹 Deleted Preview \`$PREVIEW_NAME\` for \`${{ needs.plan.outputs.branch }}\`" >> "$GITHUB_STEP_SUMMARY"
+          "$TOOLS_DIR/gh.sh" retire "${{ needs.plan.outputs.env_name }}"
+          {
+            echo "### 📌 Branch \`${{ needs.plan.outputs.branch }}\` deleted — Preview \`$PREVIEW_NAME\` is **kept**"
+            echo "- Cloudflare Preview and its stable URL were not touched; GitHub Deployments are marked inactive."
+            echo "- No automatic reclaim. To remove it manually:"
+            echo "  \`wrangler preview delete --name $PREVIEW_NAME --worker-name $WORKER_NAME --skip-confirmation\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # -------------------------------------------------------------------------
   # Protected persistent Dev (Hybrid) — explicit dispatch on approved ref only

@@ -15,7 +15,7 @@ Published v1/v1.5.0 deployments still use `wrangler versions upload` + `versions
 | Fork PR | CI without deploy credentials | Same | Same |
 | Main `push` | Production deploy/verify | Same | Same |
 | Approved Dev ref or dispatch | Not enabled | Protected Dev deploy + trigger-specific tests | Not enabled |
-| `delete` for non-main branch | Cleanup that branch Preview | Same | No Preview |
+| `delete` for non-main branch | **Keep** the Preview; retire GitHub ledger only (owner decision) | Same | No Preview |
 | PR closed / merged; branch not deleted | Retain branch Preview | Same | No Preview |
 
 Single-Worker repositories must trigger preview-capable CI on all non-main branch pushes, including documentation-only commits if the requested contract is literally "push gives URL"; implement an inexpensive build/cache fast path only if it still creates or updates the Preview correctly. Existing GitHub Actions `paths` restrictions must not silently suppress the branch URL contract. In monorepos retain changed-path/dependency selection per Worker folder: create/update previews for affected Worker apps only, and report unchanged apps explicitly.
@@ -62,7 +62,7 @@ trusted branch push --> app selection --> tests --> Preview resource inventory/p
 
 PR opened / sync ------> CI/report only (no second Native Preview for same branch)
 PR closed / merged -----> keep Preview when branch still exists
-branch deleted ---------> identify branch+Worker --> safe preview delete + owned resource cleanup
+branch deleted ---------> identify branch+Worker --> retire GitHub ledger; Preview and resources are KEPT
 protected Hybrid Dev ---> separately approved Dev deploy/test (Cron/Queue)
 main push --------------> gated Production upload/deploy/migration/verify/recovery
 ```

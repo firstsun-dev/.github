@@ -16,7 +16,8 @@
 - [ ] Trigger trusted same-repo non-main **push** Preview after tests; PR required=false; fork PR tests-only, no credentials.
 - [ ] Implement Native Preview binding preflight, Preview-safe resource provisioning/migrations, build, create/update, JSON URL extraction and URL-specific smoke.
 - [ ] Publish Deployment/summary for branches without PR; if a PR exists, update one idempotent bot-owned URL/status, guarding older runs.
-- [ ] Implement default-branch GitHub branch `delete` lifecycle and scoped Worker/resource cleanup; do not delete on PR close while branch exists.
+- [x] Implement default-branch GitHub branch `delete` lifecycle: retire the GitHub ledger and keep the Preview (no deletion on PR close or branch delete).
+- [ ] Optional scheduled sweep to reclaim Previews of deleted branches (not implemented; manual `wrangler preview delete` for now).
 - [ ] Keep Hybrid Dev on explicit protected ref/dispatch, separate concurrency keys, no branch overwrite.
 - [ ] Preserve gated Production release/verify and migration-aware policy-based recovery.
 - [ ] Add actionlint, event-matrix, branch without PR, same/different branches, negative binding, fork token, branch-delete/PR-close, race, and rollback tests.
@@ -25,7 +26,7 @@
 
 - [x] Enable non-main push trigger; pinned exact shared SHA during the pilot, now the immutable `v2.0.0` tag (heaven-www#48, #49, #51).
 - [x] First feature push with **no PR** creates URL; subsequent push keeps it; another branch has another URL.
-- [x] Exact-URL smoke/Assets; PR feedback when opened later (no duplicate Preview); PR close keeps the Preview; branch-delete cleanup removes only that Preview; Production `versions upload/deploy` verified on main.
+- [x] Exact-URL smoke/Assets; PR feedback when opened later (no duplicate Preview); PR close keeps the Preview; Production `versions upload/deploy` verified on main. Branch-delete cleanup was verified in v2.0–v2.3 (deleted only that Preview) and is **superseded**: since v2.4 a deleted branch keeps its Preview (owner decision).
 - [x] Smoke-failure recovery drill (redeploys the last successful Deployment SHA, run stays red).
 - [x] Tag immutable `v2.0.0` (and floating `v2`) after the verified pilot.
 - [ ] Prove caller pin revert; concurrent-push/force-push race, fork PR and build-failure-retains-Preview tests on real Cloudflare.

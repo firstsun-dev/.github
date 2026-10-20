@@ -12,7 +12,7 @@ The published `_cf-worker-template.yml` v1/v1.5.0 uploads a version and then dep
 - Route eligible trusted `push` events on **any non-main branch** to branch-scoped Native Previews, not to persistent/shared Dev. Preserve build/test gates.
 - Build a deterministic, collision-checked Preview identity from **repository + Worker + full original branch ref**, using a sanitized human-readable slug and a hash; no PR-number dependency.
 - Publish the real URL reported by Wrangler in workflow output / GitHub Deployment / step summary even without an open PR. If a matching PR exists, surface the same URL there idempotently.
-- Remove a branch's Preview only on branch deletion or an explicitly approved expiry/cleanup policy. Merging or closing a PR alone SHALL NOT delete a still-existing branch Preview.
+- Remove a branch's Preview only through an explicitly approved expiry/cleanup policy (branch deletion alone keeps it). Merging or closing a PR alone SHALL NOT delete a still-existing branch Preview.
 - Audit per-Worker Preview configuration, bindings, secrets, authentication, outbound side effects, resources, migrations and retention. Protect persistent Dev (Hybrid) independently.
 - Keep `@v1` and pinned `@v1.5.0` behavior unchanged until each caller opts in to a separately released v2.
 
@@ -30,7 +30,7 @@ The published `_cf-worker-template.yml` v1/v1.5.0 uploads a version and then dep
 | Main push | Production gates/deploy/verify/recovery | Same |
 | PR opened/reopened | Link the already-created branch URL (comment); **no second competing Preview**, no duplicate test run required (push already ran them) | Tests only |
 | Fork PR | Credential-free tests only; no deployment secrets or Preview | Same |
-| Branch deleted | Delete only that branch/Worker Preview and owned ephemeral resources | No Preview |
+| Branch deleted | Keep the Preview and its URL; only retire the GitHub ledger (owner decision 2026-10-20; Cloudflare cannot remove just the stable URL) | No Preview |
 | PR closed/merged while branch remains | Keep Preview | No Preview |
 | Approved Hybrid Dev trigger | Separately deploy persistent Dev, run background tests | Not applicable |
 

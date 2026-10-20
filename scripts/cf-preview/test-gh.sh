@@ -9,6 +9,7 @@ echo "gh $*" >> "$STUB_LOG"
 a="$*"
 case "$a" in
   *"deployments?environment"*"per_page=30"*) printf '3:cccc\n2:bbbb\n1:aaaa\n';;
+  *"deployments?environment"*"per_page=100"*) printf '11\n12\n';;
   *"deployments/3/statuses"*) echo failure;;
   *"deployments/2/statuses"*) echo success;;
   *"deployments/1/statuses"*) echo success;;
@@ -30,4 +31,8 @@ grep -q 'head=o:feat/a' "$T/log" && ok "matches exact head branch of same owner"
 : > "$T/log"; HAS_COMMENT=1 "$G" comment feat/a www https://u.dev abc1234 >/dev/null
 grep -q 'issues/comments/99 -X PATCH' "$T/log" && ok "idempotent: updates existing comment" || bad "update"
 grep -q 'issues/7/comments -f' "$T/log" && bad "duplicate comment created" || ok "no duplicate comment"
+
+: > "$T/log"; "$G" retire "app/preview/br-x" >/dev/null
+grep -q 'deployments/.*/statuses -f state=inactive' "$T/log" && ok "retire marks deployments inactive" || bad "retire inactive"
+grep -q -- '-X DELETE' "$T/log" && bad "retire must not delete deployments" || ok "retire never deletes deployments"
 exit $fail
