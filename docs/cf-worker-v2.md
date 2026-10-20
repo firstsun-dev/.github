@@ -38,6 +38,7 @@ permissions:
   contents: read
   deployments: write
   pull-requests: write
+  statuses: write      # commit status 'preview/<app>' with the Preview URL
 jobs:
   cf:
     uses: firstsun-dev/.github/.github/workflows/_cf-worker-v2.yml@<SHA-or-v2.x.y>
@@ -63,6 +64,13 @@ filter (`_detect-changes.yml`); the `delete` event must run **all** caller jobs 
 `test_e2e_variants` JSON matrix, `use_mailpit`) run as parallel jobs behind a single `Tests` gate.
 `preview_smoke_env` (KEY=VALUE lines) is exported before `preview_smoke_cmd`, which receives
 `TARGET_URL` and `EXPECTED_SHA`. Browsers path defaults to `/opt/playwright-browsers`.
+
+## Where to find the Preview URL
+
+* **Commit status** `preview/<app_name>` (commit page, PR checks list → *Details* = the URL)
+* **Run annotation** "Preview URL" on the workflow run page, and the run summary
+* **Deployments** tab (`<app>/preview/<name>`, `environment_url`), and the PR comment when a PR is open
+* Reusable-workflow output `preview_url` for callers
 
 ## Hosting Previews under another Worker (`preview_worker_name`)
 
