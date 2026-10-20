@@ -378,7 +378,10 @@ jobs:
         if: env.STALE != 'true'
         working-directory: ${{ inputs.app_path }}
         run: |
-          [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || { echo "::error::CLOUDFLARE_PREVIEW_API_TOKEN/ACCOUNT_ID not provided; refusing to fall back to other credentials"; exit 1; }
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::CLOUDFLARE_PREVIEW_API_TOKEN/ACCOUNT_ID not provided; refusing to fall back to other credentials"
+            exit 1
+          fi
           VER="$(pnpm exec wrangler --version | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
           echo "Project-local Wrangler: $VER"
           node "$GITHUB_WORKSPACE/$TOOLS_DIR/cli.mjs" wrangler-check --version "$VER"
@@ -422,7 +425,12 @@ jobs:
         env:
           CMD: ${{ inputs.preview_migrate_cmd }}
         run: |
-          [ -f "$PREVIEW_ENV_FILE" ] && { set -a; . "$PREVIEW_ENV_FILE"; set +a; }
+          if [ -f "$PREVIEW_ENV_FILE" ]; then
+            set -a
+            # shellcheck disable=SC1090
+            . "$PREVIEW_ENV_FILE"
+            set +a
+          fi
           bash -c "$CMD"
       - name: Stale-SHA guard (before publish)
         if: env.STALE != 'true'
@@ -454,15 +462,20 @@ jobs:
           SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
           SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
         run: |
-          [ -f "$PREVIEW_ENV_FILE" ] && { set -a; . "$PREVIEW_ENV_FILE"; set +a; }
+          if [ -f "$PREVIEW_ENV_FILE" ]; then
+            set -a
+            # shellcheck disable=SC1090
+            . "$PREVIEW_ENV_FILE"
+            set +a
+          fi
           ok=0
-          for i in 1 2 3 4 5 6 7 8; do
+          for _ in 1 2 3 4 5 6 7 8; do
             if curl -fsS -o /dev/null --max-time 20 "$TARGET_URL/"; then ok=1; break; fi
             sleep 5
           done
           [ "$ok" = 1 ] || { echo "::error::$TARGET_URL never returned 2xx"; exit 1; }
           if [ -n "$SHA_PATH" ]; then
-            for i in 1 2 3 4 5 6; do
+            for _ in 1 2 3 4 5 6; do
               curl -fsS --max-time 20 "$TARGET_URL$SHA_PATH" | grep -q "${EXPECTED_SHA:0:7}" && { found=1; break; }
               sleep 5
             done
