@@ -273,7 +273,7 @@ jobs:
             echo "### CF Worker v2 plan — \`${{ inputs.app_name }}\`"
             echo "- Strategy: \`${{ inputs.deployment_strategy }}\`"
             echo "- Event: \`$GITHUB_EVENT_NAME\` → **$ACTION** ($REASON)"
-            [ -n "$PNAME" ] && echo "- Preview identity: \`$PNAME\`"
+            if [ -n "$PNAME" ]; then echo "- Preview identity: \`$PNAME\`"; fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   # -------------------------------------------------------------------------
