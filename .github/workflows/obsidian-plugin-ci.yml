@@ -195,7 +195,27 @@ jobs:
             echo "PM=npm" >> "$GITHUB_ENV"
             npm ci
           fi
-      - env:
+      # Only consumers that set up semantic-release can finalize a release. With pnpm,
+      # `pnpm exec` cannot download a missing binary the way `npx` does, so a repo with no
+      # release setup (e.g. the plugin template) would fail here for a reason unrelated to
+      # its code. Skip with a notice instead.
+      - name: Detect release setup
+        id: release_setup
+        run: |
+          configured=false
+          for f in .releaserc .releaserc.json .releaserc.yaml .releaserc.yml .releaserc.js .releaserc.cjs .releaserc.mjs release.config.js release.config.cjs release.config.mjs release.config.ts; do
+            if [ -f "$f" ]; then configured=true; fi
+          done
+          if node -e 'const p=require("./package.json"); process.exit(p.release || (p.dependencies||{})["semantic-release"] || (p.devDependencies||{})["semantic-release"] ? 0 : 1)' 2>/dev/null; then
+            configured=true
+          fi
+          echo "configured=$configured" >> "$GITHUB_OUTPUT"
+          if [ "$configured" != true ]; then
+            echo "::notice title=Finalize Release Metadata::No semantic-release dependency or release config found; skipping release finalization."
+          fi
+      - name: Finalize release metadata
+        if: steps.release_setup.outputs.configured == 'true'
+        env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
         run: |
           if [ "$PM" = pnpm ]; then pnpm exec semantic-release; else npx semantic-release; fi
