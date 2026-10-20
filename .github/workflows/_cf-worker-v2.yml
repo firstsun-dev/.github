@@ -69,6 +69,23 @@ on:
       test_e2e_setup_cmd:
         type: string
         default: ''
+      test_e2e_variants:
+        description: >
+          JSON array of E2E variants (name, args, artifact_suffix); the default is a single run.
+        type: string
+        default: '[{"name":"","args":"","artifact_suffix":""}]'
+      test_e2e_env:
+        description: Extra env vars for E2E, one KEY=VALUE per line
+        type: string
+        default: ''
+      use_mailpit:
+        description: Start Mailpit for integration/E2E tests
+        type: boolean
+        default: false
+      preview_smoke_env:
+        description: Extra env vars for preview_smoke_cmd, one KEY=VALUE per line
+        type: string
+        default: ''
       # ---- Preview resources ----
       preview_provision_cmd:
         description: >
@@ -171,6 +188,7 @@ env:
   NODE_VERSION: 24
   PNPM_STORE_PATH: /cache/pnpm-store
   TOOLS_DIR: .cf-tools/actions/cf-preview
+  PLAYWRIGHT_BROWSERS_PATH: /opt/playwright-browsers
 
 jobs:
   # -------------------------------------------------------------------------
@@ -277,47 +295,115 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # -------------------------------------------------------------------------
-  # Tests — all events, never receive Cloudflare credentials
+  # Tests — all events, never receive Cloudflare credentials.
+  # Unit / integration / E2E (matrix) run in parallel; `test` is the single gate
+  # the deploy jobs depend on.
   # -------------------------------------------------------------------------
-  test:
-    name: Tests
+  test-unit:
+    name: Unit Tests
     needs: plan
-    if: needs.plan.outputs.action != 'cleanup' && needs.plan.outputs.action != 'skip' && needs.plan.outputs.action != 'persistent-dev'
+    if: inputs.test_unit_cmd != '' && contains(fromJSON('["preview","production","ci-only"]'), needs.plan.outputs.action)
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - uses: firstsun-dev/.github/actions/setup@v1
+        with:
+          setup-node: 'false'
+          setup-pnpm: 'false'
+      - name: Unit tests
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CMD: ${{ inputs.test_unit_cmd }}
+        run: bash -c "$CMD"
+
+  test-integration:
+    name: Integration Tests
+    needs: plan
+    if: inputs.test_integration_cmd != '' && contains(fromJSON('["preview","production","ci-only"]'), needs.plan.outputs.action)
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - uses: firstsun-dev/.github/actions/setup@v1
+        with:
+          setup-node: 'false'
+          setup-pnpm: 'false'
+      - name: Start Mailpit
+        if: inputs.use_mailpit
+        uses: firstsun-dev/.github/actions/mailpit@v1
+      - name: Integration tests
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CMD: ${{ inputs.test_integration_cmd }}
+        run: bash -c "$CMD"
+
+  test-e2e:
+    name: E2E Tests
+    needs: plan
+    if: inputs.test_e2e_cmd != '' && contains(fromJSON('["preview","production","ci-only"]'), needs.plan.outputs.action)
+    strategy:
+      fail-fast: false
+      matrix:
+        e2e: ${{ fromJSON(inputs.test_e2e_variants) }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ needs.plan.outputs.sha }}
-      - name: Setup
-        uses: firstsun-dev/.github/actions/setup@v1
+      - uses: firstsun-dev/.github/actions/setup@v1
         with:
           setup-node: 'false'
           setup-pnpm: 'false'
-      - name: Unit tests
-        if: inputs.test_unit_cmd != ''
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.test_unit_cmd }}
-        run: bash -c "$CMD"
-      - name: Integration tests
-        if: inputs.test_integration_cmd != ''
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.test_integration_cmd }}
-        run: bash -c "$CMD"
+      - name: Start Mailpit
+        if: inputs.use_mailpit
+        uses: firstsun-dev/.github/actions/mailpit@v1
+      - name: Set E2E environment
+        if: inputs.test_e2e_env != ''
+        uses: firstsun-dev/.github/actions/parse-env@v1
+        with:
+          vars: ${{ inputs.test_e2e_env }}
       - name: E2E setup
-        if: inputs.test_e2e_cmd != '' && inputs.test_e2e_setup_cmd != ''
+        if: inputs.test_e2e_setup_cmd != ''
         working-directory: ${{ inputs.app_path }}
         env:
           CMD: ${{ inputs.test_e2e_setup_cmd }}
         run: bash -c "$CMD"
       - name: E2E tests
-        if: inputs.test_e2e_cmd != ''
         working-directory: ${{ inputs.app_path }}
         env:
-          CMD: ${{ inputs.test_e2e_cmd }}
+          CMD: ${{ inputs.test_e2e_cmd }} ${{ matrix.e2e.args }}
         run: bash -c "$CMD"
+      - name: Upload E2E report
+        uses: actions/upload-artifact@v7
+        if: failure()
+        continue-on-error: true
+        with:
+          name: ${{ matrix.e2e.artifact_suffix != '' && format('e2e-report-{0}-{1}-{2}', inputs.app_name, matrix.e2e.artifact_suffix, github.run_id) || format('e2e-report-{0}-{1}', inputs.app_name, github.run_id) }}
+          path: |
+            ${{ inputs.app_path }}/playwright-report/
+            ${{ inputs.app_path }}/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  test:
+    name: Tests
+    needs: [plan, test-unit, test-integration, test-e2e]
+    if: always() && contains(fromJSON('["preview","production","ci-only"]'), needs.plan.outputs.action)
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    steps:
+      - name: Gate
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          case " $RESULTS " in *" failure "*|*" cancelled "*) echo "::error::a test job failed"; exit 1;; esac
 
   # -------------------------------------------------------------------------
   # Preview — non-main push. Branch-scoped concurrency; newest push wins.
@@ -459,6 +545,11 @@ jobs:
         run: |
           export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR" APP_DIR="$GITHUB_WORKSPACE/$APP_DIR"
           "$TOOLS_DIR/publish.sh" | tee -a "$GITHUB_OUTPUT"
+      - name: Set smoke environment
+        if: env.STALE != 'true' && steps.publish.outcome == 'success' && inputs.preview_smoke_env != ''
+        uses: firstsun-dev/.github/actions/parse-env@v1
+        with:
+          vars: ${{ inputs.preview_smoke_env }}
       - name: Smoke — exact Preview URL
         if: env.STALE != 'true' && steps.publish.outcome == 'success'
         id: smoke

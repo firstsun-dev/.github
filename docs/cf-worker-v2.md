@@ -52,6 +52,13 @@ jobs:
 Monorepos: one caller job per Worker (`app_name`, `app_path`), each guarded by a changed-path
 filter (`_detect-changes.yml`); the `delete` event must run **all** caller jobs (cleanup is idempotent).
 
+## Test inputs (v2.1.0+)
+
+`test_unit_cmd`, `test_integration_cmd`, `test_e2e_cmd` (+ `test_e2e_setup_cmd`, `test_e2e_env`,
+`test_e2e_variants` JSON matrix, `use_mailpit`) run as parallel jobs behind a single `Tests` gate.
+`preview_smoke_env` (KEY=VALUE lines) is exported before `preview_smoke_cmd`, which receives
+`TARGET_URL` and `EXPECTED_SHA`. Browsers path defaults to `/opt/playwright-browsers`.
+
 ## Wrangler config requirements
 
 * Top-level `previews` block (may be `{}`), Wrangler ≥ 4.135.0 installed project-locally.
