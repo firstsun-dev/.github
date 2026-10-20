@@ -624,6 +624,7 @@ jobs:
         env:
           APP_DIR: ${{ github.workspace }}/recover/${{ inputs.app_path }}
           BUILD_CMD: ${{ inputs.preview_build_cmd != '' && inputs.preview_build_cmd || inputs.build_cmd }}
+          PROVISION_CMD: ${{ inputs.preview_provision_cmd }}
           # Same build/preflight environment as the normal publish step, or adapters re-add
           # Preview-incompatible bindings (found by the heaven-www recovery drill).
           VITE_APP_ENV: preview
@@ -633,6 +634,9 @@ jobs:
         run: |
           export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
           (cd "$APP_DIR" && pnpm install --frozen-lockfile)
+          # Re-run the idempotent provision hook in the recovery checkout so the old SHA is bound to
+          # THIS branch's resources (e.g. branch D1), never the shared baseline. No migrations here.
+          if [ -n "$PROVISION_CMD" ]; then (cd "$APP_DIR" && bash -c "$PROVISION_CMD"); fi
           URL="$("$TOOLS_DIR/publish.sh" | sed -n 's/^preview_url=//p')"
           curl -fsS -o /dev/null --max-time 30 --retry 5 --retry-delay 5 --retry-all-errors "$URL/"
           echo "### ♻️ Recovered Preview to last good commit \`${{ steps.good.outputs.sha }}\` ($URL). Run remains FAILED for the bad commit." >> "$GITHUB_STEP_SUMMARY"
