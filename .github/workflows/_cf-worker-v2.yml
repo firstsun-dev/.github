@@ -635,7 +635,7 @@ jobs:
           pnpm install --frozen-lockfile >/dev/null 2>&1 || true
           if ! OUT="$(pnpm exec wrangler preview delete --name "$PREVIEW_NAME" --skip-confirmation 2>&1)"; then
             echo "$OUT"
-            echo "$OUT" | grep -Eqi 'not found|does not exist|no such' || exit 1
+            echo "$OUT" | grep -Eqi 'not found|10025|does not exist|no such' || exit 1
             echo "Preview already gone."
           fi
       - name: Delete exclusively-owned branch resources
