@@ -16,13 +16,19 @@ The published `_cf-worker-template.yml` v1/v1.5.0 uploads a version and then dep
 - Audit per-Worker Preview configuration, bindings, secrets, authentication, outbound side effects, resources, migrations and retention. Protect persistent Dev (Hybrid) independently.
 - Keep `@v1` and pinned `@v1.5.0` behavior unchanged until each caller opts in to a separately released v2.
 
+## Approved decisions and platform facts (2026-10-20)
+
+- Previews may reuse the repository's existing Cloudflare deploy credentials (no separate least-privilege token) — owner decision; a dedicated Preview token remains recommended for Workers with stateful bindings.
+- No per-branch D1/R2 for Blog (see Data and security policy).
+- Facts proven in the `heaven-www` pilot and `wrangler 4.151.1`: see design.md "Verified platform facts".
+
 ## Event-level behavior
 
 | Event | production-preview / hybrid | production-only |
 |---|---|---|
 | Non-main same-repo branch push | Tests, resource preflight, create/update **branch** Native Preview, smoke and publish URL | Tests only |
 | Main push | Production gates/deploy/verify/recovery | Same |
-| PR opened/synchronized | CI as appropriate; link already-created branch URL; **no second competing Preview** | Tests only |
+| PR opened/reopened | Link the already-created branch URL (comment); **no second competing Preview**, no duplicate test run required (push already ran them) | Tests only |
 | Fork PR | Credential-free tests only; no deployment secrets or Preview | Same |
 | Branch deleted | Delete only that branch/Worker Preview and owned ephemeral resources | No Preview |
 | PR closed/merged while branch remains | Keep Preview | No Preview |
@@ -36,7 +42,7 @@ A pipeline must not silently skip Preview creation due to a repository's existin
 |---|---|---|
 | `firstsun-dev/.github` | Shared v2 workflow/actions | Generic branch identity, event/trust gate, lifecycle, compatibility |
 | `firstsun-dev/heaven-www` / `www` | production-preview **pilot** | Existing CI pushes only main; enable feature-branch push |
-| `firstsun-dev/blog` / `blog` | production-preview | All branch pushes (existing path filters must not suppress), isolated schema-capable D1, non-prod R2, secrets, noindex, real URL smoke |
+| `firstsun-dev/blog` / `blog` | production-preview | All branch pushes (existing path filters must not suppress); **one shared non-production preview D1 and one shared preview R2 bucket (owner decision 2026-10-20, no per-branch resources)**; Preview-only secrets, noindex, real URL smoke |
 | `firstsun-dev/heaven-monorepo/apps/checkin` | production-preview | Independent app identity, D1, safe ID/auth integration |
 | `firstsun-dev/heaven-monorepo/apps/test-client` | production-preview | Independent app identity, auth endpoint isolation |
 | `firstsun-dev/heaven-monorepo/apps/id` | hybrid | Branch Previews plus separately protected persistent Dev for Cron; D1/R2/auth |
@@ -49,7 +55,12 @@ Other Workers discovered during implementation MUST be inventoried, classified, 
 
 ## Data and security policy
 
-Stable branch URL does **not** by itself mean isolated D1/R2. Per-branch D1 is required when branch-specific schema migrations/data mutation can conflict (Blog is in scope). R2/other mutable bindings must be independent of Production; branch-level isolation must use a distinct resource or an auditable enforced namespace with no cross-branch writes. No Preview may point at writable Production state, trusted Production Secrets, a Production service binding with side effects, or a public authentication bypass. Do not copy Dev/Production Secrets Store values into Previews by default.
+Stable branch URL does **not** by itself mean isolated D1/R2. Isolation level is a per-Worker **owner decision** and must be written down in the consumer PR:
+
+- *Shared non-production baseline* (accepted for Blog, 2026-10-20): all branch Previews bind one Preview-only D1 and one Preview-only R2 bucket; no per-branch resources are created. Known limit: branches share state, so branches with different schema revisions can disturb each other's Preview data. Migrations run only against that non-production DB.
+- *Branch-scoped resources*: a distinct resource per branch (with ownership naming, quota ceiling and cleanup). Recommended when concurrent branches routinely carry incompatible migrations, but not mandated.
+
+In every case R2/other mutable bindings must be independent of Production and bindings must carry explicit resource ids (Native Previews do not auto-provision). No Preview may point at writable Production state, trusted Production Secrets, a Production service binding with side effects, or a public authentication bypass. Do not copy Dev/Production Secrets Store values into Previews by default.
 
 Native Previews do not automatically execute Cron Triggers or Queue Consumers. Validate those in tests or protected persistent Dev only. Do not infer that a Worker rollback reverts database migrations.
 

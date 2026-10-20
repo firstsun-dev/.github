@@ -77,10 +77,20 @@ V2 SHALL use the pinned supported Native Preview interface and an explicit `prev
 
 V2 SHALL audit all mutable resources, secrets, integration calls and ingress before Preview creation. State in distinct Previews is NOT assumed isolated merely because code and URL differ.
 
-#### Scenario: Branch-scoped D1 migration
-- **WHEN** a Worker such as Blog requires schema-changing D1 migrations
-- **THEN** that branch SHALL use its own D1 identity, with migrations applied before Preview creation
-- **AND** it SHALL NOT migrate a shared Dev or Production database
+#### Scenario: Shared non-production Preview data (owner-approved)
+- **WHEN** a Worker such as Blog requires D1 migrations and its owner has chosen a shared non-production Preview baseline
+- **THEN** all branch Previews SHALL bind only that explicitly identified non-production D1/R2 resources, and migrations SHALL be applied only to that database before Preview creation
+- **AND** it SHALL NOT migrate Production or the legacy shared Dev Worker's data
+- **AND** the consumer PR SHALL record that branches share state and that differing schema revisions can interfere
+
+#### Scenario: Branch-scoped resources (optional)
+- **WHEN** an owner instead chooses per-branch D1/R2
+- **THEN** the resources SHALL have deterministic, ownership-checked names, a quota ceiling that fails closed, idempotent provisioning and deletion on branch deletion
+
+#### Scenario: Preview binding without an explicit resource id
+- **WHEN** the source or the build-generated Wrangler config declares a Preview storage binding without a resource id (for example an adapter-added KV `SESSION`)
+- **THEN** preflight SHALL fail before `wrangler preview` runs
+- **AND** the prior Preview SHALL remain unchanged
 
 #### Scenario: Production resource or unsafe Service Binding detected
 - **WHEN** Preview bindings can write Production state, share unsafe Secrets, route to an unsafe production service binding, or bypass required Access/auth
@@ -139,3 +149,10 @@ V2 SHALL keep production version traceability and smoke tests with per-app recov
 #### Scenario: Consumer stays on pinned v1
 - **WHEN** a repository continues using v1/v1.5.0
 - **THEN** its current deployment contract and release tag SHALL remain unchanged
+
+### Requirement: Branch deletion cleanup SHALL be driven from the default branch
+
+#### Scenario: Delete event handling
+- **WHEN** GitHub emits a branch `delete` event
+- **THEN** only the default branch's workflow definition runs; the caller workflow MUST therefore be merged to the default branch before cleanup works
+- **AND** deleting an already-deleted Preview (Cloudflare code 10025) SHALL be treated as success

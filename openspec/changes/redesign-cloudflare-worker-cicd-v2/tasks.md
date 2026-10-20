@@ -7,11 +7,11 @@
 - [x] Adopt user decision: **every eligible non-main branch push creates/updates a stable branch URL even without PR**; lifecycle is branch-owned, not PR-owned.
 - [x] Supersede legacy PR-alias feedback issue #33 under parent #43.
 - [ ] Review per-Worker Preview bindings and authentication threat model; approve resource policies.
-- [ ] Validate exact Native Preview CLI (Wrangler >=4.135.0), preview --json, deletion, assets/compatibility rules, quota/cost and secrets behavior on pinned dependencies.
+- [x] Validate Native Preview CLI (Wrangler 4.151.1): `--json` shape, deletion + 10025, explicit-id requirement (see design.md "Verified platform facts"). Quota/cost and Preview secrets behavior still unverified.
 
 ## Phase 1 — .github shared v2 (implementation PR; no existing v1 changes)
 
-- [ ] Add new v2 reusable workflow/entrypoint and event-specific routing; preserve published v1 callers.
+- [x] Add new v2 reusable workflow/entrypoint (released as `v2.0.0`) with event routing; v1 callers untouched.
 - [ ] Add branch-identity normalization + unconditional short hash, deterministic Worker-scoped Preview name, safe collision handling.
 - [ ] Trigger trusted same-repo non-main **push** Preview after tests; PR required=false; fork PR tests-only, no credentials.
 - [ ] Implement Native Preview binding preflight, Preview-safe resource provisioning/migrations, build, create/update, JSON URL extraction and URL-specific smoke.
@@ -23,15 +23,17 @@
 
 ## Phase 2 — heaven-www pilot
 
-- [ ] Enable non-main push trigger (current caller only handles `main` push); pin tested v2 SHA initially.
-- [ ] First feature push with **no PR** creates URL; subsequent push keeps it; another branch has another URL.
-- [ ] Verify exact-URL smoke/Assets, PR feedback if opened later, branch-delete cleanup, Production unaffected.
-- [ ] Tag immutable v2.0.0 after verified pilot; prove caller pin revert.
+- [x] Enable non-main push trigger; pinned exact shared SHA during the pilot, now the immutable `v2.0.0` tag (heaven-www#48, #49, #51).
+- [x] First feature push with **no PR** creates URL; subsequent push keeps it; another branch has another URL.
+- [x] Exact-URL smoke/Assets; PR feedback when opened later (no duplicate Preview); PR close keeps the Preview; branch-delete cleanup removes only that Preview; Production `versions upload/deploy` verified on main.
+- [x] Smoke-failure recovery drill (redeploys the last successful Deployment SHA, run stays red).
+- [x] Tag immutable `v2.0.0` (and floating `v2`) after the verified pilot.
+- [ ] Prove caller pin revert; concurrent-push/force-push race, fork PR and build-failure-retains-Preview tests on real Cloudflare.
 
 ## Phase 3 — blog and simpler stateful consumers (separate consumer PRs)
 
 - [ ] Blog: stop branch pushes to shared `blog-preview`; review path filters so every branch push creates/updates Preview even without PR.
-- [ ] Blog: branch-scoped D1 + per-branch migrations, non-Prod R2 and isolation, Preview Base secrets, rate limits, notification/TTS/analytics side-effect restrictions.
+- [ ] Blog: shared non-prod preview D1 + migrations before publish, dedicated preview R2 (no per-branch resources — owner decision), Preview Base secrets (pending), rate limits, notification/TTS/analytics side-effect restrictions. PR firstsun-dev/blog#448 (draft).
 - [ ] Blog: decouple `SITE_URL` from voice Preview QA gating; preserve noindex, SEO/E2E, content-only optimization and preview-URL smoke.
 - [ ] `heaven-monorepo/apps/checkin`: D1 migrations, auth/ID integrations, independent Worker and branch preview identity.
 - [ ] `heaven-monorepo/apps/test-client`: safe auth target, independent Worker and branch URL.
