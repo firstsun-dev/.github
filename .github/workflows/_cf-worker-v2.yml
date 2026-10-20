@@ -45,6 +45,13 @@ on:
       preview_on_branch_push:
         type: boolean
         default: true
+      preview_worker_name:
+        description: >
+          Host Native Previews under this existing Worker instead of the config's `name`
+          (wrangler preview --worker-name). Use when the production Worker must keep workers.dev /
+          Preview URLs disabled (Preview URLs need Worker-level previews_enabled).
+        type: string
+        default: ''
       wrangler_config:
         description: Wrangler config path relative to app_path
         type: string
@@ -555,6 +562,7 @@ jobs:
           VITE_APP_VERSION: ${{ inputs.app_version }}
           PREVIEW_ALLOW: ${{ inputs.preview_binding_allow }}
           PREVIEW_DENY: ${{ inputs.preview_deny_resources }}
+          WORKER_NAME: ${{ inputs.preview_worker_name }}
         run: |
           export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR" APP_DIR="$GITHUB_WORKSPACE/$APP_DIR"
           "$TOOLS_DIR/publish.sh" | tee -a "$GITHUB_OUTPUT"
@@ -643,6 +651,7 @@ jobs:
           APP_DIR: ${{ github.workspace }}/recover/${{ inputs.app_path }}
           BUILD_CMD: ${{ inputs.preview_build_cmd != '' && inputs.preview_build_cmd || inputs.build_cmd }}
           PROVISION_CMD: ${{ inputs.preview_provision_cmd }}
+          WORKER_NAME: ${{ inputs.preview_worker_name }}
           # Same build/preflight environment as the normal publish step, or adapters re-add
           # Preview-incompatible bindings (found by the heaven-www recovery drill).
           VITE_APP_ENV: preview
@@ -749,10 +758,17 @@ jobs:
       - name: Delete Native Preview (idempotent)
         if: env.SKIP != 'true'
         working-directory: ${{ inputs.app_path }}
+        env:
+          WORKER_NAME: ${{ inputs.preview_worker_name }}
         run: |
           [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "::error::no Preview token"; exit 1; }
           pnpm install --frozen-lockfile >/dev/null 2>&1 || true
-          if ! OUT="$(pnpm exec wrangler preview delete --name "$PREVIEW_NAME" --skip-confirmation 2>&1)"; then
+          WORKER_ARGS=()
+          if [ -n "$WORKER_NAME" ]; then
+            [[ "$WORKER_NAME" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "::error::bad preview_worker_name"; exit 1; }
+            WORKER_ARGS=(--worker-name "$WORKER_NAME")
+          fi
+          if ! OUT="$(pnpm exec wrangler preview delete --name "$PREVIEW_NAME" "${WORKER_ARGS[@]}" --skip-confirmation 2>&1)"; then
             echo "$OUT"
             echo "$OUT" | grep -Eqi 'not found|10025|does not exist|no such' || exit 1
             echo "Preview already gone."

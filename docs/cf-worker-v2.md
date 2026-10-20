@@ -59,6 +59,14 @@ filter (`_detect-changes.yml`); the `delete` event must run **all** caller jobs 
 `preview_smoke_env` (KEY=VALUE lines) is exported before `preview_smoke_cmd`, which receives
 `TARGET_URL` and `EXPECTED_SHA`. Browsers path defaults to `/opt/playwright-browsers`.
 
+## Hosting Previews under another Worker (`preview_worker_name`)
+
+Native Preview URLs need the **Worker-level** `previews_enabled` setting (verified: a Worker with
+`{enabled:false, previews_enabled:false}` gets `preview.urls: []`; `{enabled:false, previews_enabled:true}`
+gets a URL). If the production Worker deliberately keeps workers.dev/Preview URLs off (public URLs bound to
+production resources), set `preview_worker_name` to an existing dev Worker that has `previews_enabled`;
+`wrangler preview --worker-name` / `preview delete --worker-name` are used for publish, recovery and cleanup.
+
 ## Wrangler config requirements
 
 * Top-level `previews` block (may be `{}`), Wrangler ≥ 4.135.0 installed project-locally.
