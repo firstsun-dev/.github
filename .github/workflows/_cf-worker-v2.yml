@@ -12,7 +12,7 @@ name: CF Worker Pipeline v2
 #
 # Lifecycle (push is authoritative; PRs only report):
 #   non-main push  -> tests -> preflight -> provision/migrate -> build ->
-#                     `wrangler preview --name br-<slug>-<hash> --json` ->
+#                     `wrangler preview --name <slug> --json` ->
 #                     exact-URL smoke -> GitHub Deployment (+ PR comment if any)
 #   smoke failure  -> red status + recovery (redeploy last good SHA)
 #   branch delete  -> Preview is KEPT (stable URL stays); only the GitHub ledger is retired
@@ -29,7 +29,7 @@ on:
         type: string
         required: true
       app_name:
-        description: Unique deployment/identity name (e.g. www, heaven-id). Part of the Preview identity hash.
+        description: Unique deployment/identity name (e.g. www, heaven-id). Part of the Preview identity (Worker scope).
         type: string
         required: true
       app_path:
@@ -213,6 +213,9 @@ jobs:
     name: Plan
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 5
+    permissions:
+      contents: read
+      deployments: read
     outputs:
       action: ${{ steps.classify.outputs.action }}
       reason: ${{ steps.classify.outputs.reason }}
@@ -292,10 +295,25 @@ jobs:
         env:
           BRANCH_REF: ${{ steps.branch.outputs.branch_ref }}
           APP: ${{ inputs.app_name }}
+          HOST: ${{ inputs.preview_worker_name != '' && inputs.preview_worker_name || inputs.app_name }}
         run: |
-          node "$TOOLS_DIR/cli.mjs" identity --repo "$GITHUB_REPOSITORY" --worker "$APP" --ref "$BRANCH_REF" | tee -a "$GITHUB_OUTPUT"
+          node "$TOOLS_DIR/cli.mjs" identity --repo "$GITHUB_REPOSITORY" --worker "$APP" --host-worker "$HOST" --ref "$BRANCH_REF" | tee -a "$GITHUB_OUTPUT"
           SLUG="$(grep '^preview_name=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)"
           echo "env_name=$APP/preview/$SLUG" >> "$GITHUB_OUTPUT"
+      # The name has no hash, so two branches can normalise to the same name ("Feat/A" vs "feat-a",
+      # or a long prefix). The ledger records which full ref owns a name: fail BEFORE tests/build.
+      - name: Preview name must belong to this branch
+        if: steps.classify.outputs.action == 'preview' && steps.identity.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_REF: ${{ steps.branch.outputs.branch_ref }}
+          ENV_NAME: ${{ steps.identity.outputs.env_name }}
+        run: |
+          OWNER="$("$TOOLS_DIR/gh.sh" owner "$ENV_NAME")"
+          if [ -n "$OWNER" ] && [ "$OWNER" != "$BRANCH_REF" ]; then
+            echo "::error::Preview name for $BRANCH_REF is already used by $OWNER ($ENV_NAME). Rename the branch, or delete that Preview and its ledger first; refusing to overwrite it."
+            exit 1
+          fi
       - name: Summary
         env:
           ACTION: ${{ steps.classify.outputs.action }}
@@ -750,9 +768,14 @@ jobs:
       - run: cd "$TOOLS_DIR" && npm ci --ignore-scripts --no-audit --no-fund
       - name: Validate target identity
         run: |
-          RECOMPUTED="$(node "$TOOLS_DIR/cli.mjs" identity --repo "$GITHUB_REPOSITORY" --worker "${{ inputs.app_name }}" --ref "$BRANCH_REF" | sed -n 's/^preview_name=//p')"
+          RECOMPUTED="$(node "$TOOLS_DIR/cli.mjs" identity --repo "$GITHUB_REPOSITORY" --worker "${{ inputs.app_name }}" --host-worker "$WORKER_NAME" --ref "$BRANCH_REF" | sed -n 's/^preview_name=//p')"
           [ "$RECOMPUTED" = "$PREVIEW_NAME" ] || { echo "::error::identity mismatch"; exit 1; }
-          [[ "$PREVIEW_NAME" =~ ^br-[a-z0-9-]+-[0-9a-f]{10}$ ]] || { echo "::error::unsafe name"; exit 1; }
+          [[ "$PREVIEW_NAME" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "::error::unsafe name"; exit 1; }
+          # Names are hashless: only touch the ledger if THIS branch owns the name.
+          OWNER="$("$TOOLS_DIR/gh.sh" owner "${{ needs.plan.outputs.env_name }}")"
+          if [ -n "$OWNER" ] && [ "$OWNER" != "$BRANCH_REF" ]; then
+            echo "::notice::Name is owned by $OWNER, not this branch; leaving the ledger alone."; echo "SKIP=true" >> "$GITHUB_ENV"
+          fi
           # A new branch with the same name may already exist again (delete/recreate race): do nothing.
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/${{ needs.plan.outputs.branch }}" >/dev/null 2>&1; then
             echo "::notice::Branch exists again; leaving the ledger alone."; echo "SKIP=true" >> "$GITHUB_ENV"

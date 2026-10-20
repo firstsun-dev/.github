@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GitHub Deployment ledger + PR feedback for branch Previews. Needs GH_TOKEN, GITHUB_REPOSITORY.
-# Subcommands: start | status | last-good | comment | environments | retire | purge
+# Subcommands: start | status | last-good | comment | environments | owner | retire | purge
 set -euo pipefail
 R="${GITHUB_REPOSITORY:?}"
 cmd="${1:?}"; shift
@@ -37,6 +37,9 @@ Commit: \`$4\` · branch \`$1\` · Preview is branch-owned and persists after th
     ;;
   environments) # <prefix> -> distinct deployment environments with prefix
     gh api "repos/$R/deployments?per_page=100" --paginate -q '.[].environment' | grep -F "$1" | sort -u || true
+    ;;
+  owner) # <env> -> full branch ref that owns this Preview name (newest ledger payload), or nothing
+    gh api "repos/$R/deployments?environment=$(printf %s "$1" | jq -sRr @uri)&per_page=1" -q '.[0].payload.branch_ref // empty'
     ;;
   retire) # <env> : mark every deployment of this environment inactive (kept as history)
     for id in $(gh api "repos/$R/deployments?environment=$(printf %s "$1" | jq -sRr @uri)&per_page=100" --paginate -q '.[].id'); do

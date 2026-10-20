@@ -21,9 +21,9 @@ Every successful, trusted, non-`main` `push` affecting a Preview-enabled Worker 
 - **AND** unrelated branches' URLs/code SHALL remain unaffected
 
 #### Scenario: Two normalized branch names look alike
-- **WHEN** different raw refs normalize to the same human-readable slug
-- **THEN** a stable hash/collision check SHALL preserve independent Preview identities
-- **AND** neither branch SHALL overwrite the other's deployment
+- **WHEN** different raw refs normalize to the same slug (for example `Feat/A` and `feat-a`)
+- **THEN** the ledger collision check SHALL fail the later branch before tests and deployment, naming the owning ref
+- **AND** neither branch SHALL overwrite the other's Preview
 
 #### Scenario: Branch push fails before deploying
 - **WHEN** build, tests or binding preflight fail before the Preview update begins

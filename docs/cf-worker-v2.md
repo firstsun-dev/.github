@@ -15,7 +15,12 @@ Spec: `openspec/changes/redesign-cloudflare-worker-cicd-v2` (PR #44), tracking #
 | workflow_dispatch `target=persistent-dev` on `persistent_dev_ref` | – | protected Dev deploy | – |
 | push main | Production | Production | Production |
 
-Identity: `br-<slug≤24>-<sha256(repo\nworker\nfull-ref)[:10]>`, deterministic, collision-proof, scoped per Worker.
+Identity = the normalised branch name (`feat/Solar_Term` → `feat-solar-term`): no prefix, no hash, no commit SHA.
+URL: `https://<slug>-<worker>.<subdomain>.workers.dev` (e.g. `feat-solar-term-blog-preview…`), **one stable URL per branch**.
+Slug is truncated so `<slug>-<host worker>` fits a 63-char DNS label; an 8-hex slug gets a `b-` prefix so it never
+resembles a per-deployment URL. Normalisation is lossy (`Feat/A` and `feat-a` → `feat-a`): the GitHub Deployment
+ledger records which full branch ref owns a name and the run **fails closed in Plan, before tests**, if another
+branch already owns it (rename the branch, or delete that Preview + ledger).
 Preview URL comes only from `wrangler preview --json` → `.preview.urls[0]`.
 
 ## Caller (must be on the default branch for `delete` to work)
