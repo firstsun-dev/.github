@@ -74,6 +74,14 @@ production resources), set `preview_worker_name` to an existing dev Worker that 
 * `services`, `hyperdrive`, `secrets_store_secrets` in `previews` require an explicit `preview_binding_allow` entry (e.g. `services:ID`) — Preview service bindings hit the target's **Production** deployment.
 * No `routes`, `triggers`, queue consumers in `previews`; `assets`/`compatibility_*` stay top-level.
 
+## Smoke semantics
+
+The built-in probe (`actions/cf-preview/probe.sh`) requires an explicit `2xx` from `<preview-url>/`;
+plain redirects and 4xx/5xx fail. A redirect to `https://*.cloudflareaccess.com/` is accepted as
+**access-protected** (the Preview exists and is not public) and is surfaced in the summary, but served
+content / SHA are then unverified; `preview_smoke_cmd` receives `PREVIEW_ACCESS_PROTECTED=true` so it can
+skip content checks or use Access service-token headers.
+
 ## Failure semantics
 
 * Test/preflight/provision/build failure → `wrangler preview` is never invoked; prior Preview unchanged.
