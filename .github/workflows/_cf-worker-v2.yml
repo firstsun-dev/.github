@@ -533,6 +533,12 @@ jobs:
         env:
           APP_DIR: ${{ github.workspace }}/recover/${{ inputs.app_path }}
           BUILD_CMD: ${{ inputs.preview_build_cmd != '' && inputs.preview_build_cmd || inputs.build_cmd }}
+          # Same build/preflight environment as the normal publish step, or adapters re-add
+          # Preview-incompatible bindings (found by the heaven-www recovery drill).
+          VITE_APP_ENV: preview
+          VITE_APP_VERSION: ${{ inputs.app_version }}
+          PREVIEW_ALLOW: ${{ inputs.preview_binding_allow }}
+          PREVIEW_DENY: ${{ inputs.preview_deny_resources }}
         run: |
           export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
           (cd "$APP_DIR" && pnpm install --frozen-lockfile)
