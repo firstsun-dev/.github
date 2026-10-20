@@ -173,7 +173,7 @@ export function auditPreviewConfig(cfg, { allow = [], denyResources = [] } = {})
     for (const b of prev) {
       const key = `${kind}:${bindingKey(kind, b)}`;
       const mine = ids(b).filter(Boolean);
-      if (!mine.length) errors.push(`${key}: no resource identity`);
+      if (!mine.length) warnings.push(`${key}: no explicit resource id (Wrangler auto-provisions); confirm it is a new, Preview-only resource`);
       for (const id of mine) {
         if (prodIds.has(id)) errors.push(`${key}: Preview binds the same resource as Production (${id})`);
         if (deny.has(id)) errors.push(`${key}: Preview binds denylisted Production resource (${id})`);
