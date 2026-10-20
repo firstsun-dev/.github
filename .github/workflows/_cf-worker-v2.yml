@@ -589,15 +589,18 @@ jobs:
             . "$PREVIEW_ENV_FILE"
             set +a
           fi
-          ok=0
-          for _ in 1 2 3 4 5 6 7 8; do
-            if curl -fsS -o /dev/null --max-time 20 "$TARGET_URL/"; then ok=1; break; fi
-            sleep 5
-          done
-          [ "$ok" = 1 ] || { echo "::error::$TARGET_URL never returned 2xx"; exit 1; }
-          if [ -n "$SHA_PATH" ]; then
+          # Status-aware probe (not `curl -f`, which treats every 3xx as success). A redirect to a
+          # *.cloudflareaccess.com login means the Preview exists and is NOT public; content cannot be
+          # verified without credentials, so the SHA check is skipped and smoke commands are told.
+          RESULT="$("$GITHUB_WORKSPACE/$TOOLS_DIR/probe.sh")"
+          echo "$RESULT"
+          if [ "$RESULT" = "probe=access-protected" ]; then
+            export PREVIEW_ACCESS_PROTECTED=true
+            echo "::notice::Preview is protected by Cloudflare Access; served content/SHA not verified"
+            echo "### ℹ️ Preview is Access-protected — liveness only, content/SHA not verified" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -n "$SHA_PATH" ]; then
             for _ in 1 2 3 4 5 6; do
-              curl -fsS --max-time 20 "$TARGET_URL$SHA_PATH" | grep -q "${EXPECTED_SHA:0:7}" && { found=1; break; }
+              if curl -fsS --max-time 20 "$TARGET_URL$SHA_PATH" | grep -q "${EXPECTED_SHA:0:7}"; then found=1; break; fi
               sleep 5
             done
             [ "${found:-0}" = 1 ] || { echo "::error::Preview does not serve $EXPECTED_SHA at $SHA_PATH"; exit 1; }
@@ -665,7 +668,7 @@ jobs:
           # THIS branch's resources (e.g. branch D1), never the shared baseline. No migrations here.
           if [ -n "$PROVISION_CMD" ]; then (cd "$APP_DIR" && bash -c "$PROVISION_CMD"); fi
           URL="$("$TOOLS_DIR/publish.sh" | sed -n 's/^preview_url=//p')"
-          curl -fsS -o /dev/null --max-time 30 --retry 5 --retry-delay 5 --retry-all-errors "$URL/"
+          TARGET_URL="$URL" "$TOOLS_DIR/probe.sh"
           echo "### ♻️ Recovered Preview to last good commit \`${{ steps.good.outputs.sha }}\` ($URL). Run remains FAILED for the bad commit." >> "$GITHUB_STEP_SUMMARY"
       - name: Recovery failed
         if: failure() && steps.good.outputs.sha != '' && steps.recover.outcome == 'failure'

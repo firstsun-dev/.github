@@ -32,6 +32,8 @@ jobs:
         run: node --test scripts/cf-preview/lib.test.mjs
       - name: publish.sh behaviour (stub wrangler)
         run: scripts/cf-preview/test-publish.sh
+      - name: Preview probe classification (stub curl)
+        run: scripts/cf-preview/test-probe.sh
       - name: GitHub ledger / PR comment idempotency (stub gh)
         run: scripts/cf-preview/test-gh.sh
       - name: actionlint
