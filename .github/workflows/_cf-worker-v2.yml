@@ -82,6 +82,14 @@ on:
         description: Start Mailpit for integration/E2E tests
         type: boolean
         default: false
+      build_env_preview:
+        description: Build-time env for Preview builds, one KEY=VALUE per line (VITE_APP_ENV/VERSION are set automatically)
+        type: string
+        default: ''
+      build_env_prod:
+        description: Build-time env for the Production build, one KEY=VALUE per line
+        type: string
+        default: ''
       preview_smoke_env:
         description: Extra env vars for preview_smoke_cmd, one KEY=VALUE per line
         type: string
@@ -532,6 +540,11 @@ jobs:
           TIP="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH" -q .object.sha)"
           [ -n "$TIP" ] || { echo "::error::cannot resolve branch tip"; exit 1; }
           [ "$TIP" = "$RUN_SHA" ] || { echo "::notice::Superseded by $TIP before publish; not touching Preview."; echo "STALE=true" >> "$GITHUB_ENV"; }
+      - name: Set Preview build environment
+        if: env.STALE != 'true' && inputs.build_env_preview != ''
+        uses: firstsun-dev/.github/actions/parse-env@v1
+        with:
+          vars: ${{ inputs.build_env_preview }}
       - name: Build and publish Native Preview
         if: env.STALE != 'true'
         id: publish
@@ -618,6 +631,11 @@ jobs:
         with:
           ref: ${{ steps.good.outputs.sha }}
           path: recover
+      - name: Recovery — Preview build environment
+        if: failure() && steps.good.outputs.sha != '' && inputs.build_env_preview != ''
+        uses: firstsun-dev/.github/actions/parse-env@v1
+        with:
+          vars: ${{ inputs.build_env_preview }}
       - name: Recovery — redeploy last good and verify
         if: failure() && steps.good.outputs.sha != ''
         id: recover
@@ -822,6 +840,11 @@ jobs:
         env:
           CMD: ${{ inputs.migrate_cmd_prod }}
         run: bash -c "$CMD"
+      - name: Set Production build environment
+        if: inputs.build_env_prod != ''
+        uses: firstsun-dev/.github/actions/parse-env@v1
+        with:
+          vars: ${{ inputs.build_env_prod }}
       - name: Build
         working-directory: ${{ inputs.app_path }}
         env:
