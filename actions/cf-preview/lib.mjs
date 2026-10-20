@@ -46,7 +46,10 @@ export function previewIdentity({ repo, worker, ref }) {
       .slice(0, 24)
       .replace(/-+$/g, '') || 'branch';
   const hash = createHash('sha256').update(`${repo}\n${worker}\n${ref}`).digest('hex').slice(0, 10);
-  return { name: `br-${slug}-${hash}`, slug, hash, branch };
+  const name = `br-${slug}-${hash}`;
+  // The Preview hostname is <name>-<worker>.<subdomain>.workers.dev; a DNS label is max 63 chars.
+  if (`${name}-${worker}`.length > 63) throw new Error(`Worker name too long for Preview hostname label: ${name}-${worker}`);
+  return { name, slug, hash, branch };
 }
 
 /** Validate `wrangler preview --json` output and return the stable URL. */
