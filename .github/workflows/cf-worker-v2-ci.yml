@@ -28,6 +28,10 @@ jobs:
           node-version: 24
       - name: Install tooling deps
         run: cd actions/cf-preview && npm ci --ignore-scripts --no-audit --no-fund
+      - name: Workflow contract (skipped-ancestor gating, preview/production triggers)
+        run: |
+          pip install --quiet pyyaml==6.0.1
+          python3 scripts/cf-preview/test-workflow-contract.py
       - name: Unit tests (identity, event matrix, preflight, URL, stale guard)
         run: node --test scripts/cf-preview/lib.test.mjs
       - name: publish.sh behaviour (stub wrangler)

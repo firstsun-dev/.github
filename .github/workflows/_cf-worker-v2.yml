@@ -444,7 +444,9 @@ jobs:
   preview:
     name: Branch Preview
     needs: [plan, test]
-    if: needs.plan.outputs.action == 'preview' && needs.test.result == 'success' && needs.plan.outputs.is_fork != 'true' && github.event_name != 'pull_request'
+    # always(): the test jobs upstream of `test` are skipped when a consumer defines no unit/integration/E2E
+    # command, and GitHub's implicit success() would skip this job for any skipped ANCESTOR. Gate explicitly.
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.action == 'preview' && needs.test.result == 'success' && needs.plan.outputs.is_fork != 'true' && github.event_name != 'pull_request'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     concurrency:
@@ -833,7 +835,8 @@ jobs:
   production:
     name: Production Deploy
     needs: [plan, test]
-    if: needs.plan.outputs.action == 'production' && needs.test.result == 'success'
+    # always(): see `preview` — a skipped ancestor must not silently skip the Production deploy.
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.action == 'production' && needs.test.result == 'success'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     environment:
@@ -900,7 +903,7 @@ jobs:
   production-verify:
     name: Production Smoke
     needs: [plan, production]
-    if: needs.production.result == 'success' && inputs.verify_cmd != ''
+    if: always() && needs.plan.result == 'success' && needs.production.result == 'success' && inputs.verify_cmd != ''
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 15
     steps:
