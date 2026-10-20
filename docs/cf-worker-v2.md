@@ -38,7 +38,6 @@ permissions:
   contents: read
   deployments: write
   pull-requests: write
-  statuses: write      # commit status 'preview/<app>' with the Preview URL
 jobs:
   cf:
     uses: firstsun-dev/.github/.github/workflows/_cf-worker-v2.yml@<SHA-or-v2.x.y>
@@ -67,9 +66,10 @@ filter (`_detect-changes.yml`); the `delete` event must run **all** caller jobs 
 
 ## Where to find the Preview URL
 
-* **Commit status** `preview/<app_name>` (commit page, PR checks list → *Details* = the URL)
-* **Run annotation** "Preview URL" on the workflow run page, and the run summary
-* **Deployments** tab (`<app>/preview/<name>`, `environment_url`), and the PR comment when a PR is open
+* **On the CI job itself:** the `Branch Preview` job declares `environment: <app_name>/preview` with the Preview URL,
+  so the job shows a **"View deployment"** link in the Actions graph and on the run page
+* **Run annotation** "Preview URL" and the run summary
+* **Deployments** tab: per-branch ledger `<app>/preview/<name>` (`environment_url`), and the PR comment when a PR is open
 * Reusable-workflow output `preview_url` for callers
 
 ## Hosting Previews under another Worker (`preview_worker_name`)

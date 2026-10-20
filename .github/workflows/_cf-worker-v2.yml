@@ -460,7 +460,12 @@ jobs:
       contents: read
       deployments: write
       pull-requests: write
-      statuses: write
+    # The job itself shows the URL ("View deployment" on the job in the Actions graph / run page).
+    # One shared environment per app; the per-branch ledger lives in `<app>/preview/<slug>` (separate
+    # names on purpose: `gh.sh owner/last-good` read only the ledger deployments, which carry payloads).
+    environment:
+      name: ${{ inputs.app_name }}/preview
+      url: ${{ steps.publish.outputs.preview_url }}
     outputs:
       preview_url: ${{ steps.publish.outputs.preview_url }}
       status: ${{ steps.final.outputs.status }}
@@ -639,12 +644,7 @@ jobs:
           "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" success "$URL" "Serving $RUN_SHA"
           "$TOOLS_DIR/gh.sh" comment "$BRANCH" "${{ inputs.app_name }}" "$URL" "$RUN_SHA" || echo "::warning::PR comment skipped"
           echo "status=success" >> "$GITHUB_OUTPUT"
-          # Make the URL visible where people look: run annotations, and a commit status (shows on the
-          # commit, in the PR checks list and as a "Details" link) — not only in the Deployments tab.
           echo "::notice title=Preview URL (${{ inputs.app_name }})::$URL"
-          gh api "repos/$GITHUB_REPOSITORY/statuses/$RUN_SHA" -f state=success -f context="preview/${{ inputs.app_name }}" \
-            -f target_url="$URL" -f description="Preview ready: ${PREVIEW_NAME}" >/dev/null \
-            || echo "::warning::commit status skipped (caller needs statuses: write)"
           {
             echo "### ✅ Preview — \`${{ inputs.app_name }}\`"
             echo "- URL: $URL"
@@ -656,8 +656,6 @@ jobs:
         if: failure() && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
         run: |
           "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" failure "${{ steps.publish.outputs.preview_url }}" "Smoke failed — Preview UNVERIFIED"
-          gh api "repos/$GITHUB_REPOSITORY/statuses/$RUN_SHA" -f state=failure -f context="preview/${{ inputs.app_name }}" \
-            -f target_url="${{ steps.publish.outputs.preview_url }}" -f description="Smoke failed - Preview unverified" >/dev/null || true
           echo "### ❌ Preview smoke failed — URL is **unverified**: ${{ steps.publish.outputs.preview_url }}" >> "$GITHUB_STEP_SUMMARY"
       - name: Recovery — find last known-good SHA
         if: failure() && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
