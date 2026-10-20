@@ -347,7 +347,10 @@ jobs:
         run: |
           echo "PREVIEW_ENV_FILE=$RUNNER_TEMP/preview.env" >> "$GITHUB_ENV"
           echo "OUT_FILE=$RUNNER_TEMP/preview.json" >> "$GITHUB_ENV"
-          TIP="$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "$BRANCH_REF" | cut -f1)"
+          # Authenticated lookup (consumers are private repos). A failed lookup must fail the job,
+          # never be mistaken for "superseded".
+          TIP="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH" -q .object.sha)"
+          [ -n "$TIP" ] || { echo "::error::cannot resolve branch tip"; exit 1; }
           if [ "$TIP" != "$RUN_SHA" ]; then
             echo "::notice::Branch tip $TIP != $RUN_SHA; a newer push owns this Preview. Skipping."
             echo "STALE=true" >> "$GITHUB_ENV"
@@ -435,7 +438,8 @@ jobs:
       - name: Stale-SHA guard (before publish)
         if: env.STALE != 'true'
         run: |
-          TIP="$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "$BRANCH_REF" | cut -f1)"
+          TIP="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH" -q .object.sha)"
+          [ -n "$TIP" ] || { echo "::error::cannot resolve branch tip"; exit 1; }
           [ "$TIP" = "$RUN_SHA" ] || { echo "::notice::Superseded by $TIP before publish; not touching Preview."; echo "STALE=true" >> "$GITHUB_ENV"; }
       - name: Build and publish Native Preview
         if: env.STALE != 'true'
@@ -615,7 +619,7 @@ jobs:
           [ "$RECOMPUTED" = "$PREVIEW_NAME" ] || { echo "::error::identity mismatch"; exit 1; }
           [[ "$PREVIEW_NAME" =~ ^br-[a-z0-9-]+-[0-9a-f]{10}$ ]] || { echo "::error::unsafe name"; exit 1; }
           # A new branch with the same name may already exist again (delete/recreate race): do nothing.
-          if git ls-remote --exit-code --heads "https://github.com/$GITHUB_REPOSITORY.git" "$BRANCH_REF" >/dev/null 2>&1; then
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/${{ needs.plan.outputs.branch }}" >/dev/null 2>&1; then
             echo "::notice::Branch exists again; skipping cleanup."; echo "SKIP=true" >> "$GITHUB_ENV"
           fi
       - name: Delete Native Preview (idempotent)
