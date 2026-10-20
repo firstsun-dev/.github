@@ -49,4 +49,7 @@ check("action == 'production'" in str(jobs["production"].get("if", "")), "produc
 check("action == 'preview'" in str(jobs["preview"].get("if", "")), "preview job only on the preview action")
 env = yaml.dump(jobs["preview"].get("env", {}))
 check("secrets.CLOUDFLARE_API_TOKEN" not in env, "preview job never receives the Production token")
+env_decl = jobs["preview"].get("environment") or {}
+check(isinstance(env_decl, dict) and "preview_url" in str(env_decl.get("url", "")), "preview job shows the URL via environment.url")
+check(str(env_decl.get("name", "")).endswith("/preview"), "job environment is separate from the per-branch ledger environments")
 sys.exit(fail)

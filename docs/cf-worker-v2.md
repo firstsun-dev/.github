@@ -64,6 +64,14 @@ filter (`_detect-changes.yml`); the `delete` event must run **all** caller jobs 
 `preview_smoke_env` (KEY=VALUE lines) is exported before `preview_smoke_cmd`, which receives
 `TARGET_URL` and `EXPECTED_SHA`. Browsers path defaults to `/opt/playwright-browsers`.
 
+## Where to find the Preview URL
+
+* **On the CI job itself:** the `Branch Preview` job declares `environment: <app_name>/preview` with the Preview URL,
+  so the job shows a **"View deployment"** link in the Actions graph and on the run page
+* **Run annotation** "Preview URL" and the run summary
+* **Deployments** tab: per-branch ledger `<app>/preview/<name>` (`environment_url`), and the PR comment when a PR is open
+* Reusable-workflow output `preview_url` for callers
+
 ## Hosting Previews under another Worker (`preview_worker_name`)
 
 Native Preview URLs need the **Worker-level** `previews_enabled` setting (verified: a Worker with
