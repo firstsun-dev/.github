@@ -162,6 +162,11 @@ on:
 permissions:
   contents: read
 
+# bash -eo pipefail everywhere: `publish.sh | tee` must not mask a failed wrangler.
+defaults:
+  run:
+    shell: bash
+
 env:
   NODE_VERSION: 24
   PNPM_STORE_PATH: /cache/pnpm-store

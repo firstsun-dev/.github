@@ -122,9 +122,8 @@ test('preflight: assets/compat must be top-level', () => {
   g.previews.assets = { directory: 'x' };
   assert.equal(auditPreviewConfig(g).errors.length, 1);
 });
-test('preflight: binding without id is a warning (auto-provisioned), not an error', () => {
+test('preflight: Preview binding without id is an error (Cloudflare 10021)', () => {
   const g = { kv_namespaces: [{ binding: 'SESSION' }], previews: { kv_namespaces: [{ binding: 'SESSION' }] } };
-  const r = auditPreviewConfig(g);
-  assert.deepEqual(r.errors, []);
-  assert.equal(r.warnings.length, 1);
+  assert.equal(auditPreviewConfig(g).errors.length, 1);
+  assert.deepEqual(auditPreviewConfig({ ...g, previews: {} }).errors.length, 1); // still no counterpart
 });
