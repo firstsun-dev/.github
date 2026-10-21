@@ -5,12 +5,14 @@ on:
     paths:
       - '.github/workflows/_cf-worker-v2.yml'
       - '.github/workflows/cf-worker-v2-ci.yml'
+      - '.github/actionlint.yaml'
       - 'actions/cf-preview/**'
       - 'scripts/cf-preview/**'
   push:
     branches: [main]
     paths:
       - '.github/workflows/_cf-worker-v2.yml'
+      - '.github/actionlint.yaml'
       - 'actions/cf-preview/**'
       - 'scripts/cf-preview/**'
 
@@ -28,19 +30,29 @@ jobs:
           node-version: 24
       - name: Install tooling deps
         run: cd actions/cf-preview && npm ci --ignore-scripts --no-audit --no-fund
-      - name: Workflow contract (skipped-ancestor gating, preview/production triggers)
+      - name: Workflow contract (DAG, gating matrix, credential isolation, locks, artifacts)
         run: |
           pip install --quiet pyyaml==6.0.1
           python3 scripts/cf-preview/test-workflow-contract.py
-      - name: Unit tests (identity, event matrix, preflight, URL, stale guard)
+      - name: Unit tests (identity, event/target matrix, preflight, migration target, URL, stale guard)
         run: node --test scripts/cf-preview/lib.test.mjs
-      - name: publish.sh behaviour (stub wrangler)
-        run: scripts/cf-preview/test-publish.sh
+      - name: deploy.sh behaviour, both targets (stub wrangler)
+        run: scripts/cf-preview/test-deploy.sh
+      - name: migrate.sh behaviour (stub wrangler)
+        run: scripts/cf-preview/test-migrate.sh
+      - name: Smoke verification, fail-closed (stub curl)
+        run: scripts/cf-preview/test-smoke.sh
+      - name: Run the real Migration/Deploy job steps with stubs (result propagation, stale runs, Release gate)
+        run: python3 scripts/cf-preview/test-jobs.py
+      - name: Env import is data, not code
+        run: scripts/cf-preview/test-parse-env.sh
       - name: Preview probe classification (stub curl)
         run: scripts/cf-preview/test-probe.sh
       - name: GitHub ledger / PR comment idempotency (stub gh)
         run: scripts/cf-preview/test-gh.sh
+      - name: shellcheck (warnings and above)
+        run: shellcheck -x -S warning -P SCRIPTDIR actions/cf-preview/*.sh scripts/cf-preview/*.sh
       - name: actionlint
         run: |
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
-          ./actionlint -color .github/workflows/_cf-worker-v2.yml
+          ./actionlint -color .github/workflows/_cf-worker-v2.yml .github/workflows/cf-worker-v2-ci.yml
