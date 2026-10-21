@@ -141,3 +141,90 @@ test('preflight: Preview binding without id is an error (Cloudflare 10021)', () 
   assert.equal(auditPreviewConfig(g).errors.length, 1);
   assert.deepEqual(auditPreviewConfig({ ...g, previews: {} }).errors.length, 1); // still no counterpart
 });
+
+// ---- v2 refactor: target resolution, migration target, production audit, env import ----
+import { auditProdConfig, d1ForTarget, migrationPlan, resolveTarget } from '../../actions/cf-preview/lib.mjs';
+import { parseEnvLines } from '../../actions/cf-preview/parse-env.mjs';
+
+test('resolveTarget: only trusted push/dispatch deploys; main=prod, branch=preview', () => {
+  const r = (o) => resolveTarget({ strategy: 'production-preview', ...o });
+  assert.equal(r({ event: 'push', ref: 'refs/heads/main' }), 'prod');
+  assert.equal(r({ event: 'push', ref: 'refs/heads/feat/x' }), 'preview');
+  assert.equal(r({ event: 'workflow_dispatch', ref: 'refs/heads/main' }), 'prod');
+  assert.equal(r({ event: 'pull_request', ref: 'refs/heads/feat/x' }), 'none');
+  assert.equal(r({ event: 'pull_request', ref: 'refs/heads/main' }), 'none');
+  assert.equal(r({ event: 'delete', ref: 'refs/heads/feat/x' }), 'none');
+  assert.equal(r({ event: 'push', ref: 'refs/tags/v1' }), 'none');
+  assert.equal(r({ event: 'push', ref: 'refs/heads/feat/x', previewOnPush: false }), 'none');
+  assert.equal(resolveTarget({ event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-only' }), 'none');
+  assert.equal(resolveTarget({ event: 'push', ref: 'refs/heads/main', strategy: 'production-only' }), 'prod');
+  // Hybrid persistent Dev is never a prod/preview target
+  assert.equal(resolveTarget({ event: 'workflow_dispatch', ref: 'refs/heads/dev', strategy: 'hybrid', devRef: 'refs/heads/dev', dispatchTarget: 'persistent-dev' }), 'none');
+});
+
+const D1CFG = {
+  name: 'blog',
+  d1_databases: [{ binding: 'DB', database_name: 'blog-db', database_id: 'PROD-ID', migrations_dir: 'db/migrations' }],
+  previews: { d1_databases: [{ binding: 'DB', database_name: 'blog-db-preview', database_id: 'PREV-ID', migrations_dir: 'db/migrations' }] },
+};
+const abs = (d) => `/app/${d}`;
+test('migrationPlan: prod and preview select different physical D1 with the same SQL dir', () => {
+  const p = migrationPlan(D1CFG, 'prod', { migrationsDirAbs: abs });
+  const v = migrationPlan(D1CFG, 'preview', { migrationsDirAbs: abs });
+  assert.equal(p.databaseId, 'PROD-ID');
+  assert.equal(v.databaseId, 'PREV-ID');
+  assert.equal(p.config.d1_databases[0].migrations_dir, v.config.d1_databases[0].migrations_dir);
+  assert.equal(v.config.d1_databases.length, 1);
+});
+test('migrationPlan: Preview D1 comes from previews.d1_databases, never env.dev', () => {
+  const cfg = { ...D1CFG, env: { dev: { d1_databases: [{ binding: 'DB', database_name: 'dev-db', database_id: 'DEV-ID' }] } } };
+  assert.equal(migrationPlan(cfg, 'preview', { migrationsDirAbs: abs }).databaseId, 'PREV-ID');
+});
+test('migrationPlan: fails closed (no D1, ambiguous, no id, shared across trust boundary)', () => {
+  assert.throws(() => migrationPlan({ name: 'x', previews: {} }, 'prod', { migrationsDirAbs: abs }), /No D1 binding/);
+  assert.throws(() => migrationPlan({ ...D1CFG, previews: {} }, 'preview', { migrationsDirAbs: abs }), /No D1 binding/);
+  const two = { ...D1CFG, d1_databases: [...D1CFG.d1_databases, { binding: 'B2', database_name: 'b2', database_id: 'X' }] };
+  assert.throws(() => migrationPlan(two, 'prod', { migrationsDirAbs: abs }), /Several D1 bindings/);
+  assert.equal(migrationPlan(two, 'prod', { binding: 'B2', migrationsDirAbs: abs }).databaseId, 'X');
+  assert.throws(() => migrationPlan({ ...D1CFG, d1_databases: [{ binding: 'DB', database_name: 'n' }] }, 'prod', { migrationsDirAbs: abs }), /explicit database_id/);
+  const shared = { ...D1CFG, previews: { d1_databases: [{ ...D1CFG.d1_databases[0] }] } };
+  assert.throws(() => migrationPlan(shared, 'preview', { migrationsDirAbs: abs }), /shared across trust boundaries/);
+  assert.throws(() => migrationPlan(shared, 'prod', { migrationsDirAbs: abs }), /shared across trust boundaries/);
+  assert.throws(() => d1ForTarget(D1CFG, 'dev'), /Unknown migration target/);
+});
+test('Worker without D1 has nothing to migrate (d1ForTarget empty)', () => {
+  assert.deepEqual(d1ForTarget({ name: 'static' }, 'prod'), []);
+  assert.deepEqual(d1ForTarget({ name: 'static' }, 'preview'), []);
+});
+
+test('auditProdConfig: generated Production config must not bind Preview resources', () => {
+  const src = { d1_databases: [{ binding: 'DB', database_id: 'PROD' }], r2_buckets: [{ binding: 'B', bucket_name: 'prod-b' }],
+    previews: { d1_databases: [{ binding: 'DB', database_id: 'PREV' }], r2_buckets: [{ binding: 'B', bucket_name: 'prev-b' }] } };
+  assert.deepEqual(auditProdConfig({ d1_databases: [{ binding: 'DB', database_id: 'PROD' }], r2_buckets: [{ binding: 'B', bucket_name: 'prod-b' }] }, src).errors, []);
+  const bad = auditProdConfig({ d1_databases: [{ binding: 'DB', database_id: 'PREV' }] }, src);
+  assert.match(bad.errors[0], /Preview resource PREV/);
+  // an adapter adding a Preview R2 bucket to the Production config is caught too
+  assert.equal(auditProdConfig({ r2_buckets: [{ binding: 'X', bucket_name: 'prev-b' }] }, src).errors.length, 1);
+});
+
+test('parseEnvLines: KEY=VALUE only, comments/blank skipped, unsafe input rejected', () => {
+  assert.deepEqual(parseEnvLines('A=1\n\n# c\nB=x=y\r\nC=').pairs, [['A', '1'], ['B', 'x=y'], ['C', '']]);
+  for (const bad of ['1A=x', 'A B=x', 'novalue', '=x', 'A=$(id)\u0000z', 'A-B=1']) {
+    assert.ok(parseEnvLines(bad).errors.length === 1 || /\$\(id\)/.test(bad), `rejected: ${bad}`);
+  }
+  // shell metacharacters are data, not code: they are preserved verbatim and never evaluated here
+  assert.deepEqual(parseEnvLines('URL=https://x/?a=1&b=$(whoami)`id`;rm').pairs, [['URL', 'https://x/?a=1&b=$(whoami)`id`;rm']]);
+});
+test('parseEnvLines: credentials, runner internals and loader variables cannot be set by callers', () => {
+  for (const n of ['CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ENV', 'GITHUB_ENV', 'GITHUB_PATH', 'PATH', 'NODE_OPTIONS', 'LD_PRELOAD', 'BASH_ENV', 'RUNNER_TEMP', 'GIT_SSH_COMMAND', 'SMOKE_PASSWORD']) {
+    assert.equal(parseEnvLines(`${n}=x`).pairs.length, 0, n);
+    assert.equal(parseEnvLines(`${n}=x`).errors.length, 1, n);
+  }
+  assert.equal(parseEnvLines('VITE_PUBLIC_URL=https://x').errors.length, 0);
+});
+
+test('migrationPlan keeps migrations_table / migrations_pattern and resolves the dir against the config', () => {
+  const cfg = { name: 'x', d1_databases: [{ binding: 'DB', database_name: 'n', database_id: 'I', migrations_dir: 'sql', migrations_table: 't', migrations_pattern: '*.sql' }] };
+  const d = migrationPlan(cfg, 'prod', { migrationsDirAbs: (x) => `/abs/${x}` }).config.d1_databases[0];
+  assert.deepEqual([d.migrations_dir, d.migrations_table, d.migrations_pattern], ['/abs/sql', 't', '*.sql']);
+});

@@ -1,0 +1,6 @@
+# actionlint 1.7.12 predates `concurrency.queue` (GitHub changelog 2026-05-07) and reports it as an unknown key.
+# Only that one message is ignored, only for the shared Worker workflow; everything else is still linted.
+paths:
+  .github/workflows/_cf-worker-v2.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'

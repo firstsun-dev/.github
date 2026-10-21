@@ -23,7 +23,7 @@ export function assertWranglerSupported(version) {
     throw new Error(`Cannot parse Wrangler version: ${JSON.stringify(version)}`);
   }
   if (compareVersions(version, MIN_WRANGLER) < 0) {
-    throw new Error(`Wrangler ${version} < ${MIN_WRANGLER}: Native Previews unsupported; refusing to fall back to Dev/Production`);
+    throw new Error(`Wrangler ${version} < ${MIN_WRANGLER}: unsupported (Native Previews, d1 migrations); refusing to fall back to Dev/Production`);
   }
 }
 
@@ -234,4 +234,85 @@ export function auditPreviewConfig(cfg, { allow = [], denyResources = [] } = {})
 /** Is `candidateSha` still the tip of the branch? Guards stale/out-of-order runs. */
 export function isStale({ runSha, branchTipSha }) {
   return !branchTipSha || runSha !== branchTipSha;
+}
+
+/**
+ * Which deployment target does this event deploy to? 'prod' | 'preview' | 'none'.
+ * Single source of truth shared by the Migration and Deploy jobs (they re-check it fail-closed in addition
+ * to their job-level `if`), so a mismatch between the two can never silently select Production.
+ */
+export function resolveTarget({ event, ref, strategy, previewOnPush = true, devRef = '', dispatchTarget = '' }) {
+  if (!String(ref).startsWith('refs/heads/')) return 'none'; // tags, refs/pull/*: never a deploy target
+  const r = classifyEvent({ event, ref, strategy, devRef, dispatchTarget });
+  if (r.action === 'production') return 'prod';
+  if (r.action === 'preview') return previewOnPush ? 'preview' : 'none';
+  return 'none';
+}
+
+/** D1 bindings the given target will use, straight from the project's SOURCE Wrangler config. */
+export function d1ForTarget(cfg, target) {
+  if (target === 'prod') return cfg.d1_databases ?? [];
+  if (target === 'preview') return cfg.previews?.d1_databases ?? [];
+  throw new Error(`Unknown migration target: ${target}`);
+}
+
+/**
+ * Pick the physical D1 for a Migration job and build a minimal Wrangler config that points ONLY at it.
+ * Native Preview D1 comes from `previews.d1_databases` (never the named `env.dev`). Fails closed when the
+ * target has no D1, an ambiguous choice, no explicit id, or when the Preview and Production databases are
+ * the same physical database.
+ */
+export function migrationPlan(cfg, target, { binding = '', migrationsDirAbs }) {
+  const all = d1ForTarget(cfg, target);
+  const pool = binding ? all.filter((b) => b.binding === binding) : all;
+  if (!pool.length) throw new Error(`No D1 binding${binding ? ` "${binding}"` : ''} declared for target ${target} (${target === 'preview' ? 'previews.d1_databases' : 'd1_databases'})`);
+  if (pool.length > 1) throw new Error(`Several D1 bindings for target ${target}; set d1_binding to one of: ${pool.map((b) => b.binding).join(', ')}`);
+  const db = pool[0];
+  if (!db.database_id || !db.database_name) throw new Error(`D1 binding ${db.binding} needs explicit database_id and database_name for target ${target}`);
+  const other = d1ForTarget(cfg, target === 'prod' ? 'preview' : 'prod');
+  if (other.some((o) => o.database_id === db.database_id || o.database_name === db.database_name)) {
+    throw new Error(`Target ${target} D1 ${db.database_name} is also declared for ${target === 'prod' ? 'Preview' : 'Production'}; refusing to migrate a database shared across trust boundaries`);
+  }
+  return {
+    binding: db.binding,
+    databaseName: db.database_name,
+    databaseId: db.database_id,
+    config: {
+      name: `${cfg.name ?? 'migrate'}-migrate`,
+      compatibility_date: cfg.compatibility_date ?? '2025-01-01',
+      d1_databases: [{
+        binding: db.binding,
+        database_name: db.database_name,
+        database_id: db.database_id,
+        // Keep every supported migration setting (migrations_table, migrations_pattern, ...) as the project wrote it.
+        ...Object.fromEntries(Object.entries(db).filter(([k]) => k.startsWith('migrations_') && k !== 'migrations_dir')),
+        migrations_dir: migrationsDirAbs(db.migrations_dir ?? 'migrations'),
+      }],
+    },
+  };
+}
+
+/** Resource ids declared at the top level of a config, per binding kind (flat set). */
+function topLevelResourceIds(cfg) {
+  const ids = new Set();
+  for (const [kind, ident] of Object.entries(RESOURCE_KINDS)) {
+    for (const b of cfg[kind] ?? []) ident(b).filter(Boolean).forEach((id) => ids.add(id));
+  }
+  return ids;
+}
+
+/**
+ * Production must never bind a Preview resource. `source` is the project's wrangler config, `effective`
+ * the build-generated one (Astro/other adapters can add bindings the source lacks).
+ */
+export function auditProdConfig(effective, source) {
+  const errors = [];
+  const previewIds = new Set();
+  for (const [kind, ident] of Object.entries(RESOURCE_KINDS)) {
+    for (const b of source.previews?.[kind] ?? []) ident(b).filter(Boolean).forEach((id) => previewIds.add(id));
+  }
+  for (const id of topLevelResourceIds(effective)) {
+    if (previewIds.has(id)) errors.push(`Production config binds Preview resource ${id}`);
+  }
+  return { errors, warnings: [] };
 }
