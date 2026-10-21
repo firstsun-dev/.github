@@ -315,6 +315,14 @@ export function migrationPlan(cfg, target, { binding = '', migrationsDirAbs, dev
   };
 }
 
+/** Do the Preview and Shared Dev targets name the same physical D1? (Previews not declared => false.) */
+export function sharedPreviewDevD1(cfg, { binding = '', devEnv = 'dev' } = {}) {
+  const pick = (list) => (binding ? list.filter((b) => b.binding === binding) : list);
+  const prev = pick(d1ForTarget(cfg, 'preview'));
+  const dev = pick(d1ForTarget(cfg, 'dev', { devEnv }));
+  return dev.some((d) => prev.some((p) => (d.database_id && d.database_id === p.database_id) || (d.database_name && d.database_name === p.database_name)));
+}
+
 /**
  * Audit the EFFECTIVE (adapter-generated) config of a Shared Dev build: it must target the expected Dev Worker
  * and must not bind any Production resource (top-level resources of the SOURCE config, plus denylist).

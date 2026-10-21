@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { dirname, resolve } from 'node:path';
 import {
   assertWranglerSupported, auditDevConfig, auditPreviewConfig, auditProdConfig, classifyEvent, extractPreviewUrl,
-  isStale, migrationPlan, previewIdentity, readConfig, resolveSharedDev, resolveTarget,
+  isStale, migrationPlan, previewIdentity, readConfig, resolveSharedDev, resolveTarget, sharedPreviewDevD1,
 } from './lib.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -64,10 +64,23 @@ try {
       }) });
       break;
     }
+    case 'd1-shared': {
+      out({ shared: String(sharedPreviewDevD1(readConfig(opt('config')), { binding: opt('binding'), devEnv: opt('dev-env', 'dev') })) });
+      break;
+    }
     case 'dev-config-check': {
-      const { errors } = auditDevConfig(readConfig(opt('effective')), readConfig(opt('source')), {
-        worker: opt('worker'), denyResources: list(opt('deny')),
-      });
+      // Worker identity is mandatory. Without an adapter-generated effective config, the named Wrangler
+      // environment of the source config (env.<dev-env>) is what `wrangler deploy --env` will use: audit that.
+      if (!opt('worker')) throw new Error('Shared Dev requires an expected Worker name (dev_worker_name)');
+      const source = readConfig(opt('source'));
+      let effective;
+      if (opt('effective')) effective = readConfig(opt('effective'));
+      else {
+        effective = source.env?.[opt('dev-env', 'dev')];
+        if (!effective) throw new Error(`No effective config was generated and the source config has no env.${opt('dev-env', 'dev')}`);
+        console.log(`::notice::No adapter-generated config; auditing source env.${opt('dev-env', 'dev')}`);
+      }
+      const { errors } = auditDevConfig(effective, source, { worker: opt('worker'), denyResources: list(opt('deny')) });
       for (const e of errors) console.log(`::error::${e}`);
       if (errors.length) process.exit(1);
       out({ dev_config: 'ok' });
@@ -110,7 +123,7 @@ try {
       out({ stale: String(isStale({ runSha: opt('sha'), branchTipSha: opt('tip') })) });
       break;
     default:
-      console.error('usage: cli.mjs identity|wrangler-check|extract-url|classify|resolve|resolve-dev|dev-config-check|preflight|migration-config|effective-config|audit-prod|stale');
+      console.error('usage: cli.mjs identity|wrangler-check|extract-url|classify|resolve|resolve-dev|d1-shared|dev-config-check|preflight|migration-config|effective-config|audit-prod|stale');
       process.exit(2);
   }
 } catch (e) {

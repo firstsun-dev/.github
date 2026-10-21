@@ -143,7 +143,7 @@ test('preflight: Preview binding without id is an error (Cloudflare 10021)', () 
 });
 
 // ---- v2 refactor: target resolution, migration target, production audit, env import ----
-import { auditDevConfig, auditProdConfig, d1ForTarget, migrationPlan, resolveSharedDev, resolveTarget } from '../../actions/cf-preview/lib.mjs';
+import { auditDevConfig, auditProdConfig, d1ForTarget, migrationPlan, resolveSharedDev, sharedPreviewDevD1, resolveTarget } from '../../actions/cf-preview/lib.mjs';
 import { parseEnvLines } from '../../actions/cf-preview/parse-env.mjs';
 
 test('resolveTarget: only trusted push/dispatch deploys; main=prod, branch=preview', () => {
@@ -282,4 +282,10 @@ test('auditDevConfig: effective config must target the Dev Worker and no Product
   const prodR2 = { ...ok, r2_buckets: [{ binding: 'B', bucket_name: 'prod-b' }] };
   assert.ok(auditDevConfig(prodR2, DEVCFG, { worker: 'blog-preview' }).errors.some((e) => /prod-b/.test(e)));
   assert.ok(auditDevConfig({ ...ok, r2_buckets: [{ binding: 'B', bucket_name: 'secret-b' }] }, DEVCFG, { denyResources: ['secret-b'] }).errors.length === 1);
+});
+test('sharedPreviewDevD1: same physical D1 detected; distinct or undeclared Preview is not shared', () => {
+  assert.equal(sharedPreviewDevD1(DEVCFG), true);
+  assert.equal(sharedPreviewDevD1({ ...DEVCFG, previews: {} }), false);
+  assert.equal(sharedPreviewDevD1({ ...DEVCFG, env: { dev: { d1_databases: [{ binding: 'DB', database_name: 'other', database_id: 'X' }] } } }), false);
+  assert.equal(sharedPreviewDevD1({ ...DEVCFG, env: {} }), false);
 });

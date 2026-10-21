@@ -419,7 +419,12 @@ check(dj["outputs"]["deployed_and_verified"].endswith("|| 'false' }}") and "step
 check("failure()" in byname["Dev — mark unverified"]["if"] and "steps.smoke.outcome == 'failure'" in byname["Dev — mark unverified"]["if"], "Dev smoke failure: job fails and the deployment is marked UNVERIFIED")
 check("steps.publish.outcome != 'success'" in byname["Dev — failed before publish"]["if"] and "unchanged" in byname["Dev — failed before publish"]["run"], "Dev build/audit/migration failure: explicit 'Dev unchanged' outcome")
 check("last-good" in byname["Dev recovery — find last known-good SHA"]["run"] and "manual recovery required" in byname["Dev recovery — find last known-good SHA"]["run"], "Dev recovery: finds the last known-good SHA or states manual recovery is required")
-check("Run remains FAILED" in byname["Dev recovery — redeploy last good and verify"]["run"] and "probe.sh" in byname["Dev recovery — redeploy last good and verify"]["run"], "Dev recovery: redeploys and probes the last good commit, run stays red")
+rec = byname["Dev recovery — redeploy last good with the full verification"]
+rr = rec["run"]
+check(rr.index("dev-config-check") < rr.index('bash -eo pipefail -c "$DEPLOY_CMD"') < rr.index("smoke.sh") and "Run remains FAILED" in rr and "BUILD_CMD" in rr,
+      "Dev recovery: last-good tree gets build, Worker-identity/Production-resource audit, publish, then the FULL smoke; run stays red")
+check(rec["env"]["EXPECTED_SHA"] == "${{ steps.good.outputs.sha }}" and rec["env"]["SHA_PATH"] == "${{ inputs.sha_path }}" and rec["env"]["SMOKE_CMD"] == "${{ inputs.dev_smoke_cmd }}" and rec["env"]["DEPLOY_TARGET"] == "dev" and rec["env"]["TARGET_URL"] == "${{ inputs.app_url_dev }}",
+      "Dev recovery smoke checks the LAST-GOOD sha at sha_path and runs dev_smoke_cmd against app_url_dev")
 check("Recovery FAILED" in byname["Dev recovery failed"]["run"] or "recovery FAILED" in byname["Dev recovery failed"]["run"], "Dev recovery failure is reported explicitly")
 # retention
 all_run = "\n".join(s_.get("run", "") for j in jobs.values() for s_ in j.get("steps", []))
@@ -428,5 +433,17 @@ check(not re.search(r"CLOUDFLARE_DEV|dev-deploy|shared_dev|app_url_dev|dev_deplo
 check(runs("persistent-dev", scenario("workflow_dispatch", "refs/heads/dev", **dev_ok)) and jobs["persistent-dev"]["steps"][-2]["env"]["CMD"] == "${{ inputs.dev_deploy_cmd }}", "persistent-dev manual dispatch is unchanged and still runs dev_deploy_cmd")
 check("shared_dev_on_branch_push" not in yaml.dump(jobs["persistent-dev"]), "persistent-dev does not depend on the automatic Shared Dev switch")
 check("playwright" not in dtxt.lower() and sum(1 for s_ in dj["steps"] if "upload-artifact" in str(s_.get("uses", ""))) == 0, "Shared Dev installs no browsers and uploads no artifacts")
+
+# 8.7 review fixes (PR #64): shared-D1 guard, mandatory build, mandatory identity
+guard_d1 = byname["Shared-D1 guard (a failed Preview migration must not be followed by a Dev migration)"]
+check(dn.index(guard_d1["name"]) < ix("Start Dev ledger entry") < ix("Dev build") and dn.index(guard_d1["name"]) < ix("Apply pending Dev migrations"), "shared-D1 guard runs before the Dev build, ledger and any Dev migration")
+check(guard_d1["env"]["PREVIEW_MIGRATE_RESULT"] == "${{ needs.migrate.result }}" and "d1-shared" in guard_d1["run"] and "failure" in guard_d1["run"] and "cancelled" in guard_d1["run"] and "exit 1" in guard_d1["run"],
+      "a failed/cancelled Preview Migration on the D1 that Shared Dev also uses stops Dev before it mutates anything")
+check("needs.migrate.result" not in dj["if"], "...while Shared Dev stays independent of the Preview channel at the job level (distinct D1 or Preview off still deploys)")
+val = byname["Validate Shared Dev target, configuration and credentials (fail closed)"]
+check("dev_build_cmd" in val["env"]["BUILD_CMD"] and 'D1_ON" = true' in val["run"] and "requires dev_build_cmd" in val["run"], "Shared Dev with d1_migrations requires dev_build_cmd (build precedes the Dev D1 migration)")
+check("requires dev_worker_name" in val["run"], "Shared Dev requires dev_worker_name")
+aud = byname["Audit effective Wrangler config (Dev Worker identity, no Production resources)"]
+check(aud["if"] == "env.STALE != 'true'" and "dev-config-check" in aud["run"], "the Worker identity / resource audit is unconditional for every non-stale Shared Dev run")
 
 sys.exit(fail)

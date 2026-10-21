@@ -1087,6 +1087,9 @@ jobs:
           DISPATCH: ${{ inputs.dispatch_target }}
           DEPLOY_CMD: ${{ inputs.dev_deploy_cmd }}
           DEV_URL: ${{ inputs.app_url_dev }}
+          DEV_WORKER: ${{ inputs.dev_worker_name }}
+          BUILD_CMD: ${{ inputs.dev_build_cmd }}
+          D1_ON: ${{ inputs.d1_migrations }}
         run: |
           TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
           RESOLVED="$(node "$TOOLS/cli.mjs" resolve-dev --event "$EVENT" --ref "$BRANCH_REF" --strategy "$STRATEGY" \
@@ -1094,6 +1097,10 @@ jobs:
           [ "$RESOLVED" = dev ] || { echo "::error::target mismatch (resolved '$RESOLVED', job 'dev'); refusing to deploy"; exit 1; }
           [ -n "$DEPLOY_CMD" ] || { echo "::error::shared_dev_on_branch_push requires dev_deploy_cmd"; exit 1; }
           [ -n "$DEV_URL" ] || { echo "::error::shared_dev_on_branch_push requires app_url_dev (a Dev deployment without a probe is not verified)"; exit 1; }
+          [ -n "$DEV_WORKER" ] || { echo "::error::shared_dev_on_branch_push requires dev_worker_name (the Dev Worker identity is always verified)"; exit 1; }
+          if [ "$D1_ON" = true ] && [ -z "$BUILD_CMD" ]; then
+            echo "::error::Shared Dev with d1_migrations requires dev_build_cmd: the Dev build must succeed BEFORE the Dev D1 is migrated"; exit 1
+          fi
           if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
             echo "::error::Dev credentials not provided (CLOUDFLARE_DEV_API_TOKEN / CLOUDFLARE_DEV_ACCOUNT_ID); refusing to fall back to other credentials"; exit 1
           fi
@@ -1107,6 +1114,22 @@ jobs:
           BINDING: ${{ inputs.d1_binding }}
           DEV_ENV: ${{ inputs.dev_wrangler_env }}
         run: node "$GITHUB_WORKSPACE/$TOOLS_DIR/cli.mjs" migration-config --config "$CFG" --target dev --dev-env "$DEV_ENV" --binding "$BINDING" --out "$RUNNER_TEMP/migrate-dev-check.json" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Shared-D1 guard (a failed Preview migration must not be followed by a Dev migration)
+        if: env.STALE != 'true' && inputs.d1_migrations
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CFG: ${{ inputs.wrangler_config }}
+          BINDING: ${{ inputs.d1_binding }}
+          DEV_ENV: ${{ inputs.dev_wrangler_env }}
+          PREVIEW_MIGRATE_RESULT: ${{ needs.migrate.result }}
+        run: |
+          SHARED="$(node "$GITHUB_WORKSPACE/$TOOLS_DIR/cli.mjs" d1-shared --config "$CFG" --binding "$BINDING" --dev-env "$DEV_ENV" | sed -n 's/^shared=//p')"
+          echo "Preview and Dev share one physical D1: $SHARED (Preview migration result: $PREVIEW_MIGRATE_RESULT)"
+          if [ "$SHARED" = true ] && { [ "$PREVIEW_MIGRATE_RESULT" = failure ] || [ "$PREVIEW_MIGRATE_RESULT" = cancelled ]; }; then
+            echo "::error::Preview Migration $PREVIEW_MIGRATE_RESULT on the D1 that Shared Dev also uses; refusing to touch Dev (D1 state is unknown). Fix the migration and push again."
+            echo "### ❌ Shared Dev blocked — Preview migration $PREVIEW_MIGRATE_RESULT on the shared D1; Dev and its D1 unchanged." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
       - name: Start Dev ledger entry
         if: env.STALE != 'true'
         id: dep
@@ -1127,17 +1150,17 @@ jobs:
           VITE_APP_VERSION: ${{ inputs.app_version }}
         run: bash -eo pipefail -c "$CMD"
       - name: Audit effective Wrangler config (Dev Worker identity, no Production resources)
-        if: env.STALE != 'true' && inputs.dev_worker_name != ''
+        if: env.STALE != 'true'
         working-directory: ${{ inputs.app_path }}
         env:
           CFG: ${{ inputs.wrangler_config }}
           WORKER: ${{ inputs.dev_worker_name }}
           DENY: ${{ inputs.preview_deny_resources }}
+          DEV_ENV: ${{ inputs.dev_wrangler_env }}
         run: |
           TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
           EFFECTIVE="$(node "$TOOLS/cli.mjs" effective-config --dir . | sed -n 's/^effective_config=//p')"
-          [ -n "$EFFECTIVE" ] || { echo "::error::dev_worker_name is set but the build produced no effective Wrangler config (.wrangler/deploy/config.json); cannot verify the Dev Worker identity. Set dev_build_cmd to a build that emits it, or unset dev_worker_name."; exit 1; }
-          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY"
+          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY" --dev-env "$DEV_ENV"
       - name: Stale-SHA guard (before migration and publish)
         if: env.STALE != 'true'
         run: |
@@ -1229,7 +1252,7 @@ jobs:
           ref: ${{ steps.good.outputs.sha }}
           path: recover
           persist-credentials: false
-      - name: Dev recovery — redeploy last good and verify
+      - name: Dev recovery — redeploy last good with the full verification
         if: failure() && steps.good.outputs.sha != ''
         id: recover
         working-directory: recover/${{ inputs.app_path }}
@@ -1238,13 +1261,32 @@ jobs:
           DEPLOY_CMD: ${{ inputs.dev_deploy_cmd }}
           VITE_APP_ENV: dev
           VITE_APP_VERSION: ${{ inputs.app_version }}
+          CFG: ${{ inputs.wrangler_config }}
+          WORKER: ${{ inputs.dev_worker_name }}
+          DENY: ${{ inputs.preview_deny_resources }}
+          DEV_ENV: ${{ inputs.dev_wrangler_env }}
+          GOOD_SHA: ${{ steps.good.outputs.sha }}
           TARGET_URL: ${{ inputs.app_url_dev }}
+          DEPLOY_TARGET: dev
+          EXPECTED_SHA: ${{ steps.good.outputs.sha }}
+          SMOKE_CMD: ${{ inputs.dev_smoke_cmd }}
+          SHA_PATH: ${{ inputs.sha_path }}
+          ACCESS_TARGETS: ${{ inputs.access_protected_targets }}
+          SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
+          SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
+          NO_PROXY: '*'
         run: |
+          # Same gates as the normal publish, applied to the LAST-GOOD tree: build, Worker identity and
+          # Production-resource audit, publish, then the full smoke (probe, sha_path for the good SHA, dev_smoke_cmd).
+          TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
+          export TOOLS_DIR="$TOOLS"
           pnpm install --frozen-lockfile
           [ -z "$BUILD_CMD" ] || bash -eo pipefail -c "$BUILD_CMD"
+          EFFECTIVE="$(node "$TOOLS/cli.mjs" effective-config --dir . | sed -n 's/^effective_config=//p')"
+          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY" --dev-env "$DEV_ENV"
           bash -eo pipefail -c "$DEPLOY_CMD"
-          "$GITHUB_WORKSPACE/$TOOLS_DIR/probe.sh"
-          echo "### ♻️ Recovered Shared Dev to last good commit \`${{ steps.good.outputs.sha }}\`. Run remains FAILED for the bad commit." >> "$GITHUB_STEP_SUMMARY"
+          "$TOOLS/smoke.sh" >/dev/null
+          echo "### ♻️ Recovered and fully re-verified Shared Dev at last good commit \`$GOOD_SHA\`. Run remains FAILED for the bad commit. D1 migrations (if any) were NOT reverted." >> "$GITHUB_STEP_SUMMARY"
       - name: Dev recovery failed
         if: failure() && steps.good.outputs.sha != '' && steps.recover.outcome == 'failure'
         run: echo "### 🚨 Automatic recovery FAILED — Shared Dev serves unverified code. Push a fix from any branch." >> "$GITHUB_STEP_SUMMARY"
