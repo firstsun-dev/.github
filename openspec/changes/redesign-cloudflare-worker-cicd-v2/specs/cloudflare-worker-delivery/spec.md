@@ -1,5 +1,8 @@
 # Cloudflare Worker Delivery Capability — v2 Delta Specification
 
+> **Historical v2 contract / partially implemented (2026-10-21).** These v2 requirements describe opt-in v2 callers only; the requirements and observed shipped behavior are intentionally preserved. Further architecture changes and unfinished implementation/consumer rollout are specified by [vNext OpenSpec (PR #57)](https://github.com/firstsun-dev/.github/pull/57). They do **not** retroactively change v2/v1 consumers. The target vNext contract uses parallel CI/E2E, separate Migration and unified Prod/Preview Deploy.
+
+
 These requirements apply only to **opt-in v2** callers. Current v1/v1.5.0 delivery requirements remain valid for existing callers.
 
 ## ADDED Requirements

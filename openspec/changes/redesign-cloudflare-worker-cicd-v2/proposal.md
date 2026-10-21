@@ -1,5 +1,8 @@
 # Proposal: Cloudflare Worker CI/CD v2 — branch-push Native Previews and Hybrid Delivery
 
+> **Lifecycle status (2026-10-21): partially delivered / maintenance-only.** Shipped v2 Native Preview and release behavior is retained for existing consumers; this proposal is a **historical v2 contract**, not the active design for further CI/CD refactoring. Unfinished v2 implementation, consumer rollout and validation work is assigned to [vNext OpenSpec (PR #57)](https://github.com/firstsun-dev/.github/pull/57), with an explicit [task handoff](./tasks.md). See [v2 documentation](../../../docs/cf-worker-v2.md) for currently released behavior. No v1/v2 consumer is automatically migrated.
+
+
 ## Why
 
 The published `_cf-worker-template.yml` v1/v1.5.0 uploads a version and then deploys **every non-main branch push** to a shared `dev` Worker. Blog's opt-in Aliased Version Preview URL is branch-specific, but data bindings still point at that shared Dev environment. Multiple branches can overwrite the shared Dev endpoint, share D1 data, and mutate shared resources. Native Worker Previews (Wrangler >= 4.135.0) offer a different, branch-aware isolation contract.
