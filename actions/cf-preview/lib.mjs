@@ -249,10 +249,25 @@ export function resolveTarget({ event, ref, strategy, previewOnPush = true, devR
   return 'none';
 }
 
+/**
+ * Does this event deploy the SHARED persistent Dev Worker? 'dev' | 'none'.
+ * Independent of the Native Preview channel: only the Shared Dev switch matters. Never main (Production),
+ * never a PR / delete / tag, never the manual persistent-dev dispatch, never a production-only Worker.
+ */
+export function resolveSharedDev({ event, ref, strategy, sharedDevOnPush = false, dispatchTarget = '' }) {
+  if (!STRATEGIES.includes(strategy)) throw new Error(`Unknown deployment_strategy: ${strategy}`);
+  if (!sharedDevOnPush || strategy === 'production-only') return 'none';
+  if (!String(ref).startsWith('refs/heads/') || ref === 'refs/heads/main') return 'none';
+  if (event === 'push') return 'dev';
+  if (event === 'workflow_dispatch' && dispatchTarget !== 'persistent-dev') return 'dev';
+  return 'none';
+}
+
 /** D1 bindings the given target will use, straight from the project's SOURCE Wrangler config. */
-export function d1ForTarget(cfg, target) {
+export function d1ForTarget(cfg, target, { devEnv = 'dev' } = {}) {
   if (target === 'prod') return cfg.d1_databases ?? [];
   if (target === 'preview') return cfg.previews?.d1_databases ?? [];
+  if (target === 'dev') return cfg.env?.[devEnv]?.d1_databases ?? []; // the named Wrangler environment, never top-level
   throw new Error(`Unknown migration target: ${target}`);
 }
 
@@ -262,16 +277,24 @@ export function d1ForTarget(cfg, target) {
  * target has no D1, an ambiguous choice, no explicit id, or when the Preview and Production databases are
  * the same physical database.
  */
-export function migrationPlan(cfg, target, { binding = '', migrationsDirAbs }) {
-  const all = d1ForTarget(cfg, target);
+export function migrationPlan(cfg, target, { binding = '', migrationsDirAbs, devEnv = 'dev' }) {
+  const all = d1ForTarget(cfg, target, { devEnv });
   const pool = binding ? all.filter((b) => b.binding === binding) : all;
-  if (!pool.length) throw new Error(`No D1 binding${binding ? ` "${binding}"` : ''} declared for target ${target} (${target === 'preview' ? 'previews.d1_databases' : 'd1_databases'})`);
+  if (!pool.length) throw new Error(`No D1 binding${binding ? ` "${binding}"` : ''} declared for target ${target} (${target === 'preview' ? 'previews.d1_databases' : target === 'dev' ? `env.${devEnv}.d1_databases` : 'd1_databases'})`);
   if (pool.length > 1) throw new Error(`Several D1 bindings for target ${target}; set d1_binding to one of: ${pool.map((b) => b.binding).join(', ')}`);
   const db = pool[0];
   if (!db.database_id || !db.database_name) throw new Error(`D1 binding ${db.binding} needs explicit database_id and database_name for target ${target}`);
+  // Production is never shared with a non-Production target. Preview and Shared Dev MAY name the same physical
+  // D1 (both are non-Production); the run order and the workflow concurrency group keep their migrations apart.
   const other = d1ForTarget(cfg, target === 'prod' ? 'preview' : 'prod');
   if (other.some((o) => o.database_id === db.database_id || o.database_name === db.database_name)) {
     throw new Error(`Target ${target} D1 ${db.database_name} is also declared for ${target === 'prod' ? 'Preview' : 'Production'}; refusing to migrate a database shared across trust boundaries`);
+  }
+  if (target === 'prod') {
+    const dev = d1ForTarget(cfg, 'dev', { devEnv });
+    if (dev.some((o) => o.database_id === db.database_id || o.database_name === db.database_name)) {
+      throw new Error(`Target prod D1 ${db.database_name} is also declared for Dev; refusing to migrate a database shared across trust boundaries`);
+    }
   }
   return {
     binding: db.binding,
@@ -290,6 +313,26 @@ export function migrationPlan(cfg, target, { binding = '', migrationsDirAbs }) {
       }],
     },
   };
+}
+
+/**
+ * Audit the EFFECTIVE (adapter-generated) config of a Shared Dev build: it must target the expected Dev Worker
+ * and must not bind any Production resource (top-level resources of the SOURCE config, plus denylist).
+ */
+export function auditDevConfig(effective, source, { worker = '', denyResources = [] } = {}) {
+  const errors = [];
+  if (worker && effective.name !== worker) errors.push(`effective Wrangler config targets Worker "${effective.name}", expected the Shared Dev Worker "${worker}"`);
+  const prod = topLevelResourceIds(source);
+  const deny = new Set(denyResources);
+  for (const [kind, ident] of Object.entries(RESOURCE_KINDS)) {
+    for (const b of effective[kind] ?? []) {
+      for (const id of ident(b).filter(Boolean)) {
+        if (prod.has(id)) errors.push(`${kind}:${bindingKey(kind, b)}: Shared Dev binds the Production resource ${id}`);
+        else if (deny.has(id)) errors.push(`${kind}:${bindingKey(kind, b)}: Shared Dev binds denylisted Production resource ${id}`);
+      }
+    }
+  }
+  return { errors };
 }
 
 /** Resource ids declared at the top level of a config, per binding kind (flat set). */

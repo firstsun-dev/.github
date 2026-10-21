@@ -143,7 +143,7 @@ test('preflight: Preview binding without id is an error (Cloudflare 10021)', () 
 });
 
 // ---- v2 refactor: target resolution, migration target, production audit, env import ----
-import { auditProdConfig, d1ForTarget, migrationPlan, resolveTarget } from '../../actions/cf-preview/lib.mjs';
+import { auditDevConfig, auditProdConfig, d1ForTarget, migrationPlan, resolveSharedDev, resolveTarget } from '../../actions/cf-preview/lib.mjs';
 import { parseEnvLines } from '../../actions/cf-preview/parse-env.mjs';
 
 test('resolveTarget: only trusted push/dispatch deploys; main=prod, branch=preview', () => {
@@ -190,7 +190,7 @@ test('migrationPlan: fails closed (no D1, ambiguous, no id, shared across trust 
   const shared = { ...D1CFG, previews: { d1_databases: [{ ...D1CFG.d1_databases[0] }] } };
   assert.throws(() => migrationPlan(shared, 'preview', { migrationsDirAbs: abs }), /shared across trust boundaries/);
   assert.throws(() => migrationPlan(shared, 'prod', { migrationsDirAbs: abs }), /shared across trust boundaries/);
-  assert.throws(() => d1ForTarget(D1CFG, 'dev'), /Unknown migration target/);
+  assert.throws(() => d1ForTarget(D1CFG, 'staging'), /Unknown migration target/);
 });
 test('Worker without D1 has nothing to migrate (d1ForTarget empty)', () => {
   assert.deepEqual(d1ForTarget({ name: 'static' }, 'prod'), []);
@@ -227,4 +227,59 @@ test('migrationPlan keeps migrations_table / migrations_pattern and resolves the
   const cfg = { name: 'x', d1_databases: [{ binding: 'DB', database_name: 'n', database_id: 'I', migrations_dir: 'sql', migrations_table: 't', migrations_pattern: '*.sql' }] };
   const d = migrationPlan(cfg, 'prod', { migrationsDirAbs: (x) => `/abs/${x}` }).config.d1_databases[0];
   assert.deepEqual([d.migrations_dir, d.migrations_table, d.migrations_pattern], ['/abs/sql', 't', '*.sql']);
+});
+
+// ---- Shared Dev channel (independent of Native Preview) ----
+test('resolveSharedDev: non-main push/dispatch only, switch required, never production-only', () => {
+  const r = (o) => resolveSharedDev({ strategy: 'production-preview', sharedDevOnPush: true, ...o });
+  assert.equal(r({ event: 'push', ref: 'refs/heads/feat/x' }), 'dev');
+  assert.equal(r({ event: 'push', ref: 'refs/heads/feat/y' }), 'dev'); // every branch targets the same Dev
+  assert.equal(r({ event: 'workflow_dispatch', ref: 'refs/heads/feat/x' }), 'dev');
+  assert.equal(r({ event: 'push', ref: 'refs/heads/main' }), 'none');
+  assert.equal(r({ event: 'push', ref: 'refs/tags/v1' }), 'none');
+  assert.equal(r({ event: 'pull_request', ref: 'refs/heads/feat/x' }), 'none');
+  assert.equal(r({ event: 'delete', ref: 'refs/heads/feat/x' }), 'none'); // branch deletion never touches Dev
+  assert.equal(r({ event: 'workflow_dispatch', ref: 'refs/heads/dev', dispatchTarget: 'persistent-dev' }), 'none'); // manual path stays separate
+  assert.equal(r({ event: 'push', ref: 'refs/heads/feat/x', sharedDevOnPush: false }), 'none');
+  assert.equal(r({ event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-only' }), 'none');
+});
+test('four toggle combinations resolve independently', () => {
+  const both = (feature, dev) => [
+    resolveTarget({ event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-preview', previewOnPush: feature }),
+    resolveSharedDev({ event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-preview', sharedDevOnPush: dev }),
+  ];
+  assert.deepEqual(both(true, true), ['preview', 'dev']);
+  assert.deepEqual(both(true, false), ['preview', 'none']);
+  assert.deepEqual(both(false, true), ['none', 'dev']);
+  assert.deepEqual(both(false, false), ['none', 'none']);
+  // main is always Production, whatever the switches say
+  assert.equal(resolveTarget({ event: 'push', ref: 'refs/heads/main', strategy: 'production-preview', previewOnPush: false }), 'prod');
+});
+const DEVCFG = {
+  name: 'blog',
+  d1_databases: [{ binding: 'DB', database_name: 'blog-db', database_id: 'PROD-ID', migrations_dir: 'm' }],
+  r2_buckets: [{ binding: 'B', bucket_name: 'prod-b' }],
+  previews: { d1_databases: [{ binding: 'DB', database_name: 'blog-test', database_id: 'TEST-ID', migrations_dir: 'm' }] },
+  env: { dev: { name: 'blog-preview', d1_databases: [{ binding: 'DB', database_name: 'blog-test', database_id: 'TEST-ID', migrations_dir: 'm' }] } },
+};
+test('migrationPlan(dev): reads env.<dev>.d1_databases; may equal the Preview D1, never Production', () => {
+  const dev = migrationPlan(DEVCFG, 'dev', { migrationsDirAbs: abs });
+  const prev = migrationPlan(DEVCFG, 'preview', { migrationsDirAbs: abs });
+  assert.equal(dev.databaseId, 'TEST-ID');
+  assert.equal(dev.databaseId, prev.databaseId); // same physical D1 for both non-Production channels is accepted
+  assert.equal(migrationPlan(DEVCFG, 'prod', { migrationsDirAbs: abs }).databaseId, 'PROD-ID');
+  const bad = { ...DEVCFG, env: { dev: { d1_databases: [DEVCFG.d1_databases[0]] } } };
+  assert.throws(() => migrationPlan(bad, 'dev', { migrationsDirAbs: abs }), /shared across trust boundaries/);
+  assert.throws(() => migrationPlan({ ...DEVCFG, env: {} }, 'dev', { migrationsDirAbs: abs }), /No D1 binding.*env\.dev\.d1_databases/); // no top-level (Production) fallback
+  assert.equal(migrationPlan({ ...DEVCFG, env: { qa: DEVCFG.env.dev } }, 'dev', { devEnv: 'qa', migrationsDirAbs: abs }).databaseId, 'TEST-ID');
+});
+test('auditDevConfig: effective config must target the Dev Worker and no Production resource', () => {
+  const ok = { name: 'blog-preview', d1_databases: [{ binding: 'DB', database_id: 'TEST-ID', database_name: 'blog-test' }], r2_buckets: [{ binding: 'B', bucket_name: 'dev-b' }] };
+  assert.deepEqual(auditDevConfig(ok, DEVCFG, { worker: 'blog-preview' }).errors, []);
+  assert.match(auditDevConfig({ ...ok, name: 'blog' }, DEVCFG, { worker: 'blog-preview' }).errors[0], /expected the Shared Dev Worker "blog-preview"/);
+  const prodD1 = { ...ok, d1_databases: [{ binding: 'DB', database_id: 'PROD-ID', database_name: 'blog-db' }] };
+  assert.ok(auditDevConfig(prodD1, DEVCFG, { worker: 'blog-preview' }).errors.some((e) => /Production resource PROD-ID/.test(e)));
+  const prodR2 = { ...ok, r2_buckets: [{ binding: 'B', bucket_name: 'prod-b' }] };
+  assert.ok(auditDevConfig(prodR2, DEVCFG, { worker: 'blog-preview' }).errors.some((e) => /prod-b/.test(e)));
+  assert.ok(auditDevConfig({ ...ok, r2_buckets: [{ binding: 'B', bucket_name: 'secret-b' }] }, DEVCFG, { denyResources: ['secret-b'] }).errors.length === 1);
 });

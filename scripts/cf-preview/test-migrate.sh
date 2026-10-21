@@ -33,6 +33,12 @@ migrations_dir = "db/migrations"
 binding = "DB"
 database_name = "dev-db"
 database_id = "DEV-ID"
+migrations_dir = "db/migrations"
+[[env.qa.d1_databases]]
+binding = "DB"
+database_name = "qa-db"
+database_id = "QA-ID"
+migrations_dir = "db/migrations"
 TOML
 export PATH="$T/bin:$PATH" STUB_LOG="$T/log" TOOLS_DIR="$ROOT/actions/cf-preview" APP_DIR="$T/app"
 fail=0; ok(){ echo "PASS: $1"; }; bad(){ echo "FAIL: $1"; fail=1; }
@@ -47,6 +53,13 @@ grep -q 'migrations apply DB --remote' "$T/log" && ok "prod: uses remote migrati
 grep -q '"database_id": "PREV-ID"' "$T/log" && ! grep -q 'PROD-ID\|DEV-ID' "$T/log" && ok "preview: targets previews.d1_databases, not Production and not env.dev" || bad "preview D1 selection"
 echo "$OUT" | grep -qx 'd1_name=prev-db' && ok "preview: reports the Preview database" || bad "preview d1_name"
 grep -o '"migrations_dir": "[^"]*"' "$T/app/.wrangler/migrate.preview.json" | grep -q "$T/app/db/migrations" && ok "preview: same project-owned migrations_dir as prod" || bad "migrations_dir"
+
+: > "$T/log"; OUT="$(TARGET=dev "$M" 2>/dev/null)"
+grep -q '"database_id": "DEV-ID"' "$T/log" && ! grep -q 'PROD-ID\|PREV-ID' "$T/log" && ok "dev: targets env.dev.d1_databases, not Production and not previews" || bad "dev D1 selection"
+echo "$OUT" | grep -qx 'd1_name=dev-db' && ok "dev: reports the Dev database" || bad "dev d1_name"
+: > "$T/log"; DEV_ENV=qa TARGET=dev "$M" >/dev/null 2>&1
+grep -q '"database_id": "QA-ID"' "$T/log" && ! grep -q 'DEV-ID' "$T/log" && ok "dev: DEV_ENV selects the named Wrangler environment" || bad "DEV_ENV"
+DEV_ENV=missing TARGET=dev "$M" >/dev/null 2>&1 && bad "dev without env D1 accepted (Production fallback?)" || ok "dev: an environment without D1 fails closed (no top-level/Production fallback)"
 
 : > "$T/log"; OUT="$(STUB_PENDING=0 TARGET=preview "$M" 2>/dev/null)"
 echo "$OUT" | grep -qx 'pending=false' && ok "no pending migration: succeeds as a no-op" || bad "no-op skip"

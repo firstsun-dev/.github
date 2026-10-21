@@ -45,15 +45,16 @@ Detect Changes (monorepo only — the CALLER runs _detect-changes.yml and gates 
 | Group | Inputs |
 |---|---|
 | Identity | `tools_ref` (must equal the ref the caller pins), `app_name`, `app_path`, `app_version`, `runner`, `wrangler_config` |
-| Strategy | `deployment_strategy` (`production-preview` \| `hybrid` \| `production-only`), `preview_on_branch_push`, `preview_worker_name` |
+| Strategy | `deployment_strategy` (`production-preview` \| `hybrid` \| `production-only`), `preview_on_branch_push`, `shared_dev_on_branch_push` (default `false`), `preview_worker_name` |
 | Validation | `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `test_integration_cmd`, `build_cmd` (required), `ci_env`, `use_mailpit` |
 | E2E | `test_e2e_cmd`, `test_e2e_setup_cmd`, `test_e2e_build_cmd`, `test_e2e_env`, `test_e2e_variants` |
 | Deploy | `build_env_prod`, `build_env_preview`, `smoke_cmd`, `smoke_env`, `sha_path`, `app_url_prod`, `access_protected_targets`, `production_rollback_policy`, `preview_binding_allow`, `preview_deny_resources` |
 | Migration | `d1_migrations`, `d1_binding`, `d1_lock_scope` (no command override) |
 | Release | `release_cmd` (+ secret `RELEASE_TOKEN`) |
 | Hybrid | `persistent_dev_ref`, `dev_deploy_cmd`, `dev_smoke_cmd`, `dispatch_target` |
+| Shared Dev | `shared_dev_on_branch_push`, `app_url_dev`, `dev_deploy_cmd`, `dev_smoke_cmd`, `build_env_dev`, `dev_build_cmd`, `dev_wrangler_env` (default `dev`), `dev_worker_name`; reuses `d1_migrations`, `d1_binding`, `sha_path`, `smoke_env`, `access_protected_targets`, `preview_deny_resources` |
 
-Outputs: `deploy_url`, `deploy_target`, `version_id` (prod only). The internal `deployed_and_verified` Deploy output is what gates Release. Secrets: `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` (prod), `CLOUDFLARE_PREVIEW_API_TOKEN/ACCOUNT_ID`, `CLOUDFLARE_DEV_*`, `PREVIEW_SECRETS`, `SMOKE_USERNAME/PASSWORD`, `RELEASE_TOKEN`.
+Outputs: `deploy_url`, `deploy_target`, `version_id` (prod only), `dev_url` (Shared Dev). The internal `deployed_and_verified` Deploy output is what gates Release. Secrets: `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` (prod), `CLOUDFLARE_PREVIEW_API_TOKEN/ACCOUNT_ID`, `CLOUDFLARE_DEV_*`, `PREVIEW_SECRETS`, `SMOKE_USERNAME/PASSWORD`, `RELEASE_TOKEN`.
 
 `*_env` inputs are `KEY=VALUE` lines imported by `actions/cf-preview/parse-env.mjs` **from an environment variable** (never interpolated into a script). It rejects malformed lines and refuses `CLOUDFLARE_*`, `GITHUB_*`, `RUNNER_*`, `PATH`, `NODE_OPTIONS`, `LD_*`, `BASH_ENV`, `GIT_*`, `SMOKE_*` credentials, etc.; all-or-nothing. Application variable names remain consumer-owned. Command inputs are passed through `env:` and run with `bash -c "$CMD"`.
 
@@ -70,6 +71,35 @@ Outputs: `deploy_url`, `deploy_target`, `version_id` (prod only). The internal `
 | `test_e2e_setup_cmd` doing the build | `test_e2e_setup_cmd` + `test_e2e_build_cmd` |
 | output `preview_url` | `deploy_url` (+ `deploy_target`) |
 | `actions/cf-preview/publish.sh` | `deploy.sh` (both targets) |
+
+## Non-main channels: Feature Preview and Shared Dev
+
+Two independent switches decide what a non-main push deploys. Neither requires the other; main always follows the Production path.
+
+| `preview_on_branch_push` | `shared_dev_on_branch_push` | Non-main push |
+|---|---|---|
+| true | true | Native Preview **and** Shared Dev |
+| true | false | Native Preview only (default for existing callers) |
+| false | true | Shared Dev only |
+| false | false | validation only |
+
+* **Feature Native Preview** — unchanged: `Migration` → `Deploy`, one stable URL per branch.
+* **Shared Dev** — job `dev-deploy` ("Shared Dev"). Every branch targets the **same** Dev Worker and `app_url_dev`; the last verified deployment wins and there is no per-branch Dev. Use `shared_dev_on_branch_push` for this; the manual `persistent-dev` dispatch (Hybrid, approved ref, Cron/Queue checks) is a separate path that still runs `dev_deploy_cmd` alone.
+* `config-guard` fails the run when `deployment_strategy: production-only` is combined with `shared_dev_on_branch_push: true`. `production-only` still silently ignores `preview_on_branch_push` (its default is `true`; failing on it would break existing callers) — open question for review.
+
+### Shared Dev job order
+
+`stale-SHA guard → Dev build (dev_build_cmd, build_env_dev, CLOUDFLARE_ENV=dev_wrangler_env) → effective-config audit (dev_worker_name, no Production resource) → stale-SHA guard → Dev D1 migration → dev_deploy_cmd → smoke(app_url_dev, dev_smoke_cmd)`.
+
+* A failed build, audit or stale run never changes the running Dev Worker or its D1 (Preview migrates before it builds; Dev builds first because Dev has no separate Migration job).
+* Migration reuses `migrate.sh` with `TARGET=dev`: D1 = `env.<dev_wrangler_env>.d1_databases`, never top-level (Production); no fallback. The Preview D1 and the Dev D1 **may** be the same physical database (Blog); Production's may not. `migrations apply` is pending-only, and the job `needs` Migration/Deploy purely for ordering (their results are ignored), plus the shared concurrency group, so two channels never migrate one D1 at the same time.
+* `dev_worker_name` + `dev_build_cmd`: the adapter-generated effective config (`.wrangler/deploy/config.json`) must have `name == dev_worker_name` and bind none of the source config's top-level (Production) resources or `preview_deny_resources`.
+* Credentials: `CLOUDFLARE_DEV_API_TOKEN` / `CLOUDFLARE_DEV_ACCOUNT_ID` only, in the `<app>/dev` Environment. No Production/Preview token or `PREVIEW_SECRETS` is referenced; a missing Dev token fails closed.
+* Smoke fails the job. Recovery: the job records a ledger entry `<app>/dev/shared`; after a failed smoke it redeploys the last verified SHA (from any branch) and probes it, or states **manual recovery required** when none exists. The run stays red either way.
+* Concurrency: workflow-level group (above) queues all branches; the job also uses `cfv2-dev-<repo>-<app>`, the same group as `persistent-dev`, so automatic and manual Dev deployments never overlap. This differs from the workflow-level `cfv2-<app>-…` groups, so there is no caller/callee deadlock.
+* Retention: branch deletion and disabling a switch deploy or delete nothing; no job deletes a Worker.
+
+Consumer sketch (Blog): `preview_on_branch_push: true`, `shared_dev_on_branch_push: true`, `app_url_dev: https://blog-preview.firstsun.org`, `dev_wrangler_env: dev`, `dev_worker_name: blog-preview`, `d1_migrations: true`, a `dev_build_cmd` that builds with `CLOUDFLARE_ENV=dev` and a `dev_deploy_cmd` that only runs `wrangler deploy --config <effective config>`. Heaven ID: `preview_on_branch_push: false`, `shared_dev_on_branch_push: true`, `app_url_dev: https://id-dev.heavenfortress.com`.
 
 ## Migration, concurrency, release and secrets
 
@@ -89,7 +119,8 @@ The shared workflow now sets **workflow-level** `concurrency` with `queue: max` 
 |---|---|
 | main push / dispatch | `cfv2-<app>-prod` |
 | branch, `d1_migrations: true` | `cfv2-<app>-preview-d1-<d1_lock_scope or app>` — **one group for the shared Preview D1**, not per branch |
-| branch, no D1 | `cfv2-<app>-preview-<branch>` |
+| branch, no D1, `shared_dev_on_branch_push: true` | `cfv2-<app>-shared-dev` — **one group for the one Dev Worker**, all branches queue |
+| branch, no D1, Shared Dev off | `cfv2-<app>-preview-<branch>` |
 | PR, delete, tag, persistent-dev | private `cfv2-run-<run_id>` (never queues behind a deploy) |
 
 * Prod and Preview-D1 never block each other; apps with different physical D1 do not block each other (apps that share one Preview D1 must set the same `d1_lock_scope`).
@@ -123,6 +154,8 @@ Fail-closed (`smoke.sh`): no URL ⇒ fail; only 2xx counts (401/403/3xx-elsewher
 ## Verified vs not verified
 
 **Verified (mocked, except the same-repo concurrency experiment above; `.github/workflows/cf-worker-v2-ci.yml`, all green locally):** actionlint (+ shellcheck on inline scripts) and `shellcheck -S warning` on the scripts; Node unit tests (identity, event/target, migration target and settings, production audit, env parsing); a workflow contract test that *evaluates* every job `if:`, credential `env:` and the concurrency group over an event matrix (optional vs configured E2E, Migration failure/cancel blocking Deploy, D1-less deploy, fork/PR/tag/delete, production-only, Hybrid separation, Release gate, group per resource); `test-jobs.py`, which **executes the real `run:` steps** of the Migration and Deploy jobs against stub `gh`/`pnpm`/`curl` with GitHub step semantics and feeds results into the next job's `if:` (stale main run does not release, skipped publish, smoke failure, rollback with the same config, missing URL, Access, 401/403/5xx, SHA mismatch, name collision / deleted / stale branch / preflight failure / ambiguous D1 / missing creds all fail before any `wrangler d1`, secret-injection literal delivery); behaviour tests for `deploy.sh`, `migrate.sh`, `smoke.sh`, `parse-env.mjs`, probe and ledger. Mutation spot-checks (Release gate, collision guard, credential fallback, Migration gate) made the suites fail as intended.
+
+**Shared Dev (mocked/static only):** the four-switch matrix, main/PR/delete/tag/persistent-dev exclusion, production-only rejection, validation and skip semantics, concurrency groups, Dev-only credential selection, step order, stale handling, Dev migration target (`env.<name>`, no Production fallback, Preview==Dev D1 accepted), effective-config audit and recovery step wiring are covered by `test-workflow-contract.py`, `lib.test.mjs` and `test-migrate.sh`. **No live Shared Dev or Native Preview pilot has run**; live behaviour (Dev environment protection, the `queue: max` group across Preview and Dev, real recovery) is unverified.
 
 **Not verified (needs real GitHub/Cloudflare; no Cloudflare operation was performed):** top-level `concurrency` + `queue: max` queuing for a *cross-repository* called workflow (same-repo case verified, see above); behaviour when the queue is full; Environment approval prompts and their interaction with the group; the format/exit codes of `wrangler d1 migrations list/apply` on the Wrangler each consumer pins (including non-interactive confirmation); real Native Preview/URL stability, Access-protected smoke, last-good recovery, fork PRs, force-push ordering, quota; Astro-generated config in a real build; stub `gh` fidelity (e.g. paging of the Deployments API); cross-repository D1 sharing (**unprotected**).
 

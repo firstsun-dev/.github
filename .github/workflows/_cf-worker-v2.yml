@@ -17,11 +17,16 @@ name: CF Worker Pipeline v2
 #          |
 #      Release            optional, main only
 #
+#   Shared Dev (optional, `shared_dev_on_branch_push`): job `dev-deploy`, independent of Native Preview. After
+#   the six validation jobs (and, for ordering only, after Migration/Deploy have finished) every non-main branch
+#   push builds for Dev, migrates the Dev D1, deploys the ONE configured Dev Worker (last verified deployment
+#   wins), and smokes `app_url_dev`. Feature Preview and Shared Dev are two switches: all four combinations work.
+#
 # An optional validation job (lint/typecheck/unit/integration/e2e) is skipped only when its command input is
 # empty; Migration/Deploy treat a CONFIGURED job that is skipped as a failure.
 #
-# Event-specific handlers outside the core DAG: `lifecycle` (PR comment / branch delete) and
-# `persistent-dev` (Hybrid, protected dispatch).
+# Event-specific handlers outside the core DAG: `lifecycle` (PR comment / branch delete), `config-guard`
+# (rejects production-only + Shared Dev) and `persistent-dev` (Hybrid, protected manual dispatch).
 #
 # Caller MUST trigger on: push (all branches), pull_request, delete, workflow_dispatch.
 # `delete` only fires from the DEFAULT branch's workflow file.
@@ -39,6 +44,9 @@ on:
       version_id:
         description: Production Worker version id (prod only)
         value: ${{ jobs.deploy.outputs.version_id }}
+      dev_url:
+        description: Shared Dev URL that was deployed and smoke-tested (app_url_dev); empty when Shared Dev did not deploy
+        value: ${{ jobs.dev-deploy.outputs.url }}
     inputs:
       tools_ref:
         description: >
@@ -61,8 +69,15 @@ on:
         type: string
         default: production-preview
       preview_on_branch_push:
+        description: Feature Native Preview — one stable Preview URL per non-main branch. Independent of shared_dev_on_branch_push.
         type: boolean
         default: true
+      shared_dev_on_branch_push:
+        description: >
+          Shared Dev — every non-main branch push deploys the ONE configured Dev Worker (app_url_dev); the last
+          verified deployment wins. Independent of preview_on_branch_push. Rejected with production-only.
+        type: boolean
+        default: false
       preview_worker_name:
         description: >
           Host Native Previews under this existing Worker instead of the config's `name`
@@ -130,6 +145,10 @@ on:
         description: Build-time env for the Preview build, one KEY=VALUE per line
         type: string
         default: ''
+      build_env_dev:
+        description: Build-time env for the Shared Dev build, one KEY=VALUE per line (never falls back to the Preview or Production env)
+        type: string
+        default: ''
       smoke_cmd:
         description: Smoke command from app_path (both targets); receives TARGET_URL, EXPECTED_SHA, DEPLOY_TARGET. Default is an HTTP 2xx probe.
         type: string
@@ -191,10 +210,29 @@ on:
         type: string
         default: ''
       dev_deploy_cmd:
-        description: Command deploying the persistent Dev Worker (from app_path)
+        description: >
+          Command deploying the Dev Worker from app_path. Used by the manual persistent-dev dispatch (it must build first)
+          and by Shared Dev, which runs it with `bash -eo pipefail` AFTER dev_build_cmd when that is set (then it must only publish).
         type: string
         default: ''
       dev_smoke_cmd:
+        description: Dev smoke command (persistent-dev and Shared Dev); Shared Dev also receives TARGET_URL=app_url_dev, EXPECTED_SHA, DEPLOY_TARGET=dev
+        type: string
+        default: ''
+      app_url_dev:
+        description: Stable Shared Dev URL (environment URL, smoke target). Required when shared_dev_on_branch_push is true.
+        type: string
+        default: ''
+      dev_build_cmd:
+        description: Optional Shared Dev build from app_path (with build_env_dev). Set it so a failed build stops before anything is published. Leave empty if dev_deploy_cmd builds itself.
+        type: string
+        default: ''
+      dev_wrangler_env:
+        description: Named Wrangler environment of the Shared Dev Worker (exported as CLOUDFLARE_ENV; its D1 is env.<name>.d1_databases)
+        type: string
+        default: dev
+      dev_worker_name:
+        description: Expected Worker name of the Shared Dev deployment; the Astro/adapter-generated effective Wrangler config must match it (e.g. blog-preview)
         type: string
         default: ''
       dispatch_target:
@@ -216,7 +254,7 @@ on:
       CLOUDFLARE_ACCOUNT_ID:
         required: false
       CLOUDFLARE_DEV_API_TOKEN:
-        description: Persistent Dev token (Hybrid only)
+        description: Dev token (Hybrid persistent-dev dispatch and Shared Dev); never the Production or Preview token
         required: false
       CLOUDFLARE_DEV_ACCOUNT_ID:
         required: false
@@ -236,14 +274,15 @@ on:
 # state, `queue: max` so a newer push does not cancel an older pending run (FIFO, up to 100; beyond that
 # GitHub cancels the extra run, which is fail-closed: it deploys nothing):
 #   main                              -> <app>/prod
-#   branch, d1_migrations: true       -> one group for the shared Preview D1 (d1_lock_scope, default app_name)
-#   branch, no D1                     -> per branch
+#   branch, d1_migrations: true       -> one group for the shared Preview/Dev D1 (d1_lock_scope, default app_name)
+#   branch, no D1, Shared Dev on      -> one group for the ONE Dev Worker (all branches queue; no concurrent Dev deploys)
+#   branch, no D1, Shared Dev off     -> per branch
 #   PR / delete / persistent-dev / anything else -> a private group (never queues behind a deploy)
 # The `cfv2-` prefix is static on purpose: never reuse it (or ${{ github.workflow }}) in a CALLER group, or the
 # caller and this called workflow deadlock each other. A repo-local group does NOT protect a D1 shared with
 # another repository. `queue` is not known to actionlint 1.7.12: see .github/actionlint.yaml.
 concurrency:
-  group: ${{ ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && format('cfv2-{0}-{1}', inputs.app_name, github.ref == 'refs/heads/main' && 'prod' || (inputs.d1_migrations && format('preview-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || format('preview-{0}', github.ref_name))) || format('cfv2-run-{0}', github.run_id) }}
+  group: ${{ ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && format('cfv2-{0}-{1}', inputs.app_name, github.ref == 'refs/heads/main' && 'prod' || (inputs.d1_migrations && format('preview-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.shared_dev_on_branch_push && 'shared-dev' || format('preview-{0}', github.ref_name)))) || format('cfv2-run-{0}', github.run_id) }}
   queue: max
 
 permissions:
@@ -962,6 +1001,255 @@ jobs:
         run: rm -f "$PREVIEW_ENV_FILE" "$OUT_FILE"
 
   # -------------------------------------------------------------------------
+  # Shared Dev — optional, independent of Native Preview (own switch, own credentials, own Environment).
+  # Every non-main branch push targets the SAME Dev Worker; the last verified deployment wins. Order inside the
+  # job is chosen so nothing durable changes before it must: stale guard -> Dev build -> effective-config audit
+  # -> stale guard -> Dev D1 migration -> publish -> smoke. A failed build/audit therefore never touches the
+  # running Dev Worker or its D1. `needs` on migrate/deploy is ordering ONLY (Preview and Dev may share one
+  # physical D1, so their migrations must not overlap); their result is deliberately ignored.
+  # Branch deletion and disabling the switch never touch the Dev Worker. Not used by the manual persistent-dev path.
+  # -------------------------------------------------------------------------
+  dev-deploy:
+    name: Shared Dev
+    needs: [lint, typecheck, unit, integration, build, e2e, migrate, deploy]
+    if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && inputs.shared_dev_on_branch_push && inputs.deployment_strategy != 'production-only' && github.ref_type == 'branch' && github.ref != 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev'))
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 40
+    environment:
+      name: ${{ inputs.app_name }}/dev
+      url: ${{ inputs.app_url_dev }}
+    # Same group as the manual persistent-dev job: automatic and manual Dev deployments never overlap. Distinct
+    # from the workflow-level `cfv2-<app>-...` groups, so caller and callee cannot deadlock.
+    concurrency:
+      group: cfv2-dev-${{ github.repository }}-${{ inputs.app_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      deployments: write # Dev ledger (last known-good SHA for recovery)
+    outputs:
+      url: ${{ steps.verified.outputs.url }}
+      deployed_and_verified: ${{ steps.verified.outputs.deployed_and_verified || 'false' }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET: dev
+      BRANCH: ${{ github.ref_name }}
+      BRANCH_REF: ${{ github.ref }}
+      RUN_SHA: ${{ github.sha }}
+      APP_NAME: ${{ inputs.app_name }}
+      LEDGER_ENV: ${{ inputs.app_name }}/dev/shared
+      # Dev credentials ONLY; there is no fallback to the Preview or Production token.
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEV_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_DEV_ACCOUNT_ID }}
+      CLOUDFLARE_ENV: ${{ inputs.dev_wrangler_env }}
+      BUILD_ENV: ${{ inputs.build_env_dev }}
+      SMOKE_ENV: ${{ inputs.smoke_env }}
+    steps:
+      - name: Stale-SHA guard (start)
+        run: |
+          TIP="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH" -q .object.sha)" || { echo "::error::cannot resolve branch tip"; exit 1; }
+          [ -n "$TIP" ] || { echo "::error::cannot resolve branch tip"; exit 1; }
+          if [ "$TIP" != "$RUN_SHA" ]; then
+            echo "::notice::Branch tip $TIP != $RUN_SHA; a newer push of this branch owns Dev. Skipping (nothing deployed)."
+            echo "STALE=true" >> "$GITHUB_ENV"
+          fi
+      - name: Checkout exact SHA
+        if: env.STALE != 'true'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch tooling
+        if: env.STALE != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: actions/cf-preview
+          persist-credentials: false
+      - name: Setup dependencies
+        if: env.STALE != 'true'
+        uses: firstsun-dev/.github/actions/setup@v1
+        with:
+          setup-node: 'false'
+          setup-pnpm: 'false'
+      - name: Install tooling deps
+        if: env.STALE != 'true'
+        run: cd "$TOOLS_DIR" && npm ci --ignore-scripts --no-audit --no-fund
+      - name: Validate Shared Dev target, configuration and credentials (fail closed)
+        if: env.STALE != 'true'
+        working-directory: ${{ inputs.app_path }}
+        env:
+          EVENT: ${{ github.event_name }}
+          STRATEGY: ${{ inputs.deployment_strategy }}
+          DEV_ON: ${{ inputs.shared_dev_on_branch_push }}
+          DISPATCH: ${{ inputs.dispatch_target }}
+          DEPLOY_CMD: ${{ inputs.dev_deploy_cmd }}
+          DEV_URL: ${{ inputs.app_url_dev }}
+        run: |
+          TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
+          RESOLVED="$(node "$TOOLS/cli.mjs" resolve-dev --event "$EVENT" --ref "$BRANCH_REF" --strategy "$STRATEGY" \
+            --shared-dev-on-push "$DEV_ON" --dispatch-target "$DISPATCH" | sed -n 's/^target=//p')"
+          [ "$RESOLVED" = dev ] || { echo "::error::target mismatch (resolved '$RESOLVED', job 'dev'); refusing to deploy"; exit 1; }
+          [ -n "$DEPLOY_CMD" ] || { echo "::error::shared_dev_on_branch_push requires dev_deploy_cmd"; exit 1; }
+          [ -n "$DEV_URL" ] || { echo "::error::shared_dev_on_branch_push requires app_url_dev (a Dev deployment without a probe is not verified)"; exit 1; }
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::Dev credentials not provided (CLOUDFLARE_DEV_API_TOKEN / CLOUDFLARE_DEV_ACCOUNT_ID); refusing to fall back to other credentials"; exit 1
+          fi
+          VER="$(pnpm exec wrangler --version | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+          node "$TOOLS/cli.mjs" wrangler-check --version "$VER"
+      - name: Confirm the exact Dev migration target (read-only config check)
+        if: env.STALE != 'true' && inputs.d1_migrations
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CFG: ${{ inputs.wrangler_config }}
+          BINDING: ${{ inputs.d1_binding }}
+          DEV_ENV: ${{ inputs.dev_wrangler_env }}
+        run: node "$GITHUB_WORKSPACE/$TOOLS_DIR/cli.mjs" migration-config --config "$CFG" --target dev --dev-env "$DEV_ENV" --binding "$BINDING" --out "$RUNNER_TEMP/migrate-dev-check.json" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Start Dev ledger entry
+        if: env.STALE != 'true'
+        id: dep
+        run: |
+          PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg w "$APP_NAME" '{branch_ref:$ref,worker:$w}')"
+          ID="$("$TOOLS_DIR/gh.sh" start "$LEDGER_ENV" "$RUN_SHA" "$PAYLOAD" "Shared Dev")"
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          "$TOOLS_DIR/gh.sh" status "$ID" in_progress "" "Deploying $RUN_SHA from $BRANCH"
+      - name: Inject Dev build environment
+        if: env.STALE != 'true'
+        run: node "$TOOLS_DIR/parse-env.mjs" BUILD_ENV "$GITHUB_ENV"
+      - name: Dev build (a failure here leaves the running Dev Worker untouched)
+        if: env.STALE != 'true' && inputs.dev_build_cmd != ''
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CMD: ${{ inputs.dev_build_cmd }}
+          VITE_APP_ENV: dev
+          VITE_APP_VERSION: ${{ inputs.app_version }}
+        run: bash -eo pipefail -c "$CMD"
+      - name: Audit effective Wrangler config (Dev Worker identity, no Production resources)
+        if: env.STALE != 'true' && inputs.dev_worker_name != ''
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CFG: ${{ inputs.wrangler_config }}
+          WORKER: ${{ inputs.dev_worker_name }}
+          DENY: ${{ inputs.preview_deny_resources }}
+        run: |
+          TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
+          EFFECTIVE="$(node "$TOOLS/cli.mjs" effective-config --dir . | sed -n 's/^effective_config=//p')"
+          [ -n "$EFFECTIVE" ] || { echo "::error::dev_worker_name is set but the build produced no effective Wrangler config (.wrangler/deploy/config.json); cannot verify the Dev Worker identity. Set dev_build_cmd to a build that emits it, or unset dev_worker_name."; exit 1; }
+          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY"
+      - name: Stale-SHA guard (before migration and publish)
+        if: env.STALE != 'true'
+        run: |
+          if [ "$("$TOOLS_DIR/guard.sh" fresh)" != "stale=false" ]; then
+            echo "::notice::Superseded before publish; not touching Dev (nothing deployed)."
+            echo "STALE=true" >> "$GITHUB_ENV"
+          fi
+      - name: Apply pending Dev migrations (Dev D1 only)
+        if: env.STALE != 'true' && inputs.d1_migrations
+        env:
+          APP_DIR: ${{ github.workspace }}/${{ inputs.app_path }}
+          WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
+          D1_BINDING: ${{ inputs.d1_binding }}
+          DEV_ENV: ${{ inputs.dev_wrangler_env }}
+        run: |
+          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
+          "$TOOLS_DIR/migrate.sh" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Publish Shared Dev
+        if: env.STALE != 'true'
+        id: publish
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CMD: ${{ inputs.dev_deploy_cmd }}
+          VITE_APP_ENV: dev
+          VITE_APP_VERSION: ${{ inputs.app_version }}
+        run: bash -eo pipefail -c "$CMD"
+      - name: Inject smoke environment
+        if: env.STALE != 'true' && steps.publish.outcome == 'success'
+        run: node "$TOOLS_DIR/parse-env.mjs" SMOKE_ENV "$GITHUB_ENV"
+      - name: Smoke — Shared Dev URL (fails closed)
+        if: env.STALE != 'true' && steps.publish.outcome == 'success'
+        id: smoke
+        working-directory: ${{ inputs.app_path }}
+        env:
+          TARGET_URL: ${{ inputs.app_url_dev }}
+          DEPLOY_TARGET: dev
+          TEST_ENV: dev
+          EXPECTED_SHA: ${{ github.sha }}
+          SMOKE_CMD: ${{ inputs.dev_smoke_cmd }}
+          SHA_PATH: ${{ inputs.sha_path }}
+          ACCESS_TARGETS: ${{ inputs.access_protected_targets }}
+          SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
+          SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
+          NO_PROXY: '*'
+        run: |
+          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
+          "$TOOLS_DIR/smoke.sh" | tee -a "$GITHUB_OUTPUT"
+      - name: Mark deployed and verified
+        if: env.STALE != 'true' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'success'
+        id: verified
+        env:
+          LEVEL: ${{ steps.smoke.outputs.smoke_level }}
+          URL: ${{ inputs.app_url_dev }}
+        run: |
+          { echo "deployed_and_verified=true"; echo "smoke_level=$LEVEL"; echo "url=$URL"; } >> "$GITHUB_OUTPUT"
+          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" success "$URL" "Serving $RUN_SHA from $BRANCH ($LEVEL)"
+          {
+            echo "### ✅ Shared Dev — \`$APP_NAME\` (verification: $LEVEL)"
+            echo "- URL: $URL (shared by ALL branches; the last verified deployment wins)"
+            echo "- Branch: \`$BRANCH\` · served commit: \`$RUN_SHA\` · [run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      # ---- Failure outcomes: always explicit, the job stays red. ----
+      - name: Dev — failed before publish
+        if: failure() && steps.dep.outputs.id != '' && steps.publish.outcome != 'success'
+        run: |
+          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" error "" "Failed before publish; Dev unchanged" || true
+          echo "### ❌ Shared Dev failed before publish — the running Dev deployment is unchanged." >> "$GITHUB_STEP_SUMMARY"
+      - name: Dev — mark unverified
+        if: failure() && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
+        run: |
+          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" failure "$DEV_URL" "Smoke failed — Dev UNVERIFIED"
+          echo "### ❌ Shared Dev smoke failed — $DEV_URL is **unverified** (serves $RUN_SHA from $BRANCH)." >> "$GITHUB_STEP_SUMMARY"
+        env:
+          DEV_URL: ${{ inputs.app_url_dev }}
+      - name: Dev recovery — find last known-good SHA
+        if: failure() && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
+        id: good
+        run: |
+          GOOD="$("$TOOLS_DIR/gh.sh" last-good "$LEDGER_ENV" "${{ steps.dep.outputs.id }}" || true)"
+          echo "sha=$GOOD" >> "$GITHUB_OUTPUT"
+          if [ -z "$GOOD" ]; then
+            echo "::error::No known-good Shared Dev deployment. Fix forward by pushing a new commit (any branch)."
+            echo "### ⚠️ No prior verified Shared Dev deployment — manual recovery required: push a fix." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Dev recovery — checkout last good
+        if: failure() && steps.good.outputs.sha != ''
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.good.outputs.sha }}
+          path: recover
+          persist-credentials: false
+      - name: Dev recovery — redeploy last good and verify
+        if: failure() && steps.good.outputs.sha != ''
+        id: recover
+        working-directory: recover/${{ inputs.app_path }}
+        env:
+          BUILD_CMD: ${{ inputs.dev_build_cmd }}
+          DEPLOY_CMD: ${{ inputs.dev_deploy_cmd }}
+          VITE_APP_ENV: dev
+          VITE_APP_VERSION: ${{ inputs.app_version }}
+          TARGET_URL: ${{ inputs.app_url_dev }}
+        run: |
+          pnpm install --frozen-lockfile
+          [ -z "$BUILD_CMD" ] || bash -eo pipefail -c "$BUILD_CMD"
+          bash -eo pipefail -c "$DEPLOY_CMD"
+          "$GITHUB_WORKSPACE/$TOOLS_DIR/probe.sh"
+          echo "### ♻️ Recovered Shared Dev to last good commit \`${{ steps.good.outputs.sha }}\`. Run remains FAILED for the bad commit." >> "$GITHUB_STEP_SUMMARY"
+      - name: Dev recovery failed
+        if: failure() && steps.good.outputs.sha != '' && steps.recover.outcome == 'failure'
+        run: echo "### 🚨 Automatic recovery FAILED — Shared Dev serves unverified code. Push a fix from any branch." >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
   # Release — optional, main only, only after THIS run deployed its own SHA and verified it.
   # -------------------------------------------------------------------------
   release:
@@ -987,6 +1275,21 @@ jobs:
         env:
           CMD: ${{ inputs.release_cmd }}
         run: bash -c "$CMD"
+
+  # -------------------------------------------------------------------------
+  # Config guard — a production-only Worker must never expose a Dev deployment. Fails the run on ANY event so a
+  # misconfigured caller is visible, instead of silently skipping. (A production-only Worker keeps ignoring
+  # preview_on_branch_push, whose default is true, for backward compatibility.)
+  # -------------------------------------------------------------------------
+  config-guard:
+    name: Config guard
+    if: inputs.deployment_strategy == 'production-only' && inputs.shared_dev_on_branch_push
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 2
+    steps:
+      - run: |
+          echo "::error::deployment_strategy: production-only cannot be combined with shared_dev_on_branch_push: true (a production-only Worker must not expose an unauthorized Dev deployment). Set shared_dev_on_branch_push: false or change the strategy."
+          exit 1
 
   # -------------------------------------------------------------------------
   # Lifecycle — event-specific handler outside the core DAG. Never deploys, no Cloudflare credentials.

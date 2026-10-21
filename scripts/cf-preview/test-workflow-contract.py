@@ -75,8 +75,8 @@ def vres(migrate="success", **over):
 GREEN = vres(migrate="skipped")
 
 # ---------------------------------------------------------------- 1. topology
-check(set(jobs) == set(VALIDATION) | {"migrate", "deploy", "release", "lifecycle", "persistent-dev"},
-      "job set is exactly the six validation jobs, Migration, Deploy, Release + lifecycle/persistent-dev handlers")
+check(set(jobs) == set(VALIDATION) | {"migrate", "deploy", "dev-deploy", "release", "config-guard", "lifecycle", "persistent-dev"},
+      "job set is exactly the six validation jobs, Migration, Deploy, Shared Dev, Release + config-guard/lifecycle/persistent-dev handlers")
 check("ci" not in jobs, "the former combined CI job is gone (no combined-CI requirement remains)")
 check([jobs[j]["name"] for j in VALIDATION] == [JOB_NAME[j] for j in VALIDATION], "validation jobs are named Lint, Typecheck, Unit Tests, Integration Tests, Build Validation, E2E")
 for gone in ("plan", "test", "test-unit", "test-integration", "test-e2e", "prepare", "preview", "production",
@@ -94,7 +94,7 @@ for j in VALIDATION:
 check(set(needs_of("migrate")) == set(VALIDATION), "Migration needs all six validation jobs")
 check(set(needs_of("deploy")) == set(VALIDATION) | {"migrate"}, "Deploy needs all six validation jobs and Migration")
 check(needs_of("release") == ["deploy"], "Release needs Deploy")
-check(sum(1 for j in jobs if "deploy" in j or "publish" in j) == 1, "exactly one Deploy job implementation (no per-target deploy jobs)")
+check(sum(1 for j in jobs if j in ("deploy", "deploy-prod", "deploy-preview", "publish")) == 1, "exactly one Native Preview/Production Deploy job implementation (no per-target deploy jobs)")
 
 # ---------------------------------------------------------------- 2. gating over the event matrix
 MAIN, FEAT = "refs/heads/main", "refs/heads/feat/x"
@@ -322,5 +322,111 @@ check('gh.sh" retire' in retire["run"] and "Branch exists again" in retire["run"
 pdev = yaml.dump(jobs["persistent-dev"])
 check("CLOUDFLARE_DEV_API_TOKEN" in pdev and jobs["persistent-dev"]["environment"] == "${{ inputs.app_name }}/dev", "Hybrid Dev uses its own token and protected Environment")
 check("cron" not in deploy_text.lower() or "consumer" not in deploy_text.lower(), "Deploy makes no Cron/Queue consumer claims for Native Previews")
+
+# ---------------------------------------------------------------- 8. Shared Dev channel (independent of Native Preview)
+DEVJOB = "dev-deploy"
+inputs_def = doc[True]["workflow_call"]["inputs"]
+check(inputs_def["preview_on_branch_push"]["default"] is True and inputs_def["shared_dev_on_branch_push"]["default"] is False,
+      "interface: preview_on_branch_push is preserved; shared_dev_on_branch_push is new and defaults to false (no surprise Dev deployments)")
+check(all(k in inputs_def for k in ("app_url_dev", "dev_deploy_cmd", "dev_smoke_cmd", "build_env_dev", "dev_build_cmd", "dev_wrangler_env", "dev_worker_name")), "interface: Dev URL, deploy/smoke commands, Dev build env, Wrangler env and Worker identity inputs exist")
+check("CLOUDFLARE_DEV_API_TOKEN" in doc[True]["workflow_call"]["secrets"] and "CLOUDFLARE_DEV_ACCOUNT_ID" in doc[True]["workflow_call"]["secrets"], "interface: Dev credentials are the existing CLOUDFLARE_DEV_* secrets")
+check(set(needs_of(DEVJOB)) == set(VALIDATION) | {"migrate", "deploy"}, "Shared Dev needs the six validation jobs (+ Migration/Deploy for ordering only)")
+check(jobs["release"]["if"].count("dev-deploy") == 0 and needs_of("release") == ["deploy"], "Release depends on Production Deploy only (Shared Dev never gates or triggers it)")
+check("needs.migrate.result" not in jobs[DEVJOB]["if"] and "needs.deploy.result" not in jobs[DEVJOB]["if"], "Shared Dev does not read the Preview Migration/Deploy results (they order it, never gate it)")
+
+# 8.1 four toggle combinations (+ main, + validation-only)
+def combo(feature, dev, ref=FEAT, d1=False):
+    inp = {"preview_on_branch_push": feature, "shared_dev_on_branch_push": dev, "d1_migrations": d1}
+    needs = vres(migrate="skipped" if not (d1 and feature) else "success")
+    return runs("deploy", scenario("push", ref, inp, needs)), runs(DEVJOB, scenario("push", ref, inp, needs)), runs("migrate", scenario("push", ref, inp, needs))
+check(combo(True, True)[:2] == (True, True), "toggles: feature=true shared_dev=true -> both deploy")
+check(combo(True, False)[:2] == (True, False), "toggles: feature=true shared_dev=false -> Native Preview only")
+check(combo(False, True)[:2] == (False, True), "toggles: feature=false shared_dev=true -> Shared Dev only")
+check(combo(False, False)[:2] == (False, False), "toggles: feature=false shared_dev=false -> validation only")
+check(combo(False, True, d1=True)[2] is False and combo(True, True, d1=True)[2] is True, "Preview Migration follows the Preview switch only; Shared Dev has its own migration step")
+check(combo(True, True, MAIN)[:2] == (True, False) and combo(False, False, MAIN)[0] is True, "main follows the Production path whatever the switches say; Shared Dev never runs on main")
+check(runs("lint", scenario("push", FEAT, {"preview_on_branch_push": False, "shared_dev_on_branch_push": False})), "validation runs with both channels disabled")
+
+# 8.2 gating
+sd = lambda **kw: scenario(**dict(dict(event="push", ref=FEAT, inputs={"shared_dev_on_branch_push": True}, needs=vres(migrate="skipped")), **kw))
+check(runs(DEVJOB, sd(ref="refs/heads/other/branch")), "Shared Dev: any branch deploys the same Dev")
+check(not runs(DEVJOB, sd(event="pull_request", ref="refs/pull/1/merge", head_repo="o/r")) and not runs(DEVJOB, sd(event="pull_request", ref="refs/pull/1/merge", head_repo="fork/r")), "Shared Dev: never on a PR (same-repo or fork)")
+check(not runs(DEVJOB, sd(event="delete")) and not runs(DEVJOB, sd(ref="refs/tags/v1.0.0")), "Shared Dev: never on branch delete (the Dev Worker is retained) or a tag")
+check(not runs(DEVJOB, sd(event="workflow_dispatch", ref="refs/heads/dev", inputs={"shared_dev_on_branch_push": True, "dispatch_target": "persistent-dev"})), "Shared Dev: the manual persistent-dev dispatch is a different path")
+check(not runs(DEVJOB, sd(inputs={"shared_dev_on_branch_push": True, "deployment_strategy": "production-only"})), "Shared Dev: production-only Worker never deploys Dev")
+check(runs(DEVJOB, sd(inputs={"shared_dev_on_branch_push": True, "deployment_strategy": "hybrid"})), "Shared Dev: also available with the hybrid strategy")
+for v in VALIDATION:
+    for bad in ("failure", "cancelled", "skipped"):
+        check(not runs(DEVJOB, sd(needs=vres(migrate="skipped", **{v: bad}))), f"Shared Dev: blocked when configured {v} is {bad}")
+    if v in CMD_INPUT:
+        check(runs(DEVJOB, sd(inputs={"shared_dev_on_branch_push": True, CMD_INPUT[v]: ""}, needs=vres(migrate="skipped", **{v: "skipped"}))), f"Shared Dev: an intentionally disabled {v} does not block")
+for r in ("failure", "cancelled", "skipped", "success"):
+    check(runs(DEVJOB, sd(needs=vres(migrate=r, deploy=r))), f"Shared Dev: Preview Migration/Deploy {r} neither blocks nor is required (optional channel skips do not block unrelated work)")
+check(not runs("deploy", scenario("push", FEAT, {"preview_on_branch_push": True}, vres(migrate="skipped", build="failure"))), "a failed validation still blocks the Preview Deploy (unchanged)")
+
+# 8.3 config guard
+check(runs("config-guard", scenario("push", FEAT, {"deployment_strategy": "production-only", "shared_dev_on_branch_push": True})) and runs("config-guard", scenario("push", MAIN, {"deployment_strategy": "production-only", "shared_dev_on_branch_push": True})),
+      "config guard: production-only + shared_dev_on_branch_push fails the run on any push")
+check(not runs("config-guard", scenario("push", FEAT, {"deployment_strategy": "production-only"})) and not runs("config-guard", scenario("push", FEAT, {"shared_dev_on_branch_push": True})), "config guard: silent for valid configurations")
+check("exit 1" in jobs["config-guard"]["steps"][0]["run"] and "secrets." not in yaml.dump(jobs["config-guard"]), "config guard fails closed and holds no secrets")
+
+# 8.4 concurrency: one Dev Worker => one queue across ALL branches
+check(g(FEAT, {"shared_dev_on_branch_push": True}) == "cfv2-app-shared-dev" == g("refs/heads/other", {"shared_dev_on_branch_push": True}), "group: all branches of a non-D1 app with Shared Dev queue on one group (no concurrent Dev deploys)")
+check(g(FEAT, {"shared_dev_on_branch_push": True, "d1_migrations": True}) == "cfv2-app-preview-d1-app" == g("refs/heads/other", {"shared_dev_on_branch_push": True, "d1_migrations": True}), "group: a D1 app keeps the one shared D1 group (covers Preview and Dev migrations)")
+check(g(FEAT, {"shared_dev_on_branch_push": False}) != g("refs/heads/other", {"shared_dev_on_branch_push": False}), "group: without Shared Dev, D1-less branches stay independent")
+check(g(MAIN, {"shared_dev_on_branch_push": True}) == "cfv2-app-prod", "group: Production is never serialized behind Dev")
+dj = jobs[DEVJOB]
+check(dj["concurrency"] == jobs["persistent-dev"]["concurrency"] and dj["concurrency"]["cancel-in-progress"] is False and dj["concurrency"]["group"].startswith("cfv2-dev-"),
+      "Dev job-level group equals the manual persistent-dev group (automatic and manual Dev never overlap) and differs from the workflow-level group (no deadlock)")
+check(all(not g_(r).startswith("cfv2-dev-") for g_ in (g,) for r in (MAIN, FEAT)), "workflow-level groups can never equal the job-level Dev group")
+
+# 8.5 credentials / environments
+for tgt, ref in (("dev", FEAT),):
+    c = scenario("push", ref, secrets=SECRETS)
+    check(render(dj["env"]["CLOUDFLARE_API_TOKEN"], c) == "DEV-TOKEN" and "CLOUDFLARE_PREVIEW_API_TOKEN" not in c.secret_reads and "CLOUDFLARE_API_TOKEN" not in c.secret_reads,
+          "Shared Dev gets ONLY the Dev token (Preview and Production secrets never read)")
+c = scenario("push", FEAT, secrets={k: v for k, v in SECRETS.items() if k != "CLOUDFLARE_DEV_API_TOKEN"})
+check(render(dj["env"]["CLOUDFLARE_API_TOKEN"], c) == "", "Shared Dev: a missing Dev token stays EMPTY (no fallback)")
+dtxt = yaml.dump(dj)
+check("CLOUDFLARE_PREVIEW" not in dtxt and "secrets.CLOUDFLARE_API_TOKEN" not in dtxt and "secrets.CLOUDFLARE_ACCOUNT_ID" not in dtxt and "PREVIEW_SECRETS" not in dtxt, "Shared Dev never references Production/Preview credentials or Preview-only secrets")
+check(dj["environment"]["name"] == "${{ inputs.app_name }}/dev" == jobs["persistent-dev"]["environment"], "Shared Dev runs in the same protected <app>/dev Environment as persistent Dev")
+check(dj["environment"]["url"] == "${{ inputs.app_url_dev }}", "Shared Dev shows the stable Dev URL")
+check(dj["permissions"]["contents"] == "read" and not any(k == "pull-requests" for k in dj["permissions"]), "Shared Dev is read-only on contents and writes no PR comments")
+check(dj["env"]["BUILD_ENV"] == "${{ inputs.build_env_dev }}" and "build_env_preview" not in dtxt and "build_env_prod" not in dtxt, "Shared Dev builds with the Dev build env only (no fallback to Preview/Production env)")
+check(render(dj["env"]["CLOUDFLARE_ENV"], scenario("push", FEAT, {"dev_wrangler_env": "dev"})) == "dev", "Shared Dev selects the named Wrangler environment")
+ck = [s_ for s_ in dj["steps"] if str(s_.get("uses", "")).startswith("actions/checkout")]
+check(ck and all(s_["with"].get("persist-credentials") is False for s_ in ck), "Shared Dev checkouts do not persist the GitHub token")
+
+# 8.6 step order: nothing durable changes before it must; stale runs skip everything
+dn = [s_.get("name", "") for s_ in dj["steps"]]
+ix = lambda prefix: next(i for i, n in enumerate(dn) if n.startswith(prefix))
+check(ix("Stale-SHA guard (start)") < ix("Dev build") < ix("Audit effective Wrangler config") < ix("Stale-SHA guard (before migration") < ix("Apply pending Dev migrations") < ix("Publish Shared Dev") < ix("Smoke"),
+      "Shared Dev order: stale guard -> build -> effective-config audit -> stale guard -> migration -> publish -> smoke (a failed build never changes Dev or its D1)")
+check(ix("Confirm the exact Dev migration target") < ix("Apply pending Dev migrations") and ix("Validate Shared Dev") < ix("Confirm the exact"), "Shared Dev: migration target is validated read-only before any remote mutation")
+byname = {s_.get("name", ""): s_ for s_ in dj["steps"]}
+for n in ("Dev build (a failure here leaves the running Dev Worker untouched)", "Audit effective Wrangler config (Dev Worker identity, no Production resources)",
+          "Apply pending Dev migrations (Dev D1 only)", "Publish Shared Dev", "Smoke — Shared Dev URL (fails closed)"):
+    check("env.STALE != 'true'" in byname[n]["if"], f"Shared Dev: '{n.split(' (')[0]}' is skipped for a superseded run")
+check("migrate.sh" in byname["Apply pending Dev migrations (Dev D1 only)"]["run"] and "d1_migrations" in byname["Apply pending Dev migrations (Dev D1 only)"]["if"], "Shared Dev migrations reuse migrate.sh (target dev) and only run for D1 Workers")
+check('--target dev' in byname["Confirm the exact Dev migration target (read-only config check)"]["run"], "Shared Dev resolves the Dev migration target explicitly (env.<dev>.d1_databases, never Production)")
+check("dev-config-check" in byname["Audit effective Wrangler config (Dev Worker identity, no Production resources)"]["run"], "Shared Dev audits the adapter-generated effective Wrangler config")
+smoke_d = byname["Smoke — Shared Dev URL (fails closed)"]
+check(smoke_d["env"]["TARGET_URL"] == "${{ inputs.app_url_dev }}" and smoke_d["env"]["DEPLOY_TARGET"] == "dev" and smoke_d["env"]["SMOKE_CMD"] == "${{ inputs.dev_smoke_cmd }}" and "smoke.sh" in smoke_d["run"],
+      "Shared Dev smoke runs the shared smoke.sh against app_url_dev with dev_smoke_cmd")
+check(all(s_.get("continue-on-error") is not True for s_ in dj["steps"]) and "continue-on-error" not in dj, "Shared Dev: failures are never hidden by continue-on-error")
+check(dj["outputs"]["deployed_and_verified"].endswith("|| 'false' }}") and "steps.verified" in dj["outputs"]["deployed_and_verified"], "Shared Dev reports verified only from the final marker step")
+# failure outcomes
+check("failure()" in byname["Dev — mark unverified"]["if"] and "steps.smoke.outcome == 'failure'" in byname["Dev — mark unverified"]["if"], "Dev smoke failure: job fails and the deployment is marked UNVERIFIED")
+check("steps.publish.outcome != 'success'" in byname["Dev — failed before publish"]["if"] and "unchanged" in byname["Dev — failed before publish"]["run"], "Dev build/audit/migration failure: explicit 'Dev unchanged' outcome")
+check("last-good" in byname["Dev recovery — find last known-good SHA"]["run"] and "manual recovery required" in byname["Dev recovery — find last known-good SHA"]["run"], "Dev recovery: finds the last known-good SHA or states manual recovery is required")
+check("Run remains FAILED" in byname["Dev recovery — redeploy last good and verify"]["run"] and "probe.sh" in byname["Dev recovery — redeploy last good and verify"]["run"], "Dev recovery: redeploys and probes the last good commit, run stays red")
+check("Recovery FAILED" in byname["Dev recovery failed"]["run"] or "recovery FAILED" in byname["Dev recovery failed"]["run"], "Dev recovery failure is reported explicitly")
+# retention
+all_run = "\n".join(s_.get("run", "") for j in jobs.values() for s_ in j.get("steps", []))
+check("wrangler delete" not in all_run and "wrangler preview delete" not in "\n".join(s_.get("run", "").replace("\\`wrangler preview delete", "") for s_ in jobs["lifecycle"]["steps"] if "echo" not in s_.get("run", "")), "no job deletes a Worker; branch deletion retains the Shared Dev Worker and Native Previews")
+check(not re.search(r"CLOUDFLARE_DEV|dev-deploy|shared_dev|app_url_dev|dev_deploy_cmd|/dev\\b(?!/null)", yaml.dump(jobs["lifecycle"])), "branch-delete lifecycle never references Dev")
+check(runs("persistent-dev", scenario("workflow_dispatch", "refs/heads/dev", **dev_ok)) and jobs["persistent-dev"]["steps"][-2]["env"]["CMD"] == "${{ inputs.dev_deploy_cmd }}", "persistent-dev manual dispatch is unchanged and still runs dev_deploy_cmd")
+check("shared_dev_on_branch_push" not in yaml.dump(jobs["persistent-dev"]), "persistent-dev does not depend on the automatic Shared Dev switch")
+check("playwright" not in dtxt.lower() and sum(1 for s_ in dj["steps"] if "upload-artifact" in str(s_.get("uses", ""))) == 0, "Shared Dev installs no browsers and uploads no artifacts")
 
 sys.exit(fail)

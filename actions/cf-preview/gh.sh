@@ -6,9 +6,9 @@ R="${GITHUB_REPOSITORY:?}"
 cmd="${1:?}"; shift
 
 case "$cmd" in
-  start) # <env> <sha> <payload-json> -> deployment id
+  start) # <env> <sha> <payload-json> [description] -> deployment id
     gh api "repos/$R/deployments" -X POST --input - -q .id <<JSON
-{"ref":"$2","environment":"$1","description":"Native Preview","auto_merge":false,"required_contexts":[],"transient_environment":true,"production_environment":false,"payload":$3}
+{"ref":"$2","environment":"$1","description":"${4:-Native Preview}","auto_merge":false,"required_contexts":[],"transient_environment":true,"production_environment":false,"payload":$3}
 JSON
     ;;
   status) # <id> <state> [url] [description]

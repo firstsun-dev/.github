@@ -3,8 +3,8 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import {
-  assertWranglerSupported, auditPreviewConfig, auditProdConfig, classifyEvent, extractPreviewUrl,
-  isStale, migrationPlan, previewIdentity, readConfig, resolveTarget,
+  assertWranglerSupported, auditDevConfig, auditPreviewConfig, auditProdConfig, classifyEvent, extractPreviewUrl,
+  isStale, migrationPlan, previewIdentity, readConfig, resolveSharedDev, resolveTarget,
 } from './lib.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -57,11 +57,27 @@ try {
       out({ target });
       break;
     }
+    case 'resolve-dev': {
+      out({ target: resolveSharedDev({
+        event: opt('event'), ref: opt('ref'), strategy: opt('strategy'),
+        sharedDevOnPush: opt('shared-dev-on-push', 'false') === 'true', dispatchTarget: opt('dispatch-target'),
+      }) });
+      break;
+    }
+    case 'dev-config-check': {
+      const { errors } = auditDevConfig(readConfig(opt('effective')), readConfig(opt('source')), {
+        worker: opt('worker'), denyResources: list(opt('deny')),
+      });
+      for (const e of errors) console.log(`::error::${e}`);
+      if (errors.length) process.exit(1);
+      out({ dev_config: 'ok' });
+      break;
+    }
     case 'migration-config': {
       // Source config -> minimal config naming ONLY the selected target's D1. Preview uses previews.d1_databases.
       const cfgPath = resolve(opt('config'));
       const plan = migrationPlan(readConfig(cfgPath), opt('target'), {
-        binding: opt('binding'),
+        binding: opt('binding'), devEnv: opt('dev-env', 'dev'),
         migrationsDirAbs: (d) => resolve(dirname(cfgPath), d),
       });
       const dir = plan.config.d1_databases[0].migrations_dir;
@@ -94,7 +110,7 @@ try {
       out({ stale: String(isStale({ runSha: opt('sha'), branchTipSha: opt('tip') })) });
       break;
     default:
-      console.error('usage: cli.mjs identity|wrangler-check|extract-url|classify|resolve|preflight|migration-config|effective-config|audit-prod|stale');
+      console.error('usage: cli.mjs identity|wrangler-check|extract-url|classify|resolve|resolve-dev|dev-config-check|preflight|migration-config|effective-config|audit-prod|stale');
       process.exit(2);
   }
 } catch (e) {
