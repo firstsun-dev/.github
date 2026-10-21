@@ -6,25 +6,25 @@ This is a **proposed organization-wide cross-repository capability**, not a desc
 
 ### Requirement: One canonical hostname SHALL expose independently named MCP endpoints
 
-The organization SHALL use `https://mcp.firstsun.org/{service}` as the canonical remote Streamable HTTP MCP endpoint format. A registered service SHALL respond at its exact path and SHALL NOT require an additional `/mcp` suffix.
+The organization SHALL use `https://mcp.firstsun.org/{service}/mcp` as the canonical remote Streamable HTTP MCP endpoint format. A registered service SHALL expose Streamable HTTP at its exact `/{service}/mcp` path, NOT at bare `/{service}` or an additional nested `/mcp`.
 
 #### Scenario: ANAS is migrated
 - **WHEN** the approved ANAS migration is deployed
-- **THEN** the canonical endpoint SHALL be `https://mcp.firstsun.org/anas`
+- **THEN** the canonical endpoint SHALL be `https://mcp.firstsun.org/anas/mcp`
 - **AND** a client using that URL SHALL reach the ANAS MCP handler after authentication
 
 #### Scenario: Another MCP service is proposed
 - **WHEN** Infra MCP or Knowledge MCP is onboarded
-- **THEN** its reviewed endpoint SHALL be `https://mcp.firstsun.org/infra` or `https://mcp.firstsun.org/knowledge`, respectively
+- **THEN** its reviewed endpoint SHALL be `https://mcp.firstsun.org/infra/mcp` or `https://mcp.firstsun.org/knowledge/mcp`, respectively
 - **AND** onboarding SHALL NOT require changing the ANAS MCP application implementation
 
 ### Requirement: Service paths SHALL be unique, explicit and collision-safe
 
-Every registered `{service}` SHALL have one documented owner and route mapping. Slugs SHALL match `^[a-z][a-z0-9-]{1,31}$` and SHALL NOT use reserved platform names (`mcp`, `health`, `cdn-cgi`, `.well-known`). Routing SHALL NOT conflate one slug with any longer prefix.
+Every registered `{service}` SHALL have one documented owner and route mapping. Slugs SHALL match `^[a-z][a-z0-9-]{1,31}$` and SHALL NOT use reserved platform names (`mcp`, `health`, `cdn-cgi`, `.well-known`). Routing SHALL NOT conflate a slug or endpoint with longer prefixes, suffixes or trailing-slash variants.
 
 #### Scenario: Ambiguous request path
-- **WHEN** a client requests `/anas2` or `/infra2`
-- **THEN** it SHALL NOT be dispatched as `/anas` or `/infra`
+- **WHEN** a client requests `/anas`, `/anas/mcp2`, `/anas/mcp/` or `/infra2/mcp`
+- **THEN** it SHALL NOT be dispatched as `/anas/mcp` or `/infra/mcp`
 - **AND** it SHALL NOT invoke another registered service's tools
 
 #### Scenario: Unknown service path
@@ -36,7 +36,7 @@ Every registered `{service}` SHALL have one documented owner and route mapping. 
 `infra-config` SHALL own hostname and path-routing resources in Terraform. The organization SHALL prefer native Cloudflare Workers Custom Domain plus path-specific Workers Routes for this phase, without a new application-level MCP Gateway. The existing ANAS Custom Domain MAY remain the unmatched-path origin if the verified routing and security gates pass.
 
 #### Scenario: A future service is added
-- **WHEN** `/infra` is registered and its Worker is deployed
+- **WHEN** `/infra/mcp` is registered and its Worker is deployed
 - **THEN** a reviewed path route SHALL select the Infra Worker ahead of the hostname's unmatched-path origin
 - **AND** ANAS and Infra SHALL have separately deployable Workers and failure handling
 - **AND** each application repository SHALL NOT create competing Terraform routing resources
@@ -51,7 +51,7 @@ Every registered `{service}` SHALL have one documented owner and route mapping. 
 Each deployed MCP service SHALL have a path-scoped Cloudflare Access application and documented client policies. Its origin SHALL validate the signed Access assertion against its expected issuer and application audience before any MCP tool execution or protected data access.
 
 #### Scenario: ANAS clients authenticate
-- **WHEN** an approved interactive client uses Managed OAuth or an approved headless client uses its Service Token for `/anas`
+- **WHEN** an approved interactive client uses Managed OAuth or an approved headless client uses its Service Token for `/anas/mcp`
 - **THEN** Access and ANAS origin-side verification SHALL both succeed before MCP initialization
 - **AND** the current ANAS dual-mode authentication semantics SHALL remain intact
 
@@ -69,7 +69,7 @@ Each deployed MCP service SHALL have a path-scoped Cloudflare Access application
 Managed OAuth's unauthorized challenge and its advertised protected-resource metadata SHALL identify the intended endpoint and resolve to a client-compatible authorization flow. Multiple Access applications on `mcp.firstsun.org` SHALL NOT produce ambiguous or cross-service authorization behavior.
 
 #### Scenario: OAuth client connects to `/anas`
-- **WHEN** an OAuth-capable MCP client starts unauthenticated against `/anas`
+- **WHEN** an OAuth-capable MCP client starts unauthenticated against `/anas/mcp`
 - **THEN** the HTTP challenge and resource metadata SHALL guide it to the ANAS-specific protected resource
 - **AND** successful authorization SHALL allow MCP initialization without weakening the Access gate
 
@@ -78,14 +78,14 @@ Managed OAuth's unauthorized challenge and its advertised protected-resource met
 - **THEN** the discovery/authorization test SHALL prove their resource identities and origin audience checks are distinct
 - **AND** failure to prove this SHALL block rollout pending a revised design
 
-### Requirement: The `/mcp` to `/anas` move SHALL not retain compatibility
+### Requirement: The `/anas` to `/anas/mcp` move SHALL not retain compatibility
 
-The ANAS cutover SHALL intentionally retire its current `/mcp` MCP endpoint. It SHALL NOT provide a redirect, alias, proxy shim or dual-serving period to support the old URL.
+The ANAS cutover SHALL retire bare `/anas` and keep root `/mcp` retired. Neither old path SHALL receive a redirect, alias, proxy shim or dual-serving period.
 
 #### Scenario: Owner reconnects a client
-- **WHEN** ANAS production passes the `/anas` authentication and protocol smoke tests
-- **THEN** the operator SHALL manually update existing client settings to `/anas`
-- **AND** `/mcp` SHALL no longer initialize ANAS MCP
+- **WHEN** ANAS production passes the `/anas/mcp` authentication and protocol smoke tests
+- **THEN** the operator SHALL manually update existing client settings to `/anas/mcp`
+- **AND** neither bare `/anas` nor root `/mcp` SHALL initialize ANAS MCP
 
 ### Requirement: Cross-repository ownership and release gates SHALL be explicit
 
