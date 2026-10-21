@@ -7,10 +7,11 @@
 ```
 Detect Changes (monorepo only — the CALLER runs _detect-changes.yml and gates its calls)
         │
-   ┌────┴────┐
-   CI       E2E            parallel; no `needs` between them
-   └────┬────┘
-    Migration              dedicated job, only when d1_migrations: true
+ ┌──────┬───────────┬──────┬─────────────┬──────────────────┬─────┐
+ Lint  Typecheck  Unit Tests  Integration Tests  Build Validation  E2E     six independent jobs, no `needs` between them
+ └──────┴───────────┴──────┴─────────────┴──────────────────┴─────┘
+        │
+    Migration              dedicated job, only when d1_migrations: true; needs all six
         │
      Deploy                ONE job, target = prod (main) | preview (any other eligible branch)
         │
@@ -20,11 +21,24 @@ Detect Changes (monorepo only — the CALLER runs _detect-changes.yml and gates 
                         persistent-dev (Hybrid, protected workflow_dispatch on the approved ref)
 ```
 
-* **CI** (steps, one job): setup, `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `test_integration_cmd`, build **validation** (`build_cmd` under the target's `build_env_*` then `ci_env`; nothing is uploaded).
-* **E2E**: own setup, own **test** build (`test_e2e_build_cmd`, `test_e2e_env`), optional variants matrix. No `test_e2e_cmd` ⇒ no job; an intentional skip never blocks Migration/Deploy (the `always()` gating from the heaven-www incident is kept and tested).
-* **Migration**: after CI+E2E succeed. A failure/cancel blocks Deploy.
+**Revision (issue #61):** the former single `CI` job (Lint → Typecheck → Unit → Integration → Build as steps) is split into independent jobs for failure isolation, per-check duration/conclusion and single-job reruns. Same v2 name and public inputs; no v3.
+
+| Job (check name) | Runs when | Command input | Notes |
+|---|---|---|---|
+| `Lint` | `lint_cmd != ''` | `lint_cmd` | target build env, then `ci_env` |
+| `Typecheck` | `typecheck_cmd != ''` | `typecheck_cmd` | |
+| `Unit Tests` | `test_unit_cmd != ''` | `test_unit_cmd` | Mailpit if `use_mailpit` |
+| `Integration Tests` | `test_integration_cmd != ''` | `test_integration_cmd` | Mailpit if `use_mailpit` |
+| `Build Validation` | always (`build_cmd` is required) | `build_cmd` | validation only, nothing uploaded |
+| `E2E` | `test_e2e_cmd != ''` | setup / build / cmd, variants matrix | unchanged |
+
+* Every validation job: own checkout, `setup` action (existing dependency cache), env import, logs, a short Step Summary, no Cloudflare credentials, no shared workspace, no artifacts (only the E2E failure report, 3 days). Browsers are installed only by a consumer's E2E commands; Mailpit starts only in Unit, Integration and E2E.
+* **Skip rules.** An optional job is `skipped` on purpose only when its command input is empty. Migration and Deploy accept `skipped` for an optional job *only* in that case; a configured job that ends `skipped`, `failure` or `cancelled` blocks them, and `Build Validation` must be `success`. No Test Gate job and no `continue-on-error`.
+* **Migration**: after all six validation jobs. A failure/cancel blocks Deploy. **Deploy** needs the same six plus Migration (`skipped` accepted only when `d1_migrations` is false).
 * **Deploy**: checks the target (fail-closed re-check of the job `if`), stale-SHA guard, exact-SHA checkout, setup, target build env, independent build, source **and effective (adapter-generated)** Wrangler binding audit, publish (`wrangler preview` or `versions upload`+`deploy @100`), real URL, smoke (Access-aware), Deployment status, recovery.
-* Same-repo PRs do not re-run CI/E2E (the push run of the same SHA covers them); fork PRs run CI/E2E credential-free. No job other than `lifecycle` ever runs on a PR with write capabilities.
+* Same-repo PRs do not re-run validation (the push run of the same SHA covers them); fork PRs run it credential-free. No job other than `lifecycle` ever runs on a PR with write capabilities.
+* **Runner overhead.** One run now needs up to 5 validation jobs + the E2E matrix concurrently (e.g. 5 + 4 = 9 runners for Blog) instead of 1 + 4, and each repeats checkout and dependency install (cache hits make this cheap, never share a mutable workspace). Peak memory per runner is unchanged; peak *runner count* roughly doubles on a self-hosted pool. Mitigations: leave unused command inputs empty (the job is skipped, not a no-op runner), keep the pool large enough for the largest consumer's fan-out, and do not serialize checks. `queue: max` still serializes whole runs per resource group, so fan-out only multiplies within a run.
+* **Consumer guidance.** No input changed: callers that already pass `lint_cmd`/`typecheck_cmd`/`test_unit_cmd`/`test_integration_cmd` get distinct jobs automatically after pinning a SHA containing this change. A caller without unit/integration tests (e.g. heaven-www) leaves them empty and keeps passing. A caller's content-only fast path may keep passing an empty unit/integration/E2E command; Lint/Typecheck/Build stay required.
 
 ## Interface (inputs)
 
@@ -32,7 +46,7 @@ Detect Changes (monorepo only — the CALLER runs _detect-changes.yml and gates 
 |---|---|
 | Identity | `tools_ref` (must equal the ref the caller pins), `app_name`, `app_path`, `app_version`, `runner`, `wrangler_config` |
 | Strategy | `deployment_strategy` (`production-preview` \| `hybrid` \| `production-only`), `preview_on_branch_push`, `preview_worker_name` |
-| CI | `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `test_integration_cmd`, `build_cmd` (required), `ci_env`, `use_mailpit` |
+| Validation | `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `test_integration_cmd`, `build_cmd` (required), `ci_env`, `use_mailpit` |
 | E2E | `test_e2e_cmd`, `test_e2e_setup_cmd`, `test_e2e_build_cmd`, `test_e2e_env`, `test_e2e_variants` |
 | Deploy | `build_env_prod`, `build_env_preview`, `smoke_cmd`, `smoke_env`, `sha_path`, `app_url_prod`, `access_protected_targets`, `production_rollback_policy`, `preview_binding_allow`, `preview_deny_resources` |
 | Migration | `d1_migrations`, `d1_binding`, `d1_lock_scope` (no command override) |
@@ -47,7 +61,7 @@ Outputs: `deploy_url`, `deploy_target`, `version_id` (prod only). The internal `
 
 | Removed | Replacement |
 |---|---|
-| jobs `plan`, `test-unit`, `test-integration`, `test-e2e`, `test` (gate), `preview`, `production`, `production-verify`, `production-recovery`, `pr-link`, `cleanup` | `ci`, `e2e`, `migrate`, `deploy`, `release`, `lifecycle` |
+| jobs `plan`, `test-unit`, `test-integration`, `test-e2e`, `test` (gate), `preview`, `production`, `production-verify`, `production-recovery`, `pr-link`, `cleanup` | `lint`, `typecheck`, `unit`, `integration`, `build`, `e2e`, `migrate`, `deploy`, `release`, `lifecycle` |
 | `preview_build_cmd` | one `build_cmd`; targets differ via `build_env_prod` / `build_env_preview` |
 | `preview_provision_cmd`, `preview_cleanup_cmd` (already ignored) | removed: shared durable Preview resources with explicit `previews` bindings |
 | `preview_migrate_cmd`, `migrate_cmd_prod` | `d1_migrations: true` in the dedicated Migration job. **No command override**: a custom command could skip the target-D1 check, so the built-in `wrangler d1 migrations` path is the only one |
@@ -122,7 +136,7 @@ Inventory (org `firstsun-dev`, workflow files scanned, no consumer references `@
 | `blog` draft PR #448 (`feat/cf-worker-v2-previews`) | `@v2`, uses `preview_migrate_cmd`, `build_env_*`, `test_e2e_*`, `verify_cmd` | Pilot; rewrite per checklist (not merged) |
 | `heaven-monorepo`, `innovation-apps`, `blog` (main), `anas-mcp` | `_cf-worker-template.yml` `@v1` / `@v1.5.0` | **Unaffected** (v1 untouched) |
 
-Checklist per v2 consumer: (1) pin the candidate SHA in **both** `uses:` and `tools_ref`; (2) drop the caller-side `lint`/`build-check`/`prepare` jobs into `lint_cmd`/`typecheck_cmd`/`build_cmd` (or keep them if intentional) and drop duplicate unit/E2E; (3) rename inputs per the table (`migrate_cmd_*` no longer exist: use `d1_migrations: true`, explicit `previews.d1_databases`, and wrangler migrations; set `access_protected_targets` explicitly if Production is behind Access); (4) set `d1_migrations: true` where a D1 exists and make sure `previews.d1_databases` has an explicit DB distinct from production; (5) add `test_e2e_build_cmd` / move the test build out of `test_e2e_setup_cmd`; (6) move `verify_cmd`/`preview_smoke_cmd` to `smoke_cmd` (+ `smoke_env`, `app_url_prod`); (7) keep `on: push (all branches), pull_request, delete, workflow_dispatch`; (8) re-check Environments `<app>/prod` and `<app>/preview` (approvals apply to Migration and Deploy); (9) the caller's job `permissions` must allow `deployments: write` and `pull-requests: write` (and `contents: read`); do **not** reuse a `cfv2-*` or `${{ github.workflow }}` group at the calling job; (10) pass the new `RELEASE_TOKEN` only if `release_cmd` is used; (11) delete the caller `cleanup` job and the `if: github.event_name != 'delete'` gate on the pipeline call — `delete` is handled by `lifecycle` through the same call.
+Checklist per v2 consumer: (1) pin the candidate SHA in **both** `uses:` and `tools_ref`; (2) drop the caller-side `lint`/`build-check`/`prepare` jobs into `lint_cmd`/`typecheck_cmd`/`build_cmd` (or keep them if intentional) and drop duplicate unit/E2E; (3) rename inputs per the table (`migrate_cmd_*` no longer exist: use `d1_migrations: true`, explicit `previews.d1_databases`, and wrangler migrations; set `access_protected_targets` explicitly if Production is behind Access); (4) set `d1_migrations: true` where a D1 exists and make sure `previews.d1_databases` has an explicit DB distinct from production; (5) add `test_e2e_build_cmd` / move the test build out of `test_e2e_setup_cmd`; (6) move `verify_cmd`/`preview_smoke_cmd` to `smoke_cmd` (+ `smoke_env`, `app_url_prod`); (7) keep `on: push (all branches), pull_request, delete, workflow_dispatch`; (8) re-check Environments `<app>/prod` and `<app>/preview` (approvals apply to Migration and Deploy); (9) the caller's job `permissions` must allow `deployments: write` and `pull-requests: write` (and `contents: read`) — **and `contents: write`**, because the shared `release` job declares it and a called workflow cannot exceed its caller's permissions (a caller granting less fails at startup with `startup_failure`, observed on heaven-www); do **not** reuse a `cfv2-*` or `${{ github.workflow }}` group at the calling job; (10) pass the new `RELEASE_TOKEN` only if `release_cmd` is used; (11) delete the caller `cleanup` job and the `if: github.event_name != 'delete'` gate on the pipeline call — `delete` is handled by `lifecycle` through the same call.
 
 `heaven-www` specifically: remove `preview_smoke_cmd` → `smoke_cmd`; no D1 so `d1_migrations` stays false; keep `preview_binding_allow`/Preview credentials as-is; the separate `cleanup` caller job and the `!= 'delete'` gate on `pipeline` are removed; its `lint`/`build-check` jobs may move into `lint_cmd`/`typecheck_cmd`/`build_cmd`.
 

@@ -7,15 +7,18 @@ name: CF Worker Pipeline v2
 #
 #   [Detect Changes]  (monorepo only: the CALLER runs _detect-changes.yml and gates its calls)
 #          |
-#     +----+----+
-#     CI       E2E        run in parallel; each builds what it needs (no build artifacts between jobs)
-#     +----+----+
+#   +------+-------+-----------+-------------+------------------+------+
+#   Lint  Typecheck  Unit Tests  Integration   Build Validation   E2E     six independent jobs, all parallel, no
+#   +------+-------+-----------+-------------+------------------+------+  `needs` between them (own checkout/setup/logs)
 #          |
-#      Migration          dedicated job (d1_migrations: true); Production or Preview D1 by target
+#      Migration          dedicated job (d1_migrations: true); needs all six; Production or Preview D1 by target
 #          |
 #        Deploy           ONE job, target=prod|preview, builds independently, smoke + recovery
 #          |
 #      Release            optional, main only
+#
+# An optional validation job (lint/typecheck/unit/integration/e2e) is skipped only when its command input is
+# empty; Migration/Deploy treat a CONFIGURED job that is skipped as a failure.
 #
 # Event-specific handlers outside the core DAG: `lifecycle` (PR comment / branch delete) and
 # `persistent-dev` (Hybrid, protected dispatch).
@@ -86,12 +89,12 @@ on:
         default: ''
       build_cmd:
         description: >
-          Application build, run from app_path. CI runs it as build VALIDATION (no deploy artifact);
+          Application build, run from app_path. The Build Validation job runs it as validation (no deploy artifact);
           Deploy runs it again, independently, for the real target (build_env_prod / build_env_preview).
         type: string
         required: true
       ci_env:
-        description: Extra nonsecret env for the CI job, one KEY=VALUE per line (applied after the target build env)
+        description: Extra nonsecret env for the Lint/Typecheck/Unit/Integration/Build Validation jobs, one KEY=VALUE per line (applied after the target build env)
         type: string
         default: ''
       use_mailpit:
@@ -259,12 +262,208 @@ env:
 
 jobs:
   # -------------------------------------------------------------------------
-  # CI — Setup, Lint, Typecheck, Unit, Integration, Build validation (steps, one job).
-  # Never receives Cloudflare credentials. Same-repo PRs are covered by the push run of the same
-  # SHA; fork PRs (no push run exists) run here, credential-free.
+  # Validation — six independent jobs (Lint, Typecheck, Unit Tests, Integration Tests, Build Validation, E2E).
+  # No `needs` between them: each is scheduled as soon as the caller invokes this workflow, has its own
+  # checkout / dependency setup / env import / logs / duration / check conclusion, and can be re-run alone.
+  # An optional job whose command input is empty is skipped on purpose; Migration and Deploy accept that skip
+  # ONLY for an empty command (a configured job that ends skipped blocks them). `build_cmd` is required.
+  # None of them receives Cloudflare credentials; no job uploads or downloads a build artifact (Build
+  # Validation builds for validation only, Deploy builds again for its real target).
+  # Same-repo PRs are covered by the push run of the same SHA; fork PRs run these credential-free.
+  # Mailpit starts only where tests can need it (Unit, Integration), never in Lint / Typecheck / Build.
   # -------------------------------------------------------------------------
-  ci:
-    name: CI
+  lint:
+    name: Lint
+    if: inputs.lint_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    env:
+      VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+      VITE_APP_VERSION: ${{ inputs.app_version }}
+      TARGET_BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
+      CI_ENV: ${{ inputs.ci_env }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Fetch env-import tool
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: actions/cf-preview/parse-env.mjs
+          sparse-checkout-cone-mode: false
+      - name: Import validation env (target env, then ci_env)
+        run: |
+          node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
+          node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
+          rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope
+      - uses: firstsun-dev/.github/actions/setup@v1
+        with:
+          setup-node: 'false'
+          setup-pnpm: 'false'
+      - name: Lint
+        id: check
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CMD: ${{ inputs.lint_cmd }}
+        run: bash -c "$CMD"
+      - name: Summary
+        if: always()
+        env:
+          OUTCOME: ${{ steps.check.outcome }}
+          CMD: ${{ inputs.lint_cmd }}
+        run: |
+          {
+            echo "### Lint: $OUTCOME"
+            echo '`'"$CMD"'`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  typecheck:
+    name: Typecheck
+    if: inputs.typecheck_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    env:
+      VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+      VITE_APP_VERSION: ${{ inputs.app_version }}
+      TARGET_BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
+      CI_ENV: ${{ inputs.ci_env }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Fetch env-import tool
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: actions/cf-preview/parse-env.mjs
+          sparse-checkout-cone-mode: false
+      - name: Import validation env (target env, then ci_env)
+        run: |
+          node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
+          node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
+          rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope
+      - uses: firstsun-dev/.github/actions/setup@v1
+        with:
+          setup-node: 'false'
+          setup-pnpm: 'false'
+      - name: Typecheck
+        id: check
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CMD: ${{ inputs.typecheck_cmd }}
+        run: bash -c "$CMD"
+      - name: Summary
+        if: always()
+        env:
+          OUTCOME: ${{ steps.check.outcome }}
+          CMD: ${{ inputs.typecheck_cmd }}
+        run: |
+          {
+            echo "### Typecheck: $OUTCOME"
+            echo '`'"$CMD"'`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  unit:
+    name: Unit Tests
+    if: inputs.test_unit_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    env:
+      VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+      VITE_APP_VERSION: ${{ inputs.app_version }}
+      TARGET_BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
+      CI_ENV: ${{ inputs.ci_env }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Fetch env-import tool
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: actions/cf-preview/parse-env.mjs
+          sparse-checkout-cone-mode: false
+      - name: Import validation env (target env, then ci_env)
+        run: |
+          node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
+          node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
+          rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope
+      - uses: firstsun-dev/.github/actions/setup@v1
+        with:
+          setup-node: 'false'
+          setup-pnpm: 'false'
+      - name: Start Mailpit
+        if: inputs.use_mailpit
+        uses: firstsun-dev/.github/actions/mailpit@v1
+      - name: Unit tests
+        id: check
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CMD: ${{ inputs.test_unit_cmd }}
+        run: bash -c "$CMD"
+      - name: Summary
+        if: always()
+        env:
+          OUTCOME: ${{ steps.check.outcome }}
+          CMD: ${{ inputs.test_unit_cmd }}
+        run: |
+          {
+            echo "### Unit Tests: $OUTCOME"
+            echo '`'"$CMD"'`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  integration:
+    name: Integration Tests
+    if: inputs.test_integration_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    env:
+      VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+      VITE_APP_VERSION: ${{ inputs.app_version }}
+      TARGET_BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
+      CI_ENV: ${{ inputs.ci_env }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Fetch env-import tool
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: actions/cf-preview/parse-env.mjs
+          sparse-checkout-cone-mode: false
+      - name: Import validation env (target env, then ci_env)
+        run: |
+          node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
+          node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
+          rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope
+      - uses: firstsun-dev/.github/actions/setup@v1
+        with:
+          setup-node: 'false'
+          setup-pnpm: 'false'
+      - name: Start Mailpit
+        if: inputs.use_mailpit
+        uses: firstsun-dev/.github/actions/mailpit@v1
+      - name: Integration tests
+        id: check
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CMD: ${{ inputs.test_integration_cmd }}
+        run: bash -c "$CMD"
+      - name: Summary
+        if: always()
+        env:
+          OUTCOME: ${{ steps.check.outcome }}
+          CMD: ${{ inputs.test_integration_cmd }}
+        run: |
+          {
+            echo "### Integration Tests: $OUTCOME"
+            echo '`'"$CMD"'`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build Validation
     if: github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
@@ -283,7 +482,7 @@ jobs:
           path: .cf-tools
           sparse-checkout: actions/cf-preview/parse-env.mjs
           sparse-checkout-cone-mode: false
-      - name: Import build-validation env (target env, then ci_env)
+      - name: Import validation env (target env, then ci_env)
         run: |
           node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
           node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
@@ -292,38 +491,22 @@ jobs:
         with:
           setup-node: 'false'
           setup-pnpm: 'false'
-      - name: Start Mailpit
-        if: inputs.use_mailpit
-        uses: firstsun-dev/.github/actions/mailpit@v1
-      - name: Lint
-        if: inputs.lint_cmd != ''
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.lint_cmd }}
-        run: bash -c "$CMD"
-      - name: Typecheck
-        if: inputs.typecheck_cmd != ''
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.typecheck_cmd }}
-        run: bash -c "$CMD"
-      - name: Unit tests
-        if: inputs.test_unit_cmd != ''
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.test_unit_cmd }}
-        run: bash -c "$CMD"
-      - name: Integration tests
-        if: inputs.test_integration_cmd != ''
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.test_integration_cmd }}
-        run: bash -c "$CMD"
       - name: Build validation (target-aware, nothing is uploaded)
+        id: check
         working-directory: ${{ inputs.app_path }}
         env:
           CMD: ${{ inputs.build_cmd }}
         run: bash -c "$CMD"
+      - name: Summary
+        if: always()
+        env:
+          OUTCOME: ${{ steps.check.outcome }}
+          CMD: ${{ inputs.build_cmd }}
+        run: |
+          {
+            echo "### Build Validation: $OUTCOME"
+            echo '`'"$CMD"'`'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # -------------------------------------------------------------------------
   # E2E — parallel to CI. Own setup and own TEST build (local URLs, mock services); the Deploy job
@@ -399,10 +582,10 @@ jobs:
   # -------------------------------------------------------------------------
   migrate:
     name: Migration
-    needs: [ci, e2e]
-    # always(): `e2e` is skipped when the consumer has no E2E; implicit success() would skip Migration.
-    # A CONFIGURED E2E that did not run (skipped) does not pass: it must have succeeded.
-    if: always() && inputs.d1_migrations && needs.ci.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
+    needs: [lint, typecheck, unit, integration, build, e2e]
+    # always(): optional jobs are skipped when their command is empty; implicit success() would skip Migration.
+    # A CONFIGURED job that did not run (skipped) does not pass: it must have succeeded.
+    if: always() && inputs.d1_migrations && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     environment: ${{ github.ref == 'refs/heads/main' && format('{0}/prod', inputs.app_name) || format('{0}/preview', inputs.app_name) }}
@@ -498,11 +681,11 @@ jobs:
   # -------------------------------------------------------------------------
   deploy:
     name: Deploy
-    needs: [ci, e2e, migrate]
-    # always(): skipped e2e / migrate (no E2E configured, D1-less Worker) must not skip Deploy, but a
-    # failed/cancelled one must block it. E2E may only be skipped when no E2E is configured, and Migration
-    # only when d1_migrations is off.
-    if: always() && needs.ci.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && (needs.migrate.result == 'success' || (needs.migrate.result == 'skipped' && !inputs.d1_migrations)) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
+    needs: [lint, typecheck, unit, integration, build, e2e, migrate]
+    # always(): skipped optional jobs / migrate (empty command, D1-less Worker) must not skip Deploy, but a
+    # failed/cancelled or unexpectedly skipped one must block it. An optional job may only be skipped when its
+    # command is empty, and Migration only when d1_migrations is off.
+    if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && (needs.migrate.result == 'success' || (needs.migrate.result == 'skipped' && !inputs.d1_migrations)) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 40
     # One shared environment per app and target. Production authorization = this environment's protection
