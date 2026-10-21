@@ -82,6 +82,12 @@ A D1-capable Worker SHALL run remote migration from a distinct reusable `Migrati
 - **WHEN** no migration is pending
 - **THEN** Migration SHALL complete successfully without D1 modification.
 
+#### Scenario: Preview identity is validated before any remote migration
+- **WHEN** a Preview-enabled branch push reaches Migration
+- **THEN** the Preview name, ledger ownership (collision between normalized branch names), source binding policy, exact migration target and branch tip SHALL be validated before the first remote migration command
+- **AND** a failed check, a deleted branch or a superseded commit SHALL leave the shared Preview D1 unmodified
+- **AND** no custom migration command SHALL be able to bypass target validation.
+
 #### Scenario: Pull-request validation
 - **WHEN** the event is an untrusted PR or a PR-only validation path
 - **THEN** remote D1 Migration SHALL not execute
@@ -126,6 +132,12 @@ Production and Native Preview normal publishes SHALL share one reusable Deploy j
 - **WHEN** the target-specific build, environment resolution or binding preflight fails
 - **THEN** Deploy SHALL not publish a new Worker version/Preview
 - **AND** an existing branch Preview SHALL remain unchanged.
+
+#### Scenario: Deploy did not actually deploy
+- **WHEN** a Deploy job succeeds because the run was superseded, publishing was skipped, or smoke verification did not pass
+- **THEN** it SHALL NOT report the deployment as verified
+- **AND** Release SHALL require both a successful Deploy and an explicit verified-deployment output for the current SHA
+- **AND** a missing smoke URL, an unapproved Cloudflare Access redirect, a failed SHA check or a rollback SHALL keep Release closed.
 
 #### Scenario: Post-publish smoke fails
 - **WHEN** the deployed endpoint does not pass required smoke tests
