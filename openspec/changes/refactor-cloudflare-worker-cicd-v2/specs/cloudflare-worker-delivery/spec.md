@@ -1,10 +1,10 @@
-# Cloudflare Worker Delivery — vNext Delta Specification
+# Cloudflare Worker Delivery — v2 In-Place Refactor Delta Specification
 
-**Scope:** opt-in vNext shared workflow and its consumer contract. This does not rewrite current v1/v2 behavior. Requirements from `redesign-cloudflare-worker-cicd-v2` remain in force for eligible Native Previews except where the new vNext job topology and migration/build contracts explicitly supersede them.
+**Scope:** the in-place, breaking refactor of the v2 shared workflow (`_cf-worker-v2.yml`) and its consumer contract. v1/v1.5 are unchanged and no new major (`v3`) is introduced. Requirements from `redesign-cloudflare-worker-cicd-v2` remain in force for eligible Native Previews except where the refactored job topology and migration/build contracts explicitly supersede them; the old v2 interface is not preserved.
 
 ## ADDED Requirements
 
-### Requirement: vNext SHALL expose a minimal, independently gated delivery DAG
+### Requirement: The refactored v2 SHALL expose a minimal, independently gated delivery DAG
 
 For each eligible Worker, the normal pipeline SHALL run independent `CI` and `E2E` jobs in parallel, followed by a distinct `Migration` job, a single `Deploy` job, and an optional main-only `Release` job. A monorepo MAY prepend `Detect Changes` to select affected Workers. Setup, Lint, Typecheck, Unit/Integration checks and build validation SHALL normally remain steps within CI, not separate orchestration jobs.
 
@@ -107,7 +107,7 @@ For a Worker/target whose remote D1 is mutable, orchestration SHALL protect the 
 - **THEN** the owner SHALL explicitly approve the trust boundary and coordination design before enabling preview writes
 - **AND** a same-repository concurrency key alone SHALL NOT be claimed to protect cross-repository access.
 
-### Requirement: vNext SHALL use one target-aware Deploy job implementation
+### Requirement: The refactored v2 SHALL use one target-aware Deploy job implementation
 
 Production and Native Preview normal publishes SHALL share one reusable Deploy job and differ only through verified target-specific inputs/commands. Production permissions SHALL not be inferred from user-controlled `target` alone. Migration execution SHALL not be repeated in Deploy.
 
@@ -135,7 +135,7 @@ Production and Native Preview normal publishes SHALL share one reusable Deploy j
 
 ### Requirement: The caller SHALL own per-job environment variables and secrets boundaries
 
-Consumers SHALL continue to supply application-specific configuration for each job, without a new mandatory centralized environment configuration generator. vNext SHALL distinguish nonsecret CI/E2E inputs, target build inputs, remote D1 migration credentials and smoke credentials.
+Consumers SHALL continue to supply application-specific configuration for each job, without a new mandatory centralized environment configuration generator. The workflow SHALL distinguish nonsecret CI/E2E inputs, target build inputs, remote D1 migration credentials and smoke credentials.
 
 #### Scenario: E2E runs locally
 - **WHEN** the app supplies `test_e2e_env`
@@ -178,7 +178,7 @@ A monorepo SHALL use a lightweight Detect job for changed files and package depe
 
 ### Requirement: Existing Preview lifecycle and special deployment strategies SHALL be preserved
 
-vNext SHALL preserve v2's per-branch stable Native Preview, branch-identity collision checks, nonproduction resource preflight, fork trust boundary, protected Hybrid background-trigger testing, and documented Preview retention policy. This refactor SHALL NOT create one physical Preview D1/R2 per feature branch by default.
+The refactored v2 SHALL preserve the previously shipped per-branch stable Native Preview, branch-identity collision checks, nonproduction resource preflight, fork trust boundary, protected Hybrid background-trigger testing, and documented Preview retention policy. This refactor SHALL NOT create one physical Preview D1/R2 per feature branch by default.
 
 #### Scenario: Two Blog branches coexist
 - **WHEN** two independent eligible Blog branches pass their gates
@@ -198,15 +198,15 @@ vNext SHALL preserve v2's per-branch stable Native Preview, branch-identity coll
 - **WHEN** an ANAS MCP non-main branch is tested
 - **THEN** a public Cloudflare Access-bypassing Preview SHALL not be created.
 
-### Requirement: The vNext migration SHALL be opt-in and compatibility-safe
+### Requirement: The in-place breaking refactor SHALL not disturb pinned consumers before cutover
 
-A new major reusable workflow release SHALL be used for this breaking DAG and input revision. Existing `v1`/`v1.5.0`/`v2` callers, immutable tags and published contracts SHALL continue unchanged until an explicitly reviewed consumer migration.
+`_cf-worker-v2.yml` SHALL be refactored in place without a `v3` entrypoint or legacy-input adapters. `v1`/`v1.5.0` and every immutable `v2.x.y` tag SHALL remain unchanged, and the floating `@v2` tag SHALL NOT move until every consumer using it is ready and a reviewed cutover is made.
 
 #### Scenario: Consumer has not migrated
-- **WHEN** an existing consumer still pins v1 or v2
-- **THEN** the new vNext documentation and code SHALL not alter its deployed behavior.
+- **WHEN** an existing consumer still pins v1, an immutable v2.x.y tag, or the floating `@v2` before cutover
+- **THEN** the refactor on a feature branch SHALL not alter its deployed behavior.
 
 #### Scenario: Pilot adoption
 - **WHEN** Blog and Heaven ID migrate in separate reviewed PRs
 - **THEN** both SHALL demonstrate correct E2E/test build versus target deploy build, distinct Migration Job, stable multi-branch Previews, smoke/recovery and applicable special checks
-- **AND** the shared new-major release SHALL wait for verified pilot evidence.
+- **AND** the new immutable v2.x.y release and any move of floating `@v2` SHALL wait for verified pilot evidence.

@@ -1,25 +1,26 @@
-# Tasks: Cloudflare Worker CI/CD vNext refactor
+# Tasks: Cloudflare Worker CI/CD v2 in-place refactor
 
 ## Phase 0 — specification only (this PR)
 
 - [x] Audit current v1/v2 shared job topology and selected consumers.
 - [x] Document agreed architecture: Detect (monorepo) → [CI ∥ E2E] → Migration → Deploy → optional Release.
 - [x] Document target-specific builds, env separation, artifact-free job handoff and shared Preview resources.
-- [x] Preserve previously approved Native Preview identity, retention, protected Hybrid Dev, production recovery and v1/v2 compatibility.
-- [x] Record v2 partial implementation evidence and supersession: link v2 OpenSpec/docs PR #56 and map every remaining obligation below; do not auto-complete transferred work.
+- [x] Preserve previously approved Native Preview identity, retention, protected Hybrid Dev and production recovery. (Old v2 *interface* compatibility is explicitly not preserved.)
+- [x] Decision: refactor `_cf-worker-v2.yml` in place; no `_cf-worker-v3.yml`/`@v3`; breaking changes allowed; floating `@v2` not moved until consumers are ready.
+- [x] Record v2 partial implementation evidence: link v2 OpenSpec/docs PR #56 (historical record) and map every remaining obligation below; do not auto-complete transferred work.
 - [ ] Review/approve this delta and explicitly resolve or assign the open architecture decisions.
-- [ ] Do not modify workflows, scripts, secrets, Cloudflare runtime, or consumer repos under this doc-only PR.
+- [ ] Do not modify workflows, scripts, secrets, Cloudflare runtime, or consumer repos under this doc-only PR (implementation is a separate Draft PR).
 
 ## v2 work handoff and non-duplication
 
-The preceding v2 design was **partially delivered**, not cancelled or erased. [PR #56](https://github.com/firstsun-dev/.github/pull/56) records the currently shipped v2.x behavior and an honest carried/unverified task register. The v2 reusable workflow and already migrated consumers continue to run and receive necessary fixes. **Do not begin a second unfinished v2 feature rollout in parallel with vNext**; target future implementation and remaining consumer adoption to this vNext change. Historical v2 requirements remain valid for v2 callers until a separately reviewed migration.
+The preceding v2 design was **partially delivered**, not cancelled or erased. [PR #56](https://github.com/firstsun-dev/.github/pull/56) records the currently shipped v2.x behavior and an honest carried/unverified task register. Consumers on immutable v2.x tags keep running the shipped workflow; the in-place refactor does not reach them until they re-pin. **Do not begin a second unfinished v2 feature rollout in parallel**; target future implementation and remaining consumer adoption to this change. Historical v2 requirements remain valid where this change does not override them.
 
 Cross-repository handoff (evidence preserved; no box auto-marked complete):
 
-| Prior v2 work | Evidence / remaining gap | New vNext owner |
+| Prior v2 work | Evidence / remaining gap | New owner |
 |---|---|---|
-| Native Preview CLI, URL identity, ownership ledger, preflight, last-good recovery; heaven-www pilot | Already delivered and partly validated; **reuse**, not rebuild | Phase 1: adapt proven primitives to lean DAG, preserve regression tests |
-| v2 Plan, multiple test jobs, Test Gate and inline Preview/Production Migration | Currently shipped topology; **superseded as a future architecture**, not retroactively changed | Phase 1: CI ∥ E2E → separate Migration → single target-aware Deploy |
+| Native Preview CLI, URL identity, ownership ledger, preflight, last-good recovery; heaven-www pilot | Already delivered and partly validated; **reuse**, not rebuild | Phase 1: adapt proven primitives to the lean DAG, preserve regression tests |
+| v2 Plan, multiple test jobs, Test Gate and inline Preview/Production Migration | Currently shipped topology; **replaced in place by this refactor**; shipped tags are not rewritten | Phase 1: CI ∥ E2E → separate Migration → single target-aware Deploy |
 | Optional test skip / `always()` fix, Access-aware smoke and hosting-worker `preview_worker_name` | Already implemented; keep test coverage | Phase 1 contract tests; Phase 2 production/preview pilot |
 | Concurrency, force-push ordering, real fork PR, build-failure-retains-preview, pin revert/rollback, quota | Real-world verification incomplete; **must not be marked passed** | Phases 1, 2 and 5 acceptance gates |
 | Blog shared Preview D1/R2, URL/noindex/QA work | Present in [Blog PR #448](https://github.com/firstsun-dev/blog/pull/448) (Draft), not proof of merged rollout | Phase 2 pilot; reuse/adapt existing PR rather than duplicating it |
@@ -29,14 +30,14 @@ Cross-repository handoff (evidence preserved; no box auto-marked complete):
 | Diet Manager / Notification Hub, protected Queue/Cron Dev | Consumer work pending | Phase 4 adoption and Hybrid tests |
 | D1/R2 IaC, stateful-resource audit, ANAS Access exception, remaining worker inventory | Incomplete or exception requiring preservation | Phase 4 resource/governance work |
 | Orphan, quota, failure and cost monitoring | Outstanding | Phase 5 acceptance and ongoing governance |
-| Optional auto-sweep of deleted-branch Previews | **Not implemented; deferred** | Separate owner-approved follow-up, not assumed part of vNext; existing delete-keeps-Preview policy stays |
-| Tracking issue #43 closure | Not ready | Phase 5 only, after verified vNext consumer rollout |
+| Optional auto-sweep of deleted-branch Previews | **Not implemented; deferred** | Separate owner-approved follow-up, not assumed part of this refactor; existing delete-keeps-Preview policy stays |
+| Tracking issue #43 closure | Not ready | Phase 5 only, after verified consumer rollout |
 
 This register establishes **ownership**, not completion. Do not reinterpret `[x]` in v2 as a promise that a draft consumer PR has merged or every test has been exercised; do not reinterpret `[ ]` as completed merely because the task moved. Preserve both [v2 docs PR #56](https://github.com/firstsun-dev/.github/pull/56) and [v2 planning PR #44](https://github.com/firstsun-dev/.github/pull/44) as an auditable history.
 
 ## Phase 1 — reusable contract (separate implementation PR)
 
-- [ ] Introduce a new-major opt-in shared reusable entrypoint; do not change existing v1/v2 major tags/callers.
+- [ ] Refactor `_cf-worker-v2.yml` in place (no `_cf-worker-v3.yml`/`@v3`); remove obsolete v2 inputs, outputs, jobs and shims; do not touch v1/v1.5; do not move the floating `@v2` tag or edit consumers.
 - [ ] Build minimal job DAG with CI and E2E parallel; independently gated Migration, unified target-aware Deploy, optional Release.
 - [ ] Keep Setup/Lint/Check/Unit/Integration/Build Validation within CI steps by default; remove unnecessary Plan/Test Gate/Prepare jobs.
 - [ ] Preserve optional E2E browser matrix, skip handling, test reports, Mailpit and failure status propagation.
@@ -80,8 +81,8 @@ This register establishes **ownership**, not completion. Do not reinterpret `[x]
 - [ ] Review CI/E2E parallel durations, repeated build cost, cache use, GitHub artifact/quota behavior and affected-app skips.
 - [ ] Verify branch deletion retains Native Preview per existing v2 policy and only retires the correct ledger identity.
 - [ ] Run production rollback drill while proving D1 migrations are never implied to roll back.
-- [ ] Publish immutable new-major tag after pilots pass; migrate callers in focused PRs and document compatibility.
-- [ ] Retire unused workflows/duplicated configs only after all consumers are confirmed migrated; close tracking issue only after rollout acceptance.
+- [ ] After pilots pass: publish an immutable `v2.x.y`, then move floating `@v2` only when every `@v2` consumer is ready; migrate callers in focused PRs following the migration guide.
+- [ ] Retire unused helpers/duplicated configs only after all consumers are confirmed migrated; close tracking issue only after rollout acceptance.
 
 ## Work management
 

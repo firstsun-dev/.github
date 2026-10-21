@@ -1,10 +1,10 @@
-# Design: Cloudflare Worker CI/CD vNext
+# Design: Cloudflare Worker CI/CD v2 refactor
 
-> **Transition (2026-10-21):** v2 is already partially shipped and remains supported for existing callers. [PR #56](https://github.com/firstsun-dev/.github/pull/56) tracks the accurate v2 release history, and [vNext tasks](./tasks.md#v2-work-handoff-and-non-duplication) inherit unfinished obligations. vNext supersedes **future** DAG/migration/consumer-rollout plans only; do not alter v1/v2 published contracts as a side effect of this OpenSpec change.
+> **Decision (2026-10-21):** v2 is refactored **in place** and breaking changes are allowed. No `_cf-worker-v3.yml`, no `@v3`, no legacy-input adapters. [PR #56](https://github.com/firstsun-dev/.github/pull/56) remains the historical record of previously shipped v2.x behavior; [tasks](./tasks.md#v2-work-handoff-and-non-duplication) inherit unfinished obligations. v1/v1.5 are unchanged.
 
-## Baseline, versioning and compatibility
+## Baseline and versioning
 
-`_cf-worker-template.yml` (v1) and `_cf-worker-v2.yml` are existing independently consumed entrypoints. The latter has historically included Plan, unit/integration/E2E, Test Gate, Preview, PR link, Cleanup, Persistent Dev, Production, verification and recovery jobs; some consumer pipelines add Detect, Prepare, Lint and Build Check. Replace the **orchestration** with the simpler vNext contract, not by changing `@v1` or `@v2` in place. The v2 OpenSpec remains a record of its branch-preview decisions; this change overrides only explicitly altered behavior.
+`_cf-worker-template.yml` (v1) is untouched. `_cf-worker-v2.yml` previously included Plan, unit/integration/E2E, Test Gate, Preview, PR link, Cleanup, Persistent Dev, Production, verification and recovery jobs; some consumer pipelines add Detect, Prepare, Lint and Build Check. This change replaces the **orchestration and public interface** of `_cf-worker-v2.yml` directly (v1 stays as is). Immutable `v2.x.y` tags continue to resolve to the old workflow; the floating `@v2` tag moves only at the reviewed cutover, after consumers are ready. The original v2 OpenSpec remains a record of its branch-preview decisions; this change overrides only explicitly altered behavior.
 
 ### Normal push DAG
 
@@ -50,7 +50,7 @@ Keep per-caller command/environment customization rather than introducing a univ
 | Deploy | `build_env_prod` or `build_env_preview`, target-specific app command, deployment credentials | only chosen environment credentials |
 | Smoke (Deploy step) | actual resolved `TARGET_URL`, app `smoke_env`, scoped test credentials | never infer Preview URL from a constant |
 
-These are the **proposed vNext interface names**, not guaranteed existing v1 inputs. Preserve v1's ability to inject newline-separated KEY=VALUE values *per job*, and validate variable names/format safely instead of unsafely interpolating expressions into shell scripts. Runtime Worker `vars`, resource bindings and secrets are distinct from build-time public variables. No secret shall enter client-side `VITE_*`/`PUBLIC_*` values, logs or test reports.
+These are the **refactored v2 interface names**; the old v2 names (`preview_build_cmd`, `preview_*_cmd` provisioning hooks, `preview_smoke_env`, `verify_cmd`, ...) are removed. Preserve v1's ability to inject newline-separated KEY=VALUE values *per job*, and validate variable names/format safely instead of unsafely interpolating expressions into shell scripts. Runtime Worker `vars`, resource bindings and secrets are distinct from build-time public variables. No secret shall enter client-side `VITE_*`/`PUBLIC_*` values, logs or test reports.
 
 CI performs a build **validation** under a documented target-aware configuration when needed; it does not produce a promoted deploy artifact. E2E performs its own local/test build; it may run with localhost origin, mock OAuth, Mailpit and test D1. Deploy checks out the *same source SHA*, independently builds for Prod or Preview, validates the **effective generated Wrangler config** (critical for Astro Cloudflare adapter output), publishes, then probes the exact returned URL. Build must not accidentally inherit `CLOUDFLARE_ENV=dev` from v1: Native Preview `[previews]` config and a named `[env.dev]` are different concepts.
 
@@ -68,6 +68,8 @@ Never depend on GitHub Build Artifacts between jobs. Use fast package caches onl
 - A Worker code rollback never automatically rolls back the D1 schema.
 
 **Critical concurrency condition:** GH Actions job-level group on Migration and a separate group on Deploy do not protect the gap between them. Select/validate a serialization strategy covering the whole state-mutating migration-to-deploy transaction for a given physical D1+Worker target. When safe cross-run coordination cannot be guaranteed, use conservative target-level pipeline serialization before rollout; CI and E2E within each run must still be parallel. Assess GitHub pending-run cancellation/queue semantics explicitly. If a D1 is shared across repositories or persistent Dev, use a cross-repo coordination mechanism or document and gate the exception. Protect Prod and Preview with different scopes.
+
+**Implementation choice (Phase 1, mocked-test evidence only):** `concurrency:` groups cannot span two jobs and GitHub cancels the older *pending* run, which would drop another branch's push on a shared Preview D1. The refactor therefore uses a repository-scoped, ref-based mutex per `<app>/<prod|preview>`: Migration acquires it, Deploy releases it as its last `always()` step, waiters poll, finished holders are taken over, and Migration re-checks the branch tip after waiting. CI/E2E stay unlocked and parallel. Not covered: cross-repository D1 access and persistent-Dev sharing (still needing owner approval), real-GitHub latency, and the stale-takeover race window. Details and test evidence: `docs/cf-worker-v2-refactor.md` in the implementation PR.
 
 ### Unified Deploy contract
 
@@ -92,7 +94,7 @@ Heaven ID: hybrid Worker with protected Cron Dev and OAuth callback/cookie/CORS 
 
 ### Rollout and release controls
 
-Stage shared workflow + contract tests, then Blog and Heaven ID pilots, then monorepo selective apps, then remaining opt-in consumer repos. Consumer PRs keep existing tests, release behavior and required real-world smoke; no bulk migration without inventory. Pin candidate SHA for pilots; release an immutable new-major version only after acceptance. No changes to live credentials, Cloudflare resources, v1/v2 tags or production during documentation-only phase.
+Stage shared workflow + contract tests, then Blog and Heaven ID pilots, then monorepo selective apps, then remaining opt-in consumer repos. Consumer PRs keep existing tests, release behavior and required real-world smoke; no bulk migration without inventory. Pin a candidate SHA for pilots; publish an immutable `v2.x.y` and move floating `@v2` only after acceptance. Phase 1 (shared implementation) changes no consumer repo, live credential, Cloudflare resource, release tag or production.
 
 ## Outstanding approvals
 
