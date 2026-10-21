@@ -59,8 +59,10 @@ def release_runs(r, inputs=None):
     return bool(ev(doc["jobs"]["release"]["if"], c))
 
 
-def deploy_runs(m, e2e="success", inputs=None, ref=FEAT):
-    c = ctx(ref, dict({"d1_migrations": True}, **(inputs or {})), needs={"ci": {"result": "success"}, "e2e": {"result": e2e}, "migrate": {"result": m["result"]}})
+def deploy_runs(m, e2e="success", inputs=None, ref=FEAT, **others):
+    needs = {j: {"result": others.get(j, "success")} for j in ("lint", "typecheck", "unit", "integration", "build")}
+    needs.update({"e2e": {"result": e2e}, "migrate": {"result": m["result"]}})
+    c = ctx(ref, dict({"d1_migrations": True, "lint_cmd": "l", "typecheck_cmd": "t", "test_unit_cmd": "u", "test_integration_cmd": "i", "test_e2e_cmd": "e"}, **(inputs or {})), needs=needs)
     return bool(ev(doc["jobs"]["deploy"]["if"], c))
 
 

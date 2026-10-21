@@ -31,6 +31,8 @@ from ghexpr import Ctx, ev, render, strip_expr  # noqa: E402
 DEFAULT_INPUTS = {
     "app_name": "app", "deployment_strategy": "production-preview", "preview_on_branch_push": True,
     "d1_migrations": False, "dispatch_target": "", "persistent_dev_ref": "", "test_e2e_cmd": "pnpm e2e",
+    "lint_cmd": "pnpm lint", "typecheck_cmd": "pnpm check", "test_unit_cmd": "pnpm unit", "test_integration_cmd": "pnpm integ",
+    "build_cmd": "pnpm build", "ci_env": "", "use_mailpit": True,
     "release_cmd": "", "build_env_prod": "A=prod", "build_env_preview": "A=preview",
 }
 
@@ -56,13 +58,28 @@ def res(**kw):
     return {k: {"result": v, "outputs": {}} for k, v in kw.items()}
 
 
-GREEN = res(ci="success", e2e="success", migrate="skipped")
-CORE = ["ci", "e2e", "migrate", "deploy", "release"]
+# Six independent validation jobs; optional ones are controlled by their command input (build_cmd is required).
+VALIDATION = ["lint", "typecheck", "unit", "integration", "build", "e2e"]
+CMD_INPUT = {"lint": "lint_cmd", "typecheck": "typecheck_cmd", "unit": "test_unit_cmd", "integration": "test_integration_cmd", "e2e": "test_e2e_cmd"}
+JOB_NAME = {"lint": "Lint", "typecheck": "Typecheck", "unit": "Unit Tests", "integration": "Integration Tests", "build": "Build Validation", "e2e": "E2E"}
+CORE = VALIDATION + ["migrate", "deploy", "release"]
+
+
+def vres(migrate="success", **over):
+    """results of all six validation jobs (success unless overridden) + migrate"""
+    d = {j: "success" for j in VALIDATION}
+    d.update(over)
+    return res(migrate=migrate, **d)
+
+
+GREEN = vres(migrate="skipped")
 
 # ---------------------------------------------------------------- 1. topology
-check(set(jobs) == {"ci", "e2e", "migrate", "deploy", "release", "lifecycle", "persistent-dev"},
-      "job set is exactly CI, E2E, Migration, Deploy, Release + lifecycle/persistent-dev handlers")
-for gone in ("plan", "test", "test-unit", "test-integration", "test-e2e", "prepare", "build", "preview", "production",
+check(set(jobs) == set(VALIDATION) | {"migrate", "deploy", "release", "lifecycle", "persistent-dev"},
+      "job set is exactly the six validation jobs, Migration, Deploy, Release + lifecycle/persistent-dev handlers")
+check("ci" not in jobs, "the former combined CI job is gone (no combined-CI requirement remains)")
+check([jobs[j]["name"] for j in VALIDATION] == [JOB_NAME[j] for j in VALIDATION], "validation jobs are named Lint, Typecheck, Unit Tests, Integration Tests, Build Validation, E2E")
+for gone in ("plan", "test", "test-unit", "test-integration", "test-e2e", "prepare", "preview", "production",
              "production-verify", "production-recovery", "pr-link", "cleanup"):
     check(gone not in jobs, f"obsolete job '{gone}' is gone")
 
@@ -72,26 +89,30 @@ def needs_of(name):
     return [n] if isinstance(n, str) else list(n or [])
 
 
-check(needs_of("ci") == [] and needs_of("e2e") == [], "CI and E2E have no needs: they run in parallel, neither waits for the other")
-check(set(needs_of("migrate")) == {"ci", "e2e"}, "Migration needs CI and E2E")
-check(set(needs_of("deploy")) == {"ci", "e2e", "migrate"}, "Deploy needs CI, E2E and Migration")
+for j in VALIDATION:
+    check(needs_of(j) == [], f"{j}: no needs (independent, schedulable immediately; no job waits for another validation job)")
+check(set(needs_of("migrate")) == set(VALIDATION), "Migration needs all six validation jobs")
+check(set(needs_of("deploy")) == set(VALIDATION) | {"migrate"}, "Deploy needs all six validation jobs and Migration")
 check(needs_of("release") == ["deploy"], "Release needs Deploy")
 check(sum(1 for j in jobs if "deploy" in j or "publish" in j) == 1, "exactly one Deploy job implementation (no per-target deploy jobs)")
 
 # ---------------------------------------------------------------- 2. gating over the event matrix
 MAIN, FEAT = "refs/heads/main", "refs/heads/feat/x"
-for name in ("ci", "e2e"):
+for name in VALIDATION:
     check(runs(name, scenario("push", FEAT)), f"{name}: runs on a feature push")
     check(runs(name, scenario("push", MAIN)), f"{name}: runs on a main push")
     check(not runs(name, scenario("delete", FEAT, ev_ref_type="branch")), f"{name}: not on branch delete")
     check(not runs(name, scenario("pull_request", "refs/pull/1/merge", head_repo="o/r")), f"{name}: same-repo PR is covered by the push run (no duplicate full tests)")
     check(runs(name, scenario("pull_request", "refs/pull/1/merge", head_repo="fork/r")), f"{name}: fork PR runs (credential-free)")
     check(not runs(name, scenario("workflow_dispatch", "refs/heads/dev", {"dispatch_target": "persistent-dev"})), f"{name}: not on persistent-dev dispatch")
-check(not runs("e2e", scenario("push", FEAT, {"test_e2e_cmd": ""})), "E2E is skipped (job-level) when no E2E command is configured")
+for name, inp in CMD_INPUT.items():
+    check(not runs(name, scenario("push", FEAT, {inp: ""})), f"{name}: intentionally skipped (job-level) when {inp} is empty")
+    check(runs(name, scenario("push", FEAT, {inp: "x"})), f"{name}: runs when {inp} is configured")
+check(runs("build", scenario("push", FEAT, {"build_cmd": ""})), "build: build_cmd is required, the job is never optional")
 
 for name in ("migrate", "deploy"):
     d1 = {"d1_migrations": True}
-    needs_ok = res(ci="success", e2e="success", migrate="success")
+    needs_ok = vres()
     base = lambda **kw: scenario(**dict(dict(event="push", ref=FEAT, inputs=d1, needs=needs_ok), **kw))
     check(runs(name, base()), f"{name}: runs for a trusted feature push")
     check(runs(name, base(ref=MAIN)), f"{name}: runs for a trusted main push")
@@ -103,21 +124,23 @@ for name in ("migrate", "deploy"):
     check(not runs(name, base(inputs=dict(d1, deployment_strategy="production-only"))), f"{name}: production-only Worker has no Preview migrate/deploy on feature branches")
     check(runs(name, base(ref=MAIN, inputs=dict(d1, deployment_strategy="production-only"))), f"{name}: production-only Worker still deploys main")
     check(not runs(name, base(inputs=dict(d1, preview_on_branch_push=False))), f"{name}: preview_on_branch_push=false skips feature-branch delivery")
-    for bad in ("failure", "cancelled", "skipped"):
-        check(not runs(name, scenario("push", FEAT, d1, res(ci=bad, e2e="success", migrate="success"))), f"{name}: blocked when CI is {bad}")
-    for bad in ("failure", "cancelled"):
-        check(not runs(name, scenario("push", FEAT, d1, res(ci="success", e2e=bad, migrate="success"))), f"{name}: blocked when E2E is {bad}")
-    check(runs(name, scenario("push", FEAT, dict(d1, test_e2e_cmd=""), res(ci="success", e2e="skipped", migrate="success"))), f"{name}: an intentionally disabled E2E (no command) does not block")
-    check(not runs(name, scenario("push", FEAT, d1, res(ci="success", e2e="skipped", migrate="success"))), f"{name}: a CONFIGURED E2E that was skipped / never scheduled (empty or invalid matrix) BLOCKS")
+    for v in VALIDATION:
+        for bad in ("failure", "cancelled", "skipped"):
+            check(not runs(name, scenario("push", FEAT, d1, vres(**{v: bad}))), f"{name}: blocked when configured {v} is {bad} (a configured job that skipped is NOT validation)")
+        if v in CMD_INPUT:
+            check(runs(name, scenario("push", FEAT, dict(d1, **{CMD_INPUT[v]: ""}), vres(**{v: "skipped"}))), f"{name}: an intentionally disabled {v} ({CMD_INPUT[v]} empty) does not block")
+            check(not runs(name, scenario("push", FEAT, dict(d1, **{CMD_INPUT[v]: ""}), vres(**{v: "failure"}))), f"{name}: a failed {v} blocks even if its command is empty")
+    check(not runs(name, scenario("push", FEAT, dict(d1, build_cmd=""), vres(build="skipped"))), f"{name}: Build Validation skipped never passes (build_cmd is required)")
+    check(runs(name, scenario("push", FEAT, dict(d1, **{c: "" for c in CMD_INPUT.values()}), vres(**{v: "skipped" for v in CMD_INPUT}))), f"{name}: Worker with only a build command (all optional checks disabled) passes")
 
 # migrate itself only exists for D1 Workers
-check(not runs("migrate", scenario("push", FEAT, {"d1_migrations": False}, res(ci="success", e2e="success"))), "Migration: skipped for D1-less Workers")
+check(not runs("migrate", scenario("push", FEAT, {"d1_migrations": False}, vres())), "Migration: skipped for D1-less Workers")
 check(runs("deploy", scenario("push", FEAT, {"d1_migrations": False}, GREEN)), "Deploy: D1-less Worker deploys with Migration skipped")
 check(runs("deploy", scenario("push", MAIN, {"d1_migrations": False}, GREEN)), "Deploy: D1-less Worker deploys Production with Migration skipped")
 for bad in ("failure", "cancelled"):
-    check(not runs("deploy", scenario("push", FEAT, {"d1_migrations": True}, res(ci="success", e2e="success", migrate=bad))), f"Deploy: BLOCKED when Migration is {bad} (preview)")
-    check(not runs("deploy", scenario("push", MAIN, {"d1_migrations": True}, res(ci="success", e2e="success", migrate=bad))), f"Deploy: BLOCKED when Migration is {bad} (prod)")
-check(not runs("deploy", scenario("push", FEAT, {"d1_migrations": True}, res(ci="success", e2e="success", migrate="skipped"))),
+    check(not runs("deploy", scenario("push", FEAT, {"d1_migrations": True}, vres(migrate=bad))), f"Deploy: BLOCKED when Migration is {bad} (preview)")
+    check(not runs("deploy", scenario("push", MAIN, {"d1_migrations": True}, vres(migrate=bad))), f"Deploy: BLOCKED when Migration is {bad} (prod)")
+check(not runs("deploy", scenario("push", FEAT, {"d1_migrations": True}, vres(migrate="skipped"))),
       "Deploy: a Migration that was skipped although d1_migrations is on does NOT unblock Deploy")
 
 def dep_needs(result="success", target="prod", verified="true"):
@@ -182,11 +205,11 @@ check(render(jobs["deploy"]["environment"]["name"], c) == "app/preview", "Deploy
 check("preview_url" not in str(jobs["deploy"]["environment"]["url"]) and "steps.publish.outputs.url" in str(jobs["deploy"]["environment"]["url"]), "Deploy: the job shows the actual deployed URL (environment.url)")
 
 # ---------------------------------------------------------------- 4. secret isolation / fork safety (static)
-for name in ("ci", "e2e", "lifecycle"):
+for name in VALIDATION + ["lifecycle"]:
     text = yaml.dump(jobs[name])
     check("secrets." not in text and "CLOUDFLARE" not in text, f"{name}: no secrets and no Cloudflare credentials of any kind")
 check("secrets.CLOUDFLARE_API_TOKEN" not in yaml.dump(jobs["persistent-dev"]) and "CLOUDFLARE_DEV_API_TOKEN" in yaml.dump(jobs["persistent-dev"]), "persistent-dev uses only the Dev token")
-check("secrets.SMOKE_PASSWORD" in yaml.dump(jobs["deploy"]) and "secrets.SMOKE_PASSWORD" not in yaml.dump({k: jobs[k] for k in ("ci", "e2e", "migrate")}),
+check("secrets.SMOKE_PASSWORD" in yaml.dump(jobs["deploy"]) and "secrets.SMOKE_PASSWORD" not in yaml.dump({k: jobs[k] for k in VALIDATION + ["migrate"]}),
       "smoke credentials reach only the Deploy smoke step")
 smoke_step = next(s for s in jobs["deploy"]["steps"] if s.get("id") == "smoke")
 check("SMOKE_PASSWORD" in smoke_step.get("env", {}), "smoke credentials are scoped to the smoke step env")
@@ -210,22 +233,41 @@ check(u.get("if") == "failure()" and u.get("continue-on-error") is True and 0 < 
       "E2E report: failure-only, never fails the job, retention <= 3 days")
 e2e_text = yaml.dump(jobs["e2e"])
 deploy_text = yaml.dump({"steps": jobs["deploy"]["steps"], "env": jobs["deploy"]["env"]})  # the build/steps, not the gating `if`
-ci_text = yaml.dump(jobs["ci"])
 check("test_e2e_build_cmd" in e2e_text and "test_e2e_env" in e2e_text and "inputs.build_cmd" not in e2e_text, "E2E builds with its own test build command and env")
 check("inputs.build_cmd" in deploy_text and "test_e2e" not in deploy_text and "ci_env" not in deploy_text, "Deploy builds independently with build_cmd + target env (no E2E/CI inputs)")
-check("inputs.build_cmd" in ci_text and "ci_env" in ci_text and "test_e2e" not in ci_text, "CI validates the build with build_cmd + ci_env (nothing uploaded)")
+build_text = yaml.dump(jobs["build"])
+check("inputs.build_cmd" in build_text and "ci_env" in build_text and "test_e2e" not in build_text, "Build Validation builds with build_cmd + ci_env (nothing uploaded)")
+# each job runs exactly its own command, and only that one
+CMDS = {"lint": "lint_cmd", "typecheck": "typecheck_cmd", "unit": "test_unit_cmd", "integration": "test_integration_cmd", "build": "build_cmd"}
+for j, inp in CMDS.items():
+    t = yaml.dump(jobs[j])
+    others = [i for k, i in CMDS.items() if k != j] + ["test_e2e_cmd"]
+    check(f"inputs.{inp}" in t and not any(f"inputs.{o}" in t.replace(f"inputs.{inp}", "") for o in others), f"{j}: executes {inp} and no other job's command")
+    run_steps = [s_ for s_ in jobs[j]["steps"] if s_.get("id") == "check"]
+    check(len(run_steps) == 1 and run_steps[0]["env"]["CMD"] == "${{ inputs." + inp + " }}" and run_steps[0]["run"] == 'bash -c "$CMD"', f"{j}: runs {inp} exactly once, via env (not interpolated)")
+    names_ = [s_.get("uses", "") for s_ in jobs[j]["steps"]]
+    check(sum(1 for n in names_ if n.startswith("actions/checkout")) == 2 and any("actions/setup@" in n for n in names_), f"{j}: has its own checkout and dependency setup")
+    check(not any("playwright" in yaml.dump(s_).lower() for s_ in jobs[j]["steps"]), f"{j}: installs no browsers (Playwright is E2E-only)")
+    check("upload-artifact" not in t and "download-artifact" not in t, f"{j}: no artifacts")
+    check("GITHUB_STEP_SUMMARY" in t, f"{j}: writes a short Step Summary")
+    check(jobs[j].get("continue-on-error") is None and all(s_.get("continue-on-error") is not True for s_ in jobs[j]["steps"] if s_.get("id") == "check"), f"{j}: failures are never hidden by continue-on-error")
+for j in ("lint", "typecheck", "build"):
+    check("mailpit" not in yaml.dump(jobs[j]), f"{j}: does not start Mailpit")
+for j in ("unit", "integration", "e2e"):
+    check("mailpit" in yaml.dump(jobs[j]), f"{j}: starts Mailpit when use_mailpit is set")
+check(all(any(str(s_.get("name", "")).startswith("Import validation env") for s_ in jobs[j]["steps"]) for j in CMDS) and
+      all("parse-env.mjs\" TARGET_BUILD_ENV" in yaml.dump(jobs[j]) and "parse-env.mjs\" CI_ENV" in yaml.dump(jobs[j]) for j in CMDS),
+      "validation jobs import target build env then ci_env through the safe importer (precedence preserved)")
 check("build_env_prod" in deploy_text and "build_env_preview" in deploy_text, "Deploy injects target-specific build env")
 check(not any(k in doc[True]["workflow_call"]["inputs"] for k in ("preview_build_cmd", "preview_provision_cmd", "preview_migrate_cmd", "preview_cleanup_cmd", "preview_smoke_cmd", "preview_smoke_env", "verify_cmd", "test_e2e_variants_legacy")),
       "obsolete v2 inputs are removed (no compatibility shims)")
-steps_ci = [s.get("name", "") for s in jobs["ci"]["steps"]]
-check(all(any(w in n for n in steps_ci) for w in ("Lint", "Typecheck", "Unit", "Integration", "Build validation")), "CI contains Lint, Typecheck, Unit, Integration and Build validation as steps")
 
 # ---------------------------------------------------------------- 6. migration safety + serialization
 mig_steps = {s.get("id") or s.get("name"): s for s in jobs["migrate"]["steps"]}
 mig_text, dep_text = yaml.dump(jobs["migrate"]), yaml.dump(jobs["deploy"])
 check(not any(w in text_all for w in ("lock.sh", "cfv2-locks", "refs/cfv2")) and "contents: write" not in yaml.dump({k: jobs[k] for k in ("migrate", "deploy")}),
       "the custom Git-ref lock, its refs and its write permissions are gone")
-check(all(j.get("permissions", {}).get("contents", "read") == "read" for j in (jobs["migrate"], jobs["deploy"], jobs["ci"], jobs["e2e"])), "CI/E2E/Migration/Deploy are read-only on repository contents")
+check(all(j.get("permissions", {}).get("contents", "read") == "read" for j in [jobs["migrate"], jobs["deploy"]] + [jobs[v] for v in VALIDATION]), "validation/Migration/Deploy jobs are read-only on repository contents")
 check("migrate_cmd_prod" not in doc[True]["workflow_call"]["inputs"] and "migrate_cmd_preview" not in doc[True]["workflow_call"]["inputs"] and "MIGRATE_CMD" not in text_all,
       "no custom migration command exists: the target D1 check cannot be bypassed")
 cc = doc["concurrency"]
@@ -242,7 +284,7 @@ check(g("refs/pull/1/merge", event="pull_request").startswith("cfv2-run-") and g
 check(g("refs/heads/dev", {"dispatch_target": "persistent-dev"}, "workflow_dispatch").startswith("cfv2-run-"), "group: persistent-dev dispatch does not queue behind deploys")
 check(g("refs/tags/v1", event="push").startswith("cfv2-run-"), "group: tag pushes get a private group")
 check(all(g(r).startswith("cfv2-") for r in (MAIN, FEAT)) and "github.workflow" not in cc["group"], "group has a static prefix and never uses github.workflow (no caller/callee deadlock)")
-for j in ("migrate", "deploy", "ci", "e2e"):
+for j in ["migrate", "deploy"] + VALIDATION:
     check("concurrency" not in jobs[j], f"{j}: no job-level concurrency (a second, nested group could deadlock with the workflow-level one)")
 
 # every precondition that needs no remote mutation precedes the first remote command (Migration)

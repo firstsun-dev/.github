@@ -3,7 +3,7 @@
 ## Phase 0 — specification only (this PR)
 
 - [x] Audit current v1/v2 shared job topology and selected consumers.
-- [x] Document agreed architecture: Detect (monorepo) → [CI ∥ E2E] → Migration → Deploy → optional Release.
+- [x] Document agreed architecture: Detect (monorepo) → [Lint ∥ Typecheck ∥ Unit ∥ Integration ∥ Build Validation ∥ E2E] → Migration → Deploy → optional Release.
 - [x] Document target-specific builds, env separation, artifact-free job handoff and shared Preview resources.
 - [x] Preserve previously approved Native Preview identity, retention, protected Hybrid Dev and production recovery. (Old v2 *interface* compatibility is explicitly not preserved.)
 - [x] Decision: refactor `_cf-worker-v2.yml` in place; no `_cf-worker-v3.yml`/`@v3`; breaking changes allowed; floating `@v2` not moved until consumers are ready.
@@ -38,8 +38,8 @@ This register establishes **ownership**, not completion. Do not reinterpret `[x]
 ## Phase 1 — reusable contract (separate implementation PR)
 
 - [ ] Refactor `_cf-worker-v2.yml` in place (no `_cf-worker-v3.yml`/`@v3`); remove obsolete v2 inputs, outputs, jobs and shims; do not touch v1/v1.5; do not move the floating `@v2` tag or edit consumers.
-- [ ] Build minimal job DAG with CI and E2E parallel; independently gated Migration, unified target-aware Deploy, optional Release.
-- [ ] Keep Setup/Lint/Check/Unit/Integration/Build Validation within CI steps by default; remove unnecessary Plan/Test Gate/Prepare jobs.
+- [ ] Build minimal job DAG with the six validation jobs parallel; independently gated Migration, unified target-aware Deploy, optional Release.
+- [x] Revised (issue #61): Lint/Typecheck/Unit/Integration/Build Validation are independent jobs (not CI steps); still no Plan/Test Gate/Prepare job.
 - [ ] Preserve optional E2E browser matrix, skip handling, test reports, Mailpit and failure status propagation.
 - [x] Make remote D1 migrations a reusable **distinct job** with validated prod/preview target, no custom-command bypass and all non-mutating guards before the first remote command; bypass for no-D1 apps. (Migration history/checksum drift detection is NOT implemented; tracked as a follow-up.)
 - [x] Gate Release on an explicit `deployed_and_verified` Deploy output; fail-closed smoke; Preview secrets handled as data.

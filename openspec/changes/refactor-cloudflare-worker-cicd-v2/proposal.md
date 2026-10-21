@@ -8,7 +8,7 @@ This change is an **in-place, breaking refactor of v2** (`_cf-worker-v2.yml`). v
 
 ## Proposed outcome
 
-A single Worker uses **CI and E2E in parallel, then Migration, then Deploy, then optional main-only Release**. Monorepos prepend lightweight Detect Changes and invoke the same worker contract for dependency-affected applications. CI and E2E are parallel jobs; lint, typecheck, unit/integration checks and build validation are normally steps in CI, not more jobs. E2E may use a browser matrix where valuable.
+A single Worker uses **six independent validation jobs (Lint, Typecheck, Unit Tests, Integration Tests, Build Validation, E2E) in parallel, then Migration, then Deploy, then optional main-only Release**. Monorepos prepend lightweight Detect Changes and invoke the same worker contract for dependency-affected applications. **Revised decision (issue #61): independent validation jobs are preferred over one combined CI job** for failure isolation, independent reruns, per-check durations/conclusions and parallelism. E2E may use a browser matrix where valuable.
 
 - **Migration is always a distinct job when remote D1 migrations apply.** It selects Production or shared Preview D1 from a trusted target, applies the same project-owned migration files, and gates Deploy. D1-less Workers bypass it.
 - **Deploy is one reusable job implementation for both Production and branch Native Preview**, selected by a validated `target=prod|preview`; it performs its own target-specific build and post-publish smoke/recovery.
