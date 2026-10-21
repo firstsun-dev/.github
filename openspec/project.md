@@ -16,6 +16,7 @@ OpenSpec in this repository owns current-state and proposed behavior for:
 - release/tagging conventions used to distribute shared workflows, actions, and packages;
 - organization issue/PR templates and the public GitHub organization profile;
 - public platform/brand documentation when it defines or explains a contract owned by this repository.
+- organization-wide cross-repository hosting conventions (such as named MCP endpoints) when an OpenSpec change explicitly coordinates repository ownership; Terraform and application runtime changes remain in their owning repositories.
 
 Application-specific product behavior, infrastructure implementation, runtime secrets, and deployment policy owned by consumer repositories are out of scope unless a change explicitly coordinates across repositories.
 
@@ -43,6 +44,7 @@ The current platform is divided into these capabilities:
 7. `rclone-sync` — reusable Google Drive-backed rclone setup and synchronization.
 8. `shared-engineering-config` — shared ESLint and TypeScript configuration packages.
 9. `codegraph-index-ci` — reusable CodeGraph index maintenance (restore/sync/init/verify/cache) for consumer default branches.
+10. `mcp-service-hosting` — organization-wide path naming, ownership, authentication and onboarding contract for independently deployed MCP services; implementation remains in `infra-config` and the individual MCP repositories.
 
 A new spec SHOULD extend an existing capability unless the behavior has a distinct consumer contract, lifecycle, or failure domain.
 
