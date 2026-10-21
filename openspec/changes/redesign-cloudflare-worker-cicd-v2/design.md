@@ -1,5 +1,8 @@
 # Design: Cloudflare Worker CI/CD v2 — push-to-preview branch lifecycle
 
+> **Lifecycle status (2026-10-21): v2 as shipped; maintenance-only.** The job graph and inline migration steps below describe existing v2 behavior, **not** the approved target architecture. New work uses [vNext OpenSpec (PR #57)](https://github.com/firstsun-dev/.github/pull/57): CI/E2E parallel, separate Migration job, one target-aware Deploy job, and independent target-specific builds. Existing v2 deployments remain supported pending explicit migration. Consult [tasks.md](./tasks.md) for carry-over and evidence status.
+
+
 ## Baseline and invariants
 
 Published v1/v1.5.0 deployments still use `wrangler versions upload` + `versions deploy`, so shared Dev and Aliased Version URLs remain as-is until a caller opts into v2. Native Previews are separate deployments. Node.js 24 + pnpm 12.14.0 are the expected toolchain baseline; the installed **project** Wrangler dependency must be >= 4.135.0 and proven compatible before adoption.
@@ -56,7 +59,7 @@ Preserve app-owned build, unit/integration/E2E/migrate/verify commands, app_path
 ### Lifecycle and cleanup
 
 ```text
-trusted branch push --> app selection --> tests --> Preview resource inventory/provision/migrate
+trusted branch push --> Plan (identity + name-ownership check) --> tests --> binding preflight + caller hooks
                     --> build with Preview vars/assets --> wrangler preview --name <stable> --json
                     --> exact-URL smoke --> Deployment/summary --> optional matching PR link
 
@@ -67,7 +70,7 @@ protected Hybrid Dev ---> separately approved Dev deploy/test (Cron/Queue)
 main push --------------> gated Production upload/deploy/migration/verify/recovery
 ```
 
-Cleanup is triggered by the repository default-branch workflow's GitHub `delete` event (`ref_type=branch`); do not depend on the deleted branch's workflow being available. Use `pnpm exec wrangler preview delete --name "$PREVIEW_NAME" --skip-confirmation`, validating Worker identity and resource ownership. Only delete resources created for the same full branch ref/Worker; tolerate repeated deletes and race with a new branch of the same name. Add a safe TTL/orphan reconciliation task for deleted branches and a manual recovery path; never delete Prod, shared Dev, another branch Preview, or shared non-prod resources.
+Branch deletion is handled by the repository default-branch workflow's GitHub `delete` event (`ref_type=branch`); it must not depend on the deleted branch's workflow being available. **Owner decision (2026-10-20): the Preview is kept.** Cloudflare cannot remove only the stable URL (Preview `urls` is read-only; `wrangler preview delete` removes the Preview with all deployments), so the `delete` run only retires the GitHub Deployment ledger (`inactive`, never deleted) after validating the identity and that the deleted branch owns the name, tolerates the delete/recreate race, and prints the manual `wrangler preview delete --name <slug> --worker-name <worker>` command. Nothing is reclaimed automatically; an optional ledger-driven sweep is left as future work. Never delete Prod, shared Dev, another branch's Preview, or shared non-prod resources.
 
 ## Verified platform facts (heaven-www pilot, Wrangler 4.151.1, 2026-10-20)
 
@@ -77,6 +80,13 @@ Cleanup is triggered by the repository default-branch workflow's GitHub `delete`
 - GitHub `delete` events run only the **default branch's** workflow file, so branch-delete cleanup cannot be exercised until the caller is merged to main. A PR close/merge with the branch kept does not touch the Preview.
 - Stale-run guards must use authenticated GitHub API lookups (anonymous `git ls-remote` fails on private repos) and a failed lookup must fail the job, never read as "superseded". Pipelines feeding `GITHUB_OUTPUT` must run with `pipefail`.
 - Post-publish smoke failure recovery is implemented by redeploying the newest earlier GitHub Deployment with state `success` (rebuild that SHA with the same Preview env, probe the URL, keep the run red). Drill verified.
+
+### Visibility and gating (implementation notes)
+
+- The Preview job declares `environment: <app>/preview` with the Preview URL, so the CI job itself shows *View deployment*; the per-branch ledger uses separate `<app>/preview/<slug>` environments.
+- Downstream jobs of the optional test jobs MUST use `always()` with explicit `needs.*.result` gating: GitHub's implicit `success()` skips any job with a skipped ancestor, which silently skipped Preview **and Production** for consumers without all three test commands (found in v2.1.0–v2.5.0, fixed in v2.5.1, guarded by a static contract test).
+- The smoke probe requires an explicit 2xx; a redirect to `*.cloudflareaccess.com` is reported as `access-protected` (exists, not public, content unverified). `curl -f` is never used (it accepts any 3xx).
+- Preview-hosting Worker: when the production Worker keeps `previews_enabled=false` deliberately, Previews are hosted under another Worker with `--worker-name` (`preview_worker_name`).
 
 ## Hybrid and Production controls
 
