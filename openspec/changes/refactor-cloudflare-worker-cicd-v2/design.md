@@ -75,7 +75,7 @@ Everything that can be validated without mutating remote state (trusted target a
 
 Release is gated on an explicit `deployed_and_verified` Deploy output (this run published its own SHA and smoke passed); a stale/skipped/failed/rolled-back Deploy never releases.
 
-Known limits (documented, not resolved): a repo-local group does not protect a D1 shared with another repository or persistent Dev; Environment approvals are asked for both Migration and Deploy and a run waiting for approval holds the group; top-level `concurrency` in a *called* workflow is not explicitly confirmed by the GitHub docs read and `queue` is unknown to actionlint 1.7.12, so both must be proven in a scratch repository before the floating `@v2` moves; SQL checksum/drift detection is not implemented. Details and test evidence: `docs/cf-worker-v2-refactor.md` in the implementation PR (#58).
+Known limits (documented, not resolved): a repo-local group does not protect a D1 shared with another repository or persistent Dev; Environment approvals are asked for both Migration and Deploy and a run waiting for approval holds the group; top-level `concurrency` + `queue: max` in a *called* workflow was proven in a same-repository scratch experiment (FIFO, no overlap across two jobs of a run, no cancellation, independent keys not blocked; default single-pending cancelled intermediate runs), but the cross-repository `uses: org/.github/...@ref` case, queue-full behavior and Environment-approval interaction are still unproven, and `queue` is unknown to actionlint 1.7.12 (ignored via `.github/actionlint.yaml`); SQL checksum/drift detection is not implemented. Details and test evidence: `docs/cf-worker-v2-refactor.md` in the implementation PR (#58).
 
 ### Unified Deploy contract
 

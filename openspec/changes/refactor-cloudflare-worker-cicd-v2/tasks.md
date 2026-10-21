@@ -44,7 +44,8 @@ This register establishes **ownership**, not completion. Do not reinterpret `[x]
 - [x] Make remote D1 migrations a reusable **distinct job** with validated prod/preview target, no custom-command bypass and all non-mutating guards before the first remote command; bypass for no-D1 apps. (Migration history/checksum drift detection is NOT implemented; tracked as a follow-up.)
 - [x] Gate Release on an explicit `deployed_and_verified` Deploy output; fail-closed smoke; Preview secrets handled as data.
 - [x] Choose and implement serialization of the Migration→Deploy interval: workflow-level `concurrency` with `queue: max`, grouped by shared resource (no custom lock). Mocked evidence only (PR #58).
-- [ ] Prove in a real scratch repository that top-level `concurrency` in a *called* workflow queues overlapping runs (no overlap, FIFO, queue-full behavior, Environment-approval interaction) before moving floating `@v2`.
+- [x] Same-repository scratch proof (2026-10-21): top-level `concurrency` + `queue: max` in a called workflow serializes overlapping runs FIFO with no cancellation and covers the gap between jobs; default queue cancels intermediate runs.
+- [ ] Repeat the proof cross-repository (`uses: firstsun-dev/.github/...@ref`) and for queue-full and Environment-approval behavior before moving floating `@v2`.
 - [ ] Reuse v2 branch identity/collision ledger, stale SHA checks, Wrangler Preview publishing, URL lookup, smoke and code recovery.
 - [ ] Keep Production ref protection, scoped env/credentials, fork PR restrictions and version-aware rollback.
 - [ ] Preserve app-owned per-job env values; safely validate/import multiline KEY=VALUE inputs; no broad secret inheritance by default.
