@@ -1,4 +1,5 @@
 """Tiny GitHub-Actions expression interpreter used by the workflow tests (test-only; evaluates trusted workflow text)."""
+import json
 import re
 
 
@@ -66,6 +67,7 @@ def ev(expr, ctx, failed=False):
         "F_format": lambda f, *a: re.sub(r"\{(\d+)\}", lambda m: str(a[int(m.group(1))]), f),
         "F_contains": lambda a, b: str(b) in (a if isinstance(a, (list, tuple)) else str(a)),
         "F_fromjson": lambda s: s,
+        "F_tojson": lambda v: json.dumps(v),
     }
     env = dict(funcs, C=ctx.get_path)
     return eval(to_python(expr), {"__builtins__": {}}, env)  # noqa: S307 (test-only, trusted expression text)

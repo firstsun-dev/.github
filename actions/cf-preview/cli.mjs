@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { dirname, resolve } from 'node:path';
 import {
   assertWranglerSupported, auditDevConfig, previewHostReadiness, auditPreviewConfig, auditProdConfig, classifyEvent, extractPreviewUrl,
-  isStale, migrationPlan, previewIdentity, readConfig, rebindSha, resolveSharedDev, resolveTarget, sharedPreviewDevD1,
+  isStale, migrationPlan, previewIdentity, readConfig, rebindSha, artifactDigest, checkDeployedD1, resolveSharedDev, resolveTarget, sharedPreviewDevD1,
 } from './lib.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -81,6 +81,17 @@ try {
       console.error(`rebound ${r.replacements} commit reference(s) in ${opt('var')}`);
       break;
     }
+    case 'artifact-digest':
+      out({ artifact_digest: artifactDigest(opt('config')) });
+      break;
+    case 'd1-consistency': {
+      // The D1 the audited/published config binds must be the exact database the migration targets.
+      const r = checkDeployedD1(readConfig(opt('config')), readConfig(opt('source')), opt('target'), {
+        binding: opt('binding'), devEnv: opt('dev-env', 'dev'), mode: opt('mode', 'effective'),
+      });
+      out({ d1_binding: r.binding, d1_id: r.databaseId });
+      break;
+    }
     case 'd1-shared': {
       out({ shared: String(sharedPreviewDevD1(readConfig(opt('config')), { binding: opt('binding'), devEnv: opt('dev-env', 'dev') })) });
       break;
@@ -140,7 +151,7 @@ try {
       out({ stale: String(isStale({ runSha: opt('sha'), branchTipSha: opt('tip') })) });
       break;
     default:
-      console.error('usage: cli.mjs identity|wrangler-check|extract-url|preview-host-check|classify|resolve|resolve-dev|rebind-env|d1-shared|dev-config-check|preflight|migration-config|effective-config|audit-prod|stale');
+      console.error('usage: cli.mjs identity|wrangler-check|extract-url|preview-host-check|classify|resolve|resolve-dev|rebind-env|artifact-digest|d1-consistency|d1-shared|dev-config-check|preflight|migration-config|effective-config|audit-prod|stale');
       process.exit(2);
   }
 } catch (e) {

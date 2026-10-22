@@ -396,3 +396,69 @@ test('rebindSha: failed SHA (full and short) becomes the restored SHA', () => {
   assert.equal(r.replacements, 2);
   assert.throws(() => rebindSha('x', 'zz', '1111111'), /hex/);
 });
+
+// ---- PR #64 refactor: protected control variables, exact D1 consistency, same-artifact fingerprint ----
+import { checkDeployedD1, artifactDigest } from '../../actions/cf-preview/lib.mjs';
+import { RESERVED } from '../../actions/cf-preview/parse-env.mjs';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+test('parseEnvLines (reserved): deployment-control and verification names cannot be set by application env', () => {
+  for (const n of ['TARGET', 'DEV_ENV', 'GH_TOKEN', 'EXPECTED_SHA', 'RUN_SHA', 'GOOD_SHA', 'D1_BINDING', 'STATE_DIR', 'APP_DIR', 'BRANCH_REF', 'STALE',
+    'TOOLS_DIR', 'WRANGLER_CONFIG', 'BUILD_CMD', 'PUBLISH_CMD', 'ROLLBACK_TO', 'INPUTS_JSON', 'SMOKE_CMD', 'TARGET_URL', 'DEPLOY_TARGET', 'CF_AUDITED_CONFIG', 'VITE_APP_ENV']) {
+    assert.ok(RESERVED.has(n), `${n} is reserved`);
+    const r = parseEnvLines(`${n}=x`, { reserved: true });
+    assert.equal(r.pairs.length, 0, n);
+    assert.match(r.errors[0], /may not be set/, n);
+  }
+  // the engine rejects a whole block when ANY line is protected (all-or-nothing)
+  assert.equal(parseEnvLines('OK=1\nTARGET=prod', { reserved: true }).errors.length, 1);
+  // ordinary application names stay valid, and the validation jobs / E2E (not reserved mode) keep their existing freedom
+  assert.deepEqual(parseEnvLines('PUBLIC_COMMIT_SHA=abc\nSITE=dev', { reserved: true }).pairs, [['PUBLIC_COMMIT_SHA', 'abc'], ['SITE', 'dev']]);
+  assert.equal(parseEnvLines('APP_URL=http://localhost:4321').errors.length, 0);
+});
+
+const SRC = {
+  name: 'app',
+  d1_databases: [{ binding: 'DB', database_name: 'prod-db', database_id: 'PROD-ID' }],
+  previews: { d1_databases: [{ binding: 'DB', database_name: 'prev-db', database_id: 'PREV-ID' }] },
+  env: { dev: { name: 'app-dev', d1_databases: [{ binding: 'DB', database_name: 'dev-db', database_id: 'DEV-ID' }] } },
+};
+test('checkDeployedD1: the deployed config must bind the exact physical D1 the migration targets', () => {
+  const eff = (d1, extra = {}) => ({ name: 'app', ...extra, d1_databases: d1 });
+  const ok = [{ binding: 'DB', database_name: 'x', database_id: 'PROD-ID' }];
+  assert.equal(checkDeployedD1(eff(ok), SRC, 'prod').databaseId, 'PROD-ID');
+  assert.throws(() => checkDeployedD1(eff([{ binding: 'DB', database_id: 'OTHER' }]), SRC, 'prod'), /D1 mismatch.*PROD-ID.*OTHER/s);
+  assert.throws(() => checkDeployedD1(eff([]), SRC, 'prod'), /no D1 binding "DB"/);
+  assert.throws(() => checkDeployedD1(eff([{ binding: 'OTHER_BINDING', database_id: 'PROD-ID' }]), SRC, 'prod'), /no D1 binding "DB"/);
+  // Preview reads previews.d1_databases of the deployed config
+  assert.equal(checkDeployedD1({ previews: { d1_databases: [{ binding: 'DB', database_id: 'PREV-ID' }] } }, SRC, 'preview').databaseId, 'PREV-ID');
+  assert.throws(() => checkDeployedD1({ d1_databases: [{ binding: 'DB', database_id: 'PREV-ID' }], previews: {} }, SRC, 'preview'), /no D1 binding/);
+  // Dev: the flattened effective config (top-level) must equal env.<dev>.d1_databases of the SOURCE; DB-A migrated, DB-B deployed is refused
+  assert.equal(checkDeployedD1(eff([{ binding: 'DB', database_id: 'DEV-ID' }]), SRC, 'dev').databaseId, 'DEV-ID');
+  assert.throws(() => checkDeployedD1(eff([{ binding: 'DB', database_id: 'PROD-ID' }]), SRC, 'dev'), /D1 mismatch/);
+  // mode=source: the deployed config IS the source, selected through the named environment
+  assert.equal(checkDeployedD1(SRC, SRC, 'dev', { mode: 'source' }).databaseId, 'DEV-ID');
+});
+
+test('artifactDigest: stable for an unchanged deployable; changes when the config, entry or assets change', () => {
+  const d = mkdtempSync(join(tmpdir(), 'digest-'));
+  mkdirSync(join(d, 'dist', 'assets'), { recursive: true });
+  writeFileSync(join(d, 'dist', 'index.js'), 'export default {}');
+  writeFileSync(join(d, 'dist', 'assets', 'a.css'), 'a{}');
+  const cfg = join(d, 'dist', 'wrangler.json');
+  const write = (o) => writeFileSync(cfg, JSON.stringify({ name: 'app-dev', main: 'index.js', assets: { directory: 'assets' }, ...o }));
+  write({});
+  const base = artifactDigest(cfg);
+  assert.equal(artifactDigest(cfg), base);
+  write({ name: 'app-prod' });
+  assert.notEqual(artifactDigest(cfg), base, 'config change');
+  write({});
+  assert.equal(artifactDigest(cfg), base);
+  writeFileSync(join(d, 'dist', 'index.js'), 'export default {};//rebuilt');
+  assert.notEqual(artifactDigest(cfg), base, 'Worker entry replaced');
+  writeFileSync(join(d, 'dist', 'index.js'), 'export default {}');
+  writeFileSync(join(d, 'dist', 'assets', 'b.css'), 'b{}');
+  assert.notEqual(artifactDigest(cfg), base, 'asset added');
+});

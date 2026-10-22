@@ -5,6 +5,24 @@ set -euo pipefail
 R="${GITHUB_REPOSITORY:?}"
 cmd="${1:?}"; shift
 
+# scan_good <env> <exclude-id> [jq --arg ...] -- <jq select filter>: newest matching deployment whose latest
+# status is success with a valid https environment_url; prints "<sha> <url>".
+scan_good() {
+  local env="$1" exclude="$2" jqargs=()
+  shift 2
+  while [ "$1" != -- ]; do jqargs+=("$1"); shift; done
+  shift
+  local filter="$1" list id sha row st url
+  list="$(gh api "repos/$R/deployments?environment=$(printf %s "$env" | jq -sRr @uri)&per_page=30")" || exit 1
+  while read -r id sha; do
+    [ -n "$id" ] || continue
+    [ "$id" = "$exclude" ] && continue
+    row="$(gh api "repos/$R/deployments/$id/statuses?per_page=1" -q '.[0] | "\(.state) \(.environment_url)"')"
+    st="${row%% *}"; url="${row#* }"
+    if [ "$st" = success ] && [[ "$url" =~ ^https://[^[:space:]]+$ ]]; then echo "$sha $url"; return 0; fi
+  done < <(printf '%s' "$list" | jq -r "${jqargs[@]}" ".[] | $filter | \"\\(.id) \\(.sha)\"")
+}
+
 case "$cmd" in
   start) # <env> <sha> <payload-json> [description] -> deployment id
     gh api "repos/$R/deployments" -X POST --input - -q .id <<JSON
@@ -26,15 +44,13 @@ JSON
     # whose recorded identity matches exactly: repository, application, branch ref, HOST Worker (a Preview hosted
     # under another Worker, e.g. blog-preview vs blog, is a different Preview even with the same environment
     # string) and a valid https URL on its latest status. Legacy records without host_worker are never eligible.
-    list="$(gh api "repos/$R/deployments?environment=$(printf %s "$1" | jq -sRr @uri)&per_page=30")" || exit 1
-    while read -r id sha; do
-      [ -n "$id" ] || continue
-      [ "$id" = "${2:-}" ] && continue
-      row="$(gh api "repos/$R/deployments/$id/statuses?per_page=1" -q '.[0] | "\(.state) \(.environment_url)"')"
-      st="${row%% *}"; url="${row#* }"
-      if [ "$st" = success ] && [[ "$url" =~ ^https://[^[:space:]]+$ ]]; then echo "$sha $url"; exit 0; fi
-    done < <(printf '%s' "$list" | jq -r --arg repo "$R" --arg ref "$3" --arg host "$4" --arg app "$5" \
-      '.[] | select(.payload.repo == $repo and .payload.branch_ref == $ref and .payload.host_worker == $host and .payload.worker == $app) | "\(.id) \(.sha)"')
+    scan_good "$1" "${2:-}" --arg repo "$R" --arg ref "$3" --arg host "$4" --arg app "$5" -- \
+      'select(.payload.repo == $repo and .payload.branch_ref == $ref and .payload.host_worker == $host and .payload.worker == $app)'
+    ;;
+  last-good-dev) # <env> <exclude-id> <dev_worker> <app> -> "<sha> <url>" of the newest verified Shared Dev deployment
+    # (any branch; Dev is one shared Worker) recorded for THIS Dev Worker with a valid URL.
+    scan_good "$1" "${2:-}" --arg repo "$R" --arg dev "$3" --arg app "$4" -- \
+      'select(.payload.repo == $repo and .payload.dev_worker == $dev and .payload.worker == $app)'
     ;;
   comment) # <branch> <app_name> <url> <sha> : only same-repo PRs from this exact head branch
     owner="${R%%/*}"

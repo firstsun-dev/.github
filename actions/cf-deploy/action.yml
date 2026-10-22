@@ -1,0 +1,207 @@
+name: CF Worker delivery engine
+description: >
+  The ONE deployment implementation of Cloudflare Worker CI/CD v2, for target = prod | preview | dev:
+  Build -> effective-config audit -> exact D1 target check -> stale check -> migrate (optional) -> stale check ->
+  publish the audited artifact -> smoke -> mark verified | recover. Every step is a phase of
+  actions/cf-preview/engine.sh; this file only sequences them. The CALLER job owns the Environment, permissions,
+  concurrency and which Cloudflare credentials exist (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID in the job env).
+  The caller must have checked out the app at the run SHA and then this repository's `actions/` at `.cf-tools`.
+inputs:
+  target:
+    description: prod | preview | dev. Bound once by the engine; application env can never change it.
+    required: true
+  mode:
+    description: auto (branch / main push, with automatic recovery) | manual (persistent Dev dispatch, no recovery)
+    default: auto
+  inputs_json:
+    description: toJSON(inputs) of the calling workflow (data only; never interpolated into a script)
+    required: true
+  preview_secrets:
+    description: Preview-only secrets (KEY=VALUE lines); only read when target is preview
+    default: ''
+  smoke_username:
+    default: ''
+  smoke_password:
+    default: ''
+  sibling_result:
+    description: Result of the job this one was ordered after (Preview Deploy), for the shared-D1 guard
+    default: ''
+  sibling_migration:
+    description: Migration state reported by that job (applied | failed | none)
+    default: ''
+outputs:
+  url:
+    description: Deployed (and smoke-tested) URL
+    value: ${{ steps.verified.outputs.url || steps.publish.outputs.url }}
+  version_id:
+    description: Production Worker version id (prod only)
+    value: ${{ steps.publish.outputs.version_id }}
+  deployed_and_verified:
+    description: true ONLY when this run published its own SHA and the smoke passed
+    value: ${{ steps.verified.outputs.deployed_and_verified || 'false' }}
+  smoke_level:
+    description: content | liveness
+    value: ${{ steps.verified.outputs.smoke_level }}
+  migration:
+    description: applied | failed | none
+    value: ${{ steps.migration_state.outputs.state }}
+runs:
+  using: composite
+  steps:
+    - name: Initialise (bind target, validate credentials and env as data)
+      id: init
+      shell: bash
+      env:
+        ENGINE_TARGET: ${{ inputs.target }}
+        ENGINE_MODE: ${{ inputs.mode }}
+        INPUTS_JSON: ${{ inputs.inputs_json }}
+        PREVIEW_SECRETS: ${{ inputs.target == 'preview' && inputs.preview_secrets || '' }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" init'
+    - name: Stale-SHA guard (start)
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" guard start'
+    - name: Setup dependencies
+      if: env.STALE != 'true'
+      uses: firstsun-dev/.github/actions/setup@v1
+      with:
+        setup-node: 'false'
+        setup-pnpm: 'false'
+    - name: Install tooling deps
+      if: env.STALE != 'true'
+      shell: bash
+      run: cd "$GITHUB_ACTION_PATH/../cf-preview" && npm ci --ignore-scripts --no-audit --no-fund
+    - name: Prepare (Wrangler version, Preview identity and ledger, ledger entry)
+      if: env.STALE != 'true'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" prepare'
+    - name: Build and audit the deployable (nothing remote is changed)
+      if: env.STALE != 'true'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" build'
+    - name: Validate the exact migration target (same physical D1 as the deployed config)
+      if: env.STALE != 'true'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" audit-d1'
+    - name: Shared-D1 guard (Dev after a failed Preview migration)
+      if: env.STALE != 'true' && inputs.target == 'dev'
+      shell: bash
+      env:
+        PREVIEW_MIGRATION: ${{ inputs.sibling_migration }}
+        PREVIEW_JOB_RESULT: ${{ inputs.sibling_result }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" d1-guard'
+    - name: Stale-SHA guard (before migration)
+      if: env.STALE != 'true'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" guard before-migration'
+    - name: Apply pending D1 migrations (this target only)
+      id: migrate
+      if: env.STALE != 'true'
+      shell: bash
+      env:
+        ENGINE_TARGET: ${{ inputs.target }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" migrate | tee -a "$GITHUB_OUTPUT"'
+    - name: Stale-SHA guard (after migration, before publish)
+      if: env.STALE != 'true'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" guard before-publish'
+    - name: Publish the audited artifact
+      id: publish
+      if: env.STALE != 'true'
+      shell: bash
+      env:
+        ENGINE_TARGET: ${{ inputs.target }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" publish | tee -a "$GITHUB_OUTPUT"'
+    - name: Smoke the exact deployed URL (fails closed)
+      id: smoke
+      if: env.STALE != 'true' && steps.publish.outcome == 'success'
+      shell: bash
+      env:
+        PUBLISHED_URL: ${{ steps.publish.outputs.url }}
+        SMOKE_USERNAME: ${{ inputs.smoke_username }}
+        SMOKE_PASSWORD: ${{ inputs.smoke_password }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" smoke | tee -a "$GITHUB_OUTPUT"'
+    # The ONLY place deployed_and_verified becomes true: this run published its own SHA and its smoke passed.
+    - name: Mark deployed and verified
+      id: verified
+      if: env.STALE != 'true' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'success'
+      shell: bash
+      env:
+        PUBLISHED_URL: ${{ steps.publish.outputs.url }}
+        SMOKE_LEVEL: ${{ steps.smoke.outputs.smoke_level }}
+        VERSION_ID: ${{ steps.publish.outputs.version_id }}
+        PREVIOUS_VERSION_ID: ${{ steps.publish.outputs.previous_version_id }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" verified | tee -a "$GITHUB_OUTPUT"'
+    - name: Report migration state
+      id: migration_state
+      if: always()
+      shell: bash
+      env:
+        OUTCOME: ${{ steps.migrate.outcome }}
+      run: |
+        case "$OUTCOME" in success) S=applied;; failure|cancelled) S=failed;; *) S=none;; esac
+        echo "state=$S" >> "$GITHUB_OUTPUT"
+    # ---- Failure outcomes: always explicit, the job stays red. ----
+    - name: Failed before or during publish
+      if: failure() && steps.init.outcome == 'success' && steps.publish.outcome != 'success' && env.STALE != 'true'
+      shell: bash
+      env:
+        PREVIEW_MUTATED: ${{ steps.publish.outputs.preview_mutated }}
+        PUBLISH_STARTED: ${{ steps.publish.outputs.publish_started }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" fail-prepublish'
+    - name: Published but smoke failed - mark unverified
+      if: failure() && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
+      shell: bash
+      env:
+        PUBLISHED_URL: ${{ steps.publish.outputs.url }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" unverified'
+    - name: Production recovery (policy-driven; D1 is never rolled back)
+      if: failure() && inputs.target == 'prod' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
+      shell: bash
+      env:
+        PREVIOUS_VERSION_ID: ${{ steps.publish.outputs.previous_version_id }}
+        ENGINE_TARGET: ${{ inputs.target }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" prod-recover'
+    - name: Recovery - find the last known-good deployment of this target
+      id: good
+      if: failure() && inputs.mode == 'auto' && inputs.target != 'prod' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" recover-find | tee -a "$GITHUB_OUTPUT"'
+    - name: Recovery - checkout last good
+      if: failure() && steps.good.outputs.sha != ''
+      uses: actions/checkout@v6
+      with:
+        ref: ${{ steps.good.outputs.sha }}
+        path: recover
+        persist-credentials: false
+    - name: Recovery - rebuild, audit and republish last good (no migration)
+      id: recover
+      if: failure() && steps.good.outputs.sha != ''
+      shell: bash
+      env:
+        ENGINE_TARGET: ${{ inputs.target }}
+        GOOD_SHA: ${{ steps.good.outputs.sha }}
+        GOOD_URL: ${{ steps.good.outputs.url }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" recover-run | tee -a "$GITHUB_OUTPUT"'
+    - name: Recovery - verify the restored deployment (full smoke, last-good SHA)
+      id: rverify
+      if: failure() && steps.good.outputs.sha != '' && steps.recover.outcome == 'success'
+      shell: bash
+      env:
+        RECOVERED_URL: ${{ steps.recover.outputs.url }}
+        GOOD_SHA: ${{ steps.good.outputs.sha }}
+        SMOKE_USERNAME: ${{ inputs.smoke_username }}
+        SMOKE_PASSWORD: ${{ inputs.smoke_password }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" recover-verify | tee -a "$GITHUB_OUTPUT"'
+    - name: Recovery - record the outcome accurately
+      if: failure() && steps.good.outputs.sha != ''
+      shell: bash
+      env:
+        GOOD_SHA: ${{ steps.good.outputs.sha }}
+        RECOVERED: ${{ steps.recover.outcome }}
+        VERIFIED: ${{ steps.rverify.outcome }}
+        SMOKE_LEVEL: ${{ steps.rverify.outputs.smoke_level }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" recover-record'
+    - name: Remove staged env files
+      if: always()
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" cleanup'

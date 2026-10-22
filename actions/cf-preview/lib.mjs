@@ -1,6 +1,8 @@
 // Pure helpers for Cloudflare Worker CI/CD v2 (branch-owned Native Previews).
 // No I/O except readConfig(); everything else is deterministic and unit-tested.
-import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { dirname, join, resolve as resolvePath, relative } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 import { parse as parseJsonc } from 'jsonc-parser';
 
@@ -404,4 +406,55 @@ export function rebindSha(text, from, to) {
   swap(new RegExp(from, 'gi'), to);
   swap(new RegExp(`\\b${from.slice(0, 7)}\\b`, 'gi'), to.slice(0, 7));
   return { text, replacements: n };
+}
+
+/**
+ * The D1 the DEPLOYED Worker will bind must be the exact physical database the migration targets.
+ * `deployedCfg` is the audited config that will be published (adapter-generated effective config, or the source
+ * config when mode is 'source'); `source` is the project's source config used for migration targeting.
+ */
+export function checkDeployedD1(deployedCfg, source, target, { binding = '', devEnv = 'dev', mode = 'effective' } = {}) {
+  const plan = migrationPlan(source, target, { binding, devEnv, migrationsDirAbs: (d) => d });
+  let deployed;
+  if (mode === 'source') deployed = d1ForTarget(source, target, { devEnv });
+  else deployed = target === 'preview' ? (deployedCfg.previews?.d1_databases ?? []) : (deployedCfg.d1_databases ?? []);
+  const hit = deployed.find((b) => b.binding === plan.binding);
+  if (!hit) throw new Error(`The deployed config has no D1 binding "${plan.binding}" but migrations target ${plan.databaseName}; refusing to migrate or publish`);
+  if (hit.database_id !== plan.databaseId) {
+    throw new Error(`D1 mismatch: migrations target ${plan.databaseName} (${plan.databaseId}) but the deployed config binds ${plan.binding} to ${hit.database_name ?? '?'} (${hit.database_id}); refusing to migrate DB-A and deploy a Worker connected to DB-B`);
+  }
+  return { binding: plan.binding, databaseId: plan.databaseId };
+}
+
+/**
+ * Cheap fingerprint of the audited deployable: the config file itself, the Worker entry directory and the static
+ * assets directory it names (path + size + content hash per file; mtime is ignored, only a real change counts). Used to prove that a caller-supplied publish command
+ * did not rebuild or replace what the audit approved.
+ */
+export function artifactDigest(configPath) {
+  const h = createHash('sha256');
+  const cfgFile = resolvePath(configPath);
+  h.update('config\0'); h.update(readFileSync(cfgFile));
+  const cfg = readConfig(cfgFile);
+  const base = dirname(cfgFile);
+  const roots = [];
+  if (cfg.assets?.directory) roots.push(resolvePath(base, cfg.assets.directory));
+  if (cfg.main) roots.push(dirname(resolvePath(base, cfg.main)));
+  const walk = (dir, out) => {
+    if (!existsSync(dir)) return;
+    for (const name of readdirSync(dir).sort()) {
+      if (name === 'node_modules' || name === '.wrangler') continue;
+      const p = join(dir, name);
+      const st = statSync(p);
+      if (st.isDirectory()) walk(p, out);
+      else out.push(`${p}\0${st.size}\0${createHash('sha256').update(readFileSync(p)).digest('hex')}`);
+    }
+  };
+  for (const r of [...new Set(roots)].sort()) {
+    const files = [];
+    walk(r, files);
+    h.update(`root\0${relative(base, r)}\0`);
+    for (const f of files) h.update(f.replace(r, '') + '\n');
+  }
+  return h.digest('hex');
 }

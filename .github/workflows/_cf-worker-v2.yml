@@ -1,32 +1,34 @@
 name: CF Worker Pipeline v2
 
 # ---------------------------------------------------------------------------
-# Cloudflare Worker CI/CD v2 — lean, parallel, target-aware delivery.
-# OpenSpec: openspec/changes/refactor-cloudflare-worker-cicd-v2 (PR #57), tracking #43.
-# Migration guide / interface: docs/cf-worker-v2-refactor.md
+# Cloudflare Worker CI/CD v2 — thin workflow, ONE reusable delivery engine.
+# OpenSpec: openspec/changes/refactor-cloudflare-worker-cicd-v2 (PR #57), openspec/changes/add-cloudflare-shared-dev-channel.
+# Interface / migration guide: docs/cf-worker-v2-refactor.md
 #
-#   [Detect Changes]  (monorepo only: the CALLER runs _detect-changes.yml and gates its calls)
-#          |
-#   +------+-------+-----------+-------------+------------------+------+
-#   Lint  Typecheck  Unit Tests  Integration   Build Validation   E2E     six independent jobs, all parallel, no
-#   +------+-------+-----------+-------------+------------------+------+  `needs` between them (own checkout/setup/logs)
-#          |
-#      Migration          dedicated job (d1_migrations: true); needs all six; Production or Preview D1 by target
-#          |
-#        Deploy           ONE job, target=prod|preview, builds independently, smoke + recovery
-#          |
-#      Release            optional, main only
+#   Lint  Typecheck  Unit Tests  Integration  Build Validation  E2E      six independent, parallel jobs (no `needs`
+#     \       \          |            |             /            /       between them) -> actions/cf-ci-check
+#      +-------+----------+------------+------------+-----------+
+#                         |                                      |
+#                 Deploy  target=prod|preview             Shared Dev  target=dev  (needs Deploy for ORDERING only)
+#                         |                                      |
+#                         +--------- actions/cf-deploy ----------+       the SAME engine for every target:
+#              build -> config audit -> D1 target check -> stale check -> migrate (optional step) -> stale check
+#                         -> publish the audited artifact -> smoke -> mark verified | recover
+#                         |
+#                      Release   optional, main only, after a VERIFIED Production deploy
 #
-#   Shared Dev (optional, `shared_dev_on_branch_push`): job `dev-deploy`, independent of Native Preview. After
-#   the six validation jobs (and, for ordering only, after Migration/Deploy have finished) every non-main branch
-#   push builds for Dev, migrates the Dev D1, deploys the ONE configured Dev Worker (last verified deployment
-#   wins), and smokes `app_url_dev`. Feature Preview and Shared Dev are two switches: all four combinations work.
+# There is no Prepare/Plan/Test-Gate/Migration job: Migration is a step inside the engine, after the deployable
+# build and config audit and before the publish of that audited artifact. Event handlers outside the DAG:
+# `lifecycle` (PR comment / branch delete), `config-guard` (production-only + Shared Dev is rejected) and
+# `persistent-dev` (Hybrid, protected manual dispatch; the same engine in manual mode).
 #
 # An optional validation job (lint/typecheck/unit/integration/e2e) is skipped only when its command input is
-# empty; Migration/Deploy treat a CONFIGURED job that is skipped as a failure.
+# empty; Deploy and Shared Dev treat a CONFIGURED job that is skipped, failed or cancelled as a failure.
 #
-# Event-specific handlers outside the core DAG: `lifecycle` (PR comment / branch delete), `config-guard`
-# (rejects production-only + Shared Dev) and `persistent-dev` (Hybrid, protected manual dispatch).
+# Local composite actions: a reusable workflow called from another repository resolves `uses: ./...` against the
+# CALLER's workspace and `uses:` cannot take an expression. Every job therefore checks out firstsun-dev/.github at
+# `tools_ref` into `.cf-tools` and references the actions as the static path `./.cf-tools/actions/<name>`.
+# `tools_ref` MUST equal the ref the caller pins this workflow at.
 #
 # Caller MUST trigger on: push (all branches), pull_request, delete, workflow_dispatch.
 # `delete` only fires from the DEFAULT branch's workflow file.
@@ -192,7 +194,10 @@ on:
         default: manual
       # ---- Migration ----
       d1_migrations:
-        description: The Worker has remote D1 migrations; enables the dedicated Migration job. Leave false for D1-less Workers.
+        description: >
+          The Worker has remote D1 migrations; enables the Migration STEP of the delivery engine (after the build and
+          config audit, before the publish). Production, Preview and Shared Dev apply the same project-owned SQL to
+          their own D1. Leave false for D1-less Workers.
         type: boolean
         default: false
       d1_binding:
@@ -201,9 +206,10 @@ on:
         default: ''
       d1_lock_scope:
         description: >
-          Identity of the PHYSICAL shared Preview D1 (default: app_name). Apps in this repository that share one
-          Preview D1 must use the same value so their runs are serialized together. Does not protect a D1 shared
-          with ANOTHER repository.
+          Identity of the PHYSICAL shared D1 (default: app_name). Apps in this repository that share one D1 must use
+          the same value so their runs are serialized together: it names the run-level concurrency group (separate
+          Production and non-Production groups) and the Shared Dev / persistent-Dev group. GitHub concurrency is
+          repository-scoped: it CANNOT lock a D1 shared with ANOTHER repository.
         type: string
         default: ''
       # ---- Release ----
@@ -218,10 +224,11 @@ on:
         default: ''
       dev_deploy_cmd:
         description: >
-          Command deploying the Dev Worker from app_path. Split contract (set dev_build_cmd): dev_build_cmd builds only,
-          dev_deploy_cmd publishes only, dev_smoke_cmd verifies only; Shared Dev and the manual persistent-dev dispatch
-          both run build -> config audit -> migration -> publish -> smoke. Legacy contract (dev_build_cmd empty): the
-          manual dispatch runs dev_deploy_cmd (which must build) and the optional dev_smoke_cmd exactly as before.
+          OPTIONAL publish-only command for the Dev Worker (default: `wrangler deploy --config <audited config>`).
+          The engine builds with dev_build_cmd (or build_cmd) and audits the effective config FIRST; this command runs
+          afterwards with CF_AUDITED_CONFIG exported, must publish THAT config (`wrangler deploy --config
+          "$CF_AUDITED_CONFIG"`) and must not rebuild: a changed config or deployable fails the run. Legacy manual
+          dispatch (dev_build_cmd empty): dev_deploy_cmd builds and publishes exactly as before.
         type: string
         default: ''
       dev_smoke_cmd:
@@ -233,7 +240,7 @@ on:
         type: string
         default: ''
       dev_build_cmd:
-        description: Dev build from app_path (with build_env_dev), build only. Required by Shared Dev with d1_migrations; setting it also opts the manual persistent-dev dispatch into the split contract. Leave empty only for a legacy persistent-dev caller whose dev_deploy_cmd builds itself.
+        description: Dev build from app_path (with build_env_dev), build only; falls back to build_cmd when empty. REQUIRED with d1_migrations (the Dev build must succeed before the Dev D1 is migrated). Setting it also opts the manual persistent-dev dispatch into the engine. Leave empty only for a legacy persistent-dev caller whose dev_deploy_cmd builds itself.
         type: string
         default: ''
       dev_wrangler_env:
@@ -291,26 +298,28 @@ on:
         description: Token for release_cmd (exported as GH_TOKEN); defaults to nothing, GITHUB_TOKEN is NOT used for releases
         required: false
 
-# Serialization of the whole Migration -> Deploy interval (GitHub `concurrency` cannot span two jobs, so the
-# whole RUN is the unit; CI and E2E still run in parallel inside a run). One group per piece of shared mutable
-# state, `queue: max` so a newer push does not cancel an older pending run (FIFO, up to 100; beyond that
-# GitHub cancels the extra run, which is fail-closed: it deploys nothing):
-#   main                              -> <app>/prod
-#   branch, d1_migrations: true       -> one group for the shared Preview/Dev D1 (d1_lock_scope, default app_name)
-#   branch, no D1, Shared Dev on      -> one group for the ONE Dev Worker (all branches queue; no concurrent Dev deploys)
-#   branch, no D1, Shared Dev off     -> per branch
-#   PR / delete / persistent-dev / anything else -> a private group (never queues behind a deploy)
-# The `cfv2-` prefix is static on purpose: never reuse it (or ${{ github.workflow }}) in a CALLER group, or the
-# caller and this called workflow deadlock each other. A repo-local group does NOT protect a D1 shared with
-# another repository. `queue` is not known to actionlint 1.7.12: see .github/actionlint.yaml.
+# One run-level concurrency group per piece of shared mutable state (GitHub `concurrency` cannot span two jobs, so
+# the whole RUN is the unit; CI and E2E still run in parallel inside a run). `queue: max` keeps FIFO instead of
+# cancelling an older pending run (beyond 100 GitHub cancels the extra run: fail-closed, it deploys nothing).
+# The identity is the RESOURCE, not the app: `d1_lock_scope` replaces app_name so apps that share one physical D1
+# share one group, and Production and non-Production are always different groups:
+#   main                               -> cfv2-prod-<d1_lock_scope|app_name>
+#   branch, d1_migrations              -> cfv2-nonprod-d1-<d1_lock_scope|app_name>   (Preview AND Shared Dev D1)
+#   branch, no D1, Shared Dev on       -> cfv2-shared-dev-<app_name>                  (the ONE Dev Worker)
+#   branch, no D1, Shared Dev off      -> cfv2-<app_name>-preview-<branch>
+#   PR / delete / persistent-dev / any other event -> a private group (never queues behind a deploy)
+# The Shared Dev and persistent-Dev jobs additionally share the job-level group cfv2-dev-<repo>-<scope|app_name>.
+# The `cfv2-` prefix is static on purpose: never reuse it (or ${{ github.workflow }}) in a CALLER group, or caller
+# and callee deadlock. A repo-local group does NOT protect a D1 shared with another repository.
+# `queue` is not known to actionlint 1.7.12: see .github/actionlint.yaml.
 concurrency:
-  group: ${{ ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && format('cfv2-{0}-{1}', inputs.app_name, github.ref == 'refs/heads/main' && 'prod' || (inputs.d1_migrations && format('preview-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.shared_dev_on_branch_push && 'shared-dev' || format('preview-{0}', github.ref_name)))) || format('cfv2-run-{0}', github.run_id) }}
+  group: ${{ ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && (github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.shared_dev_on_branch_push && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id) }}
   queue: max
 
 permissions:
   contents: read
 
-# bash -eo pipefail everywhere: `deploy.sh | tee` must not mask a failed wrangler.
+# bash -eo pipefail everywhere.
 defaults:
   run:
     shell: bash
@@ -323,256 +332,150 @@ env:
 
 jobs:
   # -------------------------------------------------------------------------
-  # Validation — six independent jobs (Lint, Typecheck, Unit Tests, Integration Tests, Build Validation, E2E).
-  # No `needs` between them: each is scheduled as soon as the caller invokes this workflow, has its own
-  # checkout / dependency setup / env import / logs / duration / check conclusion, and can be re-run alone.
-  # An optional job whose command input is empty is skipped on purpose; Migration and Deploy accept that skip
-  # ONLY for an empty command (a configured job that ends skipped blocks them). `build_cmd` is required.
-  # None of them receives Cloudflare credentials; no job uploads or downloads a build artifact (Build
-  # Validation builds for validation only, Deploy builds again for its real target).
-  # Same-repo PRs are covered by the push run of the same SHA; fork PRs run these credential-free.
-  # Mailpit starts only where tests can need it (Unit, Integration), never in Lint / Typecheck / Build.
+  # Validation — six independent jobs, no `needs` between them: each has its own checkout / setup / logs / check
+  # conclusion and can be re-run alone. Bodies are actions/cf-ci-check. None receives Cloudflare credentials and
+  # none uploads a build artifact (Build Validation builds for validation only; the engine builds again for its
+  # real target). Same-repo PRs are covered by the push run of the same SHA; fork PRs run these credential-free.
   # -------------------------------------------------------------------------
   lint:
     name: Lint
     if: inputs.lint_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
-    env:
-      VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      VITE_APP_VERSION: ${{ inputs.app_version }}
-      TARGET_BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
-      CI_ENV: ${{ inputs.ci_env }}
     steps:
       - uses: actions/checkout@v6
-      - name: Fetch env-import tool
+      - name: Fetch CI action and env-import tool
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview/parse-env.mjs
+          sparse-checkout: |
+            actions/cf-ci-check
+            actions/cf-preview/parse-env.mjs
           sparse-checkout-cone-mode: false
-      - name: Import validation env (target env, then ci_env)
-        run: |
-          node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
-          node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
-          rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope
-      - uses: firstsun-dev/.github/actions/setup@v1
+          persist-credentials: false
+      - uses: ./.cf-tools/actions/cf-ci-check
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Lint
-        id: check
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.lint_cmd }}
-        run: bash -c "$CMD"
-      - name: Summary
-        if: always()
-        env:
-          OUTCOME: ${{ steps.check.outcome }}
-          CMD: ${{ inputs.lint_cmd }}
-        run: |
-          {
-            echo "### Lint: $OUTCOME"
-            echo '`'"$CMD"'`'
-          } >> "$GITHUB_STEP_SUMMARY"
-
+          title: Lint
+          cmd: ${{ inputs.lint_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
   typecheck:
     name: Typecheck
     if: inputs.typecheck_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
-    env:
-      VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      VITE_APP_VERSION: ${{ inputs.app_version }}
-      TARGET_BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
-      CI_ENV: ${{ inputs.ci_env }}
     steps:
       - uses: actions/checkout@v6
-      - name: Fetch env-import tool
+      - name: Fetch CI action and env-import tool
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview/parse-env.mjs
+          sparse-checkout: |
+            actions/cf-ci-check
+            actions/cf-preview/parse-env.mjs
           sparse-checkout-cone-mode: false
-      - name: Import validation env (target env, then ci_env)
-        run: |
-          node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
-          node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
-          rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope
-      - uses: firstsun-dev/.github/actions/setup@v1
+          persist-credentials: false
+      - uses: ./.cf-tools/actions/cf-ci-check
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Typecheck
-        id: check
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.typecheck_cmd }}
-        run: bash -c "$CMD"
-      - name: Summary
-        if: always()
-        env:
-          OUTCOME: ${{ steps.check.outcome }}
-          CMD: ${{ inputs.typecheck_cmd }}
-        run: |
-          {
-            echo "### Typecheck: $OUTCOME"
-            echo '`'"$CMD"'`'
-          } >> "$GITHUB_STEP_SUMMARY"
-
+          title: Typecheck
+          cmd: ${{ inputs.typecheck_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
   unit:
     name: Unit Tests
     if: inputs.test_unit_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
-    env:
-      VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      VITE_APP_VERSION: ${{ inputs.app_version }}
-      TARGET_BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
-      CI_ENV: ${{ inputs.ci_env }}
     steps:
       - uses: actions/checkout@v6
-      - name: Fetch env-import tool
+      - name: Fetch CI action and env-import tool
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview/parse-env.mjs
+          sparse-checkout: |
+            actions/cf-ci-check
+            actions/cf-preview/parse-env.mjs
           sparse-checkout-cone-mode: false
-      - name: Import validation env (target env, then ci_env)
-        run: |
-          node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
-          node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
-          rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope
-      - uses: firstsun-dev/.github/actions/setup@v1
+          persist-credentials: false
+      - uses: ./.cf-tools/actions/cf-ci-check
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Start Mailpit
-        if: inputs.use_mailpit
-        uses: firstsun-dev/.github/actions/mailpit@v1
-      - name: Unit tests
-        id: check
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.test_unit_cmd }}
-        run: bash -c "$CMD"
-      - name: Summary
-        if: always()
-        env:
-          OUTCOME: ${{ steps.check.outcome }}
-          CMD: ${{ inputs.test_unit_cmd }}
-        run: |
-          {
-            echo "### Unit Tests: $OUTCOME"
-            echo '`'"$CMD"'`'
-          } >> "$GITHUB_STEP_SUMMARY"
-
+          title: Unit Tests
+          cmd: ${{ inputs.test_unit_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
+          use_mailpit: ${{ inputs.use_mailpit }}
   integration:
     name: Integration Tests
     if: inputs.test_integration_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
-    env:
-      VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      VITE_APP_VERSION: ${{ inputs.app_version }}
-      TARGET_BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
-      CI_ENV: ${{ inputs.ci_env }}
     steps:
       - uses: actions/checkout@v6
-      - name: Fetch env-import tool
+      - name: Fetch CI action and env-import tool
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview/parse-env.mjs
+          sparse-checkout: |
+            actions/cf-ci-check
+            actions/cf-preview/parse-env.mjs
           sparse-checkout-cone-mode: false
-      - name: Import validation env (target env, then ci_env)
-        run: |
-          node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
-          node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
-          rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope
-      - uses: firstsun-dev/.github/actions/setup@v1
+          persist-credentials: false
+      - uses: ./.cf-tools/actions/cf-ci-check
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Start Mailpit
-        if: inputs.use_mailpit
-        uses: firstsun-dev/.github/actions/mailpit@v1
-      - name: Integration tests
-        id: check
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.test_integration_cmd }}
-        run: bash -c "$CMD"
-      - name: Summary
-        if: always()
-        env:
-          OUTCOME: ${{ steps.check.outcome }}
-          CMD: ${{ inputs.test_integration_cmd }}
-        run: |
-          {
-            echo "### Integration Tests: $OUTCOME"
-            echo '`'"$CMD"'`'
-          } >> "$GITHUB_STEP_SUMMARY"
-
+          title: Integration Tests
+          cmd: ${{ inputs.test_integration_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
+          use_mailpit: ${{ inputs.use_mailpit }}
   build:
     name: Build Validation
     if: github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
-    env:
-      VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      VITE_APP_VERSION: ${{ inputs.app_version }}
-      TARGET_BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
-      CI_ENV: ${{ inputs.ci_env }}
     steps:
       - uses: actions/checkout@v6
-      - name: Fetch env-import tool
+      - name: Fetch CI action and env-import tool
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview/parse-env.mjs
+          sparse-checkout: |
+            actions/cf-ci-check
+            actions/cf-preview/parse-env.mjs
           sparse-checkout-cone-mode: false
-      - name: Import validation env (target env, then ci_env)
-        run: |
-          node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
-          node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
-          rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope
-      - uses: firstsun-dev/.github/actions/setup@v1
+          persist-credentials: false
+      - uses: ./.cf-tools/actions/cf-ci-check
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Build validation (target-aware, nothing is uploaded)
-        id: check
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.build_cmd }}
-        run: bash -c "$CMD"
-      - name: Summary
-        if: always()
-        env:
-          OUTCOME: ${{ steps.check.outcome }}
-          CMD: ${{ inputs.build_cmd }}
-        run: |
-          {
-            echo "### Build Validation: $OUTCOME"
-            echo '`'"$CMD"'`'
-          } >> "$GITHUB_STEP_SUMMARY"
+          title: Build Validation
+          cmd: ${{ inputs.build_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
 
-  # -------------------------------------------------------------------------
-  # E2E — parallel to CI. Own setup and own TEST build (local URLs, mock services); the Deploy job
-  # never reuses it. Never receives Cloudflare credentials.
-  # -------------------------------------------------------------------------
+  # E2E — own setup and own TEST build (local URLs, mock services); never reused for a deployment.
   e2e:
     name: E2E
     if: inputs.test_e2e_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
@@ -636,767 +539,125 @@ jobs:
           retention-days: 3
 
   # -------------------------------------------------------------------------
-  # Migration — dedicated job, only when d1_migrations is true. Runs after CI and E2E.
-  # Every precondition that needs no remote mutation runs BEFORE the first remote command:
-  # target/credentials, Preview identity + ledger ownership, source binding policy, migration target,
-  # branch tip. Serialization with other runs comes from the workflow-level concurrency group.
+  # Deploy — the ONE Production / Native Preview job. target = prod (main) | preview (other branches); the engine
+  # (actions/cf-deploy) builds, audits, validates the exact D1 target, migrates (optional step), publishes the
+  # audited artifact, smokes, and recovers. Only the credentials of THIS target exist in the job env; there is no
+  # fallback. `deployed_and_verified` is true ONLY when this run published its own SHA and the smoke passed.
   # -------------------------------------------------------------------------
-  migrate:
-    name: Migration
+  deploy:
+    name: Deploy
     needs: [lint, typecheck, unit, integration, build, e2e]
-    # always(): optional jobs are skipped when their command is empty; implicit success() would skip Migration.
-    # A CONFIGURED job that did not run (skipped) does not pass: it must have succeeded.
-    if: always() && inputs.d1_migrations && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
+    # always(): skipped optional jobs (empty command) must not skip Deploy, but a failed / cancelled / unexpectedly
+    # skipped CONFIGURED one must block it.
+    if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
-    environment: ${{ github.ref == 'refs/heads/main' && format('{0}/prod', inputs.app_name) || format('{0}/preview', inputs.app_name) }}
+    timeout-minutes: 45
+    # One Environment per app and target; Production authorization = its protection rules + the main-only credentials.
+    environment:
+      name: ${{ github.ref == 'refs/heads/main' && format('{0}/prod', inputs.app_name) || format('{0}/preview', inputs.app_name) }}
+      url: ${{ steps.engine.outputs.url }}
     permissions:
       contents: read
-      deployments: read # ledger ownership lookup
+      deployments: write
+      pull-requests: write
     outputs:
-      superseded: ${{ steps.fresh.outputs.stale }}
-      pending: ${{ steps.apply.outputs.pending }}
+      url: ${{ steps.engine.outputs.url }}
+      target: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+      version_id: ${{ steps.engine.outputs.version_id }}
+      deployed_and_verified: ${{ steps.engine.outputs.deployed_and_verified || 'false' }}
+      smoke_level: ${{ steps.engine.outputs.smoke_level }}
+      migration: ${{ steps.engine.outputs.migration }}
     env:
       GH_TOKEN: ${{ github.token }}
-      TARGET: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      BRANCH: ${{ github.ref_name }}
-      BRANCH_REF: ${{ github.ref }}
-      RUN_SHA: ${{ github.sha }}
-      APP_NAME: ${{ inputs.app_name }}
-      HOST_WORKER: ${{ inputs.preview_worker_name != '' && inputs.preview_worker_name || inputs.app_name }}
-      # Each credential is populated ONLY for its own target and never falls back to the other one.
       CLOUDFLARE_API_TOKEN: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_API_TOKEN) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_API_TOKEN) || '' }}
       CLOUDFLARE_ACCOUNT_ID: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_ACCOUNT_ID) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID) || '' }}
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Fetch tooling
-        uses: actions/checkout@v6
-        with:
-          repository: firstsun-dev/.github
-          ref: ${{ inputs.tools_ref }}
-          path: .cf-tools
-          sparse-checkout: actions/cf-preview
-          persist-credentials: false
-      - uses: firstsun-dev/.github/actions/setup@v1
-        with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Install tooling deps
-        run: cd "$TOOLS_DIR" && npm ci --ignore-scripts --no-audit --no-fund
-      # ---- preconditions: nothing below this line until "Apply" touches remote state ----
-      - name: Verify trusted target and credentials (fail closed)
-        env:
-          EVENT: ${{ github.event_name }}
-          STRATEGY: ${{ inputs.deployment_strategy }}
-          PREVIEW_ON: ${{ inputs.preview_on_branch_push }}
-          DISPATCH: ${{ inputs.dispatch_target }}
-        run: |
-          RESOLVED="$(node "$TOOLS_DIR/cli.mjs" resolve --event "$EVENT" --ref "$BRANCH_REF" --strategy "$STRATEGY" \
-            --preview-on-push "$PREVIEW_ON" --dispatch-target "$DISPATCH" | sed -n 's/^target=//p')"
-          [ "$RESOLVED" = "$TARGET" ] || { echo "::error::target mismatch (resolved '$RESOLVED', job '$TARGET'); refusing to migrate"; exit 1; }
-          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "::error::$TARGET credentials not provided; refusing to fall back to other credentials"; exit 1
-          fi
-      - name: Preview identity and ledger ownership (collision fails here)
-        id: identity
-        if: env.TARGET == 'preview'
-        run: |
-          "$TOOLS_DIR/guard.sh" identity | tee -a "$GITHUB_ENV"
-      - name: Preflight source config — Preview binding / auth isolation
-        if: env.TARGET == 'preview'
-        working-directory: ${{ inputs.app_path }}
-        env:
-          ALLOW: ${{ inputs.preview_binding_allow }}
-          DENY: ${{ inputs.preview_deny_resources }}
-          CFG: ${{ inputs.wrangler_config }}
-        run: node "$GITHUB_WORKSPACE/$TOOLS_DIR/cli.mjs" preflight --config "$CFG" --allow "$ALLOW" --deny "$DENY"
-      - name: Confirm the exact migration target (read-only config check)
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CFG: ${{ inputs.wrangler_config }}
-          BINDING: ${{ inputs.d1_binding }}
-        run: node "$GITHUB_WORKSPACE/$TOOLS_DIR/cli.mjs" migration-config --config "$CFG" --target "$TARGET" --binding "$BINDING" --out "$RUNNER_TEMP/migrate-check.json"
-      - name: Stale-SHA guard (branch must still be at this commit)
-        id: fresh
-        run: |
-          "$TOOLS_DIR/guard.sh" fresh | tee -a "$GITHUB_OUTPUT"
-      # ---- the only remote mutation ----
-      - name: Apply pending migrations (this target's D1 only)
-        id: apply
-        if: steps.fresh.outputs.stale != 'true'
-        env:
-          APP_DIR: ${{ github.workspace }}/${{ inputs.app_path }}
-          WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
-          D1_BINDING: ${{ inputs.d1_binding }}
-        run: |
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          "$TOOLS_DIR/migrate.sh" | tee -a "$GITHUB_OUTPUT"
-
-  # -------------------------------------------------------------------------
-  # Deploy — the single deploy implementation. target = prod (main) | preview (other branches).
-  # Credentials for the other target are never populated. Builds independently; no build artifacts.
-  # `deployed_and_verified` is true ONLY when this run published its own SHA and smoke passed.
-  # -------------------------------------------------------------------------
-  deploy:
-    name: Deploy
-    needs: [lint, typecheck, unit, integration, build, e2e, migrate]
-    # always(): skipped optional jobs / migrate (empty command, D1-less Worker) must not skip Deploy, but a
-    # failed/cancelled or unexpectedly skipped one must block it. An optional job may only be skipped when its
-    # command is empty, and Migration only when d1_migrations is off.
-    if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && (needs.migrate.result == 'success' || (needs.migrate.result == 'skipped' && !inputs.d1_migrations)) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 40
-    # One shared environment per app and target. Production authorization = this environment's protection
-    # rules + the main-only credential expression below. The per-branch ledger lives in `<app>/preview/<slug>`.
-    environment:
-      name: ${{ github.ref == 'refs/heads/main' && format('{0}/prod', inputs.app_name) || format('{0}/preview', inputs.app_name) }}
-      url: ${{ steps.publish.outputs.url }}
-    permissions:
-      contents: read
-      deployments: write
-      pull-requests: write
-    outputs:
-      url: ${{ steps.publish.outputs.url }}
-      target: ${{ env.TARGET }}
-      version_id: ${{ steps.publish.outputs.version_id }}
-      deployed_and_verified: ${{ steps.verified.outputs.deployed_and_verified || 'false' }}
-      smoke_level: ${{ steps.verified.outputs.smoke_level || '' }}
-    env:
-      GH_TOKEN: ${{ github.token }}
-      TARGET: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      BRANCH: ${{ github.ref_name }}
-      BRANCH_REF: ${{ github.ref }}
-      RUN_SHA: ${{ github.sha }}
-      APP_NAME: ${{ inputs.app_name }}
-      HOST_WORKER: ${{ inputs.preview_worker_name != '' && inputs.preview_worker_name || inputs.app_name }}
-      CLOUDFLARE_API_TOKEN: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_API_TOKEN) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_API_TOKEN) || '' }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_ACCOUNT_ID) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID) || '' }}
-      BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
-      SMOKE_ENV: ${{ inputs.smoke_env }}
-    steps:
-      # Early skip for a superseded run (API only). Fails closed if the tip cannot be resolved.
-      - name: Stale-SHA guard (start)
-        run: |
-          TIP="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH" -q .object.sha)" || { echo "::error::cannot resolve branch tip"; exit 1; }
-          [ -n "$TIP" ] || { echo "::error::cannot resolve branch tip"; exit 1; }
-          if [ "$TIP" != "$RUN_SHA" ]; then
-            echo "::notice::Branch tip $TIP != $RUN_SHA; a newer push owns this target. Skipping (nothing deployed)."
-            echo "STALE=true" >> "$GITHUB_ENV"
-          fi
-      - name: Checkout exact SHA
-        if: env.STALE != 'true'
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Fetch tooling
+      - name: Fetch delivery tooling
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
           persist-credentials: false
-      - name: Setup dependencies
-        if: env.STALE != 'true'
-        uses: firstsun-dev/.github/actions/setup@v1
+      - id: engine
+        uses: ./.cf-tools/actions/cf-deploy
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Install tooling deps
-        if: env.STALE != 'true'
-        run: cd "$TOOLS_DIR" && npm ci --ignore-scripts --no-audit --no-fund
-      - name: Validate trusted ref, target and credentials (fail closed)
-        if: env.STALE != 'true'
-        working-directory: ${{ inputs.app_path }}
-        env:
-          EVENT: ${{ github.event_name }}
-          STRATEGY: ${{ inputs.deployment_strategy }}
-          PREVIEW_ON: ${{ inputs.preview_on_branch_push }}
-          DISPATCH: ${{ inputs.dispatch_target }}
-          POLICY: ${{ inputs.production_rollback_policy }}
-        run: |
-          TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          case "$STRATEGY" in production-preview|hybrid|production-only) ;; *) echo "::error::bad deployment_strategy"; exit 1;; esac
-          case "$POLICY" in automatic|manual|disabled) ;; *) echo "::error::bad production_rollback_policy"; exit 1;; esac
-          RESOLVED="$(node "$TOOLS/cli.mjs" resolve --event "$EVENT" --ref "$BRANCH_REF" --strategy "$STRATEGY" \
-            --preview-on-push "$PREVIEW_ON" --dispatch-target "$DISPATCH" | sed -n 's/^target=//p')"
-          [ "$RESOLVED" = "$TARGET" ] || { echo "::error::target mismatch (resolved '$RESOLVED', job '$TARGET'); refusing to deploy"; exit 1; }
-          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "::error::$TARGET credentials not provided; refusing to fall back to other credentials"; exit 1
-          fi
-          if [ "$TARGET" = preview ]; then
-            VER="$(pnpm exec wrangler --version | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-            echo "Project-local Wrangler: $VER"
-            node "$TOOLS/cli.mjs" wrangler-check --version "$VER"
-          fi
-          echo "PREVIEW_ENV_FILE=$RUNNER_TEMP/preview.env" >> "$GITHUB_ENV"
-          echo "OUT_FILE=$RUNNER_TEMP/preview.json" >> "$GITHUB_ENV"
-      - id: identity
-        name: Preview identity and name-collision check (re-checked after Migration)
-        if: env.STALE != 'true' && env.TARGET == 'preview'
-        run: |
-          "$TOOLS_DIR/guard.sh" identity | tee -a "$GITHUB_ENV"
-      - name: Preflight source config — Preview binding / auth isolation
-        if: env.STALE != 'true' && env.TARGET == 'preview'
-        working-directory: ${{ inputs.app_path }}
-        env:
-          ALLOW: ${{ inputs.preview_binding_allow }}
-          DENY: ${{ inputs.preview_deny_resources }}
-          CFG: ${{ inputs.wrangler_config }}
-        run: node "$GITHUB_WORKSPACE/$TOOLS_DIR/cli.mjs" preflight --config "$CFG" --allow "$ALLOW" --deny "$DENY"
-      # Preview secrets are DATA: validated, masked, written owner-only, and later exported through quoted
-      # variables (envfile.sh). They are never sourced or evaluated as shell, and only the Preview build and
-      # smoke processes see them.
-      - name: Stage Preview-only secrets (validated, masked)
-        if: env.STALE != 'true' && env.TARGET == 'preview'
-        env:
-          PREVIEW_SECRETS: ${{ secrets.PREVIEW_SECRETS }}
-        run: |
-          umask 077
-          node "$TOOLS_DIR/parse-env.mjs" PREVIEW_SECRETS "$PREVIEW_ENV_FILE" --mask
-      - name: Start Deployment (Preview ledger)
-        if: env.STALE != 'true' && env.TARGET == 'preview'
-        id: dep
-        run: |
-          PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg n "$PREVIEW_NAME" --arg w "$APP_NAME" --arg h "$HOST_WORKER" --arg r "$GITHUB_REPOSITORY" '{branch_ref:$ref,preview_name:$n,worker:$w,host_worker:$h,repo:$r}')"
-          ID="$("$TOOLS_DIR/gh.sh" start "$ENV_NAME" "$RUN_SHA" "$PAYLOAD")"
-          echo "id=$ID" >> "$GITHUB_OUTPUT"
-          "$TOOLS_DIR/gh.sh" status "$ID" in_progress "" "Publishing $RUN_SHA"
-      - name: Stale-SHA guard (before publish)
-        if: env.STALE != 'true'
-        run: |
-          if [ "$("$TOOLS_DIR/guard.sh" fresh)" != "stale=false" ]; then
-            echo "::notice::Superseded before publish; not touching the target (nothing deployed)."
-            echo "STALE=true" >> "$GITHUB_ENV"
-          fi
-      - name: Inject target build environment
-        if: env.STALE != 'true'
-        run: node "$TOOLS_DIR/parse-env.mjs" BUILD_ENV "$GITHUB_ENV"
-      - name: Build, validate effective Wrangler config, publish
-        if: env.STALE != 'true'
-        id: publish
-        env:
-          APP_DIR: ${{ github.workspace }}/${{ inputs.app_path }}
-          BUILD_CMD: ${{ inputs.build_cmd }}
-          WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
-          VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-          VITE_APP_VERSION: ${{ inputs.app_version }}
-          PREVIEW_ALLOW: ${{ inputs.preview_binding_allow }}
-          PREVIEW_DENY: ${{ inputs.preview_deny_resources }}
-          WORKER_NAME: ${{ inputs.preview_worker_name }}
-          PREVIEW_HOST_CHECK: ${{ inputs.preview_host_check }}
-          APP_URL_PROD: ${{ inputs.app_url_prod }}
-          COMMIT_MSG: ${{ github.event.head_commit.message }}
-          APP_VERSION: ${{ inputs.app_version }}
-        run: |
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          "$TOOLS_DIR/deploy.sh" | tee -a "$GITHUB_OUTPUT"
-      - name: Stage smoke environment (smoke-only; never merged into the job environment)
-        if: env.STALE != 'true' && steps.publish.outcome == 'success'
-        run: |
-          umask 077
-          node "$TOOLS_DIR/parse-env.mjs" SMOKE_ENV "$RUNNER_TEMP/smoke.env"
-          echo "SMOKE_ENV_FILE=$RUNNER_TEMP/smoke.env" >> "$GITHUB_ENV"
-      - name: Smoke — exact deployed URL (fails closed)
-        if: env.STALE != 'true' && steps.publish.outcome == 'success'
-        id: smoke
-        working-directory: ${{ inputs.app_path }}
-        env:
-          TARGET_URL: ${{ steps.publish.outputs.url }}
-          DEPLOY_TARGET: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-          TEST_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-          EXPECTED_SHA: ${{ github.sha }}
-          SMOKE_CMD: ${{ inputs.smoke_cmd }}
-          SHA_PATH: ${{ inputs.sha_path }}
-          ACCESS_TARGETS: ${{ inputs.access_protected_targets }}
-          SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
-          SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
-          NO_PROXY: '*'
-        run: |
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          "$TOOLS_DIR/smoke.sh" | tee -a "$GITHUB_OUTPUT"
-      # The ONLY place deployed_and_verified becomes true: this run published its own SHA and smoke passed.
-      - name: Mark deployed and verified
-        if: env.STALE != 'true' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'success'
-        id: verified
-        env:
-          LEVEL: ${{ steps.smoke.outputs.smoke_level }}
-        run: |
-          { echo "deployed_and_verified=true"; echo "smoke_level=$LEVEL"; } >> "$GITHUB_OUTPUT"
-      - name: Report success
-        if: steps.verified.outputs.deployed_and_verified == 'true'
-        env:
-          URL: ${{ steps.publish.outputs.url }}
-          VID: ${{ steps.publish.outputs.version_id }}
-          PREV: ${{ steps.publish.outputs.previous_version_id }}
-          LEVEL: ${{ steps.smoke.outputs.smoke_level }}
-          POLICY: ${{ inputs.production_rollback_policy }}
-        run: |
-          if [ "$TARGET" = preview ]; then
-            "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" success "$URL" "Serving $RUN_SHA ($LEVEL)"
-            "$TOOLS_DIR/gh.sh" comment "$BRANCH" "$APP_NAME" "$URL" "$RUN_SHA" || echo "::warning::PR comment skipped"
-            echo "::notice title=Preview URL ($APP_NAME)::$URL"
-            {
-              echo "### ✅ Preview — \`$APP_NAME\` (verification: $LEVEL)"
-              echo "- URL: $URL"
-              echo "- Branch: \`$BRANCH\` · identity \`$PREVIEW_NAME\`"
-              echo "- Served commit: \`$RUN_SHA\` · [run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            {
-              echo "### ✅ Production — \`$APP_NAME\` (verification: $LEVEL)"
-              echo "- Version: \`$VID\` · previous: \`$PREV\`"
-              echo "- Rollback policy: \`$POLICY\`. A Worker rollback does NOT revert D1 migrations or external side effects."
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-      # ---- Post-publish failure: the target may now serve unverified code. ----
-      - name: Preview — mark unverified
-        if: failure() && env.TARGET == 'preview' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
-        run: |
-          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" failure "${{ steps.publish.outputs.url }}" "Smoke failed — Preview UNVERIFIED"
-          echo "### ❌ Preview smoke failed — URL is **unverified**: ${{ steps.publish.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
-      # Recovery only exists after a publish that returned a URL and then failed smoke. A failure before any
-      # mutation, or a publish without a usable URL, never reaches these steps.
-      - name: Preview recovery — find last known-good deployment of THIS Preview on THIS host Worker
-        if: failure() && env.TARGET == 'preview' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
-        id: good
-        run: |
-          ROW="$("$TOOLS_DIR/gh.sh" last-good-preview "$ENV_NAME" "${{ steps.dep.outputs.id }}" "$BRANCH_REF" "$HOST_WORKER" "$APP_NAME" || true)"
-          if [ -n "$ROW" ]; then
-            { echo "sha=${ROW%% *}"; echo "url=${ROW#* }"; } >> "$GITHUB_OUTPUT"
-          else
-            { echo "sha="; echo "url="; } >> "$GITHUB_OUTPUT"
-            echo "::error::No known-good deployment of this Preview on host Worker '$HOST_WORKER'. (Deployments hosted by another Worker are not eligible.) Fix forward by pushing a new commit. (Deleting the branch does NOT remove the Native Preview; see the manual delete command in the branch-delete summary.)"
-            echo "### ⚠️ No prior verified deployment on host Worker \`$HOST_WORKER\` — manual recovery required: push a fix. Deleting the branch keeps the Preview." >> "$GITHUB_STEP_SUMMARY"
-          fi
-      - name: Preview recovery — checkout last good
-        if: failure() && steps.good.outputs.sha != ''
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ steps.good.outputs.sha }}
-          path: recover
-          persist-credentials: false
-      - name: Preview recovery — redeploy last good
-        if: failure() && steps.good.outputs.sha != ''
-        id: recover
-        env:
-          APP_DIR: ${{ github.workspace }}/recover/${{ inputs.app_path }}
-          BUILD_CMD: ${{ inputs.build_cmd }}
-          WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
-          WORKER_NAME: ${{ inputs.preview_worker_name }}
-          VITE_APP_ENV: preview
-          APP_VERSION_IN: ${{ inputs.app_version }}
-          PREVIEW_ALLOW: ${{ inputs.preview_binding_allow }}
-          PREVIEW_DENY: ${{ inputs.preview_deny_resources }}
-          GOOD_SHA: ${{ steps.good.outputs.sha }}
-          GOOD_URL: ${{ steps.good.outputs.url }}
-        run: |
-          # The recovered deployment is built with its OWN identity and the Preview BUILD environment, restored
-          # explicitly from build_env_preview (rebound from the failed SHA to the last-good SHA); smoke-only
-          # variables are never part of it.
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          . "$TOOLS_DIR/envfile.sh"
-          [ "${WORKER_NAME:-$APP_NAME}" = "$HOST_WORKER" ] || { echo "::error::recovery would target Worker '${WORKER_NAME:-$APP_NAME}', not the approved host '$HOST_WORKER'"; exit 1; }
-          REBOUND_ENV="$(node "$TOOLS_DIR/cli.mjs" rebind-env --var BUILD_ENV --from "$RUN_SHA" --to "$GOOD_SHA")"
-          export REBOUND_ENV
-          umask 077
-          node "$TOOLS_DIR/parse-env.mjs" REBOUND_ENV "$RUNNER_TEMP/preview-recover.env"
-          load_env_file "$RUNNER_TEMP/preview-recover.env"
-          rm -f "$RUNNER_TEMP/preview-recover.env"
-          VITE_APP_VERSION="$(APP_VERSION_IN="$APP_VERSION_IN" node "$TOOLS_DIR/cli.mjs" rebind-env --var APP_VERSION_IN --from "$RUN_SHA" --to "$GOOD_SHA")"
-          export VITE_APP_VERSION
-          (cd "$APP_DIR" && pnpm install --frozen-lockfile)
-          OUT="$("$TOOLS_DIR/deploy.sh")"
-          URL="$(printf '%s\n' "$OUT" | sed -n 's/^url=//p')"
-          [ -n "$URL" ] || { echo "::error::recovery produced no Preview URL"; exit 1; }
-          [ "$URL" = "$GOOD_URL" ] || { echo "::error::recovered URL $URL differs from the recorded last-good URL $GOOD_URL; refusing to verify a different Preview"; exit 1; }
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-      - name: Preview recovery — verify the restored deployment (full smoke, last-good SHA)
-        if: failure() && steps.good.outputs.sha != '' && steps.recover.outcome == 'success'
-        id: rverify
-        working-directory: ${{ inputs.app_path }}
-        env:
-          TARGET_URL: ${{ steps.recover.outputs.url }}
-          DEPLOY_TARGET: preview
-          TEST_ENV: preview
-          EXPECTED_SHA: ${{ steps.good.outputs.sha }}
-          SMOKE_CMD: ${{ inputs.smoke_cmd }}
-          SHA_PATH: ${{ inputs.sha_path }}
-          ACCESS_TARGETS: ${{ inputs.access_protected_targets }}
-          SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
-          SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
-          NO_PROXY: '*'
-        run: |
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          "$TOOLS_DIR/smoke.sh" | tee -a "$GITHUB_OUTPUT"
-      - name: Preview recovery — record the outcome accurately
-        if: failure() && steps.good.outputs.sha != ''
-        env:
-          LEVEL: ${{ steps.rverify.outputs.smoke_level }}
-          GOOD_SHA: ${{ steps.good.outputs.sha }}
-          RECOVERED: ${{ steps.recover.outcome }}
-          VERIFIED: ${{ steps.rverify.outcome }}
-        run: |
-          if [ "$RECOVERED" = success ] && [ "$VERIFIED" = success ] && [ "$LEVEL" = content ]; then
-            "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" failure "" "Smoke failed for $RUN_SHA; Preview restored to $GOOD_SHA and verified" || true
-            echo "### ♻️ Preview restored to last good commit \`$GOOD_SHA\` and verified (content-level smoke). Run remains FAILED for the bad commit. D1 migrations (if any) were NOT reverted." >> "$GITHUB_STEP_SUMMARY"
-          elif [ "$RECOVERED" = success ] && [ "$VERIFIED" = success ]; then
-            "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" failure "" "Smoke failed for $RUN_SHA; Preview restored to $GOOD_SHA — Access liveness only, content NOT verified" || true
-            echo "### ⚠️ Preview redeployed from \`$GOOD_SHA\` but only Cloudflare Access liveness was observed ($LEVEL): content and commit identity are **NOT verified**. Run remains FAILED. D1 migrations were NOT reverted." >> "$GITHUB_STEP_SUMMARY"
-          else
-            "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" error "" "Smoke failed for $RUN_SHA; recovery to $GOOD_SHA FAILED — Preview UNVERIFIED" || true
-            echo "### 🚨 Automatic recovery FAILED — Preview serves unverified code. Push a fix (deleting the branch keeps the Preview)." >> "$GITHUB_STEP_SUMMARY"
-          fi
-      - name: Preview — failed before publish
-        if: failure() && env.TARGET == 'preview' && steps.dep.outputs.id != '' && steps.publish.outcome != 'success' && steps.publish.outputs.preview_mutated != 'true'
-        run: |
-          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" error "" "Failed before publish; previous Preview unchanged" || true
-          echo "### ❌ Failed before publish — existing Preview unchanged." >> "$GITHUB_STEP_SUMMARY"
-      - name: Preview — publish returned no usable URL (state unverified, no recovery)
-        if: failure() && env.TARGET == 'preview' && steps.dep.outputs.id != '' && steps.publish.outcome != 'success' && steps.publish.outputs.preview_mutated == 'true'
-        run: |
-          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" error "" "Publish ran but returned no usable URL; Preview UNVERIFIED" || true
-          echo "### ❌ Native Preview publish returned **no usable URL** — the Preview may have been modified and is **unverified**. No automatic recovery (nothing to verify against). Check that the host Worker \`$HOST_WORKER\` has Preview URLs enabled, then push again." >> "$GITHUB_STEP_SUMMARY"
-      - name: Production recovery (policy-driven; D1 is never rolled back)
-        if: failure() && env.TARGET == 'prod' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
-        env:
-          POLICY: ${{ inputs.production_rollback_policy }}
-          PREV_ID: ${{ steps.publish.outputs.previous_version_id }}
-          APP_DIR: ${{ github.workspace }}/${{ inputs.app_path }}
-          WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
-        run: |
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          if [ "$POLICY" = automatic ] && [ -n "$PREV_ID" ]; then
-            # Same Wrangler config / Worker identity resolution as the publish (deploy.sh ROLLBACK_TO).
-            ROLLBACK_TO="$PREV_ID" "$TOOLS_DIR/deploy.sh"
-            echo "### ♻️ Rolled back to \`$PREV_ID\`. D1 migrations (if any) were NOT reverted. The run stays FAILED and no Release runs." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "### 🚨 Production smoke FAILED (policy: $POLICY). Manual rollback: \`wrangler versions deploy ${PREV_ID:-<prev>}@100 --yes\` after confirming schema compatibility." >> "$GITHUB_STEP_SUMMARY"
-          fi
-          exit 1   # keep the run red regardless of policy
-      - name: Remove staged Preview secrets
-        if: always()
-        run: rm -f "$PREVIEW_ENV_FILE" "$OUT_FILE" "$RUNNER_TEMP/smoke.env"
+          target: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+          inputs_json: ${{ toJSON(inputs) }}
+          preview_secrets: ${{ github.ref != 'refs/heads/main' && secrets.PREVIEW_SECRETS || '' }}
+          smoke_username: ${{ secrets.SMOKE_USERNAME }}
+          smoke_password: ${{ secrets.SMOKE_PASSWORD }}
 
   # -------------------------------------------------------------------------
-  # Shared Dev — optional, independent of Native Preview (own switch, own credentials, own Environment).
-  # Every non-main branch push targets the SAME Dev Worker; the last verified deployment wins. Order inside the
-  # job is chosen so nothing durable changes before it must: stale guard -> Dev build -> effective-config audit
-  # -> stale guard -> Dev D1 migration -> publish -> smoke. A failed build/audit therefore never touches the
-  # running Dev Worker or its D1. `needs` on migrate/deploy is ordering ONLY (Preview and Dev may share one
-  # physical D1, so their migrations must not overlap); their result is deliberately ignored.
-  # Branch deletion and disabling the switch never touch the Dev Worker. Not used by the manual persistent-dev path.
+  # Shared Dev — optional, independent of Native Preview (own switch, own Dev credentials, own Environment). The
+  # SAME engine with target = dev: every non-main branch push updates the ONE Dev Worker; the last verified
+  # deployment wins. `needs: deploy` is ORDERING ONLY (Preview and Dev may share one physical D1, so their
+  # migrations must never overlap); Deploy's result is ignored except by the engine's shared-D1 guard. Branch
+  # deletion and disabling the switch never touch the Dev Worker. Not used by the manual persistent-dev path.
   # -------------------------------------------------------------------------
   dev-deploy:
     name: Shared Dev
-    needs: [lint, typecheck, unit, integration, build, e2e, migrate, deploy]
+    needs: [lint, typecheck, unit, integration, build, e2e, deploy]
     if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && inputs.shared_dev_on_branch_push && inputs.deployment_strategy != 'production-only' && github.ref_type == 'branch' && github.ref != 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev'))
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 40
+    timeout-minutes: 45
     environment:
       name: ${{ inputs.app_name }}/dev
-      url: ${{ inputs.app_url_dev }}
-    # Same group as the manual persistent-dev job: automatic and manual Dev deployments never overlap. Distinct
-    # from the workflow-level `cfv2-<app>-...` groups, so caller and callee cannot deadlock.
+      url: ${{ steps.engine.outputs.url }}
+    # Same group as the manual persistent-dev job: automatic and manual Dev deployments never overlap. Keyed by the
+    # shared-D1 scope when set, distinct from the run-level groups, so caller and callee cannot deadlock.
     concurrency:
-      group: cfv2-dev-${{ github.repository }}-${{ inputs.app_name }}
+      group: cfv2-dev-${{ github.repository }}-${{ inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name }}
       cancel-in-progress: false
     permissions:
       contents: read
       deployments: write # Dev ledger (last known-good SHA for recovery)
     outputs:
-      url: ${{ steps.verified.outputs.url }}
-      deployed_and_verified: ${{ steps.verified.outputs.deployed_and_verified || 'false' }}
+      url: ${{ steps.engine.outputs.url }}
+      deployed_and_verified: ${{ steps.engine.outputs.deployed_and_verified || 'false' }}
     env:
       GH_TOKEN: ${{ github.token }}
-      TARGET: dev
-      BRANCH: ${{ github.ref_name }}
-      BRANCH_REF: ${{ github.ref }}
-      RUN_SHA: ${{ github.sha }}
-      APP_NAME: ${{ inputs.app_name }}
-      LEDGER_ENV: ${{ inputs.app_name }}/dev/shared
       # Dev credentials ONLY; there is no fallback to the Preview or Production token.
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEV_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_DEV_ACCOUNT_ID }}
-      CLOUDFLARE_ENV: ${{ inputs.dev_wrangler_env }}
-      BUILD_ENV: ${{ inputs.build_env_dev }}
-      SMOKE_ENV: ${{ inputs.smoke_env }}
     steps:
-      - name: Stale-SHA guard (start)
-        run: |
-          TIP="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH" -q .object.sha)" || { echo "::error::cannot resolve branch tip"; exit 1; }
-          [ -n "$TIP" ] || { echo "::error::cannot resolve branch tip"; exit 1; }
-          if [ "$TIP" != "$RUN_SHA" ]; then
-            echo "::notice::Branch tip $TIP != $RUN_SHA; a newer push of this branch owns Dev. Skipping (nothing deployed)."
-            echo "STALE=true" >> "$GITHUB_ENV"
-          fi
-      - name: Checkout exact SHA
-        if: env.STALE != 'true'
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Fetch tooling
-        if: env.STALE != 'true'
+      - name: Fetch delivery tooling
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
           persist-credentials: false
-      - name: Setup dependencies
-        if: env.STALE != 'true'
-        uses: firstsun-dev/.github/actions/setup@v1
+      - id: engine
+        uses: ./.cf-tools/actions/cf-deploy
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Install tooling deps
-        if: env.STALE != 'true'
-        run: cd "$TOOLS_DIR" && npm ci --ignore-scripts --no-audit --no-fund
-      - name: Validate Shared Dev target, configuration and credentials (fail closed)
-        if: env.STALE != 'true'
-        working-directory: ${{ inputs.app_path }}
-        env:
-          EVENT: ${{ github.event_name }}
-          STRATEGY: ${{ inputs.deployment_strategy }}
-          DEV_ON: ${{ inputs.shared_dev_on_branch_push }}
-          DISPATCH: ${{ inputs.dispatch_target }}
-          DEPLOY_CMD: ${{ inputs.dev_deploy_cmd }}
-          DEV_URL: ${{ inputs.app_url_dev }}
-          DEV_WORKER: ${{ inputs.dev_worker_name }}
-          BUILD_CMD: ${{ inputs.dev_build_cmd }}
-          D1_ON: ${{ inputs.d1_migrations }}
-        run: |
-          TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          RESOLVED="$(node "$TOOLS/cli.mjs" resolve-dev --event "$EVENT" --ref "$BRANCH_REF" --strategy "$STRATEGY" \
-            --shared-dev-on-push "$DEV_ON" --dispatch-target "$DISPATCH" | sed -n 's/^target=//p')"
-          [ "$RESOLVED" = dev ] || { echo "::error::target mismatch (resolved '$RESOLVED', job 'dev'); refusing to deploy"; exit 1; }
-          [ -n "$DEPLOY_CMD" ] || { echo "::error::shared_dev_on_branch_push requires dev_deploy_cmd"; exit 1; }
-          [ -n "$DEV_URL" ] || { echo "::error::shared_dev_on_branch_push requires app_url_dev (a Dev deployment without a probe is not verified)"; exit 1; }
-          [ -n "$DEV_WORKER" ] || { echo "::error::shared_dev_on_branch_push requires dev_worker_name (the Dev Worker identity is always verified)"; exit 1; }
-          if [ "$D1_ON" = true ] && [ -z "$BUILD_CMD" ]; then
-            echo "::error::Shared Dev with d1_migrations requires dev_build_cmd: the Dev build must succeed BEFORE the Dev D1 is migrated"; exit 1
-          fi
-          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "::error::Dev credentials not provided (CLOUDFLARE_DEV_API_TOKEN / CLOUDFLARE_DEV_ACCOUNT_ID); refusing to fall back to other credentials"; exit 1
-          fi
-          VER="$(pnpm exec wrangler --version | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-          node "$TOOLS/cli.mjs" wrangler-check --version "$VER"
-      - name: Confirm the exact Dev migration target (read-only config check)
-        if: env.STALE != 'true' && inputs.d1_migrations
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CFG: ${{ inputs.wrangler_config }}
-          BINDING: ${{ inputs.d1_binding }}
-          DEV_ENV: ${{ inputs.dev_wrangler_env }}
-        run: node "$GITHUB_WORKSPACE/$TOOLS_DIR/cli.mjs" migration-config --config "$CFG" --target dev --dev-env "$DEV_ENV" --binding "$BINDING" --out "$RUNNER_TEMP/migrate-dev-check.json" | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Shared-D1 guard (a failed Preview migration must not be followed by a Dev migration)
-        if: env.STALE != 'true' && inputs.d1_migrations
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CFG: ${{ inputs.wrangler_config }}
-          BINDING: ${{ inputs.d1_binding }}
-          DEV_ENV: ${{ inputs.dev_wrangler_env }}
-          PREVIEW_MIGRATE_RESULT: ${{ needs.migrate.result }}
-        run: |
-          SHARED="$(node "$GITHUB_WORKSPACE/$TOOLS_DIR/cli.mjs" d1-shared --config "$CFG" --binding "$BINDING" --dev-env "$DEV_ENV" | sed -n 's/^shared=//p')"
-          echo "Preview and Dev share one physical D1: $SHARED (Preview migration result: $PREVIEW_MIGRATE_RESULT)"
-          if [ "$SHARED" = true ] && { [ "$PREVIEW_MIGRATE_RESULT" = failure ] || [ "$PREVIEW_MIGRATE_RESULT" = cancelled ]; }; then
-            echo "::error::Preview Migration $PREVIEW_MIGRATE_RESULT on the D1 that Shared Dev also uses; refusing to touch Dev (D1 state is unknown). Fix the migration and push again."
-            echo "### ❌ Shared Dev blocked — Preview migration $PREVIEW_MIGRATE_RESULT on the shared D1; Dev and its D1 unchanged." >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-      - name: Start Dev ledger entry
-        if: env.STALE != 'true'
-        id: dep
-        run: |
-          PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg w "$APP_NAME" '{branch_ref:$ref,worker:$w}')"
-          ID="$("$TOOLS_DIR/gh.sh" start "$LEDGER_ENV" "$RUN_SHA" "$PAYLOAD" "Shared Dev")"
-          echo "id=$ID" >> "$GITHUB_OUTPUT"
-          "$TOOLS_DIR/gh.sh" status "$ID" in_progress "" "Deploying $RUN_SHA from $BRANCH"
-      - name: Inject Dev build environment
-        if: env.STALE != 'true'
-        run: node "$TOOLS_DIR/parse-env.mjs" BUILD_ENV "$GITHUB_ENV"
-      - name: Dev build (a failure here leaves the running Dev Worker untouched)
-        if: env.STALE != 'true' && inputs.dev_build_cmd != ''
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.dev_build_cmd }}
-          VITE_APP_ENV: dev
-          VITE_APP_VERSION: ${{ inputs.app_version }}
-        run: bash -eo pipefail -c "$CMD"
-      - name: Audit effective Wrangler config (Dev Worker identity, no Production resources)
-        if: env.STALE != 'true'
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CFG: ${{ inputs.wrangler_config }}
-          WORKER: ${{ inputs.dev_worker_name }}
-          DENY: ${{ inputs.dev_deny_resources }}
-          DEV_ENV: ${{ inputs.dev_wrangler_env }}
-          ALLOW: ${{ inputs.dev_binding_allow }}
-          PROD_URL: ${{ inputs.app_url_prod }}
-        run: |
-          TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          EFFECTIVE="$(node "$TOOLS/cli.mjs" effective-config --dir . | sed -n 's/^effective_config=//p')"
-          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY" --dev-env "$DEV_ENV" --allow "$ALLOW" --prod-url "$PROD_URL"
-      - name: Stale-SHA guard (before migration and publish)
-        if: env.STALE != 'true'
-        run: |
-          if [ "$("$TOOLS_DIR/guard.sh" fresh)" != "stale=false" ]; then
-            echo "::notice::Superseded before publish; not touching Dev (nothing deployed)."
-            echo "STALE=true" >> "$GITHUB_ENV"
-          fi
-      - name: Apply pending Dev migrations (Dev D1 only)
-        if: env.STALE != 'true' && inputs.d1_migrations
-        env:
-          APP_DIR: ${{ github.workspace }}/${{ inputs.app_path }}
-          WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
-          D1_BINDING: ${{ inputs.d1_binding }}
-          DEV_ENV: ${{ inputs.dev_wrangler_env }}
-        run: |
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          "$TOOLS_DIR/migrate.sh" | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Publish Shared Dev
-        if: env.STALE != 'true'
-        id: publish
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.dev_deploy_cmd }}
-          VITE_APP_ENV: dev
-          VITE_APP_VERSION: ${{ inputs.app_version }}
-        run: bash -eo pipefail -c "$CMD"
-      - name: Stage smoke environment (smoke-only; never merged into the job environment)
-        if: env.STALE != 'true' && steps.publish.outcome == 'success'
-        run: |
-          umask 077
-          node "$TOOLS_DIR/parse-env.mjs" SMOKE_ENV "$RUNNER_TEMP/smoke.env"
-          echo "SMOKE_ENV_FILE=$RUNNER_TEMP/smoke.env" >> "$GITHUB_ENV"
-      - name: Smoke — Shared Dev URL (fails closed)
-        if: env.STALE != 'true' && steps.publish.outcome == 'success'
-        id: smoke
-        working-directory: ${{ inputs.app_path }}
-        env:
-          TARGET_URL: ${{ inputs.app_url_dev }}
-          DEPLOY_TARGET: dev
-          TEST_ENV: dev
-          EXPECTED_SHA: ${{ github.sha }}
-          SMOKE_CMD: ${{ inputs.dev_smoke_cmd }}
-          SHA_PATH: ${{ inputs.sha_path }}
-          ACCESS_TARGETS: ${{ inputs.access_protected_targets }}
-          SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
-          SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
-          NO_PROXY: '*'
-        run: |
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          "$TOOLS_DIR/smoke.sh" | tee -a "$GITHUB_OUTPUT"
-      - name: Mark deployed and verified
-        if: env.STALE != 'true' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'success'
-        id: verified
-        env:
-          LEVEL: ${{ steps.smoke.outputs.smoke_level }}
-          URL: ${{ inputs.app_url_dev }}
-        run: |
-          { echo "deployed_and_verified=true"; echo "smoke_level=$LEVEL"; echo "url=$URL"; } >> "$GITHUB_OUTPUT"
-          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" success "$URL" "Serving $RUN_SHA from $BRANCH ($LEVEL)"
-          {
-            echo "### ✅ Shared Dev — \`$APP_NAME\` (verification: $LEVEL)"
-            echo "- URL: $URL (shared by ALL branches; the last verified deployment wins)"
-            echo "- Branch: \`$BRANCH\` · served commit: \`$RUN_SHA\` · [run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
-          } >> "$GITHUB_STEP_SUMMARY"
-      # ---- Failure outcomes: always explicit, the job stays red. ----
-      - name: Dev — failed before publish
-        if: failure() && steps.dep.outputs.id != '' && steps.publish.outcome != 'success'
-        run: |
-          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" error "" "Failed before publish; Dev unchanged" || true
-          echo "### ❌ Shared Dev failed before publish — the running Dev deployment is unchanged." >> "$GITHUB_STEP_SUMMARY"
-      - name: Dev — mark unverified
-        if: failure() && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
-        run: |
-          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" failure "$DEV_URL" "Smoke failed — Dev UNVERIFIED"
-          echo "### ❌ Shared Dev smoke failed — $DEV_URL is **unverified** (serves $RUN_SHA from $BRANCH)." >> "$GITHUB_STEP_SUMMARY"
-        env:
-          DEV_URL: ${{ inputs.app_url_dev }}
-      - name: Dev recovery — find last known-good SHA
-        if: failure() && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
-        id: good
-        run: |
-          GOOD="$("$TOOLS_DIR/gh.sh" last-good "$LEDGER_ENV" "${{ steps.dep.outputs.id }}" || true)"
-          echo "sha=$GOOD" >> "$GITHUB_OUTPUT"
-          if [ -z "$GOOD" ]; then
-            echo "::error::No known-good Shared Dev deployment. Fix forward by pushing a new commit (any branch)."
-            echo "### ⚠️ No prior verified Shared Dev deployment — manual recovery required: push a fix." >> "$GITHUB_STEP_SUMMARY"
-          fi
-      - name: Dev recovery — checkout last good
-        if: failure() && steps.good.outputs.sha != ''
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ steps.good.outputs.sha }}
-          path: recover
-          persist-credentials: false
-      - name: Dev recovery — redeploy last good with the full verification
-        if: failure() && steps.good.outputs.sha != ''
-        id: recover
-        working-directory: recover/${{ inputs.app_path }}
-        env:
-          BUILD_CMD: ${{ inputs.dev_build_cmd }}
-          DEPLOY_CMD: ${{ inputs.dev_deploy_cmd }}
-          VITE_APP_ENV: dev
-          # Caller-expanded values embed the FAILED run's commit (build_env_dev via ${{ github.sha }}, app_version).
-          # They are rebound to the last-good SHA below; nothing here is reused unchanged.
-          APP_VERSION_IN: ${{ inputs.app_version }}
-          CFG: ${{ inputs.wrangler_config }}
-          WORKER: ${{ inputs.dev_worker_name }}
-          DENY: ${{ inputs.dev_deny_resources }}
-          DEV_ENV: ${{ inputs.dev_wrangler_env }}
-          ALLOW: ${{ inputs.dev_binding_allow }}
-          PROD_URL: ${{ inputs.app_url_prod }}
-          GOOD_SHA: ${{ steps.good.outputs.sha }}
-          TARGET_URL: ${{ inputs.app_url_dev }}
-          DEPLOY_TARGET: dev
-          EXPECTED_SHA: ${{ steps.good.outputs.sha }}
-          SMOKE_CMD: ${{ inputs.dev_smoke_cmd }}
-          SHA_PATH: ${{ inputs.sha_path }}
-          ACCESS_TARGETS: ${{ inputs.access_protected_targets }}
-          SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
-          SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
-          NO_PROXY: '*'
-        run: |
-          # Same gates as the normal publish, applied to the LAST-GOOD tree and its own identity: rebound build
-          # environment and version, build, Worker identity / resource audit, publish, then the full smoke
-          # (probe, sha_path for the good SHA, dev_smoke_cmd). D1 is never rolled back.
-          TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          export TOOLS_DIR="$TOOLS"
-          . "$TOOLS/envfile.sh"
-          pnpm install --frozen-lockfile
-          REBOUND_ENV="$(node "$TOOLS/cli.mjs" rebind-env --var BUILD_ENV --from "$RUN_SHA" --to "$GOOD_SHA")"
-          export REBOUND_ENV
-          node "$TOOLS/parse-env.mjs" REBOUND_ENV "$RUNNER_TEMP/dev-recover.env"
-          load_env_file "$RUNNER_TEMP/dev-recover.env"
-          rm -f "$RUNNER_TEMP/dev-recover.env"
-          export CLOUDFLARE_ENV="${CLOUDFLARE_ENV:-}"
-          VITE_APP_VERSION="$(APP_VERSION_IN="$APP_VERSION_IN" node "$TOOLS/cli.mjs" rebind-env --var APP_VERSION_IN --from "$RUN_SHA" --to "$GOOD_SHA")"
-          export VITE_APP_VERSION
-          [ -z "$APP_VERSION_IN" ] || [ "$APP_VERSION_IN" != "$VITE_APP_VERSION" ] || echo "::warning::app_version is not derived from the commit SHA; recovery keeps it as configured"
-          [ -z "$BUILD_CMD" ] || bash -eo pipefail -c "$BUILD_CMD"
-          EFFECTIVE="$(node "$TOOLS/cli.mjs" effective-config --dir . | sed -n 's/^effective_config=//p')"
-          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY" --dev-env "$DEV_ENV" --allow "$ALLOW" --prod-url "$PROD_URL"
-          bash -eo pipefail -c "$DEPLOY_CMD"
-          "$TOOLS/smoke.sh" >/dev/null
-          if [ -n "$SHA_PATH" ]; then LEVEL="commit identity verified at $SHA_PATH"; else LEVEL="smoke passed but commit identity NOT verified (set sha_path)"; fi
-          echo "### ♻️ Shared Dev redeployed from last good commit \`$GOOD_SHA\` — $LEVEL. Run remains FAILED for the bad commit. D1 migrations (if any) were NOT reverted." >> "$GITHUB_STEP_SUMMARY"
-      - name: Dev recovery failed
-        if: failure() && steps.good.outputs.sha != '' && steps.recover.outcome == 'failure'
-        run: echo "### 🚨 Automatic recovery FAILED — Shared Dev serves unverified code. Push a fix from any branch." >> "$GITHUB_STEP_SUMMARY"
+          target: dev
+          inputs_json: ${{ toJSON(inputs) }}
+          smoke_username: ${{ secrets.SMOKE_USERNAME }}
+          smoke_password: ${{ secrets.SMOKE_PASSWORD }}
+          sibling_result: ${{ needs.deploy.result }}
+          sibling_migration: ${{ needs.deploy.outputs.migration }}
 
   # -------------------------------------------------------------------------
-  # Release — optional, main only, only after THIS run deployed its own SHA and verified it.
+  # Release — optional, main only, only after THIS run deployed its own SHA to Production and verified it.
   # -------------------------------------------------------------------------
   release:
     name: Release
@@ -1512,40 +773,37 @@ jobs:
 
   # -------------------------------------------------------------------------
   # Protected persistent Dev (Hybrid) — explicit dispatch on the approved ref only. Never a side effect of a
-  # feature-branch push.
+  # feature-branch push. With dev_build_cmd it is the SAME engine in manual mode (build -> audit -> migration ->
+  # publish -> smoke -> ledger; no automatic recovery). Without it, the legacy two-command contract is unchanged.
   # -------------------------------------------------------------------------
   persistent-dev:
     name: Persistent Dev (Hybrid)
     if: github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     environment: ${{ inputs.app_name }}/dev
     concurrency:
-      group: cfv2-dev-${{ github.repository }}-${{ inputs.app_name }}
+      group: cfv2-dev-${{ github.repository }}-${{ inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name }}
       cancel-in-progress: false
     permissions:
       contents: read
-      deployments: write # split contract only: Dev ledger entry, recorded verified ONLY after the smoke passes
+      deployments: write # engine mode only: Dev ledger entry, recorded verified ONLY after the smoke passes
     env:
       GH_TOKEN: ${{ github.token }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEV_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_DEV_ACCOUNT_ID }}
-      BRANCH_REF: ${{ github.ref }}
-      RUN_SHA: ${{ github.sha }}
-      APP_NAME: ${{ inputs.app_name }}
-      LEDGER_ENV: ${{ inputs.app_name }}/dev/shared
-      BUILD_ENV: ${{ inputs.build_env_dev }}
-      SMOKE_ENV: ${{ inputs.smoke_env }}
     steps:
       - uses: actions/checkout@v6
         with:
+          fetch-depth: 0
           persist-credentials: false
+      # ---- Legacy contract (dev_build_cmd empty): dev_deploy_cmd builds and publishes; never recorded in the Shared
+      # Dev last-good ledger, so automatic recovery can never treat it as a known-good release.
       - uses: firstsun-dev/.github/actions/setup@v1
+        if: inputs.dev_build_cmd == ''
         with:
           setup-node: 'false'
           setup-pnpm: 'false'
-      # ---- Legacy contract (dev_build_cmd empty): unchanged. dev_deploy_cmd builds and publishes; never recorded
-      # in the Shared Dev last-good ledger, so automatic recovery can never treat it as a known-good release.
       - name: Deploy persistent Dev
         if: inputs.dev_build_cmd == ''
         working-directory: ${{ inputs.app_path }}
@@ -1560,122 +818,25 @@ jobs:
         env:
           CMD: ${{ inputs.dev_smoke_cmd }}
         run: bash -c "$CMD"
-      # ---- Split contract (dev_build_cmd set): the same sequence and gates as automatic Shared Dev, without
-      # automatic recovery. Build / publish / smoke are separate commands, so a manual run can neither skip the build
-      # nor be recorded as verified without a passing smoke.
-      - name: Fetch tooling
+      # ---- Engine contract (dev_build_cmd set).
+      - name: Fetch delivery tooling
         if: inputs.dev_build_cmd != ''
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
           persist-credentials: false
-      - name: Install tooling deps
+      - id: engine
         if: inputs.dev_build_cmd != ''
-        run: cd "$TOOLS_DIR" && npm ci --ignore-scripts --no-audit --no-fund
-      - name: Validate manual Dev configuration and credentials (fail closed)
-        if: inputs.dev_build_cmd != ''
-        env:
-          DEPLOY_CMD: ${{ inputs.dev_deploy_cmd }}
-          DEV_URL: ${{ inputs.app_url_dev }}
-          DEV_WORKER: ${{ inputs.dev_worker_name }}
-        run: |
-          [ -n "$DEPLOY_CMD" ] || { echo "::error::dev_deploy_cmd required"; exit 1; }
-          [ -n "$DEV_URL" ] || { echo "::error::the split Dev contract requires app_url_dev (smoke target)"; exit 1; }
-          [ -n "$DEV_WORKER" ] || { echo "::error::the split Dev contract requires dev_worker_name"; exit 1; }
-          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "::error::Dev credentials not provided; refusing to fall back to other credentials"; exit 1
-          fi
-      - name: Start Dev ledger entry (manual)
-        if: inputs.dev_build_cmd != ''
-        id: dep
-        run: |
-          PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg w "$APP_NAME" '{branch_ref:$ref,worker:$w,manual:true}')"
-          ID="$("$TOOLS_DIR/gh.sh" start "$LEDGER_ENV" "$RUN_SHA" "$PAYLOAD" "Persistent Dev (manual)")"
-          echo "id=$ID" >> "$GITHUB_OUTPUT"
-          "$TOOLS_DIR/gh.sh" status "$ID" in_progress "" "Manual deploy of $RUN_SHA"
-      - name: Inject Dev build environment
-        if: inputs.dev_build_cmd != ''
-        run: node "$TOOLS_DIR/parse-env.mjs" BUILD_ENV "$GITHUB_ENV"
-      - name: Dev build
-        if: inputs.dev_build_cmd != ''
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.dev_build_cmd }}
-          CLOUDFLARE_ENV: ${{ inputs.dev_wrangler_env }}
-          VITE_APP_ENV: dev
-          VITE_APP_VERSION: ${{ inputs.app_version }}
-        run: bash -eo pipefail -c "$CMD"
-      - name: Audit effective Wrangler config (Dev Worker identity, resource policy)
-        if: inputs.dev_build_cmd != ''
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CFG: ${{ inputs.wrangler_config }}
-          WORKER: ${{ inputs.dev_worker_name }}
-          DENY: ${{ inputs.dev_deny_resources }}
-          DEV_ENV: ${{ inputs.dev_wrangler_env }}
-          ALLOW: ${{ inputs.dev_binding_allow }}
-          PROD_URL: ${{ inputs.app_url_prod }}
-        run: |
-          TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          EFFECTIVE="$(node "$TOOLS/cli.mjs" effective-config --dir . | sed -n 's/^effective_config=//p')"
-          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY" --dev-env "$DEV_ENV" --allow "$ALLOW" --prod-url "$PROD_URL"
-      - name: Apply pending Dev migrations (Dev D1 only)
-        if: inputs.dev_build_cmd != '' && inputs.d1_migrations
-        env:
-          APP_DIR: ${{ github.workspace }}/${{ inputs.app_path }}
-          WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
-          D1_BINDING: ${{ inputs.d1_binding }}
-          DEV_ENV: ${{ inputs.dev_wrangler_env }}
-        run: |
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          "$TOOLS_DIR/migrate.sh" | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Publish Dev
-        if: inputs.dev_build_cmd != ''
-        id: publish
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.dev_deploy_cmd }}
-          VITE_APP_ENV: dev
-          VITE_APP_VERSION: ${{ inputs.app_version }}
-        run: bash -eo pipefail -c "$CMD"
-      - name: Stage smoke environment (smoke-only; never merged into the job environment)
-        if: inputs.dev_build_cmd != '' && steps.publish.outcome == 'success'
-        run: |
-          umask 077
-          node "$TOOLS_DIR/parse-env.mjs" SMOKE_ENV "$RUNNER_TEMP/smoke.env"
-          echo "SMOKE_ENV_FILE=$RUNNER_TEMP/smoke.env" >> "$GITHUB_ENV"
-      - name: Smoke — Dev URL (fails closed)
-        if: inputs.dev_build_cmd != '' && steps.publish.outcome == 'success'
-        id: smoke
-        working-directory: ${{ inputs.app_path }}
-        env:
-          TARGET_URL: ${{ inputs.app_url_dev }}
-          DEPLOY_TARGET: dev
-          TEST_ENV: dev
-          EXPECTED_SHA: ${{ github.sha }}
-          SMOKE_CMD: ${{ inputs.dev_smoke_cmd }}
-          SHA_PATH: ${{ inputs.sha_path }}
-          ACCESS_TARGETS: ${{ inputs.access_protected_targets }}
-          SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
-          SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
-          NO_PROXY: '*'
-        run: |
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          "$TOOLS_DIR/smoke.sh" | tee -a "$GITHUB_OUTPUT"
-      # The ONLY place a manual deployment becomes "known good": publish succeeded AND the smoke passed.
-      - name: Record verified manual deployment
-        if: inputs.dev_build_cmd != '' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'success'
-        env:
-          LEVEL: ${{ steps.smoke.outputs.smoke_level }}
-          URL: ${{ inputs.app_url_dev }}
-        run: |
-          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" success "$URL" "Manual deploy of $RUN_SHA verified ($LEVEL)"
-          echo "### ✅ Persistent Dev verified — \`$APP_NAME\` at \`$RUN_SHA\` ($LEVEL)" >> "$GITHUB_STEP_SUMMARY"
-      - name: Record failed manual deployment
-        if: failure() && inputs.dev_build_cmd != '' && steps.dep.outputs.id != ''
-        run: |
-          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" failure "" "Manual deploy failed or unverified; NOT a known-good release" || true
-          echo "### ❌ Persistent Dev run failed — not recorded as known-good. Dev may serve unverified code; no automatic recovery for manual runs." >> "$GITHUB_STEP_SUMMARY"
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: dev
+          mode: manual
+          inputs_json: ${{ toJSON(inputs) }}
+          smoke_username: ${{ secrets.SMOKE_USERNAME }}
+          smoke_password: ${{ secrets.SMOKE_PASSWORD }}

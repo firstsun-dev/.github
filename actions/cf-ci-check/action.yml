@@ -1,0 +1,67 @@
+name: CF Worker CI check
+description: >
+  One validation job body (Lint, Typecheck, Unit, Integration, Build Validation): import the target build env and
+  ci_env as data, set up dependencies, run exactly ONE command, write a short summary. Never receives Cloudflare
+  credentials. The caller must have checked out the app and then this repository's `actions/cf-ci-check` and
+  `actions/cf-preview/parse-env.mjs` at `.cf-tools` (the checkout is removed again so linters never see it).
+inputs:
+  title:
+    description: Check name for the summary
+    required: true
+  cmd:
+    description: The single command to run (passed through env, never interpolated)
+    required: true
+  app_path:
+    description: Working directory of the app
+    default: .
+  build_env_prod:
+    description: Production build env (KEY=VALUE lines); used on main
+    default: ''
+  build_env_preview:
+    description: Preview build env (KEY=VALUE lines); used on every other ref
+    default: ''
+  ci_env:
+    description: Extra nonsecret env applied after the target build env
+    default: ''
+  app_version:
+    description: Value for VITE_APP_VERSION
+    default: ''
+  use_mailpit:
+    description: Start Mailpit before the command
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Import validation env (target env, then ci_env)
+      shell: bash
+      env:
+        TARGET_BUILD_ENV: ${{ github.ref == 'refs/heads/main' && inputs.build_env_prod || github.ref != 'refs/heads/main' && inputs.build_env_preview || '' }}
+        CI_ENV: ${{ inputs.ci_env }}
+      run: |
+        node "$GITHUB_ACTION_PATH/../cf-preview/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
+        node "$GITHUB_ACTION_PATH/../cf-preview/parse-env.mjs" CI_ENV "$GITHUB_ENV"
+        rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope (no later step needs it)
+    - uses: firstsun-dev/.github/actions/setup@v1
+      with:
+        setup-node: 'false'
+        setup-pnpm: 'false'
+    - if: inputs.use_mailpit == 'true'
+      uses: firstsun-dev/.github/actions/mailpit@v1
+    - name: ${{ inputs.title }}
+      id: check
+      shell: bash
+      working-directory: ${{ inputs.app_path }}
+      env:
+        CMD: ${{ inputs.cmd }}
+        VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+        VITE_APP_VERSION: ${{ inputs.app_version }}
+      run: bash -c "$CMD"
+    - name: Summary
+      if: always()
+      shell: bash
+      env:
+        OUTCOME: ${{ steps.check.outcome }}
+        TITLE: ${{ inputs.title }}
+        CMD: ${{ inputs.cmd }}
+      run: |
+        { echo "### $TITLE: $OUTCOME"; echo '`'"$CMD"'`'; } >> "$GITHUB_STEP_SUMMARY"
