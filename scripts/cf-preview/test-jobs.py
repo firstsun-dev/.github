@@ -114,7 +114,17 @@ check(not release_runs(r), "prod without smoke URL -> Release does NOT run")
 r = deploy(env={"STUB_PROBES": "302 https://t.cloudflareaccess.com/cdn-cgi/access/login/x"})
 check(r["result"] == "failure" and r["outputs"]["deployed_and_verified"] == "false", "prod redirect to Cloudflare Access without approval FAILS (not application verification)")
 r = deploy(inputs={"access_protected_targets": "preview prod"}, env={"STUB_PROBES": "302 https://t.cloudflareaccess.com/cdn-cgi/access/login/x"})
-check(r["result"] == "success" and r["outputs"]["smoke_level"] == "liveness" and r["outputs"]["deployed_and_verified"] == "true", "explicitly approved Access-protected prod: verified at LIVENESS level only")
+ACCESS = "302 https://t.cloudflareaccess.com/cdn-cgi/access/login/x"
+check(r["result"] == "success" and r["outputs"]["smoke_level"] == "liveness" and r["outputs"]["deployed_and_verified"] == "false", "approved Access-protected prod: LIVENESS only -> published but NOT verified")
+check(r["outputs"]["published_unverified"] == "true" and r["outputs"]["verified_url"] == "" and r["outputs"]["published_url"] == "https://app.example.com" and r["outputs"]["url"] == "https://app.example.com", "liveness: published_url set (and legacy url kept), verified_url empty, published_unverified=true")
+check(not release_runs(r), "prod Access liveness only -> Release BLOCKED")
+check("Release is **blocked**" in r["summary"] and "NOT VERIFIED" in r["summary"], "liveness-only Production keeps a diagnostic summary")
+r = deploy(env={"STUB_PROBES": "200 "})
+check(r["outputs"]["smoke_level"] == "content" and r["outputs"]["verified_url"] == "https://app.example.com" and r["outputs"]["published_unverified"] == "false" and release_runs(r), "prod content smoke succeeds -> verified_url set, Release allowed")
+r = deploy(inputs={"access_protected_targets": "preview prod", "sha_path": "/version.json", "smoke_env": "PROBE_HEADERS=CF-Access-Client-Id: x"}, env={"STUB_PROBES": "200 ", "STUB_SHA_BODY": SHA[:7]})
+check(r["outputs"]["smoke_level"] == "content-sha" and r["outputs"]["deployed_and_verified"] == "true" and release_runs(r), "prod authenticated probe on an Access-protected target + matching SHA -> content-sha, Release allowed")
+r = deploy(inputs={"access_protected_targets": "preview prod"}, env={"STUB_PROBES": "500 "})
+check(r["outputs"]["verified_url"] == "" and r["outputs"]["deployed_and_verified"] == "false" and r["outputs"]["published_unverified"] != "true", "failed smoke -> no verified output")
 for code in ("401 ", "403 ", "404 ", "500 ", "302 https://evil.example/x", "000 "):
     r = deploy(env={"STUB_PROBES": code})
     check(r["result"] == "failure" and r["outputs"]["deployed_and_verified"] == "false", f"prod probe '{code.strip()}' fails and is not verified")
@@ -142,7 +152,10 @@ check(r2["result"] == "failure" and not published(r2) and "pnpm exec wrangler pr
 r2 = deploy(FEAT, env={"STUB_OWNER_REF": FEAT})
 check(r2["result"] == "success", "ledger owned by THIS branch ref: same branch updates its Preview")
 r = deploy(FEAT, env={"STUB_PROBES": "302 https://t.cloudflareaccess.com/cdn-cgi/access/login/x"})
-check(r["result"] == "success" and r["outputs"]["smoke_level"] == "liveness", "Access-protected Preview (default approval): liveness reported, not content")
+check(r["result"] == "success" and r["outputs"]["smoke_level"] == "liveness" and r["outputs"]["deployed_and_verified"] == "false" and r["outputs"]["published_unverified"] == "true", "Access-protected Preview (default approval): liveness reported, published but NOT verified")
+check("state=inactive" in r["log"] and "state=success" not in r["log"], "Preview liveness is never recorded as a success (known-good) ledger status")
+r = deploy(FEAT, inputs={"smoke_env": "PROBE_HEADERS=CF-Access-Client-Id: x"}, env={"STUB_PROBES": "200 "})
+check(r["outputs"]["smoke_level"] == "content" and r["outputs"]["deployed_and_verified"] == "true" and r["outputs"]["verified_url"] != "" and "state=success" in r["log"], "Preview with authenticated content smoke -> verified, success ledger status")
 
 
 def good_dep(**over):
@@ -174,7 +187,7 @@ r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ", "STUB_DEPLOYMENTS":
 check(r["log"].count("preview --name feat-x") == 1, "recovery ineligible: the candidate's latest status is not success")
 r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ", "STUB_DEPLOYMENTS": good_dep(), "STUB_STATUS": "success "})
 check(r["log"].count("preview --name feat-x") == 1, "recovery ineligible: no valid recorded Preview URL")
-r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ;200 ", "STUB_DEPLOYMENTS": good_dep(), "STUB_STATUS": "success https://other.example.workers.dev"})
+r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ;200 ", "STUB_DEPLOYMENTS": good_dep(), "STUB_STATUS": "success https://other.example.workers.dev Serving good (content)"})
 check(r["result"] == "failure" and "restored to last good" not in r["summary"] and "Automatic recovery FAILED" in r["summary"], "recovery whose URL differs from the recorded last-good URL is refused and reported as failed")
 r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ;500 ", "STUB_DEPLOYMENTS": good_dep()})
 check(r["result"] == "failure" and "Automatic recovery FAILED" in r["summary"] and "restored to last good" not in r["summary"] and "state=error" in r["log"], "recovery smoke failure stays visible, is recorded as error and is never reported as recovered")
@@ -450,8 +463,16 @@ pf = deploy(FEAT, inputs=D1, toml=SHARED_TOML, env={"STUB_APPLY_FAIL": "1"})
 df = dev(inputs=dict(D1, dev_binding_allow=""), toml=SHARED_TOML, needs={"deploy": {"result": pf["result"], "outputs": pf["outputs"]}})
 check(pf["outputs"]["migration"] == "failed" and df["result"] == "failure" and not ran(df, "migrations apply") and not ran(df, "PUBLISH"), "shared D1: a failed Preview migration (job output) stops the Dev migration and publish")
 
+r = dev(inputs={"dev_deploy_cmd": ""})
+check(r["result"] == "success" and "wrangler deploy --config " in r["log"] and "wrangler.toml --env dev" in r["log"] and r["log"].index("BUILD") < r["log"].index("wrangler deploy"), "Shared Dev built-in publish (no dev_deploy_cmd): wrangler deploy gets the audited --config (and the named env for a source config), after the build")
+
+# Verification level: Access liveness is published-but-unverified and never a known-good record
+r = dev(inputs={"access_protected_targets": "preview dev"}, env={"STUB_PROBES": "302 https://t.cloudflareaccess.com/cdn-cgi/access/login/x"})
+check(r["result"] == "success" and r["outputs"]["smoke_level"] == "liveness" and r["outputs"]["deployed_and_verified"] == "false" and r["outputs"]["verified_url"] == "" and r["outputs"]["published_unverified"] == "true", "Shared Dev Access liveness only: published, NOT verified")
+check("state=success" not in r["log"] and "state=inactive" in r["log"], "Shared Dev liveness is not recorded as content-verified last-good")
+
 # Smoke failure and recovery
-GD = {"STUB_DEPLOYMENTS": json.dumps([{"id": 7, "sha": GOOD, "payload": {"repo": "o/r", "dev_worker": "app-dev", "worker": "app"}}]), "STUB_STATUS": "success https://dev.example.com"}
+GD = {"STUB_DEPLOYMENTS": json.dumps([{"id": 7, "sha": GOOD, "payload": {"repo": "o/r", "dev_worker": "app-dev", "worker": "app"}}]), "STUB_STATUS": "success https://dev.example.com Serving good (content)"}
 r = dev(env=dict(GD, STUB_PROBES="500 ;200 "))
 check(r["result"] == "failure" and r["outputs"]["deployed_and_verified"] == "false" and "unverified" in r["summary"], "smoke failure: job red, deployment marked unverified")
 builds = [l for l in r["log"].splitlines() if l.startswith("BUILD")]

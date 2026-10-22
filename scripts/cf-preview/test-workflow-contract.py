@@ -391,7 +391,9 @@ check("CANNOT lock a D1 shared with ANOTHER repository" in inputs_def["d1_lock_s
 # ---------------------------------------------------------------- 11. interface preserved / Hybrid / lifecycle / retention
 check(all(k in inputs_def for k in ("app_url_dev", "dev_deploy_cmd", "dev_smoke_cmd", "build_env_dev", "dev_build_cmd", "dev_wrangler_env", "dev_worker_name", "dev_binding_allow", "dev_deny_resources")), "interface: Dev URL, deploy/smoke commands, build env, Wrangler env, identity and resource-policy inputs exist")
 check("CLOUDFLARE_DEV_API_TOKEN" in doc[True]["workflow_call"]["secrets"] and "CLOUDFLARE_DEV_ACCOUNT_ID" in doc[True]["workflow_call"]["secrets"], "interface: Dev credentials are the existing CLOUDFLARE_DEV_* secrets")
-check(set(doc[True]["workflow_call"]["outputs"]) == {"deploy_url", "deploy_target", "version_id", "dev_url"}, "outputs: deploy_url, deploy_target, version_id, dev_url are preserved")
+check({"deploy_url", "deploy_target", "version_id", "dev_url"} <= set(doc[True]["workflow_call"]["outputs"]), "outputs: deploy_url, deploy_target, version_id, dev_url are preserved (existing consumers)")
+check(set(doc[True]["workflow_call"]["outputs"]) == {"deploy_url", "deploy_target", "version_id", "dev_url", "deploy_verified_url", "deploy_published_unverified", "dev_verified_url", "dev_published_unverified"}, "outputs: verified URLs and published-but-unverified flags are additive")
+check("verified" in doc[True]["workflow_call"]["outputs"]["deploy_verified_url"]["value"] or "verified_url" in doc[True]["workflow_call"]["outputs"]["deploy_verified_url"]["value"], "outputs: deploy_verified_url comes from the engine's verified_url")
 pd = jobs["persistent-dev"]
 check(pd["if"] == "github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref" and pd["environment"] == "${{ inputs.app_name }}/dev",
       "persistent-dev keeps the approved-ref gate and protected Environment")

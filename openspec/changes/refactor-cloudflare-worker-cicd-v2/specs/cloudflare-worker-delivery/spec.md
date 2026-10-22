@@ -224,3 +224,18 @@ The refactored v2 SHALL preserve the previously shipped per-branch stable Native
 - **WHEN** Blog and Heaven ID migrate in separate reviewed PRs
 - **THEN** both SHALL demonstrate correct E2E/test build versus target deploy build, distinct Migration Job, stable multi-branch Previews, smoke/recovery and applicable special checks
 - **AND** the new immutable v2.x.y release and any move of floating `@v2` SHALL wait for verified pilot evidence.
+
+### Requirement: Verification levels distinguish published, liveness-verified and content-verified deployments
+
+The delivery engine SHALL report the smoke outcome as `liveness` (only the Cloudflare Access login answered), `content` (the application answered) or `content-sha` (content and the expected commit SHA verified). Only `content` and `content-sha` SHALL set `deployed_and_verified=true`, emit `verified_url`, record a `success` ledger status eligible for automatic recovery, or allow Release. A `liveness` outcome SHALL be reported as `published_unverified=true` with `published_url`, SHALL NOT be recorded as a known-good deployment, and SHALL NOT satisfy `sha_path` or `smoke_cmd` verification.
+
+#### Scenario: Production Access liveness only
+
+- **WHEN** Production is listed in `access_protected_targets` and only the Access login redirect answers
+- **THEN** the job succeeds with `smoke_level=liveness`, `deployed_and_verified=false` and a published-but-unverified summary
+- **AND** Release does not run
+
+#### Scenario: Authenticated content smoke
+
+- **WHEN** service-token headers supplied through `smoke_env` `PROBE_HEADERS` let the probe reach the application
+- **THEN** the level is `content` (or `content-sha` when `sha_path` matches) and the deployment is eligible as verified and known-good

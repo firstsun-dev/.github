@@ -38,8 +38,14 @@ on:
   workflow_call:
     outputs:
       deploy_url:
-        description: URL that was deployed and smoke-tested (Preview URL or app_url_prod); empty when nothing was deployed
+        description: URL that was published and smoke-tested (Preview URL or app_url_prod); empty when nothing was deployed. May be published-but-unverified - gate on deploy_verified_url
         value: ${{ jobs.deploy.outputs.url }}
+      deploy_verified_url:
+        description: Same URL, only when content-level verification passed; empty for Access-liveness-only or failed deployments
+        value: ${{ jobs.deploy.outputs.verified_url }}
+      deploy_published_unverified:
+        description: true when deploy published a reachable but NOT content-verified deployment (Access liveness only)
+        value: ${{ jobs.deploy.outputs.published_unverified }}
       deploy_target:
         description: prod | preview
         value: ${{ jobs.deploy.outputs.target }}
@@ -47,8 +53,14 @@ on:
         description: Production Worker version id (prod only)
         value: ${{ jobs.deploy.outputs.version_id }}
       dev_url:
-        description: Shared Dev URL that was deployed and smoke-tested (app_url_dev); empty when Shared Dev did not deploy
+        description: Shared Dev URL that was published and smoke-tested (app_url_dev); empty when Shared Dev did not deploy. May be published-but-unverified - gate on dev_verified_url
         value: ${{ jobs.dev-deploy.outputs.url }}
+      dev_verified_url:
+        description: Shared Dev URL only when content-level verification passed
+        value: ${{ jobs.dev-deploy.outputs.verified_url }}
+      dev_published_unverified:
+        description: true when Shared Dev published a reachable but NOT content-verified deployment (Access liveness only)
+        value: ${{ jobs.dev-deploy.outputs.published_unverified }}
     inputs:
       tools_ref:
         description: >
@@ -162,11 +174,13 @@ on:
       access_protected_targets:
         description: >
           Space-separated targets (preview and/or prod) where a redirect to Cloudflare Access counts as LIVENESS only
-          (content/SHA not verified). Any target not listed fails smoke on an Access redirect.
+          (published but NOT content/SHA-verified: no Release, not a known-good deployment). Any target not listed fails
+          smoke on an Access redirect. For content verification of an Access-protected target, send service-token
+          headers through smoke_env PROBE_HEADERS so the probe reaches the application itself.
         type: string
         default: preview
       sha_path:
-        description: Optional path (e.g. /version.json) that must contain the commit SHA once served
+        description: Optional path (e.g. /version.json) that must contain the commit SHA once served (smoke_level content-sha)
         type: string
         default: ''
       preview_host_check:
@@ -566,6 +580,9 @@ jobs:
       version_id: ${{ steps.engine.outputs.version_id }}
       deployed_and_verified: ${{ steps.engine.outputs.deployed_and_verified || 'false' }}
       smoke_level: ${{ steps.engine.outputs.smoke_level }}
+      published_url: ${{ steps.engine.outputs.published_url }}
+      verified_url: ${{ steps.engine.outputs.verified_url }}
+      published_unverified: ${{ steps.engine.outputs.published_unverified || 'false' }}
       migration: ${{ steps.engine.outputs.migration }}
     env:
       GH_TOKEN: ${{ github.token }}
@@ -624,6 +641,10 @@ jobs:
     outputs:
       url: ${{ steps.engine.outputs.url }}
       deployed_and_verified: ${{ steps.engine.outputs.deployed_and_verified || 'false' }}
+      smoke_level: ${{ steps.engine.outputs.smoke_level }}
+      published_url: ${{ steps.engine.outputs.published_url }}
+      verified_url: ${{ steps.engine.outputs.verified_url }}
+      published_unverified: ${{ steps.engine.outputs.published_unverified || 'false' }}
     env:
       GH_TOKEN: ${{ github.token }}
       # Dev credentials ONLY; there is no fallback to the Preview or Production token.

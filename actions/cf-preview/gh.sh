@@ -17,9 +17,11 @@ scan_good() {
   while read -r id sha; do
     [ -n "$id" ] || continue
     [ "$id" = "$exclude" ] && continue
-    row="$(gh api "repos/$R/deployments/$id/statuses?per_page=1" -q '.[0] | "\(.state) \(.environment_url)"')"
-    st="${row%% *}"; url="${row#* }"
-    if [ "$st" = success ] && [[ "$url" =~ ^https://[^[:space:]]+$ ]]; then echo "$sha $url"; return 0; fi
+    row="$(gh api "repos/$R/deployments/$id/statuses?per_page=1" -q '.[0] | "\(.state) \(.environment_url) \(.description)"')"
+    st="${row%% *}"; rest="${row#* }"; url="${rest%% *}"; desc="${rest#* }"
+    # Known-good = success AND content-level verification recorded by the engine ("Serving <sha> (content|content-sha)").
+    # Liveness-only and legacy records without the marker are never eligible.
+    if [ "$st" = success ] && [[ "$url" =~ ^https://[^[:space:]]+$ ]] && [[ "$desc" =~ \((content|content-sha)\) ]]; then echo "$sha $url"; return 0; fi
   done < <(printf '%s' "$list" | jq -r "${jqargs[@]}" ".[] | $filter | \"\\(.id) \\(.sha)\"")
 }
 
@@ -52,12 +54,13 @@ JSON
     scan_good "$1" "${2:-}" --arg repo "$R" --arg dev "$3" --arg app "$4" -- \
       'select(.payload.repo == $repo and .payload.dev_worker == $dev and .payload.worker == $app)'
     ;;
-  comment) # <branch> <app_name> <url> <sha> : only same-repo PRs from this exact head branch
+  comment) # <branch> <app_name> <url> <sha> [note] : only same-repo PRs from this exact head branch
     owner="${R%%/*}"
     marker="<!-- cf-preview:$2 -->"
     body="$marker
 **Preview ($2)**: $3
-Commit: \`$4\` · branch \`$1\` · Preview is branch-owned and persists after this PR closes."
+Commit: \`$4\` · branch \`$1\` · Preview is branch-owned and persists after this PR closes.${5:+
+**$5**}"
     for pr in $(gh api "repos/$R/pulls?state=open&head=$owner:$1" -q '.[] | select(.head.repo.full_name == "'"$R"'") | .number'); do
       cid="$(gh api "repos/$R/issues/$pr/comments" --paginate -q '.[] | select(.body | startswith("'"$marker"'")) | .id' | head -1)"
       if [ -n "$cid" ]; then gh api "repos/$R/issues/comments/$cid" -X PATCH -f body="$body" >/dev/null

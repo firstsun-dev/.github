@@ -232,7 +232,7 @@ The shared workflow now sets **workflow-level** `concurrency` with `queue: max` 
 `Deploy` exposes `deployed_and_verified` (default false). It becomes true only in the step that runs after **this run published its own SHA and smoke passed**. A stale run, a skipped publish, a failed smoke (with or without rollback), or a missing URL leaves it false. `Release` requires `deploy.result == success`, `deployed_and_verified == true` and `target == prod`. A configured E2E that did not run (skipped / empty or invalid matrix) now blocks Migration and Deploy; only `test_e2e_cmd: ''` allows a skip.
 
 ### Smoke
-Fail-closed (`smoke.sh`): no URL ⇒ fail; only 2xx counts (401/403/3xx-elsewhere/5xx/no response fail); a `sha_path` that is missing or serves another commit fails; a redirect to Cloudflare Access is **liveness only** and passes only for targets listed in `access_protected_targets` (default `preview`; prod must opt in explicitly). Production rollback runs through `publish.sh ROLLBACK_TO`, i.e. the same audited config as the publish, then the run stays red and Release stays closed. A failed automatic rollback is reported as failed, never as rolled back.
+Fail-closed (`smoke.sh`): no URL ⇒ fail; only 2xx counts (401/403/3xx-elsewhere/5xx/no response fail); a `sha_path` that is missing or serves another commit fails; a redirect to Cloudflare Access is **liveness only** and passes only for targets listed in `access_protected_targets` (default `preview`; prod must opt in explicitly) — it is *published but not verified* (see "Verification levels"). Production rollback runs through `publish.sh ROLLBACK_TO`, i.e. the same audited config as the publish, then the run stays red and Release stays closed. A failed automatic rollback is reported as failed, never as rolled back.
 
 ### Preview secrets
 `PREVIEW_SECRETS` is staged by `parse-env.mjs` (validated names, all-or-nothing, `::add-mask::`, owner-only file, removed at the end of the job) and exported into the Preview build/smoke processes through quoted variables (`envfile.sh`), never `source`d. Values with `$()`, backticks, quotes, `;`, `=` and spaces arrive literally; names such as `CLOUDFLARE_*`, `GITHUB_*`, `PATH`, `NODE_OPTIONS` are rejected; multi-line values are not supported (a newline starts a new `NAME=` line and a non-conforming line is an error). Only the Deploy publish/smoke steps see them; CI, E2E and Migration never do.
@@ -246,6 +246,21 @@ Fail-closed (`smoke.sh`): no URL ⇒ fail; only 2xx counts (401/403/3xx-elsewher
 * Bindings: Preview source preflight before the first remote command; **effective generated config audited** after the build for both targets.
 * Artifacts: none cross jobs; the only upload is the E2E report on failure, retention 3 days.
 * Residual: callers' commands are trusted code; Preview migration can still break other branches' code.
+
+## Verification levels
+
+`smoke.sh` reports one level; `engine.sh verified` turns it into the public outcome.
+
+| Level | Meaning | `deployed_and_verified` | Ledger status | Release / known-good |
+| --- | --- | --- | --- | --- |
+| *(no smoke / smoke failed)* | published, unverified | `false` | `failure` / `error` | no |
+| `liveness` | only the Cloudflare Access login redirect answered (target listed in `access_protected_targets`) | `false`, `published_unverified=true` | `inactive` (description says unverified) | **no** |
+| `content` | the application itself answered 2xx (directly, or through an authenticated probe: service-token headers via `smoke_env` `PROBE_HEADERS`) | `true` | `success … (content)` | yes |
+| `content-sha` | content verified **and** `sha_path` served the expected commit | `true` | `success … (content-sha)` | yes |
+
+* Under an Access redirect `smoke_cmd`/`sha_path` cannot raise the level: an unauthenticated command may be reading the login page. Provide `PROBE_HEADERS` (also applied to the `sha_path` request) so the probe reaches the application.
+* Outputs (additive; `url`/`deploy_url`/`dev_url` keep their meaning "published URL"): `published_url`, `verified_url` (only at content level), `published_unverified`; workflow outputs `deploy_verified_url`, `deploy_published_unverified`, `dev_verified_url`, `dev_published_unverified`. Gate consumers on the `*_verified_url` outputs.
+* The ledger scan (`last-good-preview`, `last-good-dev`) only accepts `success` records whose description carries `(content)` or `(content-sha)`; liveness-only and legacy records are never recovery targets. Recovery verifies against the **last-good** SHA.
 
 ## Verified vs not verified
 

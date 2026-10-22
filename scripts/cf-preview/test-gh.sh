@@ -32,12 +32,24 @@ G="$ROOT/actions/cf-preview/gh.sh"
 dep() { printf '{"id":%s,"sha":"%s","payload":{"repo":"o/r","branch_ref":"refs/heads/feat/a","host_worker":"%s","worker":"www"%s}}' "$1" "$2" "$3" "${4:-}"; }
 LP_JSON="[$(dep 5 newest-wrong-host blog-preview),$(dep 4 right-host-failed blog),$(dep 3 right-host-nourl blog),$(dep 2 right-host-good blog),$(dep 1 older-good blog)]"
 export LP_JSON
-LP_ST_5="success https://feat-a-blog-preview.x.workers.dev" LP_ST_4="failure https://u.example.com" LP_ST_3="success " LP_ST_2="success https://feat-a-blog.x.workers.dev" LP_ST_1="success https://old.example.com"
+LP_ST_5="success https://feat-a-blog-preview.x.workers.dev Serving s5 (content)" LP_ST_4="failure https://u.example.com" LP_ST_3="success " LP_ST_2="success https://feat-a-blog.x.workers.dev Serving s2 (content-sha)" LP_ST_1="success https://old.example.com Serving s1 (content)"
 export LP_ST_5 LP_ST_4 LP_ST_3 LP_ST_2 LP_ST_1
 LP() { "$G" last-good-preview "www/preview/feat-a" "${1:-0}" refs/heads/feat/a "${2:-blog}" www; }
 [ "$(LP 0)" = "right-host-good https://feat-a-blog.x.workers.dev" ] && ok "last-good-preview: skips another host Worker, failed, and URL-less deployments" || bad "last-good-preview basic: $(LP 0)"
 [ "$(LP 2)" = "older-good https://old.example.com" ] && ok "last-good-preview: honours the excluded (current) deployment" || bad "exclude"
 [ "$(LP 0 blog-preview)" = "newest-wrong-host https://feat-a-blog-preview.x.workers.dev" ] && ok "last-good-preview: same branch hosted by blog-preview resolves only to blog-preview records" || bad "other host"
+# Verification level: only content-level success is a known-good deployment (liveness-only / legacy records are not).
+LP_ST_2="success https://feat-a-blog.x.workers.dev Serving s2 (liveness)"
+[ "$(LP 0)" = "older-good https://old.example.com" ] && ok "last-good-preview: a liveness-only success is NOT known-good" || bad "liveness eligible: $(LP 0)"
+LP_ST_2="success https://feat-a-blog.x.workers.dev"
+[ "$(LP 0)" = "older-good https://old.example.com" ] && ok "last-good-preview: a legacy success without a verification marker is NOT known-good" || bad "legacy success eligible"
+LP_ST_2="success https://feat-a-blog.x.workers.dev Serving s2 (content-sha)"; export LP_ST_2
+dev() { printf '{"id":%s,"sha":"%s","payload":{"repo":"o/r","dev_worker":"blog-preview","worker":"blog"}}' "$1" "$2"; }
+LP_JSON="[$(dev 5 dev-liveness),$(dev 4 dev-good)]"
+LP_ST_5="success https://dev.example.com Published s5; unverified (liveness)" LP_ST_4="success https://dev.example.com Serving s4 (content-sha)"; export LP_ST_5 LP_ST_4
+[ "$("$G" last-good-dev "blog/dev/shared" 0 blog-preview blog)" = "dev-good https://dev.example.com" ] && ok "last-good-dev: Dev liveness-only is not recorded as content-verified last-good" || bad "dev liveness eligible"
+LP_JSON="[$(dep 5 newest-wrong-host blog-preview),$(dep 4 right-host-failed blog),$(dep 3 right-host-nourl blog),$(dep 2 right-host-good blog),$(dep 1 older-good blog)]"; export LP_JSON LP_ST_5
+LP_ST_5="success https://feat-a-blog-preview.x.workers.dev Serving s5 (content)"; export LP_ST_5
 [ -z "$(LP 0 someone-else)" ] && ok "last-good-preview: unknown host Worker has no eligible deployment" || bad "unknown host"
 [ -z "$("$G" last-good-preview "www/preview/feat-a" 0 refs/heads/other blog www)" ] && ok "last-good-preview: another branch ref is not eligible" || bad "branch"
 [ -z "$("$G" last-good-preview "www/preview/feat-a" 0 refs/heads/feat/a blog other-app)" ] && ok "last-good-preview: another application is not eligible" || bad "app"

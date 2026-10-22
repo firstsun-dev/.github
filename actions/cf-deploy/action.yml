@@ -31,16 +31,25 @@ inputs:
     default: ''
 outputs:
   url:
-    description: Deployed (and smoke-tested) URL
+    description: Published URL (kept for existing consumers; verified or not - see verified_url / published_unverified)
     value: ${{ steps.verified.outputs.url || steps.publish.outputs.url }}
+  published_url:
+    description: URL this run published, whether or not its content was verified
+    value: ${{ steps.verified.outputs.published_url || steps.publish.outputs.url }}
+  verified_url:
+    description: URL only when content-level verification passed (smoke_level content | content-sha); empty otherwise
+    value: ${{ steps.verified.outputs.verified_url }}
+  published_unverified:
+    description: true when published and reachable but NOT content-verified (Cloudflare Access liveness only)
+    value: ${{ steps.verified.outputs.published_unverified || 'false' }}
   version_id:
     description: Production Worker version id (prod only)
     value: ${{ steps.publish.outputs.version_id }}
   deployed_and_verified:
-    description: true ONLY when this run published its own SHA and the smoke passed
+    description: true ONLY when this run published its own SHA and a CONTENT-level smoke passed (never for Access liveness)
     value: ${{ steps.verified.outputs.deployed_and_verified || 'false' }}
   smoke_level:
-    description: content | liveness
+    description: liveness (Access login reachable only) | content (application responded) | content-sha (content and commit SHA verified)
     value: ${{ steps.verified.outputs.smoke_level }}
   migration:
     description: applied | failed | none
@@ -120,7 +129,7 @@ runs:
         SMOKE_USERNAME: ${{ inputs.smoke_username }}
         SMOKE_PASSWORD: ${{ inputs.smoke_password }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" smoke | tee -a "$GITHUB_OUTPUT"'
-    # The ONLY place deployed_and_verified becomes true: this run published its own SHA and its smoke passed.
+    # The ONLY place deployed_and_verified becomes true: this run published its own SHA and its smoke passed at content level.
     - name: Mark deployed and verified
       id: verified
       if: env.STALE != 'true' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'success'

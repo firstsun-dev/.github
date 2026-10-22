@@ -179,24 +179,35 @@ case "$PHASE" in
       ACCESS_TARGETS="$(inp access_protected_targets)" SMOKE_ENV_FILE="$S/smoke.env" PREVIEW_ENV_FILE="$S/preview.env" NO_PROXY='*' \
       "$TOOLS_DIR/smoke.sh";;
 
-  verified)
+  verified) # smoke passed: published; "verified" only at content level (liveness = Access login reachable only)
     ctx
     URL="${PUBLISHED_URL:-$(target_url)}"
-    echo "deployed_and_verified=true"; echo "smoke_level=${SMOKE_LEVEL:-}"; echo "url=$URL"
+    LEVEL="${SMOKE_LEVEL:-}"
+    case "$LEVEL" in
+      content|content-sha) V=true; NOTE="verification: $LEVEL"; LEDGER_STATE=success; LEDGER_DESC="Serving $RUN_SHA ($LEVEL)";;
+      *) V=false; NOTE="PUBLISHED, NOT VERIFIED — Cloudflare Access liveness only; content and commit NOT verified"
+         LEDGER_STATE=inactive; LEDGER_DESC="Published $RUN_SHA; unverified (${LEVEL:-no smoke level}); not a known-good deployment";;
+    esac
+    echo "deployed_and_verified=$V"; echo "smoke_level=$LEVEL"; echo "url=$URL"; echo "published_url=$URL"
+    if [ "$V" = true ]; then echo "verified_url=$URL"; echo "published_unverified=false"
+    else echo "verified_url="; echo "published_unverified=true"
+      echo "::warning::$TARGET $URL is published but NOT content-verified (smoke_level='$LEVEL'); no Release, no known-good record. Provide an authenticated probe (smoke_env PROBE_HEADERS) for content verification." >&2
+    fi
     case "$TARGET" in
       preview)
-        "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" success "$URL" "Serving $RUN_SHA (${SMOKE_LEVEL:-})"
-        "$TOOLS_DIR/gh.sh" comment "$BRANCH" "$APP_NAME" "$URL" "$RUN_SHA" >&2 || echo "::warning::PR comment skipped" >&2
+        "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" "$LEDGER_STATE" "$URL" "$LEDGER_DESC"
+        "$TOOLS_DIR/gh.sh" comment "$BRANCH" "$APP_NAME" "$URL" "$RUN_SHA" "$([ "$V" = true ] || echo 'UNVERIFIED: Access liveness only; content and commit not verified')" >&2 || echo "::warning::PR comment skipped" >&2
         echo "::notice title=Preview URL ($APP_NAME)::$URL" >&2
-        summary "### ✅ Preview — \`$APP_NAME\` (verification: ${SMOKE_LEVEL:-})"
-        summary "- URL: $URL · branch \`$BRANCH\` · identity \`$PREVIEW_NAME\` · served commit \`$RUN_SHA\`";;
+        summary "### $([ "$V" = true ] && echo ✅ || echo ⚠️) Preview — \`$APP_NAME\` ($NOTE)"
+        summary "- URL: $URL · branch \`$BRANCH\` · identity \`$PREVIEW_NAME\` · commit \`$RUN_SHA\`";;
       dev)
-        "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" success "$URL" "Serving $RUN_SHA from $BRANCH (${SMOKE_LEVEL:-})"
-        summary "### ✅ Shared Dev — \`$APP_NAME\` (verification: ${SMOKE_LEVEL:-})"
-        summary "- URL: $URL (one Dev for ALL branches; the last verified deployment wins) · branch \`$BRANCH\` · served commit \`$RUN_SHA\`";;
+        "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" "$LEDGER_STATE" "$URL" "$LEDGER_DESC from $BRANCH"
+        summary "### $([ "$V" = true ] && echo ✅ || echo ⚠️) Shared Dev — \`$APP_NAME\` ($NOTE)"
+        summary "- URL: $URL (one Dev for ALL branches; the last verified deployment wins) · branch \`$BRANCH\` · commit \`$RUN_SHA\`";;
       prod)
-        summary "### ✅ Production — \`$APP_NAME\` (verification: ${SMOKE_LEVEL:-})"
-        summary "- Version: \`${VERSION_ID:-}\` · previous: \`${PREVIOUS_VERSION_ID:-}\` · rollback policy \`$(inp production_rollback_policy)\`. A Worker rollback does NOT revert D1 migrations or external side effects.";;
+        summary "### $([ "$V" = true ] && echo ✅ || echo ⚠️) Production — \`$APP_NAME\` ($NOTE)"
+        summary "- Version: \`${VERSION_ID:-}\` · previous: \`${PREVIOUS_VERSION_ID:-}\` · rollback policy \`$(inp production_rollback_policy)\`. A Worker rollback does NOT revert D1 migrations or external side effects."
+        [ "$V" = true ] || summary "- Release is **blocked**: Production was not content-verified.";;
     esac;;
 
   fail-prepublish) # a phase before/at publish failed
@@ -281,7 +292,7 @@ case "$PHASE" in
 
   recover-record)
     ctx
-    if [ "${RECOVERED:-}" = success ] && [ "${VERIFIED:-}" = success ] && [ "${SMOKE_LEVEL:-}" = content ]; then
+    if [ "${RECOVERED:-}" = success ] && [ "${VERIFIED:-}" = success ] && { [ "${SMOKE_LEVEL:-}" = content ] || [ "${SMOKE_LEVEL:-}" = content-sha ]; }; then
       "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" failure "" "Smoke failed for $RUN_SHA; $TARGET restored to $GOOD_SHA and verified" || true
       summary "### ♻️ $TARGET restored to last good commit \`$GOOD_SHA\` and verified (content-level smoke). Run remains FAILED for the bad commit. D1 migrations (if any) were NOT reverted."
     elif [ "${RECOVERED:-}" = success ] && [ "${VERIFIED:-}" = success ]; then

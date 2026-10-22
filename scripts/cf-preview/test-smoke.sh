@@ -31,4 +31,7 @@ SHA_PATH=/v STUB_SHA_BODY=zzzzzzz run >/dev/null && bad "SHA mismatch accepted" 
 SHA_PATH=/v STUB_SHA_FAIL=1 run >/dev/null && bad "missing SHA endpoint ignored" || ok "configured SHA endpoint missing fails"
 SMOKE_CMD='test "$TARGET_URL" = https://x.example' run >/dev/null && ok "smoke_cmd receives TARGET_URL" || bad "smoke cmd env"
 SMOKE_CMD='exit 3' run >/dev/null && bad "failing smoke_cmd accepted" || ok "failing smoke_cmd fails"
+[ "$(SHA_PATH=/v STUB_SHA_BODY=abcdef1 run)" = smoke_level=content-sha ] && ok "matching sha_path -> content-sha" || bad "content-sha level"
+[ "$(STUB_OUT="$ACC" ACCESS_TARGETS=prod SMOKE_CMD=true SHA_PATH=/v STUB_SHA_BODY=abcdef1 run)" = smoke_level=liveness ] && ok "Access + passing smoke_cmd/sha stays liveness (no unauthenticated content claim)" || bad "access upgraded"
+[ "$(PROBE_HEADERS='CF-Access-Client-Id: x' STUB_OUT='200 ' ACCESS_TARGETS=prod SHA_PATH=/v STUB_SHA_BODY=abcdef1 run)" = smoke_level=content-sha ] && ok "authenticated probe of an Access-protected target -> content-sha" || bad "authenticated"
 exit $fail

@@ -34,7 +34,7 @@ case "$a" in
   *"per_page=30"*" -q "*) [ -n "${STUB_LASTGOOD:-}" ] && echo "9:$STUB_LASTGOOD";;
   *"per_page=30"*) printf '%s' "${STUB_DEPLOYMENTS:-[]}";;
   *"deployments/9/statuses"*) echo success;;
-  *"/statuses?per_page=1"*"environment_url"*) echo "${STUB_STATUS:-success https://stable.example.workers.dev}";;
+  *"/statuses?per_page=1"*"environment_url"*) echo "${STUB_STATUS:-success https://stable.example.workers.dev Serving good (content)}";;
 esac
 exit 0
 '''
