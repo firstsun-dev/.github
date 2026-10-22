@@ -5,6 +5,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath, relative } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 import { parse as parseJsonc } from 'jsonc-parser';
+import { DEV_SHAREABLE_KINDS } from './dev-policy.mjs';
 
 export const STRATEGIES = ['production-preview', 'hybrid', 'production-only'];
 export const MIN_WRANGLER = '4.135.0';
@@ -198,7 +199,9 @@ function queueProducers(cfg) {
 /**
  * Audit a parsed Wrangler config for Preview safety. Returns { errors, warnings }.
  * `allow` is a list of "kind:binding" strings the caller has explicitly approved
- * (e.g. "services:ID_SERVICE"), `denyResources` extra Production identities to reject.
+ * (e.g. "services:ID_SERVICE"), `denyResources` extra Production identities to reject. An entry
+ * "kind:BINDING=identity" (e.g. "r2_buckets:CACHE=prod-bucket") additionally lets that exact binding share that
+ * exact Production resource; only storage kinds in DEV_SHAREABLE_KINDS qualify, never D1.
  */
 export function auditPreviewConfig(cfg, { allow = [], denyResources = [] } = {}) {
   const errors = [];
@@ -230,6 +233,9 @@ export function auditPreviewConfig(cfg, { allow = [], denyResources = [] } = {})
       const mine = ids(b).filter(Boolean);
       if (!mine.length) errors.push(`${key}: Preview binding needs an explicit resource id (Native Previews do not auto-provision; Cloudflare rejects it with 10021)`);
       for (const id of mine) {
+        // An exact "kind:BINDING=identity" entry for a shareable storage kind approves sharing that one
+        // resource under that one binding; it waives the Production-collision and denylist checks only.
+        if (DEV_SHAREABLE_KINDS.includes(kind) && allowed.has(`${key}=${id}`)) continue;
         if (prodIds.has(id)) errors.push(`${key}: Preview binds the same resource as Production (${id})`);
         if (deny.has(id)) errors.push(`${key}: Preview binds denylisted Production resource (${id})`);
       }
