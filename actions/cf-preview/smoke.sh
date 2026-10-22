@@ -5,7 +5,7 @@
 #   redirect to *.cloudflareaccess.com -> liveness ONLY, and only for targets listed in ACCESS_TARGETS
 #                               (explicit per-target approval; default none). Content/SHA is NOT verified, whatever
 #                               smoke_cmd does: content-level verification of an Access-protected target needs an
-#                               authenticated probe (PROBE_HEADERS, e.g. a service token, from smoke_env), which then
+#                               authenticated probe (CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET, or PROBE_HEADERS; auth.sh), which then
 #                               sees the application's own 2xx.
 #   anything else               -> FAIL
 # Only content / content-sha count as "verified" (engine.sh); liveness is published-but-unverified.
@@ -24,9 +24,15 @@ load_env_file "${SMOKE_ENV_FILE:-}"
 result="$("$TOOLS_DIR/probe.sh")"
 echo "$result" >&2
 level=content
-hdr=()
-while IFS= read -r h; do [ -n "$h" ] && hdr+=(-H "$h"); done <<< "${PROBE_HEADERS:-}"
+# shellcheck source=auth.sh
+. "$TOOLS_DIR/auth.sh"
+setup_auth_headers || exit 1   # partial service token -> actionable failure, never anonymous
+hdr=("${AUTH_ARGS[@]}")
 if [ "$result" = "probe=access-protected" ]; then
+  if [ "$AUTH_CONFIGURED" = true ]; then
+    echo "::error::$TARGET_URL still redirects to Cloudflare Access although CF_ACCESS_CLIENT_ID/SECRET were sent: the service token is invalid, expired or not allowed by the Access policy; not verified" >&2
+    exit 1
+  fi
   case " ${ACCESS_TARGETS:-} " in
     *" $DEPLOY_TARGET "*) ;;
     *) echo "::error::$TARGET_URL redirects to Cloudflare Access; that is not application verification and Access is not approved for target '$DEPLOY_TARGET' (access_protected_targets)" >&2; exit 1;;

@@ -74,6 +74,9 @@ case "$PHASE" in
     STRATEGY="$(inp deployment_strategy)"; POLICY="$(inp production_rollback_policy)"
     case "$STRATEGY" in production-preview|hybrid|production-only) ;; *) die "bad deployment_strategy";; esac
     case "$POLICY" in automatic|manual|disabled) ;; *) die "bad production_rollback_policy";; esac
+    if [ "$STRATEGY" = production-only ] && [ "$(inp shared_dev_on_branch_push)" = true ]; then
+      die "deployment_strategy: production-only cannot be combined with shared_dev_on_branch_push: true; refusing to publish or migrate anything"
+    fi
     EVENT="${GITHUB_EVENT_NAME:?}"
     if [ "$M" = manual ]; then
       ACTION="$(node "$TOOLS_DIR/cli.mjs" classify --event "$EVENT" --ref "$BRANCH_REF" --strategy "$STRATEGY" --dev-ref "$(inp persistent_dev_ref)" --dispatch-target "$(inp dispatch_target)" | sed -n 's/^action=//p')"

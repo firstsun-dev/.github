@@ -190,6 +190,18 @@ check(not runs("persistent-dev", scenario("workflow_dispatch", "refs/heads/other
 check(not runs("persistent-dev", scenario("push", "refs/heads/dev", **dev_ok)), "Hybrid: a push never deploys persistent Dev")
 check(not runs("persistent-dev", scenario("workflow_dispatch", "refs/heads/dev", inputs=dict(dev_ok["inputs"], deployment_strategy="production-preview"))), "Hybrid: requires the hybrid strategy")
 
+# ---- config guard fails closed on the DEPLOYMENT path (not only a separate failing job)
+BAD = {"deployment_strategy": "production-only", "shared_dev_on_branch_push": True}
+check(runs("config-guard", scenario("push", MAIN, BAD, GREEN)) and runs("config-guard", scenario("push", FEAT, BAD, GREEN)), "Config guard: production-only + Shared Dev is reported")
+check(not runs("deploy", scenario("push", MAIN, BAD, GREEN)) and not runs("deploy", scenario("push", FEAT, BAD, GREEN)) and not runs(DEVJOB, scenario("push", FEAT, BAD, GREEN)),
+      "Config guard: production-only + Shared Dev reaches NO deployment job (no publish, no remote D1 migration, no Production version change)")
+check(not runs("release", scenario("push", MAIN, dict(BAD, release_cmd="pnpm release"), {"deploy": {"result": "skipped", "outputs": {}}})), "Config guard: a skipped Deploy never releases")
+check(runs("deploy", scenario("push", MAIN, {"deployment_strategy": "production-only", "preview_on_branch_push": True}, GREEN)), "Config guard: production-only + default Preview=true is still accepted and Production deploys")
+check(not runs("config-guard", scenario("push", MAIN, {"deployment_strategy": "production-only", "preview_on_branch_push": True}, GREEN)), "Config guard: that backward-compatible combination is not reported")
+BOTH = {"preview_on_branch_push": True, "shared_dev_on_branch_push": True}
+check(runs("deploy", scenario("push", FEAT, dict(BOTH, deployment_strategy="production-preview"), GREEN)) and runs(DEVJOB, scenario("push", FEAT, dict(BOTH, deployment_strategy="production-preview"), GREEN)), "Config guard: production-preview + both channels accepted")
+check(runs(DEVJOB, scenario("push", FEAT, {"deployment_strategy": "hybrid", "shared_dev_on_branch_push": True}, GREEN)) and not runs("config-guard", scenario("push", FEAT, {"deployment_strategy": "hybrid", "shared_dev_on_branch_push": True}, GREEN)), "Config guard: hybrid + Shared Dev accepted")
+
 # ---------------------------------------------------------------- 4. the four Preview x Shared Dev combinations
 def combo(feature, dev, ref=FEAT, d1=False):
     inp = {"preview_on_branch_push": feature, "shared_dev_on_branch_push": dev, "d1_migrations": d1}
@@ -378,6 +390,14 @@ check(g(FEAT, {"d1_migrations": True, "app_name": "blog"}) != g(FEAT, {"d1_migra
 check(g(FEAT, {"shared_dev_on_branch_push": True}) == "cfv2-shared-dev-app" == g("refs/heads/other", {"shared_dev_on_branch_push": True}), "group: all branches of a non-D1 app with Shared Dev queue on one group (no concurrent Dev deploys)")
 check(g(FEAT, {"shared_dev_on_branch_push": True, "d1_migrations": True}) == "cfv2-nonprod-d1-app", "group: a D1 app keeps the one shared D1 group (covers Preview and Dev migrations)")
 check(g(FEAT) != g("refs/heads/other") and g(FEAT).startswith("cfv2-app-preview-"), "group: D1-less, Dev-less branches stay independent")
+OFF = {"preview_on_branch_push": False, "shared_dev_on_branch_push": False, "d1_migrations": True}
+check(g(FEAT, OFF).startswith("cfv2-app-preview-") and g(FEAT, OFF) != g("refs/heads/other", OFF), "group: CI-only runs (both channels off) of different branches are NOT serialized on the shared D1 group even with d1_migrations")
+check(g(FEAT, dict(OFF, preview_on_branch_push=True)) == "cfv2-nonprod-d1-app" == g("refs/heads/other", dict(OFF, preview_on_branch_push=True)), "group: Native Preview on + D1 migrations -> shared non-production D1 group")
+check(g(FEAT, dict(OFF, shared_dev_on_branch_push=True)) == "cfv2-nonprod-d1-app", "group: Shared Dev on + D1 migrations -> shared non-production D1 group")
+check(g(FEAT, dict(OFF, preview_on_branch_push=True, shared_dev_on_branch_push=True)) == g(FEAT, dict(OFF, shared_dev_on_branch_push=True)), "group: both channels on share ONE D1 group (Preview/Dev migration serialization kept)")
+check(g(FEAT, dict(OFF, deployment_strategy="production-only")).startswith("cfv2-app-preview-"), "group: production-only has no non-production channel -> no shared D1 serialization")
+check(g(MAIN, OFF) == "cfv2-prod-app" and not g(MAIN, OFF).startswith("cfv2-nonprod"), "group: Production lock stays separate from the non-production lock")
+check(g(FEAT, dict(OFF, shared_dev_on_branch_push=True, d1_migrations=False)) == "cfv2-shared-dev-app", "group: Shared Dev without a D1 keeps the one-Dev-Worker group")
 check(g(MAIN, {"shared_dev_on_branch_push": True}) == "cfv2-prod-app", "group: Production is never serialized behind Dev")
 check(g("refs/pull/1/merge", event="pull_request").startswith("cfv2-run-") and g("refs/heads/x", event="delete").startswith("cfv2-run-"), "group: PR / delete runs get a private group")
 check(g("refs/heads/dev", {"dispatch_target": "persistent-dev"}, "workflow_dispatch").startswith("cfv2-run-"), "group: persistent-dev dispatch does not queue behind deploys")

@@ -258,9 +258,16 @@ Fail-closed (`smoke.sh`): no URL ⇒ fail; only 2xx counts (401/403/3xx-elsewher
 | `content` | the application itself answered 2xx (directly, or through an authenticated probe: service-token headers via `smoke_env` `PROBE_HEADERS`) | `true` | `success … (content)` | yes |
 | `content-sha` | content verified **and** `sha_path` served the expected commit | `true` | `success … (content-sha)` | yes |
 
-* Under an Access redirect `smoke_cmd`/`sha_path` cannot raise the level: an unauthenticated command may be reading the login page. Provide `PROBE_HEADERS` (also applied to the `sha_path` request) so the probe reaches the application.
+* Under an Access redirect `smoke_cmd`/`sha_path` cannot raise the level: an unauthenticated command may be reading the login page.
+* **Authenticated smoke (`auth.sh`):** set `CF_ACCESS_CLIENT_ID` + `CF_ACCESS_CLIENT_SECRET` (standard Access service token; both or neither — a single one fails with an actionable error, never anonymous) and/or the legacy `PROBE_HEADERS`. The same headers go to the initial probe and the `sha_path` request, as a 0600 `curl -H @file` (never argv), values masked. A token that is still redirected to Access is a failure (invalid/expired token), not liveness. Put them in `PREVIEW_SECRETS` (Preview) or `smoke_env` (any target) — they are exported only inside the smoke process.
 * Outputs (additive; `url`/`deploy_url`/`dev_url` keep their meaning "published URL"): `published_url`, `verified_url` (only at content level), `published_unverified`; workflow outputs `deploy_verified_url`, `deploy_published_unverified`, `dev_verified_url`, `dev_published_unverified`. Gate consumers on the `*_verified_url` outputs.
 * The ledger scan (`last-good-preview`, `last-good-dev`) only accepts `success` records whose description carries `(content)` or `(content-sha)`; liveness-only and legacy records are never recovery targets. Recovery verifies against the **last-good** SHA.
+
+## Deployment guard, lifecycle and concurrency (review fixes)
+
+* `deployment_strategy: production-only` + `shared_dev_on_branch_push: true`: `config-guard` reports it **and** the Deploy job's `if:` plus `engine.sh init` refuse it, so nothing is published or migrated. `production-only` + the default `preview_on_branch_push: true` stays accepted.
+* PR lifecycle comments only a Preview returned by the host-bound `last-good-preview` lookup (repo, app, branch ref, host Worker, https URL, content-verified); otherwise the comment is left unchanged. Branch deletion still keeps the Native Preview.
+* Run concurrency: the shared non-production D1 group applies only when a non-main channel (Preview and/or Shared Dev, strategy ≠ `production-only`) can run **and** `d1_migrations` is true; CI-only runs use the per-branch group. Production keeps its own group.
 
 ## Verified vs not verified
 

@@ -466,6 +466,35 @@ check(pf["outputs"]["migration"] == "failed" and df["result"] == "failure" and n
 r = dev(inputs={"dev_deploy_cmd": ""})
 check(r["result"] == "success" and "wrangler deploy --config " in r["log"] and "wrangler.toml --env dev" in r["log"] and r["log"].index("BUILD") < r["log"].index("wrangler deploy"), "Shared Dev built-in publish (no dev_deploy_cmd): wrangler deploy gets the audited --config (and the named env for a source config), after the build")
 
+# Config guard, on the REAL deployment path: the engine refuses before any remote command
+r = deploy(MAIN, inputs={"deployment_strategy": "production-only", "shared_dev_on_branch_push": True})
+check(r["result"] == "failure" and not published(r) and "wrangler versions" not in r["log"] and "migrations apply" not in r["log"] and "-X POST" not in r["log"], "production-only + Shared Dev: the engine fails at init, before build, migration, publish or any ledger write")
+r = deploy(MAIN, inputs={"deployment_strategy": "production-only", "preview_on_branch_push": True}, env={"STUB_PROBES": "200 "})
+check(r["result"] == "success" and published(r) and r["outputs"]["deployed_and_verified"] == "true", "production-only + default Preview=true: accepted, Production deploys")
+
+# PR lifecycle advertises only a VERIFIED Preview bound to this host Worker, application, repo and branch
+def lifecycle(deps, status="success https://stable.example.workers.dev Serving good (content)", inputs=None):
+    ws = make_workspace(APP_TOML)
+    c = ctx(FEAT, inputs, {}, event="pull_request")
+    c["github"]["event"] = {"pull_request": {"head": {"ref": "feat/x", "repo": {"full_name": "o/r"}}}}
+    r = run_job(doc, "lifecycle", c, ws, {"STUB_DEPLOYMENTS": deps, "STUB_STATUS": status})
+    return r
+
+
+def advertised(r):
+    return "pulls?state=open" in r["log"]
+
+
+r = lifecycle(good_dep())
+check(r["result"] == "success" and advertised(r), "lifecycle: a verified Preview for this host Worker, app, repo and branch is advertised")
+check(not advertised(lifecycle(good_dep(payload={"host_worker": "blog-preview"}))), "lifecycle: an old-host (blog-preview) Preview record is NOT advertised for the new host")
+check(not advertised(lifecycle(good_dep(payload={"branch_ref": "refs/heads/other"}))), "lifecycle: another branch ref is not advertised")
+check(not advertised(lifecycle(good_dep(payload={"worker": "other-app"}))) and not advertised(lifecycle(good_dep(payload={"repo": "x/y"}))), "lifecycle: another application or repository is not advertised")
+check(not advertised(lifecycle(good_dep(), status="success https://stable.example.workers.dev Published s; unverified (liveness)")), "lifecycle: a liveness-only Preview is not advertised as verified")
+check(not advertised(lifecycle(good_dep(), status="success http://insecure.example")), "lifecycle: a non-https or unverified record is not advertised")
+r = lifecycle("[]")
+check(r["result"] == "success" and not advertised(r), "lifecycle: no matching verified Preview leaves the PR comment unchanged (job still succeeds)")
+
 # Verification level: Access liveness is published-but-unverified and never a known-good record
 r = dev(inputs={"access_protected_targets": "preview dev"}, env={"STUB_PROBES": "302 https://t.cloudflareaccess.com/cdn-cgi/access/login/x"})
 check(r["result"] == "success" and r["outputs"]["smoke_level"] == "liveness" and r["outputs"]["deployed_and_verified"] == "false" and r["outputs"]["verified_url"] == "" and r["outputs"]["published_unverified"] == "true", "Shared Dev Access liveness only: published, NOT verified")

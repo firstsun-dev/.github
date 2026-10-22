@@ -239,3 +239,13 @@ The delivery engine SHALL report the smoke outcome as `liveness` (only the Cloud
 
 - **WHEN** service-token headers supplied through `smoke_env` `PROBE_HEADERS` let the probe reach the application
 - **THEN** the level is `content` (or `content-sha` when `sha_path` matches) and the deployment is eligible as verified and known-good
+
+#### Scenario: Access service token authenticates smoke
+
+- **WHEN** `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` are both configured
+- **THEN** both headers are sent to the probe and the `sha_path` request without appearing in argv or logs
+- **AND** a single configured credential, or a token that is still redirected to Access, fails the smoke
+
+### Requirement: Invalid configuration and CI-only runs never touch shared deployment state
+
+An invalid `production-only` + `shared_dev_on_branch_push: true` configuration SHALL NOT reach publish, remote D1 migration or a Production version change. The PR lifecycle SHALL advertise only a content-verified Preview whose repository, application, branch ref and host Worker match. The shared non-production D1 concurrency group SHALL apply only to runs that can execute a non-production migration or deployment.

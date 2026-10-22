@@ -318,16 +318,17 @@ on:
 # The identity is the RESOURCE, not the app: `d1_lock_scope` replaces app_name so apps that share one physical D1
 # share one group, and Production and non-Production are always different groups:
 #   main                               -> cfv2-prod-<d1_lock_scope|app_name>
-#   branch, d1_migrations              -> cfv2-nonprod-d1-<d1_lock_scope|app_name>   (Preview AND Shared Dev D1)
-#   branch, no D1, Shared Dev on       -> cfv2-shared-dev-<app_name>                  (the ONE Dev Worker)
-#   branch, no D1, Shared Dev off      -> cfv2-<app_name>-preview-<branch>
+#   branch, d1_migrations, a non-main channel enabled (Preview and/or Shared Dev, strategy != production-only)
+#                                      -> cfv2-nonprod-d1-<d1_lock_scope|app_name>   (Preview AND Shared Dev D1)
+#   branch, Shared Dev on, no D1 lock  -> cfv2-shared-dev-<app_name>                  (the ONE Dev Worker)
+#   branch, both channels off          -> cfv2-<app_name>-preview-<branch>            (CI-only: no shared D1 serialization)
 #   PR / delete / persistent-dev / any other event -> a private group (never queues behind a deploy)
 # The Shared Dev and persistent-Dev jobs additionally share the job-level group cfv2-dev-<repo>-<scope|app_name>.
 # The `cfv2-` prefix is static on purpose: never reuse it (or ${{ github.workflow }}) in a CALLER group, or caller
 # and callee deadlock. A repo-local group does NOT protect a D1 shared with another repository.
 # `queue` is not known to actionlint 1.7.12: see .github/actionlint.yaml.
 concurrency:
-  group: ${{ ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && (github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.shared_dev_on_branch_push && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id) }}
+  group: ${{ ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && (github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.preview_on_branch_push || inputs.shared_dev_on_branch_push) && inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && inputs.shared_dev_on_branch_push && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id) }}
   queue: max
 
 permissions:
@@ -561,9 +562,11 @@ jobs:
   deploy:
     name: Deploy
     needs: [lint, typecheck, unit, integration, build, e2e]
+    # Fail closed: an invalid strategy/channel combination (see `config-guard`, which reports it) never reaches the
+    # Cloudflare publish, the remote D1 migration or a Production version change. engine.sh `init` repeats the check.
     # always(): skipped optional jobs (empty command) must not skip Deploy, but a failed / cancelled / unexpectedly
     # skipped CONFIGURED one must block it.
-    if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
+    if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && !(inputs.deployment_strategy == 'production-only' && inputs.shared_dev_on_branch_push) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     # One Environment per app and target; Production authorization = its protection rules + the main-only credentials.
@@ -761,15 +764,17 @@ jobs:
           NAME="$(node "$TOOLS_DIR/cli.mjs" identity --repo "$GITHUB_REPOSITORY" --worker "$APP" --host-worker "$WORKER_NAME" --ref "refs/heads/$BRANCH" | sed -n 's/^preview_name=//p')"
           [[ "$NAME" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "::error::unsafe name"; exit 1; }
           { echo "PREVIEW_NAME=$NAME"; echo "ENV_NAME=$APP/preview/$NAME"; } >> "$GITHUB_ENV"
-      - name: Comment existing Preview URL on the PR
+      - name: Comment the existing VERIFIED Preview URL on the PR
         if: env.SKIP != 'true' && github.event_name == 'pull_request'
+        env:
+          APP: ${{ inputs.app_name }}
         run: |
-          ID="$(gh api "repos/$GITHUB_REPOSITORY/deployments?environment=$(printf %s "$ENV_NAME" | jq -sRr @uri)&per_page=1" -q '.[0].id // empty')"
-          [ -n "$ID" ] || { echo "No branch Preview yet; the next push creates it."; exit 0; }
-          read -r STATE URL < <(gh api "repos/$GITHUB_REPOSITORY/deployments/$ID/statuses?per_page=1" -q '.[0] | "\(.state) \(.environment_url)"')
-          SHA="$(gh api "repos/$GITHUB_REPOSITORY/deployments/$ID" -q .sha)"
-          [ "$STATE" = success ] || { echo "Latest Preview deployment is $STATE; not advertising."; exit 0; }
-          "$TOOLS_DIR/gh.sh" comment "$BRANCH" "${{ inputs.app_name }}" "$URL" "$SHA"
+          # Host-bound known-good lookup: same repository, application, branch ref and HOST Worker, https URL and a
+          # content-level verified success. An old host (e.g. blog-preview), another branch or a liveness-only
+          # deployment is never advertised.
+          ROW="$("$TOOLS_DIR/gh.sh" last-good-preview "$ENV_NAME" "" "refs/heads/$BRANCH" "$WORKER_NAME" "$APP" || true)"
+          [ -n "$ROW" ] || { echo "No verified Preview for this branch on host Worker $WORKER_NAME; PR comment unchanged."; exit 0; }
+          "$TOOLS_DIR/gh.sh" comment "$BRANCH" "$APP" "${ROW#* }" "${ROW%% *}"
       # Policy (owner decision): deleting a branch does NOT delete its Native Preview. The Preview and its stable
       # URL are kept (Cloudflare cannot remove only the stable URL: Preview `urls` is read-only and
       # `wrangler preview delete` removes the Preview with all deployments). Only the GitHub ledger is retired.
