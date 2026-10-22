@@ -81,7 +81,7 @@ check(release_runs(r), "prod success -> Release runs")
 
 r = deploy(env={"STUB_TIPS": OTHER})
 check(r["result"] == "success" and r["outputs"]["deployed_and_verified"] == "false" and not published(r), "stale main run: the job succeeds, nothing built or published, not verified")
-check("npm" not in r["log"] and "pnpm" not in r["log"], "stale main run: stopped before any dependency install or build")
+check("pnpm" not in r["log"] and "BUILD" not in r["log"] and r["log"].count("npm ci") == 1, "stale main run: only the local tooling install (needed by the engine itself) ran; no application install or build")
 check(not release_runs(r), "REGRESSION stale main run -> Release does NOT run although Deploy succeeded")
 
 r = deploy(env={"STUB_TIPS": f"{SHA},{OTHER}"})
