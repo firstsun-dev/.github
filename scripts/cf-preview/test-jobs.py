@@ -3,6 +3,7 @@
 next job's `if:`. Covers result propagation the static contract test cannot: stale runs never reach Release,
 smoke/rollback keep Release closed, nothing remote is touched before the pre-migration guards pass.
 Mocked: no Cloudflare, no GitHub. See docs/cf-worker-v2-refactor.md for what this does NOT prove."""
+import json
 import sys
 
 import yaml
@@ -15,6 +16,7 @@ WF = ".github/workflows/_cf-worker-v2.yml"
 doc = yaml.safe_load(open(WF))
 INPUT_DEFAULTS = {k: v.get("default", "") for k, v in doc[True]["workflow_call"]["inputs"].items()}
 SHA, OTHER = "abcdef1234567890", "ffffffffffffffff"
+GOOD = "1111111222222233"
 MAIN, FEAT = "refs/heads/main", "refs/heads/feat/x"
 fail = 0
 
@@ -27,7 +29,8 @@ def check(ok, msg):
 
 
 def ctx(ref, inputs=None, secrets=None, needs=None, event="push"):
-    i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", tools_ref="x")
+    # preview_host_check off: the job tests must not call the real Cloudflare API (test-deploy.sh covers it).
+    i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", tools_ref="x", preview_host_check=False)
     i.update(inputs or {})
     return Ctx({"github": {"event_name": event, "ref": ref, "ref_type": "branch", "ref_name": ref.split("/", 2)[-1],
                            "repository": "o/r", "sha": SHA, "event": {"head_commit": {"message": "feat: x\nbody"}}},
@@ -137,9 +140,56 @@ r2 = deploy(FEAT, env={"STUB_OWNER_REF": FEAT})
 check(r2["result"] == "success", "ledger owned by THIS branch ref: same branch updates its Preview")
 r = deploy(FEAT, env={"STUB_PROBES": "302 https://t.cloudflareaccess.com/cdn-cgi/access/login/x"})
 check(r["result"] == "success" and r["outputs"]["smoke_level"] == "liveness", "Access-protected Preview (default approval): liveness reported, not content")
-r = deploy(FEAT, env={"STUB_PROBES": "500 ;200 ", "STUB_LASTGOOD": "goodsha"})
+def good_dep(**over):
+    p = {"repo": "o/r", "branch_ref": FEAT, "host_worker": "app", "worker": "app"}
+    p.update(over.pop("payload", {}))
+    return json.dumps([dict({"id": 7, "sha": GOOD, "payload": p}, **over)])
+
+
+PREV_IN = {"build_cmd": 'echo "BUILD noindex=$SITE_NOINDEX commit=$PUBLIC_COMMIT_SHA ver=$VITE_APP_VERSION gaid=$GA_ID" >> "$STUB_LOG"',
+           "app_version": SHA, "build_env_preview": f"SITE_NOINDEX=true\nGA_ID=test-ga\nPUBLIC_COMMIT_SHA={SHA}",
+           "smoke_env": "SITE_NOINDEX=false\nGA_ID=PROD-GA"}  # the Blog incident: Production-oriented smoke_env
+r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ;200 ", "STUB_DEPLOYMENTS": good_dep()})
 check(r["result"] == "failure" and r["outputs"]["deployed_and_verified"] == "false", "preview smoke failure: job red, not verified")
-check(r["log"].count("preview --name feat-x") == 2, "preview recovery redeploys the last good SHA")
+check(r["log"].count("preview --name feat-x") == 2, "preview recovery redeploys the last good deployment")
+bl = [l for l in r["log"].splitlines() if l.startswith("BUILD")]
+check(len(bl) == 2 and bl[0] == f"BUILD noindex=true commit={SHA} ver={SHA} gaid=test-ga", "the normal Preview build uses the Preview build env (smoke_env cannot leak into it)")
+check(len(bl) == 2 and bl[1] == f"BUILD noindex=true commit={GOOD} ver={GOOD} gaid=test-ga", "recovery rebuild restores the Preview build env and rebinds commit/version to the LAST-GOOD sha (not the smoke_env values)")
+check("restored to last good commit" in r["summary"] and "content-level" in r["summary"] and "NOT reverted" in r["summary"], "recovery verified at content level is reported as such, D1 not reverted")
+r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ", "STUB_DEPLOYMENTS": good_dep(payload={"host_worker": "blog-preview"})})
+check(r["result"] == "failure" and r["log"].count("preview --name feat-x") == 1 and "No prior verified deployment on host Worker" in r["summary"], "a last-good deployment hosted by a DIFFERENT Worker is not eligible for recovery")
+for label, over in (("legacy record without host_worker", {"payload": {"host_worker": None}}), ("different branch", {"payload": {"branch_ref": "refs/heads/other"}}),
+                    ("different application", {"payload": {"worker": "other-app"}}), ("different repository", {"payload": {"repo": "x/y"}})):
+    dep = json.loads(good_dep(**over))
+    if label.startswith("legacy"):
+        del dep[0]["payload"]["host_worker"]
+    r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ", "STUB_DEPLOYMENTS": json.dumps(dep)})
+    check(r["log"].count("preview --name feat-x") == 1 and "No prior verified deployment" in r["summary"], f"recovery ineligible: {label}")
+r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ", "STUB_DEPLOYMENTS": good_dep(), "STUB_STATUS": "failure https://stable.example.workers.dev"})
+check(r["log"].count("preview --name feat-x") == 1, "recovery ineligible: the candidate's latest status is not success")
+r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ", "STUB_DEPLOYMENTS": good_dep(), "STUB_STATUS": "success "})
+check(r["log"].count("preview --name feat-x") == 1, "recovery ineligible: no valid recorded Preview URL")
+r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ;200 ", "STUB_DEPLOYMENTS": good_dep(), "STUB_STATUS": "success https://other.example.workers.dev"})
+check(r["result"] == "failure" and "RECOVERY" not in r["summary"] and "recovery FAILED" in r["summary"].replace("Automatic recovery FAILED", "recovery FAILED"), "recovery whose URL differs from the recorded last-good URL is refused and reported as failed")
+r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ;500 ", "STUB_DEPLOYMENTS": good_dep()})
+check(r["result"] == "failure" and "Automatic recovery FAILED" in r["summary"] and "restored to last good" not in r["summary"], "recovery smoke failure stays visible and is never reported as recovered")
+r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ;302 https://t.cloudflareaccess.com/cdn-cgi/access/login/x", "STUB_DEPLOYMENTS": good_dep()})
+check(r["result"] == "failure" and "NOT verified" in r["summary"] and "restored to last good" not in r["summary"], "Access liveness after recovery is NOT reported as verified recovery")
+r = deploy(FEAT, inputs=dict(PREV_IN, sha_path="/version.json"), env={"STUB_PROBES": "500 ;200 ", "STUB_DEPLOYMENTS": good_dep(), "STUB_SHA_BODY": SHA[:7]})
+check(r["result"] == "failure" and "restored to last good" not in r["summary"] and "Automatic recovery FAILED" in r["summary"], "recovery serving the FAILED commit's identity (sha_path) is not accepted")
+r = deploy(FEAT, inputs=dict(PREV_IN, sha_path="/version.json"), env={"STUB_PROBES": "500 ;200 ", "STUB_DEPLOYMENTS": good_dep(), "STUB_SHA_BODY": GOOD[:7]})
+check("restored to last good commit" in r["summary"], "recovery serving the last-good commit identity is verified")
+# the empty-URL incident, executed through the real Deploy steps
+for raw, label in (('{"preview":{"urls":[]}}', "empty preview.urls"), ('{"preview":{}}', "missing urls"), ("garbage", "malformed JSON"), ("", "no output")):
+    r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PREVIEW_RAW": raw, "STUB_DEPLOYMENTS": good_dep()})
+    st = dict(r["steps"])
+    check(r["result"] == "failure" and st.get("Build, validate effective Wrangler config, publish") == "failure", f"{label}: Publish fails")
+    check(st.get("Smoke — exact deployed URL (fails closed)") == "skipped" and r["outputs"]["deployed_and_verified"] == "false" and r["outputs"]["url"] == "", f"{label}: Smoke never runs against an empty URL and nothing is reported as deployed")
+    check(r["log"].count("preview --name feat-x") == 1 and "no usable URL" in r["summary"] and "unverified" in r["summary"], f"{label}: no recovery is attempted and the summary says the Preview state is unverified")
+r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PREVIEW_FAIL": "1", "STUB_DEPLOYMENTS": good_dep()})
+check(r["result"] == "failure" and "unchanged" in r["summary"] and r["log"].count("preview --name feat-x") == 1, "wrangler preview failure before any mutation: 'unchanged', no recovery")
+r = deploy(FEAT, inputs=dict(PREV_IN, build_cmd="false"), env={"STUB_DEPLOYMENTS": good_dep()})
+check(r["result"] == "failure" and "preview --name" not in r["log"] and "unchanged" in r["summary"], "build failure: nothing published, no recovery")
 r = deploy(FEAT, env={"STUB_PREVIEW_FAIL": "1"})
 check(r["result"] == "failure" and r["outputs"]["deployed_and_verified"] == "false", "preview publish failure: not verified")
 r = deploy(FEAT, secrets=dict(PREV_SECRETS, PREVIEW_SECRETS="EVIL=$(touch PWNED)`touch PWNED2`;touch PWNED3 \"q\" 'x'\nPLAIN=a b=c"),
@@ -200,7 +250,6 @@ check(deploy_runs({"result": "success"}, e2e="skipped", inputs={"test_e2e_cmd": 
 
 # ======================================================================= Shared Dev (dev-deploy) executed with stubs
 DEV_SECRETS = {"CLOUDFLARE_DEV_API_TOKEN": "DT", "CLOUDFLARE_DEV_ACCOUNT_ID": "DA"}
-GOOD = "1111111222222233"
 DEV_TOML = '''name = "app"
 [[d1_databases]]
 binding = "DB"
@@ -307,6 +356,15 @@ r = dev(env={"STUB_PROBES": "500 ;500 ", "STUB_LASTGOOD": GOOD})
 check(r["result"] == "failure" and "recovery FAILED" in r["summary"], "recovery failure stays visible")
 r = dev(env={"STUB_PROBES": "500 "})
 check(r["result"] == "failure" and r["log"].count("PUBLISH") == 1 and "manual recovery required" in r["summary"], "no known-good commit: no recovery attempted, manual recovery required")
+# Dev recovery regression coverage (executed)
+r = dev(env={"STUB_PROBES": "500 ;200 ", "STUB_LASTGOOD": GOOD})
+check("versions upload" not in r["log"] and "versions deploy" not in r["log"] and "wrangler preview" not in r["log"] and "preview --name" not in r["log"], "Dev recovery never takes the Production or Preview publish path")
+check("state=success" not in r["log"], "a failed Dev deployment whose recovery succeeded is still never recorded as verified")
+r = dev(env={"STUB_PROBES": "500 ;500 ", "STUB_LASTGOOD": GOOD})
+check("state=success" not in r["log"] and "recovery FAILED" in r["summary"], "no verified deployment is recorded after a failed recovery")
+tamper = 'case "$PWD" in */recover*) sed -i "s/name = \\"app-dev\\"/name = \\"app\\"/" wrangler.toml;; esac; echo "BUILD ver=$VITE_APP_VERSION commit=$PUBLIC_COMMIT_SHA cfenv=$CLOUDFLARE_ENV" >> "$STUB_LOG"'
+r = dev(inputs={"dev_build_cmd": tamper}, env={"STUB_PROBES": "500 ;200 ", "STUB_LASTGOOD": GOOD})
+check(r["result"] == "failure" and r["log"].count("PUBLISH") == 1 and "recovery FAILED" in r["summary"], "the config audit runs on the RECOVERED build: a last-good tree with the wrong Worker identity is not published")
 rb = dev(env={"STUB_PROBES": "500 ;200 ", "STUB_LASTGOOD": GOOD}, inputs={"build_env_dev": f"PUBLIC_COMMIT_SHA={SHA}\nSHORT={SHA[:7]}"})
 check(f"commit={GOOD}" in rb["log"], "build env referencing the failed SHA (full) is rebound for the restored commit")
 

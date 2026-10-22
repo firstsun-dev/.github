@@ -143,7 +143,7 @@ test('preflight: Preview binding without id is an error (Cloudflare 10021)', () 
 });
 
 // ---- v2 refactor: target resolution, migration target, production audit, env import ----
-import { auditDevConfig, auditProdConfig, d1ForTarget, migrationPlan, resolveSharedDev, sharedPreviewDevD1, resolveTarget } from '../../actions/cf-preview/lib.mjs';
+import { previewHostReadiness, rebindSha, auditDevConfig, auditProdConfig, d1ForTarget, migrationPlan, resolveSharedDev, sharedPreviewDevD1, resolveTarget } from '../../actions/cf-preview/lib.mjs';
 import { parseEnvLines } from '../../actions/cf-preview/parse-env.mjs';
 
 test('resolveTarget: only trusted push/dispatch deploys; main=prod, branch=preview', () => {
@@ -361,4 +361,38 @@ test('sharedPreviewDevD1: same physical D1 detected; distinct or undeclared Prev
   assert.equal(sharedPreviewDevD1({ ...DEVCFG, previews: {} }), false);
   assert.equal(sharedPreviewDevD1({ ...DEVCFG, env: { dev: { d1_databases: [{ binding: 'DB', database_name: 'other', database_id: 'X' }] } } }), false);
   assert.equal(sharedPreviewDevD1({ ...DEVCFG, env: {} }), false);
+});
+
+test('extractPreviewUrl: fails closed on every unusable payload (the empty-URL incident)', () => {
+  assert.equal(extractPreviewUrl('{"preview":{"urls":["https://a-blog.x.workers.dev"]}}'), 'https://a-blog.x.workers.dev');
+  assert.equal(extractPreviewUrl('log line\n{"preview":{"urls":["https://a.example.com/"]}}'), 'https://a.example.com');
+  assert.throws(() => extractPreviewUrl('{"preview":{"urls":[]}}'), /EMPTY `preview.urls`.*Enable Preview URLs/);
+  assert.throws(() => extractPreviewUrl('{"preview":{}}'), /preview.urls` is missing/);
+  assert.throws(() => extractPreviewUrl('{}'), /no `preview` object/);
+  assert.throws(() => extractPreviewUrl('not json'), /not valid JSON/);
+  assert.throws(() => extractPreviewUrl(''), /produced no output/);
+  assert.throws(() => extractPreviewUrl('{"preview":{"urls":[""]}}'), /empty or not a string/);
+  assert.throws(() => extractPreviewUrl('{"preview":{"urls":[7]}}'), /empty or not a string/);
+  assert.throws(() => extractPreviewUrl('{"preview":{"urls":["http://x.example.com"]}}'), /must be https/);
+  assert.throws(() => extractPreviewUrl('{"preview":{"urls":["nope"]}}'), /not a valid URL/);
+  assert.throws(() => extractPreviewUrl('null'), /no `preview` object/);
+});
+const apiRes = (status, body) => async () => ({ ok: status < 300, status, json: async () => body });
+test('previewHostReadiness: blocks only on a definitive previews_enabled=false', async () => {
+  const a = { accountId: 'a', token: 't', worker: 'blog' };
+  assert.equal((await previewHostReadiness(apiRes(200, { result: { previews_enabled: true } }), a)).level, 'ok');
+  const off = await previewHostReadiness(apiRes(200, { result: { previews_enabled: false, enabled: false } }), a);
+  assert.equal(off.level, 'block');
+  assert.match(off.message, /preview_urls = true|Preview URLs/);
+  assert.equal((await previewHostReadiness(apiRes(403, {}), a)).level, 'unknown');
+  assert.equal((await previewHostReadiness(apiRes(404, {}), a)).level, 'unknown');
+  assert.equal((await previewHostReadiness(async () => { throw new Error('x'); }, a)).level, 'unknown');
+  assert.equal((await previewHostReadiness(apiRes(200, { result: {} }), a)).level, 'unknown');
+  assert.equal((await previewHostReadiness(apiRes(200, {}), { ...a, token: '' })).level, 'unknown');
+});
+test('rebindSha: failed SHA (full and short) becomes the restored SHA', () => {
+  const r = rebindSha('A=abcdef1234567890\nB=abcdef1\nC=keep', 'abcdef1234567890', '1111111222222233');
+  assert.equal(r.text, 'A=1111111222222233\nB=1111111\nC=keep');
+  assert.equal(r.replacements, 2);
+  assert.throws(() => rebindSha('x', 'zz', '1111111'), /hex/);
 });

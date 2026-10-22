@@ -167,6 +167,13 @@ on:
         description: Optional path (e.g. /version.json) that must contain the commit SHA once served
         type: string
         default: ''
+      preview_host_check:
+        description: >
+          Before a Native Preview publish, read-only check that the host Worker has previews_enabled (Cloudflare
+          Workers subdomain API). Set false for approved custom-domain Preview hosting, where that flag does not
+          apply; the strict post-publish URL validation always runs.
+        type: boolean
+        default: true
       preview_binding_allow:
         description: Space-separated approved high-risk Preview bindings, e.g. "services:ID hyperdrive:H"
         type: string
@@ -856,7 +863,7 @@ jobs:
         if: env.STALE != 'true' && env.TARGET == 'preview'
         id: dep
         run: |
-          PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg n "$PREVIEW_NAME" --arg w "$APP_NAME" '{branch_ref:$ref,preview_name:$n,worker:$w}')"
+          PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg n "$PREVIEW_NAME" --arg w "$APP_NAME" --arg h "$HOST_WORKER" --arg r "$GITHUB_REPOSITORY" '{branch_ref:$ref,preview_name:$n,worker:$w,host_worker:$h,repo:$r}')"
           ID="$("$TOOLS_DIR/gh.sh" start "$ENV_NAME" "$RUN_SHA" "$PAYLOAD")"
           echo "id=$ID" >> "$GITHUB_OUTPUT"
           "$TOOLS_DIR/gh.sh" status "$ID" in_progress "" "Publishing $RUN_SHA"
@@ -882,15 +889,19 @@ jobs:
           PREVIEW_ALLOW: ${{ inputs.preview_binding_allow }}
           PREVIEW_DENY: ${{ inputs.preview_deny_resources }}
           WORKER_NAME: ${{ inputs.preview_worker_name }}
+          PREVIEW_HOST_CHECK: ${{ inputs.preview_host_check }}
           APP_URL_PROD: ${{ inputs.app_url_prod }}
           COMMIT_MSG: ${{ github.event.head_commit.message }}
           APP_VERSION: ${{ inputs.app_version }}
         run: |
           export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
           "$TOOLS_DIR/deploy.sh" | tee -a "$GITHUB_OUTPUT"
-      - name: Inject smoke environment
+      - name: Stage smoke environment (smoke-only; never merged into the job environment)
         if: env.STALE != 'true' && steps.publish.outcome == 'success'
-        run: node "$TOOLS_DIR/parse-env.mjs" SMOKE_ENV "$GITHUB_ENV"
+        run: |
+          umask 077
+          node "$TOOLS_DIR/parse-env.mjs" SMOKE_ENV "$RUNNER_TEMP/smoke.env"
+          echo "SMOKE_ENV_FILE=$RUNNER_TEMP/smoke.env" >> "$GITHUB_ENV"
       - name: Smoke — exact deployed URL (fails closed)
         if: env.STALE != 'true' && steps.publish.outcome == 'success'
         id: smoke
@@ -949,15 +960,19 @@ jobs:
         run: |
           "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" failure "${{ steps.publish.outputs.url }}" "Smoke failed — Preview UNVERIFIED"
           echo "### ❌ Preview smoke failed — URL is **unverified**: ${{ steps.publish.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
-      - name: Preview recovery — find last known-good SHA
+      # Recovery only exists after a publish that returned a URL and then failed smoke. A failure before any
+      # mutation, or a publish without a usable URL, never reaches these steps.
+      - name: Preview recovery — find last known-good deployment of THIS Preview on THIS host Worker
         if: failure() && env.TARGET == 'preview' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
         id: good
         run: |
-          GOOD="$("$TOOLS_DIR/gh.sh" last-good "$ENV_NAME" "${{ steps.dep.outputs.id }}" || true)"
-          echo "sha=$GOOD" >> "$GITHUB_OUTPUT"
-          if [ -z "$GOOD" ]; then
-            echo "::error::No known-good deployment for this Preview. Fix forward by pushing a new commit. (Deleting the branch does NOT remove the Native Preview; see the manual delete command in the branch-delete summary.)"
-            echo "### ⚠️ No prior verified deployment — manual recovery required: push a fix. Deleting the branch keeps the Preview." >> "$GITHUB_STEP_SUMMARY"
+          ROW="$("$TOOLS_DIR/gh.sh" last-good-preview "$ENV_NAME" "${{ steps.dep.outputs.id }}" "$BRANCH_REF" "$HOST_WORKER" "$APP_NAME" || true)"
+          if [ -n "$ROW" ]; then
+            { echo "sha=${ROW%% *}"; echo "url=${ROW#* }"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "sha="; echo "url="; } >> "$GITHUB_OUTPUT"
+            echo "::error::No known-good deployment of this Preview on host Worker '$HOST_WORKER'. (Deployments hosted by another Worker are not eligible.) Fix forward by pushing a new commit. (Deleting the branch does NOT remove the Native Preview; see the manual delete command in the branch-delete summary.)"
+            echo "### ⚠️ No prior verified deployment on host Worker \`$HOST_WORKER\` — manual recovery required: push a fix. Deleting the branch keeps the Preview." >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Preview recovery — checkout last good
         if: failure() && steps.good.outputs.sha != ''
@@ -966,7 +981,7 @@ jobs:
           ref: ${{ steps.good.outputs.sha }}
           path: recover
           persist-credentials: false
-      - name: Preview recovery — redeploy last good and verify
+      - name: Preview recovery — redeploy last good
         if: failure() && steps.good.outputs.sha != ''
         id: recover
         env:
@@ -974,26 +989,79 @@ jobs:
           BUILD_CMD: ${{ inputs.build_cmd }}
           WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
           WORKER_NAME: ${{ inputs.preview_worker_name }}
-          # Same build/preflight environment as the normal publish (BUILD_ENV is already in the job env), or
-          # adapters re-add Preview-incompatible bindings (found by the heaven-www recovery drill).
           VITE_APP_ENV: preview
-          VITE_APP_VERSION: ${{ inputs.app_version }}
+          APP_VERSION_IN: ${{ inputs.app_version }}
           PREVIEW_ALLOW: ${{ inputs.preview_binding_allow }}
           PREVIEW_DENY: ${{ inputs.preview_deny_resources }}
+          GOOD_SHA: ${{ steps.good.outputs.sha }}
+          GOOD_URL: ${{ steps.good.outputs.url }}
+        run: |
+          # The recovered deployment is built with its OWN identity and the Preview BUILD environment, restored
+          # explicitly from build_env_preview (rebound from the failed SHA to the last-good SHA); smoke-only
+          # variables are never part of it.
+          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
+          . "$TOOLS_DIR/envfile.sh"
+          [ "${WORKER_NAME:-$APP_NAME}" = "$HOST_WORKER" ] || { echo "::error::recovery would target Worker '${WORKER_NAME:-$APP_NAME}', not the approved host '$HOST_WORKER'"; exit 1; }
+          REBOUND_ENV="$(node "$TOOLS_DIR/cli.mjs" rebind-env --var BUILD_ENV --from "$RUN_SHA" --to "$GOOD_SHA")"
+          export REBOUND_ENV
+          umask 077
+          node "$TOOLS_DIR/parse-env.mjs" REBOUND_ENV "$RUNNER_TEMP/preview-recover.env"
+          load_env_file "$RUNNER_TEMP/preview-recover.env"
+          rm -f "$RUNNER_TEMP/preview-recover.env"
+          VITE_APP_VERSION="$(APP_VERSION_IN="$APP_VERSION_IN" node "$TOOLS_DIR/cli.mjs" rebind-env --var APP_VERSION_IN --from "$RUN_SHA" --to "$GOOD_SHA")"
+          export VITE_APP_VERSION
+          (cd "$APP_DIR" && pnpm install --frozen-lockfile)
+          OUT="$("$TOOLS_DIR/deploy.sh")"
+          URL="$(printf '%s\n' "$OUT" | sed -n 's/^url=//p')"
+          [ -n "$URL" ] || { echo "::error::recovery produced no Preview URL"; exit 1; }
+          [ "$URL" = "$GOOD_URL" ] || { echo "::error::recovered URL $URL differs from the recorded last-good URL $GOOD_URL; refusing to verify a different Preview"; exit 1; }
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+      - name: Preview recovery — verify the restored deployment (full smoke, last-good SHA)
+        if: failure() && steps.good.outputs.sha != '' && steps.recover.outcome == 'success'
+        id: rverify
+        working-directory: ${{ inputs.app_path }}
+        env:
+          TARGET_URL: ${{ steps.recover.outputs.url }}
+          DEPLOY_TARGET: preview
+          TEST_ENV: preview
+          EXPECTED_SHA: ${{ steps.good.outputs.sha }}
+          SMOKE_CMD: ${{ inputs.smoke_cmd }}
+          SHA_PATH: ${{ inputs.sha_path }}
+          ACCESS_TARGETS: ${{ inputs.access_protected_targets }}
+          SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
+          SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
+          NO_PROXY: '*'
         run: |
           export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          (cd "$APP_DIR" && pnpm install --frozen-lockfile)
-          URL="$("$TOOLS_DIR/deploy.sh" | sed -n 's/^url=//p')"
-          TARGET_URL="$URL" "$TOOLS_DIR/probe.sh"
-          echo "### ♻️ Recovered Preview to last good commit \`${{ steps.good.outputs.sha }}\` ($URL). Run remains FAILED for the bad commit." >> "$GITHUB_STEP_SUMMARY"
-      - name: Preview recovery failed
-        if: failure() && steps.good.outputs.sha != '' && steps.recover.outcome == 'failure'
-        run: echo "### 🚨 Automatic recovery FAILED — Preview serves unverified code. Push a fix (deleting the branch keeps the Preview)." >> "$GITHUB_STEP_SUMMARY"
+          "$TOOLS_DIR/smoke.sh" | tee -a "$GITHUB_OUTPUT"
+      - name: Preview recovery — record the outcome accurately
+        if: failure() && steps.good.outputs.sha != ''
+        env:
+          LEVEL: ${{ steps.rverify.outputs.smoke_level }}
+          GOOD_SHA: ${{ steps.good.outputs.sha }}
+          RECOVERED: ${{ steps.recover.outcome }}
+          VERIFIED: ${{ steps.rverify.outcome }}
+        run: |
+          if [ "$RECOVERED" = success ] && [ "$VERIFIED" = success ] && [ "$LEVEL" = content ]; then
+            "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" failure "" "Smoke failed for $RUN_SHA; Preview restored to $GOOD_SHA and verified" || true
+            echo "### ♻️ Preview restored to last good commit \`$GOOD_SHA\` and verified (content-level smoke). Run remains FAILED for the bad commit. D1 migrations (if any) were NOT reverted." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$RECOVERED" = success ] && [ "$VERIFIED" = success ]; then
+            "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" failure "" "Smoke failed for $RUN_SHA; Preview restored to $GOOD_SHA — Access liveness only, content NOT verified" || true
+            echo "### ⚠️ Preview redeployed from \`$GOOD_SHA\` but only Cloudflare Access liveness was observed ($LEVEL): content and commit identity are **NOT verified**. Run remains FAILED. D1 migrations were NOT reverted." >> "$GITHUB_STEP_SUMMARY"
+          else
+            "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" error "" "Smoke failed for $RUN_SHA; recovery to $GOOD_SHA FAILED — Preview UNVERIFIED" || true
+            echo "### 🚨 Automatic recovery FAILED — Preview serves unverified code. Push a fix (deleting the branch keeps the Preview)." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Preview — failed before publish
-        if: failure() && env.TARGET == 'preview' && steps.dep.outputs.id != '' && steps.publish.outcome != 'success'
+        if: failure() && env.TARGET == 'preview' && steps.dep.outputs.id != '' && steps.publish.outcome != 'success' && steps.publish.outputs.preview_mutated != 'true'
         run: |
           "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" error "" "Failed before publish; previous Preview unchanged" || true
           echo "### ❌ Failed before publish — existing Preview unchanged." >> "$GITHUB_STEP_SUMMARY"
+      - name: Preview — publish returned no usable URL (state unverified, no recovery)
+        if: failure() && env.TARGET == 'preview' && steps.dep.outputs.id != '' && steps.publish.outcome != 'success' && steps.publish.outputs.preview_mutated == 'true'
+        run: |
+          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" error "" "Publish ran but returned no usable URL; Preview UNVERIFIED" || true
+          echo "### ❌ Native Preview publish returned **no usable URL** — the Preview may have been modified and is **unverified**. No automatic recovery (nothing to verify against). Check that the host Worker \`$HOST_WORKER\` has Preview URLs enabled, then push again." >> "$GITHUB_STEP_SUMMARY"
       - name: Production recovery (policy-driven; D1 is never rolled back)
         if: failure() && env.TARGET == 'prod' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
         env:
@@ -1013,7 +1081,7 @@ jobs:
           exit 1   # keep the run red regardless of policy
       - name: Remove staged Preview secrets
         if: always()
-        run: rm -f "$PREVIEW_ENV_FILE" "$OUT_FILE"
+        run: rm -f "$PREVIEW_ENV_FILE" "$OUT_FILE" "$RUNNER_TEMP/smoke.env"
 
   # -------------------------------------------------------------------------
   # Shared Dev — optional, independent of Native Preview (own switch, own credentials, own Environment).
@@ -1204,9 +1272,12 @@ jobs:
           VITE_APP_ENV: dev
           VITE_APP_VERSION: ${{ inputs.app_version }}
         run: bash -eo pipefail -c "$CMD"
-      - name: Inject smoke environment
+      - name: Stage smoke environment (smoke-only; never merged into the job environment)
         if: env.STALE != 'true' && steps.publish.outcome == 'success'
-        run: node "$TOOLS_DIR/parse-env.mjs" SMOKE_ENV "$GITHUB_ENV"
+        run: |
+          umask 077
+          node "$TOOLS_DIR/parse-env.mjs" SMOKE_ENV "$RUNNER_TEMP/smoke.env"
+          echo "SMOKE_ENV_FILE=$RUNNER_TEMP/smoke.env" >> "$GITHUB_ENV"
       - name: Smoke — Shared Dev URL (fails closed)
         if: env.STALE != 'true' && steps.publish.outcome == 'success'
         id: smoke
@@ -1570,9 +1641,12 @@ jobs:
           VITE_APP_ENV: dev
           VITE_APP_VERSION: ${{ inputs.app_version }}
         run: bash -eo pipefail -c "$CMD"
-      - name: Inject smoke environment
+      - name: Stage smoke environment (smoke-only; never merged into the job environment)
         if: inputs.dev_build_cmd != '' && steps.publish.outcome == 'success'
-        run: node "$TOOLS_DIR/parse-env.mjs" SMOKE_ENV "$GITHUB_ENV"
+        run: |
+          umask 077
+          node "$TOOLS_DIR/parse-env.mjs" SMOKE_ENV "$RUNNER_TEMP/smoke.env"
+          echo "SMOKE_ENV_FILE=$RUNNER_TEMP/smoke.env" >> "$GITHUB_ENV"
       - name: Smoke — Dev URL (fails closed)
         if: inputs.dev_build_cmd != '' && steps.publish.outcome == 'success'
         id: smoke

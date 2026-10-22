@@ -10,7 +10,8 @@ cat > "$T/bin/pnpm" <<'STUB'
 echo "$*" >> "$STUB_LOG"
 [ "$1 $2" = "exec wrangler" ] || exit 0
 case "$3" in
-  preview) [ "${STUB_FAIL:-}" = 1 ] && exit 9; echo '{"preview":{"urls":["https://stable.example.workers.dev"]}}';;
+  preview) [ "${STUB_FAIL:-}" = 1 ] && exit 9
+           if [ -n "${STUB_PREVIEW_RAW+x}" ]; then printf '%s' "$STUB_PREVIEW_RAW"; else echo '{"preview":{"urls":["https://stable.example.workers.dev"]}}'; fi;;
   deployments) echo '[{"created_on":"2024-01-01","versions":[{"version_id":"prev-1","percentage":100}]}]';;
   versions) if [ "$4" = upload ]; then echo "Worker Version ID: new-2"; fi;;
 esac
@@ -49,6 +50,66 @@ rm -rf "$T/app/.wrangler" "$T/app/dist"
 GOOD_BUILD='mkdir -p .wrangler/deploy dist && echo "{\"configPath\":\"../../dist/wrangler.json\"}" > .wrangler/deploy/config.json && echo "{\"name\":\"x\",\"previews\":{}}" > dist/wrangler.json'
 TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD="$GOOD_BUILD" "$D" >/dev/null 2>&1 && ok "preview: clean effective config accepted" || bad "clean effective config rejected"
 rm -rf "$T/app/.wrangler" "$T/app/dist"
+
+# ---- the empty-URL incident (blog run 39708495349): `wrangler preview --json` without a usable URL ----
+# Root cause: `echo "url=$(node cli.mjs extract-url | sed ...)"` made the extractor's failure invisible (the
+# pipeline status is sed's, echo's is 0) and published `url=` as a successful output, so Smoke ran with no URL.
+incident() { # <label> <raw wrangler stdout>
+  : > "$T/log"
+  local out rc=0
+  out="$(TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true STUB_PREVIEW_RAW="$2" "$D" 2>"$T/err")" || rc=$?
+  [ "$rc" != 0 ] && ok "$1: publish fails" || bad "$1: publish must fail (rc=$rc)"
+  echo "$out" | grep -q '^url=' && bad "$1: reported a url= line" || ok "$1: no url= line is emitted (nothing for Smoke to run against)"
+  echo "$out" | grep -qx 'preview_mutated=true' && ok "$1: reports that the Preview may have been modified" || bad "$1: preview_mutated missing"
+}
+incident "empty preview.urls" '{"preview":{"urls":[]}}'
+grep -q 'EMPTY `preview.urls`' "$T/err" && grep -q 'Preview URLs' "$T/err" && ok "empty preview.urls: actionable error explains how to enable Preview URLs" || bad "empty urls diagnostic"
+incident "missing urls property" '{"preview":{}}'
+incident "missing preview object" '{"other":1}'
+incident "malformed JSON" 'this is not json'
+incident "empty wrangler output" ''
+incident "non-string URL" '{"preview":{"urls":[null]}}'
+incident "empty-string URL" '{"preview":{"urls":[""]}}'
+incident "http URL" '{"preview":{"urls":["http://x.example.com"]}}'
+incident "relative URL" '{"preview":{"urls":["/just/a/path"]}}'
+grep -q 'AKIA\|secret' "$T/err" && bad "diagnostics leaked payload content" || ok "diagnostics do not echo the Wrangler payload"
+# a child parser that exits nonzero without printing anything must fail the parent
+mkdir -p "$T/badtools"; ln -sf "$ROOT/actions/cf-preview/envfile.sh" "$T/badtools/envfile.sh"
+printf 'process.exit(3);\n' > "$T/badtools/cli.mjs"
+: > "$T/log"
+OUT="$(TOOLS_DIR="$T/badtools" TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true "$D" 2>/dev/null)" && bad "silent failing parser accepted" || ok "child extractor exiting nonzero makes deploy.sh fail"
+echo "$OUT" | grep -q '^url=' && bad "url= emitted after a failed parser" || ok "no empty/guessed URL after a failed parser"
+# valid output still yields exactly one clean url
+OUT="$(TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true "$D" 2>/dev/null)"
+[ "$(echo "$OUT" | grep -c '^url=')" = 1 ] && echo "$OUT" | grep -qx 'url=https://stable.example.workers.dev' && ok "valid payload: exactly one https url= line" || bad "valid url output"
+
+# ---- Preview host readiness (read-only Cloudflare API stub on localhost) ----
+cat > "$T/api.mjs" <<'JS'
+import http from 'node:http';
+const mode = process.env.API_MODE;
+const s = http.createServer((req, res) => {
+  if (mode === 'down') { res.statusCode = 500; return res.end('{}'); }
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify({ success: true, result: { enabled: false, previews_enabled: mode === 'enabled' } }));
+}).listen(0, '127.0.0.1', () => console.log(s.address().port));
+JS
+host_case() { # <mode> -> sets API port, runs deploy, echoes rc
+  API_MODE="$1" node "$T/api.mjs" > "$T/port" & local pid=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$T/port" ] && break; sleep 0.3; done
+  rm -f "$T/built"; : > "$T/log"
+  local rc=0
+  CF_API_BASE="http://127.0.0.1:$(cat "$T/port")" CLOUDFLARE_API_TOKEN=t CLOUDFLARE_ACCOUNT_ID=a HOST_WORKER=blog \
+    TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD="touch $T/built" "$D" >/dev/null 2>"$T/err" || rc=$?
+  kill $pid 2>/dev/null; wait $pid 2>/dev/null || true; : > "$T/port"
+  return $rc
+}
+host_case disabled && bad "previews_enabled=false must refuse" || ok "host check: previews_enabled=false refuses the publish"
+[ -e "$T/built" ] && bad "built despite no Preview host" || ok "host check: refusal happens before the build and before any wrangler call"
+grep -q 'preview --name' "$T/log" && bad "published despite no Preview host" || ok "host check: wrangler preview never runs"
+grep -q 'previews_enabled=false' "$T/err" && grep -q 'never changes the Worker automatically' "$T/err" && ok "host check: actionable error, no automatic change" || bad "host check diagnostic"
+host_case enabled && grep -q 'preview --name' "$T/log" && ok "host check: previews_enabled=true proceeds" || bad "host check enabled"
+host_case down && grep -q 'preview --name' "$T/log" && ok "host check: unreadable API only warns (strict post-publish validation still applies)" || bad "host check unknown"
+PREVIEW_HOST_CHECK=false host_case disabled && grep -q 'preview --name' "$T/log" && ok "host check: preview_host_check=false (custom-domain hosting) skips the flag; URL still validated after publish" || bad "host check opt-out"
 
 # ---- prod ----
 cat > "$T/app/wrangler.toml" <<'TOML'

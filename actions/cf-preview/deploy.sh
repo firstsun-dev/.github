@@ -18,6 +18,12 @@ CFG="${WRANGLER_CONFIG:-wrangler.toml}"
 if [ "$TARGET" = preview ]; then
   : "${PREVIEW_NAME:?}"
   [[ "$PREVIEW_NAME" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "::error::refusing unsafe preview name: $PREVIEW_NAME" >&2; exit 1; }
+  # Read-only: refuse BEFORE the build and before any mutation when the host Worker has no Preview URL host
+  # (previews_enabled=false). Opt out (custom-domain Preview hosting) with PREVIEW_HOST_CHECK=false; an unreadable
+  # answer only warns, strict post-publish URL validation below still applies.
+  if [ "${PREVIEW_HOST_CHECK:-true}" != false ] && [ -n "${HOST_WORKER:-}" ]; then
+    node "$TOOLS_DIR/cli.mjs" preview-host-check --worker "$HOST_WORKER" >&2
+  fi
 fi
 
 cd "$APP_DIR"
@@ -65,7 +71,19 @@ if [ "$TARGET" = preview ]; then
   fi
   # Stderr (progress logs) must not pollute the JSON on stdout.
   pnpm exec wrangler preview --name "$PREVIEW_NAME" "${WORKER_ARGS[@]}" "${CFG_ARGS[@]}" --json > "$OUT_FILE"
-  echo "url=$(node "$TOOLS_DIR/cli.mjs" extract-url --file "$OUT_FILE" | sed -n 's/^preview_url=//p')"
+  # From here on the Preview may already have been modified: tell the workflow, so a failure below is never
+  # reported as "existing Preview unchanged" and never triggers a recovery that has no URL to verify.
+  echo "preview_mutated=true"
+  # The extractor runs on its own so its exit status is NOT swallowed by a pipeline or command substitution
+  # inside `echo` (the incident: `echo "url=$(extract | sed ...)"` printed `url=` and exited 0).
+  if ! EXTRACTED="$(node "$TOOLS_DIR/cli.mjs" extract-url --file "$OUT_FILE")"; then
+    printf '%s\n' "$EXTRACTED" | sed -n 's/^::error:://p' | head -5 | cut -c1-600 | sed 's/^/::error::/' >&2
+    echo "::error::Preview publish returned no usable URL; refusing to report a deployment (Preview state is unverified)" >&2
+    exit 1
+  fi
+  PREVIEW_URL="$(printf '%s\n' "$EXTRACTED" | sed -n 's/^preview_url=//p')"
+  [[ "$PREVIEW_URL" =~ ^https://[^[:space:]]+$ ]] || { echo "::error::Preview URL missing or not https after extraction" >&2; exit 1; }
+  echo "url=$PREVIEW_URL"
   exit 0
 fi
 

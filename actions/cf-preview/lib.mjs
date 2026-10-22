@@ -60,28 +60,70 @@ export function previewIdentity({ repo, worker, ref, hostWorker }) {
 
 export const PREVIEW_NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
-/** Validate `wrangler preview --json` output and return the stable URL. */
+/**
+ * Validate `wrangler preview --json` output and return the stable URL. Fails closed: a missing/malformed payload,
+ * a missing or EMPTY `preview.urls`, a non-string, non-https or otherwise invalid URL all throw (never an empty URL).
+ */
 export function extractPreviewUrl(json) {
   let data = json;
   if (typeof json === 'string') {
+    if (!json.trim()) throw new Error('`wrangler preview --json` produced no output (the Preview was not created or Wrangler failed before printing JSON)');
     try {
       data = JSON.parse(json);
     } catch {
       // wrangler may print log lines before the JSON document; take the last top-level object.
       const start = json.lastIndexOf('\n{');
-      data = JSON.parse(json.slice(start >= 0 ? start + 1 : json.indexOf('{')));
+      try {
+        data = JSON.parse(json.slice(start >= 0 ? start + 1 : json.indexOf('{')));
+      } catch {
+        throw new Error('`wrangler preview --json` output is not valid JSON; refusing to guess a Preview URL');
+      }
     }
   }
-  const url = data?.preview?.urls?.[0];
-  if (typeof url !== 'string') throw new Error('Unexpected wrangler preview --json shape: .preview.urls[0] missing');
+  if (!data || typeof data !== 'object' || !data.preview || typeof data.preview !== 'object') {
+    throw new Error(`Unexpected wrangler preview --json shape: no \`preview\` object (top-level keys: ${Object.keys(data ?? {}).slice(0, 8).join(', ') || 'none'})`);
+  }
+  const urls = data.preview.urls;
+  if (!Array.isArray(urls)) throw new Error('Unexpected wrangler preview --json shape: `preview.urls` is missing');
+  if (urls.length === 0) {
+    throw new Error('wrangler returned an EMPTY `preview.urls`: the host Worker has no Preview URL host. Enable Preview URLs for the host Worker (Workers & Pages > the Worker > Settings > Domains & Routes > Preview URLs, or `preview_urls = true` deployed to the Worker) or use an approved custom-domain Preview host; the Preview was NOT verified');
+  }
+  const url = urls[0];
+  if (typeof url !== 'string' || !url.trim()) throw new Error('`preview.urls[0]` is empty or not a string');
   let u;
   try {
     u = new URL(url);
   } catch {
-    throw new Error(`Preview URL is not a valid URL: ${url}`);
+    throw new Error('Preview URL is not a valid URL');
   }
-  if (u.protocol !== 'https:') throw new Error(`Preview URL must be https: ${url}`);
+  if (u.protocol !== 'https:') throw new Error(`Preview URL must be https: ${u.protocol}//${u.host}`);
   return u.origin + (u.pathname === '/' ? '' : u.pathname);
+}
+
+/**
+ * Read-only readiness check for the Worker that will HOST Native Previews: the Cloudflare Workers subdomain API
+ * reports `previews_enabled`. Returns { ok, level, message }. Only a definitive `previews_enabled === false`
+ * blocks (level 'block'); an unreadable answer (API/permission/404/network) is 'unknown' and is covered by the
+ * strict post-publish URL validation. Custom-domain Preview hosting cannot be derived from this flag and is
+ * opted out with preview_host_check: false.
+ */
+export async function previewHostReadiness(fetchFn, { accountId, token, worker, base = 'https://api.cloudflare.com/client/v4' }) {
+  if (!accountId || !token || !worker) return { ok: false, level: 'unknown', message: 'missing account, token or Worker name for the Preview host check' };
+  let res;
+  try {
+    res = await fetchFn(`${base}/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(worker)}/subdomain`, { headers: { Authorization: `Bearer ${token}` } });
+  } catch (e) {
+    return { ok: false, level: 'unknown', message: `Preview host check unavailable (${e.name ?? 'network error'})` };
+  }
+  if (!res.ok) return { ok: false, level: 'unknown', message: `Preview host check unavailable (HTTP ${res.status}); relying on post-publish URL validation` };
+  let body;
+  try { body = await res.json(); } catch { return { ok: false, level: 'unknown', message: 'Preview host check returned an unreadable body' }; }
+  const r = body?.result ?? {};
+  if (r.previews_enabled === true) return { ok: true, level: 'ok', message: `Worker ${worker} has Preview URLs enabled` };
+  if (r.previews_enabled === false) {
+    return { ok: false, level: 'block', message: `Worker "${worker}" has previews_enabled=false: no Preview URL host exists. Enable Preview URLs for that Worker (Settings > Domains & Routes > Preview URLs, or deploy it with \`preview_urls = true\`) — this pipeline never changes the Worker automatically. For custom-domain Preview hosting set preview_host_check: false.` };
+  }
+  return { ok: false, level: 'unknown', message: 'Preview host check: previews_enabled not reported' };
 }
 
 /**

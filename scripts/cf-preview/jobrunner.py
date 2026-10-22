@@ -25,8 +25,10 @@ case "$a" in
     [ "${tips[$i]}" = GONE ] && exit 1; echo "${tips[$i]}";;
   *"payload.branch_ref"*) echo "${STUB_OWNER_REF:-}";;
   *"deployments"*"-X POST"*"--input -"*) cat >> "$STUB_LOG"; echo 4242;;
-  *"per_page=30"*) [ -n "${STUB_LASTGOOD:-}" ] && echo "9:$STUB_LASTGOOD";;
+  *"per_page=30"*" -q "*) [ -n "${STUB_LASTGOOD:-}" ] && echo "9:$STUB_LASTGOOD";;
+  *"per_page=30"*) printf '%s' "${STUB_DEPLOYMENTS:-[]}";;
   *"deployments/9/statuses"*) echo success;;
+  *"/statuses?per_page=1"*"environment_url"*) echo "${STUB_STATUS:-success https://stable.example.workers.dev}";;
 esac
 exit 0
 '''
@@ -35,7 +37,8 @@ echo "pnpm $*" >> "$STUB_LOG"
 [ "$1" = exec ] && [ "$2" = wrangler ] || exit 0
 case "$3 $4 $5" in
   "--version  ") echo "4.140.0";;
-  "preview "*) [ "${STUB_PREVIEW_FAIL:-}" = 1 ] && exit 9; echo '{"preview":{"urls":["https://stable.example.workers.dev"]}}';;
+  "preview "*) [ "${STUB_PREVIEW_FAIL:-}" = 1 ] && exit 9
+               if [ -n "${STUB_PREVIEW_RAW+x}" ]; then printf '%s' "$STUB_PREVIEW_RAW"; else echo '{"preview":{"urls":["https://stable.example.workers.dev"]}}'; fi;;
   "deployments list"*) echo '[{"created_on":"2024-01-01","versions":[{"version_id":"prev-1","percentage":100}]}]';;
   "versions upload"*) echo "Worker Version ID: new-2";;
   "d1 migrations list") [ "${STUB_PENDING:-1}" = 1 ] && echo "Migrations to be applied: 0001.sql" || echo "No migrations to apply!";;

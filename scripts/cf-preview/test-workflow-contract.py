@@ -467,4 +467,24 @@ check("rebind-env" in rr and "--from \"$RUN_SHA\" --to \"$GOOD_SHA\"" in rr and 
 check("VITE_APP_VERSION" not in rec["env"] and "APP_VERSION_IN" in rec["env"], "recovery never reuses the failed run's version value unchanged")
 check("NOT verified" in rr and "NOT reverted" in rr, "recovery states when commit identity is unverified and that D1 is not reverted")
 
+# 8.9 post-incident fixes: smoke env isolation, host readiness, ledger identity, Preview recovery
+check(inputs_def["preview_host_check"]["default"] is True, "preview_host_check defaults to true (custom-domain hosting opts out)")
+pub = next(x for x in jobs["deploy"]["steps"] if x.get("id") == "publish")
+check(pub["env"]["PREVIEW_HOST_CHECK"] == "${{ inputs.preview_host_check }}" and pub["run"].count("deploy.sh") == 1, "Publish passes the host-readiness switch to the single deploy.sh")
+for jn in ("deploy", "dev-deploy", "persistent-dev"):
+    t = yaml.dump(jobs[jn])
+    check("SMOKE_ENV\" \"$GITHUB_ENV\"" not in t.replace("'", "").replace('\\"', '"') and "SMOKE_ENV_FILE" in t, f"{jn}: smoke-only env is staged in a file and never merged into GITHUB_ENV")
+dstep = {x.get("name"): x for x in jobs["deploy"]["steps"]}
+check("host_worker" in next(x for x in jobs["deploy"]["steps"] if x.get("id") == "dep")["run"] and "$GITHUB_REPOSITORY" in next(x for x in jobs["deploy"]["steps"] if x.get("id") == "dep")["run"], "Preview ledger records repository and the actual host Worker")
+check("last-good-preview" in dstep["Preview recovery — find last known-good deployment of THIS Preview on THIS host Worker"]["run"] and "$HOST_WORKER" in dstep["Preview recovery — find last known-good deployment of THIS Preview on THIS host Worker"]["run"], "Preview recovery lookup is bound to the host Worker identity")
+check("last-good " not in dstep["Preview recovery — find last known-good deployment of THIS Preview on THIS host Worker"]["run"].replace("last-good-preview", ""), "Preview recovery no longer uses the environment-string-only lookup")
+pr = dstep["Preview recovery — redeploy last good"]["run"]
+check("rebind-env" in pr and "load_env_file" in pr and "GOOD_URL" in pr and "HOST_WORKER" in pr, "Preview recovery rebinds build env/version, checks the host Worker and the recorded URL")
+rv = dstep["Preview recovery — verify the restored deployment (full smoke, last-good SHA)"]
+check(rv["env"]["EXPECTED_SHA"] == "${{ steps.good.outputs.sha }}" and rv["env"]["SMOKE_CMD"] == "${{ inputs.smoke_cmd }}" and "smoke.sh" in rv["run"], "Preview recovery runs the configured smoke against the last-good SHA")
+check("steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'" in dstep["Preview recovery — find last known-good deployment of THIS Preview on THIS host Worker"]["if"], "Preview recovery only after a published URL failed smoke (never before a mutation or without a URL)")
+nu = dstep["Preview — publish returned no usable URL (state unverified, no recovery)"]
+check("preview_mutated == 'true'" in nu["if"] and "unverified" in nu["run"], "a publish without a usable URL is reported as unverified and never recovered")
+check("preview_mutated != 'true'" in dstep["Preview — failed before publish"]["if"], "'existing Preview unchanged' is only claimed when no mutation happened")
+
 sys.exit(fail)

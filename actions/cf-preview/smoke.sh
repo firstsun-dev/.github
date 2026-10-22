@@ -5,7 +5,7 @@
 #   redirect to *.cloudflareaccess.com -> liveness ONLY, and only for targets listed in ACCESS_TARGETS
 #                               (explicit per-target approval; default none). Content/SHA is NOT verified.
 #   anything else               -> FAIL
-# Env: TARGET_URL DEPLOY_TARGET(prod|preview) EXPECTED_SHA TOOLS_DIR [SHA_PATH] [SMOKE_CMD] [ACCESS_TARGETS]
+# Env: TARGET_URL DEPLOY_TARGET(prod|preview|dev) [SMOKE_ENV_FILE] EXPECTED_SHA TOOLS_DIR [SHA_PATH] [SMOKE_CMD] [ACCESS_TARGETS]
 #      [PREVIEW_ENV_FILE] [SHA_ATTEMPTS=6] [SHA_SLEEP=5]
 set -euo pipefail
 : "${DEPLOY_TARGET:?}" "${TOOLS_DIR:?}"
@@ -13,6 +13,9 @@ set -euo pipefail
 # shellcheck source=envfile.sh
 . "$TOOLS_DIR/envfile.sh"
 [ "$DEPLOY_TARGET" != preview ] || load_env_file "${PREVIEW_ENV_FILE:-}"
+# Smoke-only variables live in their own file and are exported ONLY here (never into GITHUB_ENV), so they cannot
+# overwrite the target build environment of a later step such as a recovery rebuild.
+load_env_file "${SMOKE_ENV_FILE:-}"
 
 result="$("$TOOLS_DIR/probe.sh")"
 echo "$result" >&2

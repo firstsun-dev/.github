@@ -3,7 +3,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import {
-  assertWranglerSupported, auditDevConfig, auditPreviewConfig, auditProdConfig, classifyEvent, extractPreviewUrl,
+  assertWranglerSupported, auditDevConfig, previewHostReadiness, auditPreviewConfig, auditProdConfig, classifyEvent, extractPreviewUrl,
   isStale, migrationPlan, previewIdentity, readConfig, rebindSha, resolveSharedDev, resolveTarget, sharedPreviewDevD1,
 } from './lib.mjs';
 
@@ -29,6 +29,16 @@ try {
     case 'extract-url':
       out({ preview_url: extractPreviewUrl(readFileSync(opt('file'), 'utf8')) });
       break;
+    case 'preview-host-check': {
+      const r = await previewHostReadiness(fetch, {
+        accountId: process.env.CLOUDFLARE_ACCOUNT_ID, token: process.env.CLOUDFLARE_API_TOKEN, worker: opt('worker'),
+        base: process.env.CF_API_BASE || undefined,
+      });
+      if (r.level === 'block') { console.log(`::error::${r.message}`); process.exit(1); }
+      console.log(r.level === 'ok' ? `::notice::${r.message}` : `::warning::${r.message}`);
+      out({ preview_host: r.level });
+      break;
+    }
     case 'classify': {
       const r = classifyEvent({
         event: opt('event'), ref: opt('ref'), strategy: opt('strategy'),
@@ -130,7 +140,7 @@ try {
       out({ stale: String(isStale({ runSha: opt('sha'), branchTipSha: opt('tip') })) });
       break;
     default:
-      console.error('usage: cli.mjs identity|wrangler-check|extract-url|classify|resolve|resolve-dev|rebind-env|d1-shared|dev-config-check|preflight|migration-config|effective-config|audit-prod|stale');
+      console.error('usage: cli.mjs identity|wrangler-check|extract-url|preview-host-check|classify|resolve|resolve-dev|rebind-env|d1-shared|dev-config-check|preflight|migration-config|effective-config|audit-prod|stale');
       process.exit(2);
   }
 } catch (e) {

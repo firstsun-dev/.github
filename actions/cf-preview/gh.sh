@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GitHub Deployment ledger + PR feedback for branch Previews. Needs GH_TOKEN, GITHUB_REPOSITORY.
-# Subcommands: start | status | last-good | comment | environments | owner | retire | purge
+# Subcommands: start | status | last-good | last-good-preview | comment | environments | owner | retire | purge
 set -euo pipefail
 R="${GITHUB_REPOSITORY:?}"
 cmd="${1:?}"; shift
@@ -21,6 +21,20 @@ JSON
       st="$(gh api "repos/$R/deployments/$id/statuses?per_page=1" -q '.[0].state // empty')"
       if [ "$st" = "success" ]; then echo "$sha"; exit 0; fi
     done
+    ;;
+  last-good-preview) # <env> <exclude-id> <branch_ref> <host_worker> <app> -> "<sha> <url>" of the newest SUCCESSFUL deployment
+    # whose recorded identity matches exactly: repository, application, branch ref, HOST Worker (a Preview hosted
+    # under another Worker, e.g. blog-preview vs blog, is a different Preview even with the same environment
+    # string) and a valid https URL on its latest status. Legacy records without host_worker are never eligible.
+    list="$(gh api "repos/$R/deployments?environment=$(printf %s "$1" | jq -sRr @uri)&per_page=30")" || exit 1
+    while read -r id sha; do
+      [ -n "$id" ] || continue
+      [ "$id" = "${2:-}" ] && continue
+      row="$(gh api "repos/$R/deployments/$id/statuses?per_page=1" -q '.[0] | "\(.state) \(.environment_url)"')"
+      st="${row%% *}"; url="${row#* }"
+      if [ "$st" = success ] && [[ "$url" =~ ^https://[^[:space:]]+$ ]]; then echo "$sha $url"; exit 0; fi
+    done < <(printf '%s' "$list" | jq -r --arg repo "$R" --arg ref "$3" --arg host "$4" --arg app "$5" \
+      '.[] | select(.payload.repo == $repo and .payload.branch_ref == $ref and .payload.host_worker == $host and .payload.worker == $app) | "\(.id) \(.sha)"')
     ;;
   comment) # <branch> <app_name> <url> <sha> : only same-repo PRs from this exact head branch
     owner="${R%%/*}"
