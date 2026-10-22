@@ -1,5 +1,7 @@
 # Cloudflare Worker Delivery — v2 In-Place Refactor Delta Specification
 
+> **Amended by `add-cloudflare-shared-dev-channel` (PR #64):** the requirement "Remote D1 migrations SHALL run as a separate, target-bound job" is renamed and modified there — migration is an explicit step of the single Deploy engine, not a job. Wherever this document says `Migration` job, read "Migration step of Deploy".
+
 **Scope:** the in-place, breaking refactor of the v2 shared workflow (`_cf-worker-v2.yml`) and its consumer contract. v1/v1.5 are unchanged and no new major (`v3`) is introduced. Requirements from `redesign-cloudflare-worker-cicd-v2` remain in force for eligible Native Previews except where the refactored job topology and migration/build contracts explicitly supersede them; the old v2 interface is not preserved.
 
 ## ADDED Requirements

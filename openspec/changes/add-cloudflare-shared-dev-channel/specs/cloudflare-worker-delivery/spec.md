@@ -53,3 +53,47 @@ With `dev_build_cmd` set, build, publish and smoke SHALL be separate commands an
 ### Requirement: Dev recovery SHALL rebuild the last-good commit with that commit's identity
 
 Recovery SHALL rebind the failed run's SHA in build environment and version to the last-good SHA, repeat the audit and full smoke, state when commit identity is unverified, never claim success when unverified, and never roll back D1.
+
+## RENAMED Requirements
+- FROM: `### Requirement: Remote D1 migrations SHALL run as a separate, target-bound job`
+- TO: `### Requirement: Remote D1 migrations SHALL run as an explicit, target-bound step of the delivery engine`
+
+## MODIFIED Requirements
+
+### Requirement: Remote D1 migrations SHALL run as an explicit, target-bound step of the delivery engine
+
+A D1-capable Worker SHALL apply remote migrations from one explicit step of the single delivery engine inside the Deploy (Production / Native Preview) and Shared Dev jobs, never from a standalone job and never from a caller-supplied command. Production, Preview and Shared Dev SHALL apply the same project-owned migration SQL to their own D1. The required order SHALL be: validation succeeded → deployable built → effective Wrangler configuration audited → exact migration target validated → stale-SHA check → pending migrations applied → stale-SHA check → audited artifact published → smoke → verified / recovery. Schema SHALL NOT be migrated before the deployable build and the configuration audit succeeded. The target SHALL be bound from the engine target and SHALL NOT be derivable from application build or smoke environment. Worker recovery SHALL NEVER roll a D1 schema back.
+
+#### Scenario: Failed migration prevents publish
+- **WHEN** a migration step fails
+- **THEN** the job SHALL fail, nothing SHALL be published or marked verified, and Release SHALL NOT run.
+
+#### Scenario: Branch advances during a long migration
+- **WHEN** the branch tip changes while the migration runs
+- **THEN** the run SHALL re-check the exact tip immediately before publishing and SHALL NOT publish the superseded code over a newer deployment.
+
+#### Scenario: Deployed D1 differs from the migration target
+- **WHEN** the D1 binding of the configuration that will be published (including an adapter-generated configuration) has a different physical `database_id` than the validated migration target
+- **THEN** the run SHALL fail before the migration and before the publish.
+
+## ADDED Requirements
+
+### Requirement: Production, Native Preview and Shared Dev SHALL use one delivery implementation
+
+The workflow SHALL contain a single Deploy job for `target = prod | preview` and SHALL call the same composite delivery engine from the Shared Dev job (`target = dev`) and the manual persistent-Dev job (`mode = manual`). Build, audit, migration, publish, smoke and recovery logic SHALL NOT be duplicated per target; target differences SHALL be explicit, validated parameters. Complex logic SHALL live in tested scripts, not inline workflow YAML.
+
+#### Scenario: Cross-repository reusable workflow
+- **WHEN** the workflow is called from another repository
+- **THEN** each job SHALL check out `firstsun-dev/.github` at `tools_ref` into `.cf-tools` before referencing the composite actions by the static path `./.cf-tools/actions/<name>`; no `uses:` SHALL contain an expression.
+
+### Requirement: Application environment SHALL NOT override deployment controls
+
+`build_env_prod`, `build_env_preview`, `build_env_dev`, `smoke_env` and Preview secrets are data. Names that control the delivery target, credentials, D1 target, branch SHA, verification or engine state (including `TARGET`, `DEV_ENV`, `GH_TOKEN`, `EXPECTED_SHA`) SHALL be rejected for the whole block, and application env SHALL never be written to the job environment.
+
+### Requirement: The audited artifact SHALL be exactly the published artifact
+
+The build stage SHALL be separate from the publish stage. The audited configuration (and its Worker entry and assets fingerprint) SHALL be recorded and the publish SHALL pass it explicitly, SHALL not rely on an ambient named environment, and SHALL fail if a caller-supplied publish command changes it.
+
+### Requirement: Concurrency SHALL serialize by shared resource identity
+
+The run-level concurrency group SHALL be derived from the shared resource (`d1_lock_scope`, else the app) with distinct Production and non-Production groups, so applications that share one physical D1 are serialized regardless of `app_name`. Automatic Shared Dev and manual persistent Dev SHALL share one group. The limitation that GitHub concurrency cannot lock a D1 shared with another repository SHALL be documented.
