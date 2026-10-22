@@ -64,4 +64,17 @@ env "${TOKEN_ENV[@]}" STUB_SHA_BODY=zzzzzzz SHA_PATH=/v DEPLOY_TARGET=prod TARGE
 # legacy PROBE_HEADERS keeps working (probe and sha), including several headers
 : > "$STUB_LOG"
 [ "$(PROBE_HEADERS=$'X-A: 1\nX-B: 2' SHA_PATH=/v STUB_SHA_BODY=abcdef1 run)" = smoke_level=content-sha ] && grep -q '^sha|X-A: 1;X-B: 2|' "$STUB_LOG" && grep -q '^probe|X-A: 1;X-B: 2|' "$STUB_LOG" && ok "legacy PROBE_HEADERS (multiple) still sent to probe and SHA endpoint" || bad "legacy PROBE_HEADERS"
+# ---- exact SHA comparison (no substring matching) ----
+FULL=0123456789abcdef0123456789abcdef01234567
+sha() { EXPECTED_SHA="$FULL" SHA_PATH=/v STUB_SHA_BODY="$1" run; }
+[ "$(sha "{\"sha\":\"$FULL\"}")" = smoke_level=content-sha ] && ok "full SHA equal -> content-sha" || bad "full equal"
+sha "{\"sha\":\"${FULL:0:7}\"}" >/dev/null && ok "abbreviated SHA that is a prefix of the expected one is still accepted (compat)" || bad "abbrev compat"
+sha "${FULL:0:12}" >/dev/null && ok "12-char abbreviation accepted" || bad "abbrev 12"
+sha "{\"sha\":\"${FULL:0:7}fffffffffffffffffffffffffffffffff\"}" >/dev/null && bad "same first 7 chars but different full SHA accepted" || ok "full SHA differing after 7 chars fails (was a false positive)"
+sha "{\"sha\":\"${FULL:0:7}fffffffffffffffffffffffffffffffff\",\"short\":\"${FULL:0:7}\"}" >/dev/null && bad "abbreviated fallback beat a mismatching full SHA" || ok "a mismatching full SHA is not rescued by an abbreviated field"
+sha "build-x${FULL}y" >/dev/null && bad "substring inside a larger word accepted" || ok "SHA embedded in a longer word is not a match"
+sha "${FULL}0123" >/dev/null && bad "longer hex run accepted" || ok "longer hex run (not a SHA) is not a match"
+sha "{\"sha\":\"$(printf '%s' "$FULL" | tr a-f A-F)\"}" >/dev/null && ok "case-insensitive equality" || bad "case"
+sha "${FULL:0:6}" >/dev/null && bad "6-char value accepted" || ok "too-short value fails"
+sha "{\"sha\":\"7777777\"}" >/dev/null && bad "other abbreviated SHA accepted" || ok "non-prefix abbreviated SHA fails"
 exit $fail
