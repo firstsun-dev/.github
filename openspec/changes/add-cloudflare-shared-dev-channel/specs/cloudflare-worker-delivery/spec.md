@@ -33,3 +33,23 @@ Shared Dev SHALL use only `CLOUDFLARE_DEV_API_TOKEN`/`CLOUDFLARE_DEV_ACCOUNT_ID`
 ### Requirement: Manual Persistent Dev dispatch SHALL remain available and distinct
 
 The `persistent-dev` workflow_dispatch path SHALL keep its approved-ref gate, Environment, concurrency group and behaviour, and SHALL NOT be triggered by the automatic Shared Dev switch.
+
+### Requirement: Shared Dev resource sharing SHALL be exact, explicit and independent of Preview policy
+
+Shared Dev SHALL audit its effective config with its own policy inputs (`dev_binding_allow`, `dev_deny_resources`), never `preview_binding_allow`/`preview_deny_resources`. A Production collision SHALL fail unless an exact `kind:BINDING=identity` entry for a supported storage kind (R2, KV, Vectorize, Analytics Engine) matches the bound resource. Hard-denied resources SHALL always fail; a Production D1 SHALL never be approvable; unknown kinds, malformed, duplicate or unmatched entries, missing identities and identity mismatches SHALL fail closed.
+
+#### Scenario: Exact approved R2
+- **WHEN** the Dev config binds `SHINYI_MUYU_VOICE_CACHE` to `firstsun-blog-assets` and the allowlist approves exactly that
+- **THEN** the audit passes; a different bucket under the same binding, or the same bucket under another binding, fails.
+
+### Requirement: Shared Dev SHALL NOT reach Production queues, services, routes or unverifiable bindings
+
+Queue producers, consumers and dead-letter queues, Service Bindings, routes/custom domains, cross-Worker Durable Objects and bindings the audit cannot verify SHALL fail closed against Production identities; Service Bindings SHALL require an exact approval and SHALL NOT target Production Workers.
+
+### Requirement: Manual and automatic Dev deployments SHALL share one command contract and one verification rule
+
+With `dev_build_cmd` set, build, publish and smoke SHALL be separate commands and both paths SHALL run them with the same audit. A deployment SHALL enter the known-good ledger only after its smoke passes; legacy manual runs SHALL never enter it.
+
+### Requirement: Dev recovery SHALL rebuild the last-good commit with that commit's identity
+
+Recovery SHALL rebind the failed run's SHA in build environment and version to the last-good SHA, repeat the audit and full smoke, state when commit identity is unverified, never claim success when unverified, and never roll back D1.

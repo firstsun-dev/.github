@@ -198,4 +198,140 @@ check(not deploy_runs(m, ref=MAIN), "failed Production migration BLOCKS Producti
 check(not deploy_runs({"result": "success"}, e2e="skipped", inputs={"test_e2e_cmd": "pnpm e2e"}), "a configured E2E that never ran blocks Deploy")
 check(deploy_runs({"result": "success"}, e2e="skipped", inputs={"test_e2e_cmd": ""}), "intentionally disabled E2E does not block Deploy")
 
+# ======================================================================= Shared Dev (dev-deploy) executed with stubs
+DEV_SECRETS = {"CLOUDFLARE_DEV_API_TOKEN": "DT", "CLOUDFLARE_DEV_ACCOUNT_ID": "DA"}
+GOOD = "1111111222222233"
+DEV_TOML = '''name = "app"
+[[d1_databases]]
+binding = "DB"
+database_name = "prod-db"
+database_id = "PROD-ID"
+[[r2_buckets]]
+binding = "ASSETS"
+bucket_name = "prod-assets"
+[previews]
+[[previews.d1_databases]]
+binding = "DB"
+database_name = "shared-db"
+database_id = "SHARED-ID"
+[env.dev]
+name = "app-dev"
+[[env.dev.d1_databases]]
+binding = "DB"
+database_name = "shared-db"
+database_id = "SHARED-ID"
+[[env.dev.r2_buckets]]
+binding = "ASSETS"
+bucket_name = "prod-assets"
+'''
+DEV_INPUTS = {
+    "shared_dev_on_branch_push": True, "app_url_dev": "https://dev.example.com", "dev_worker_name": "app-dev",
+    "app_version": SHA, "build_env_dev": f"PUBLIC_COMMIT_SHA={SHA}\nSITE=dev", "dev_wrangler_env": "dev",
+    "dev_build_cmd": 'echo "BUILD ver=$VITE_APP_VERSION commit=$PUBLIC_COMMIT_SHA cfenv=$CLOUDFLARE_ENV" >> "$STUB_LOG"',
+    "dev_deploy_cmd": 'echo "PUBLISH" >> "$STUB_LOG"',
+    "dev_binding_allow": "r2_buckets:ASSETS=prod-assets",
+}
+
+
+def dev(inputs=None, env=None, toml=DEV_TOML, needs=None, secrets=None, ref=FEAT):
+    ws = make_workspace(toml)
+    n = needs if needs is not None else {"migrate": {"result": "skipped"}}
+    r = run_job(doc, "dev-deploy", ctx(ref, dict(DEV_INPUTS, **(inputs or {})), DEV_SECRETS if secrets is None else secrets, n),
+                ws, dict({"STUB_TIPS": SHA}, **(env or {})))
+    r["ws"] = ws
+    return r
+
+
+def ran(r, what):
+    return what in r["log"]
+
+
+r = dev()
+check(r["result"] == "success" and r["outputs"]["deployed_and_verified"] == "true" and r["outputs"]["url"] == "https://dev.example.com", "Shared Dev success: built, audited, published, smoked, verified at app_url_dev")
+check(ran(r, "BUILD ver=" + SHA + " commit=" + SHA + " cfenv=dev") and ran(r, "PUBLISH"), "Shared Dev builds with the Dev build env and CLOUDFLARE_ENV=dev_wrangler_env")
+check("state=success" in r["log"] and "d1 migrations" not in r["log"], "Shared Dev success is recorded in the ledger only after the smoke; no migration for a D1-less config")
+r = dev(inputs={"d1_migrations": True})
+check(r["result"] == "success" and "d1 migrations apply DB --remote" in r["log"] and "SHARED-ID" in open(r["ws"] / "w" / ".wrangler" / "migrate.dev.json").read() and "PROD-ID" not in open(r["ws"] / "w" / ".wrangler" / "migrate.dev.json").read(),
+      "Shared Dev migrates the Dev D1 (env.dev), never the Production D1")
+b_i, m_i, p_i = r["log"].index("BUILD"), r["log"].index("migrations apply"), r["log"].index("PUBLISH")
+check(b_i < m_i < p_i, "order in the executed job: build -> migration -> publish")
+
+r = dev(inputs={"dev_build_cmd": "false", "d1_migrations": True})
+check(r["result"] == "failure" and not ran(r, "migrations apply") and not ran(r, "PUBLISH") and "unchanged" in r["summary"], "build failure: no migration, no publish, explicit 'Dev unchanged' outcome")
+r = dev(toml=DEV_TOML.replace('name = "app-dev"', 'name = "app"'), inputs={"d1_migrations": True})
+check(r["result"] == "failure" and ran(r, "BUILD") and not ran(r, "migrations apply") and not ran(r, "PUBLISH"), "audit failure (wrong Worker identity): no migration, no publish")
+r = dev(inputs={"d1_migrations": True}, env={"STUB_APPLY_FAIL": "1"})
+check(r["result"] == "failure" and ran(r, "BUILD") and not ran(r, "PUBLISH"), "migration failure prevents publish")
+r = dev(inputs={"dev_binding_allow": ""})
+check(r["result"] == "failure" and not ran(r, "PUBLISH") and not ran(r, "migrations apply"), "unapproved Production R2 sharing fails the audit before anything is published")
+r = dev(inputs={"dev_binding_allow": "r2_buckets:ASSETS=another-bucket"})
+check(r["result"] == "failure" and not ran(r, "PUBLISH"), "allowlist naming a different bucket does not approve the shared one")
+r = dev(inputs={"dev_binding_allow": "r2_buckets:ASSETS=prod-assets", "dev_deny_resources": "prod-assets"})
+check(r["result"] == "failure" and not ran(r, "PUBLISH"), "dev_deny_resources beats dev_binding_allow")
+r = dev(inputs={"preview_deny_resources": "prod-assets"})
+check(r["result"] == "success", "a Preview-only denylist does not affect the approved Dev share")
+r = dev(inputs={"d1_migrations": True, "dev_build_cmd": ""})
+check(r["result"] == "failure" and not ran(r, "PUBLISH") and not ran(r, "migrations apply"), "d1_migrations without dev_build_cmd fails closed")
+r = dev(secrets={})
+check(r["result"] == "failure" and not ran(r, "BUILD"), "missing Dev credentials fail closed before the build")
+r = dev(secrets={"CLOUDFLARE_API_TOKEN": "PT", "CLOUDFLARE_ACCOUNT_ID": "PA", "CLOUDFLARE_PREVIEW_API_TOKEN": "VT"})
+check(r["result"] == "failure" and not ran(r, "BUILD"), "Production/Preview credentials are never a fallback for Dev")
+r = dev(env={"STUB_TIPS": OTHER})
+check(r["result"] == "success" and not ran(r, "BUILD") and not ran(r, "PUBLISH") and r["outputs"]["deployed_and_verified"] == "false", "stale run: nothing built, migrated or published")
+r = dev(env={"STUB_TIPS": f"{SHA},{OTHER}"}, inputs={"d1_migrations": True})
+check(r["result"] == "success" and ran(r, "BUILD") and not ran(r, "migrations apply") and not ran(r, "PUBLISH"), "superseded after the build: no migration and no publish")
+
+# Shared-D1 guard
+r = dev(inputs={"d1_migrations": True}, needs={"migrate": {"result": "failure"}})
+check(r["result"] == "failure" and not ran(r, "BUILD") and not ran(r, "migrations apply") and not ran(r, "PUBLISH"), "Preview Migration failed on the SHARED D1: Dev builds, migrates and publishes nothing")
+r = dev(inputs={"d1_migrations": True}, needs={"migrate": {"result": "cancelled"}})
+check(r["result"] == "failure" and not ran(r, "PUBLISH"), "...also when the Preview Migration was cancelled")
+distinct = DEV_TOML.replace('database_name = "shared-db"\ndatabase_id = "SHARED-ID"\n[env.dev]', 'database_name = "preview-only-db"\ndatabase_id = "PREVIEW-ONLY"\n[env.dev]')
+assert distinct != DEV_TOML
+r = dev(inputs={"d1_migrations": True}, needs={"migrate": {"result": "failure"}}, toml=distinct)
+check(r["result"] == "success" and ran(r, "PUBLISH"), "Preview Migration failed but the D1s differ: Shared Dev is independent and deploys")
+r = dev(inputs={"d1_migrations": True}, needs={"migrate": {"result": "success"}})
+check(r["result"] == "success", "Preview Migration succeeded on the shared D1: Dev proceeds")
+
+# Smoke failure and recovery
+r = dev(env={"STUB_PROBES": "500 ;200 ", "STUB_LASTGOOD": GOOD})
+check(r["result"] == "failure" and r["outputs"]["deployed_and_verified"] == "false" and "unverified" in r["summary"], "smoke failure: job red, deployment marked unverified")
+builds = [l for l in r["log"].splitlines() if l.startswith("BUILD")]
+check(len(builds) == 2 and builds[1] == f"BUILD ver={GOOD} commit={GOOD} cfenv=dev", "recovery builds the LAST-GOOD commit with its own version and rebound build env (not the failed SHA)")
+check(SHA not in builds[1] and r["log"].count("PUBLISH") == 2 and "fully" not in r["summary"] and "Run remains FAILED" in r["summary"] and "identity NOT verified" in r["summary"], "recovery redeploys; without sha_path it says commit identity was NOT verified; run stays red")
+r = dev(inputs={"sha_path": "/version.json"}, env={"STUB_PROBES": "500 ;200 ", "STUB_LASTGOOD": GOOD, "STUB_SHA_BODY": GOOD[:7]})
+check(r["result"] == "failure" and "commit identity verified at /version.json" in r["summary"], "with sha_path the recovery verifies the restored commit identity")
+r = dev(inputs={"sha_path": "/version.json"}, env={"STUB_PROBES": "500 ;200 ", "STUB_LASTGOOD": GOOD, "STUB_SHA_BODY": SHA[:7]})
+check(r["result"] == "failure" and "commit identity verified" not in r["summary"], "recovery serving the wrong commit is NOT reported as verified")
+r = dev(env={"STUB_PROBES": "500 ;500 ", "STUB_LASTGOOD": GOOD})
+check(r["result"] == "failure" and "recovery FAILED" in r["summary"], "recovery failure stays visible")
+r = dev(env={"STUB_PROBES": "500 "})
+check(r["result"] == "failure" and r["log"].count("PUBLISH") == 1 and "manual recovery required" in r["summary"], "no known-good commit: no recovery attempted, manual recovery required")
+rb = dev(env={"STUB_PROBES": "500 ;200 ", "STUB_LASTGOOD": GOOD}, inputs={"build_env_dev": f"PUBLIC_COMMIT_SHA={SHA}\nSHORT={SHA[:7]}"})
+check(f"commit={GOOD}" in rb["log"], "build env referencing the failed SHA (full) is rebound for the restored commit")
+
+# Manual persistent-dev: legacy vs split contract
+PD = dict(DEV_INPUTS, deployment_strategy="hybrid", persistent_dev_ref="refs/heads/dev", dispatch_target="persistent-dev", shared_dev_on_branch_push=False)
+
+
+def manual(inputs=None, env=None, toml=DEV_TOML):
+    ws = make_workspace(toml)
+    r = run_job(doc, "persistent-dev", ctx("refs/heads/dev", dict(PD, **(inputs or {})), DEV_SECRETS, event="workflow_dispatch"), ws, dict({"STUB_TIPS": SHA}, **(env or {})))
+    r["ws"] = ws
+    return r
+
+
+r = manual(inputs={"dev_build_cmd": "", "dev_smoke_cmd": 'echo SMOKE >> "$STUB_LOG"'})
+check(r["result"] == "success" and ran(r, "PUBLISH") and ran(r, "SMOKE") and not ran(r, "BUILD") and "-X POST" not in r["log"] and "statuses" not in r["log"], "legacy persistent-dev: unchanged (deploy + optional smoke), never written to the known-good ledger")
+r = manual()
+check(r["result"] == "success" and r["log"].index("BUILD") < r["log"].index("PUBLISH") and "state=success" in r["log"], "split contract: manual run builds first, publishes, smokes and is recorded verified")
+r = manual(inputs={"dev_build_cmd": "false"})
+check(r["result"] == "failure" and not ran(r, "PUBLISH") and "state=success" not in r["log"], "split contract: manual build failure publishes nothing and records nothing as good")
+r = manual(env={"STUB_PROBES": "500 "})
+check(r["result"] == "failure" and ran(r, "PUBLISH") and "state=success" not in r["log"] and "state=failure" in r["log"], "split contract: a manual deploy whose smoke fails is NEVER recorded as known-good")
+r = manual(inputs={"dev_worker_name": ""})
+check(r["result"] == "failure" and not ran(r, "PUBLISH"), "split contract: manual run also requires the Worker identity")
+r = manual(toml=DEV_TOML.replace('name = "app-dev"', 'name = "app"'))
+check(r["result"] == "failure" and not ran(r, "PUBLISH"), "split contract: manual run applies the same config audit")
+
 sys.exit(fail)

@@ -430,7 +430,7 @@ check("Recovery FAILED" in byname["Dev recovery failed"]["run"] or "recovery FAI
 all_run = "\n".join(s_.get("run", "") for j in jobs.values() for s_ in j.get("steps", []))
 check("wrangler delete" not in all_run and "wrangler preview delete" not in "\n".join(s_.get("run", "").replace("\\`wrangler preview delete", "") for s_ in jobs["lifecycle"]["steps"] if "echo" not in s_.get("run", "")), "no job deletes a Worker; branch deletion retains the Shared Dev Worker and Native Previews")
 check(not re.search(r"CLOUDFLARE_DEV|dev-deploy|shared_dev|app_url_dev|dev_deploy_cmd|/dev\\b(?!/null)", yaml.dump(jobs["lifecycle"])), "branch-delete lifecycle never references Dev")
-check(runs("persistent-dev", scenario("workflow_dispatch", "refs/heads/dev", **dev_ok)) and jobs["persistent-dev"]["steps"][-2]["env"]["CMD"] == "${{ inputs.dev_deploy_cmd }}", "persistent-dev manual dispatch is unchanged and still runs dev_deploy_cmd")
+check(runs("persistent-dev", scenario("workflow_dispatch", "refs/heads/dev", **dev_ok)) and next(x for x in jobs["persistent-dev"]["steps"] if x.get("name") == "Deploy persistent Dev")["env"]["CMD"] == "${{ inputs.dev_deploy_cmd }}", "persistent-dev manual dispatch (legacy contract) still runs dev_deploy_cmd")
 check("shared_dev_on_branch_push" not in yaml.dump(jobs["persistent-dev"]), "persistent-dev does not depend on the automatic Shared Dev switch")
 check("playwright" not in dtxt.lower() and sum(1 for s_ in dj["steps"] if "upload-artifact" in str(s_.get("uses", ""))) == 0, "Shared Dev installs no browsers and uploads no artifacts")
 
@@ -447,5 +447,24 @@ aud = byname["Audit effective Wrangler config (Dev Worker identity, no Productio
 check(aud["if"] == "env.STALE != 'true'" and "dev-config-check" in aud["run"], "the Worker identity / resource audit is unconditional for every non-stale Shared Dev run")
 
 check("dev_binding_allow" in inputs_def and "--allow" in aud["run"] and "--allow" in rr, "dev_binding_allow reaches both the normal audit and the recovery audit")
+
+# 8.8 PR #64 review round 2: resource policy separation, command contract, recovery identity
+dtxt_all = yaml.dump(dj)
+check("preview_deny_resources" not in dtxt_all and "preview_binding_allow" not in dtxt_all and "dev_deny_resources" in dtxt_all, "Shared Dev audits use dev_deny_resources/dev_binding_allow only (never the Preview policy inputs)")
+check("preview_deny_resources" not in yaml.dump(jobs["persistent-dev"]) and "dev_deny_resources" in yaml.dump(jobs["persistent-dev"]), "manual Dev audit also uses the Dev policy")
+check("preview_deny_resources" in yaml.dump(jobs["deploy"]) and "dev_deny_resources" not in yaml.dump(jobs["deploy"]) and "dev_binding_allow" not in yaml.dump(jobs["deploy"]), "Native Preview keeps its own policy and ignores the Dev inputs")
+check("--prod-url" in aud["run"], "the Dev audit receives the Production URL (route/host check)")
+pd_steps = {x.get("name"): x for x in jobs["persistent-dev"]["steps"]}
+legacy = [x for x in jobs["persistent-dev"]["steps"] if x.get("if", "").startswith("inputs.dev_build_cmd == ''")]
+split = [x for x in jobs["persistent-dev"]["steps"] if "inputs.dev_build_cmd != ''" in x.get("if", "")]
+check(len(legacy) == 2 and len(split) >= 8, "persistent-dev: legacy steps (dev_build_cmd empty) and split-contract steps (dev_build_cmd set) are mutually exclusive")
+check(jobs["persistent-dev"]["if"] == "github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref" and jobs["persistent-dev"]["environment"] == "${{ inputs.app_name }}/dev",
+      "persistent-dev keeps the approved-ref gate and protected Environment")
+rec_ok = pd_steps["Record verified manual deployment"]
+check("steps.smoke.outcome == 'success'" in rec_ok["if"] and "steps.publish.outcome == 'success'" in rec_ok["if"], "a manual deployment is recorded verified only after publish AND smoke succeeded")
+check(all("gh.sh" not in x.get("run", "") for x in legacy), "legacy manual runs never write the known-good ledger")
+check("rebind-env" in rr and "--from \"$RUN_SHA\" --to \"$GOOD_SHA\"" in rr and "BUILD_ENV" in rr and "load_env_file" in rr, "recovery rebinds build env and version from the failed SHA to the last-good SHA")
+check("VITE_APP_VERSION" not in rec["env"] and "APP_VERSION_IN" in rec["env"], "recovery never reuses the failed run's version value unchanged")
+check("NOT verified" in rr and "NOT reverted" in rr, "recovery states when commit identity is unverified and that D1 is not reverted")
 
 sys.exit(fail)

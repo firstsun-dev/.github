@@ -323,31 +323,7 @@ export function sharedPreviewDevD1(cfg, { binding = '', devEnv = 'dev' } = {}) {
   return dev.some((d) => prev.some((p) => (d.database_id && d.database_id === p.database_id) || (d.database_name && d.database_name === p.database_name)));
 }
 
-/**
- * Audit the EFFECTIVE (adapter-generated) config of a Shared Dev build: it must target the expected Dev Worker
- * and must not bind any Production resource (top-level resources of the SOURCE config, plus denylist).
- */
-export function auditDevConfig(effective, source, { worker = '', denyResources = [], allow = [] } = {}) {
-  const errors = [];
-  const allowed = new Set(allow);
-  for (const a of allowed) {
-    if (!/^[a-z0-9_]+:[A-Za-z0-9_.-]+$/.test(a)) errors.push(`dev_binding_allow entry "${a}" must look like kind:BINDING`);
-    else if (a.startsWith('d1_databases:')) errors.push(`dev_binding_allow cannot allow a D1 database (${a}): Shared Dev never shares a D1 with Production`);
-  }
-  if (worker && effective.name !== worker) errors.push(`effective Wrangler config targets Worker "${effective.name}", expected the Shared Dev Worker "${worker}"`);
-  const prod = topLevelResourceIds(source);
-  const deny = new Set(denyResources);
-  for (const [kind, ident] of Object.entries(RESOURCE_KINDS)) {
-    for (const b of effective[kind] ?? []) {
-      if (allowed.has(`${kind}:${bindingKey(kind, b)}`) && kind !== 'd1_databases') continue; // explicit, documented exception
-      for (const id of ident(b).filter(Boolean)) {
-        if (prod.has(id)) errors.push(`${kind}:${bindingKey(kind, b)}: Shared Dev binds the Production resource ${id}`);
-        else if (deny.has(id)) errors.push(`${kind}:${bindingKey(kind, b)}: Shared Dev binds denylisted Production resource ${id}`);
-      }
-    }
-  }
-  return { errors };
-}
+export { auditDevConfig, parseDevAllow, DEV_SHAREABLE_KINDS } from './dev-policy.mjs';
 
 /** Resource ids declared at the top level of a config, per binding kind (flat set). */
 function topLevelResourceIds(cfg) {
@@ -372,4 +348,18 @@ export function auditProdConfig(effective, source) {
     if (previewIds.has(id)) errors.push(`Production config binds Preview resource ${id}`);
   }
   return { errors, warnings: [] };
+}
+
+/**
+ * Rebind commit identity in caller-provided text (e.g. build_env_dev, which the caller expanded with the FAILED
+ * run's SHA) to the SHA being restored. Replaces the full SHA and standalone 7-char short SHAs. Returns the new
+ * text and how many replacements were made.
+ */
+export function rebindSha(text, from, to) {
+  if (!/^[0-9a-f]{7,40}$/i.test(from) || !/^[0-9a-f]{7,40}$/i.test(to)) throw new Error('rebindSha needs hex SHAs');
+  let n = 0;
+  const swap = (re, rep) => { text = text.replace(re, () => { n += 1; return rep; }); };
+  swap(new RegExp(from, 'gi'), to);
+  swap(new RegExp(`\\b${from.slice(0, 7)}\\b`, 'gi'), to.slice(0, 7));
+  return { text, replacements: n };
 }

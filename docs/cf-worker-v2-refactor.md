@@ -52,7 +52,7 @@ Detect Changes (monorepo only — the CALLER runs _detect-changes.yml and gates 
 | Migration | `d1_migrations`, `d1_binding`, `d1_lock_scope` (no command override) |
 | Release | `release_cmd` (+ secret `RELEASE_TOKEN`) |
 | Hybrid | `persistent_dev_ref`, `dev_deploy_cmd`, `dev_smoke_cmd`, `dispatch_target` |
-| Shared Dev | `shared_dev_on_branch_push`, `app_url_dev`, `dev_deploy_cmd`, `dev_smoke_cmd`, `build_env_dev`, `dev_build_cmd`, `dev_wrangler_env` (default `dev`), `dev_worker_name`, `dev_binding_allow`; reuses `d1_migrations`, `d1_binding`, `sha_path`, `smoke_env`, `access_protected_targets`, `preview_deny_resources` |
+| Shared Dev | `shared_dev_on_branch_push`, `app_url_dev`, `dev_deploy_cmd`, `dev_smoke_cmd`, `build_env_dev`, `dev_build_cmd`, `dev_wrangler_env` (default `dev`), `dev_worker_name`, `dev_binding_allow`, `dev_deny_resources`; reuses `d1_migrations`, `d1_binding`, `sha_path`, `smoke_env`, `access_protected_targets`, `preview_deny_resources` |
 
 Outputs: `deploy_url`, `deploy_target`, `version_id` (prod only), `dev_url` (Shared Dev). The internal `deployed_and_verified` Deploy output is what gates Release. Secrets: `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` (prod), `CLOUDFLARE_PREVIEW_API_TOKEN/ACCOUNT_ID`, `CLOUDFLARE_DEV_*`, `PREVIEW_SECRETS`, `SMOKE_USERNAME/PASSWORD`, `RELEASE_TOKEN`.
 
@@ -93,8 +93,7 @@ Two independent switches decide what a non-main push deploys. Neither requires t
 
 * A failed build, audit or stale run never changes the running Dev Worker or its D1 (Preview migrates before it builds; Dev builds first because Dev has no separate Migration job).
 * Migration reuses `migrate.sh` with `TARGET=dev`: D1 = `env.<dev_wrangler_env>.d1_databases`, never top-level (Production); no fallback. The Preview D1 and the Dev D1 **may** be the same physical database (Blog); Production's may not. `migrations apply` is pending-only, and the job `needs` Migration/Deploy purely for ordering (their results are ignored), plus the shared concurrency group, so two channels never migrate one D1 at the same time.
-* `dev_worker_name` is **required**, and the audit runs on every Shared Dev run: the adapter-generated effective config (`.wrangler/deploy/config.json`), or if none was generated the source `env.<dev_wrangler_env>` block, must have `name == dev_worker_name` and bind none of the source config's top-level (Production) resources or `preview_deny_resources`.
-* `dev_binding_allow` (`kind:BINDING`, e.g. `r2_buckets:SHINYI_MUYU_VOICE_CACHE`) lets the Dev config keep a deliberately shared non-D1 Production resource (Blog's voice cache bucket, isolated by key prefix); a D1 can never be allowed.
+* `dev_worker_name` is **required**, and the audit runs on every Shared Dev run (automatic and manual split-contract): the adapter-generated effective config (`.wrangler/deploy/config.json`), or if none was generated the source `env.<dev_wrangler_env>` block, must have `name == dev_worker_name` and pass the resource policy below.
 * With `d1_migrations`, `dev_build_cmd` is **required**, so the Dev build always succeeds before the Dev D1 is migrated.
 * **Shared-D1 guard:** if the Preview and Dev D1 are the same physical database and the Preview Migration failed or was cancelled, Shared Dev stops before building or migrating (D1 state unknown). With distinct D1s or Preview off, Dev still deploys.
 * Credentials: `CLOUDFLARE_DEV_API_TOKEN` / `CLOUDFLARE_DEV_ACCOUNT_ID` only, in the `<app>/dev` Environment. No Production/Preview token or `PREVIEW_SECRETS` is referenced; a missing Dev token fails closed.
@@ -103,6 +102,54 @@ Two independent switches decide what a non-main push deploys. Neither requires t
 * Retention: branch deletion and disabling a switch deploy or delete nothing; no job deletes a Worker.
 
 Consumer sketch (Blog): `preview_on_branch_push: true`, `shared_dev_on_branch_push: true`, `app_url_dev: https://blog-preview.firstsun.org`, `dev_wrangler_env: dev`, `dev_worker_name: blog-preview`, `d1_migrations: true`, a required `dev_build_cmd` that builds with `CLOUDFLARE_ENV=dev` and a `dev_deploy_cmd` that only runs `wrangler deploy --config <effective config>`. Heaven ID: `preview_on_branch_push: false`, `shared_dev_on_branch_push: true`, `app_url_dev: https://id-dev.heavenfortress.com`.
+
+### Shared Dev resource policy (identity-aware, fail-closed)
+
+Production, Feature Preview and Shared Dev may share a resource **only when the sharing is explicit, exact and verified**. The Dev audit (`actions/cf-preview/dev-policy.mjs`) compares the Dev Worker's effective config with the Production (source top-level) config. It uses **only** `dev_binding_allow`, `dev_deny_resources` and the Production identities it discovers; `preview_binding_allow` / `preview_deny_resources` keep governing Native Preview and are never consulted for Dev (so Preview can block the Production bucket while Dev deliberately shares it).
+
+Precedence per binding: **1.** `dev_deny_resources` (hard deny, always fails, even if allowlisted) → **2.** allow-entry identity mismatch fails → **3.** a Production collision fails unless an exact, supported allow entry matches. An allow entry never skips another check (Worker identity, queues, services, routes, ...).
+
+`dev_binding_allow` syntax, whitespace/newline separated, `kind:BINDING=exact-identity`:
+
+```yaml
+dev_binding_allow: |
+  r2_buckets:SHINYI_MUYU_VOICE_CACHE=firstsun-blog-assets
+  kv_namespaces:CACHE=<namespace id>
+  services:AUTH=heaven-id-dev          # or worker#environment
+```
+
+| Kind | Identity compared | Production collision | Allowlist |
+|---|---|---|---|
+| `r2_buckets` | `bucket_name` | fail | exact `=bucket_name` |
+| `kv_namespaces` | `id` | fail | exact `=id` |
+| `vectorize` | `index_name` | fail | exact `=index_name` |
+| `analytics_engine_datasets` | `dataset` | fail | exact `=dataset` |
+| `d1_databases` | `database_id` **and** `database_name` | fail, **never approvable** | rejected |
+| `hyperdrive` (`id`), `secrets_store_secrets` (`store_id/secret_name`, full), `pipelines` (`pipeline`), `ratelimits` (`namespace_id`) | exact identity | fail | **not supported** (collision detection only) |
+| `queues` producers / consumers / `dead_letter_queue` | queue name | fail, no allowlist | **not supported** |
+| `services` | `service` (+ `#environment`) | Production Worker/service, or the Production Worker itself: fail, not approvable | default **deny**: each binding needs `services:BINDING=target` and must not be a Production target |
+| `routes` / `route` | pattern / host | a Production route or the `app_url_prod` host: fail | none |
+| `durable_objects` with another Worker's `script_name`; `workflows`, `dispatch_namespaces`, `mtls_certificates`, `containers`, `tail_consumers`, `unsafe` | — | **unsupported**: fail closed (cannot be verified generically) | none |
+
+Rules: an unknown kind, a malformed entry, a duplicate entry, an entry that matches no Dev binding, a binding declared twice, a binding with a missing or incomplete identity (e.g. a secret without `store_id`) and an identity mismatch (same binding, different bucket/id) all fail. A matching local binding **name** is never evidence that a remote service or resource is safe.
+
+* **Why D1 is always isolated:** a Production D1 holds Production data and is the only target of Production migrations; Preview and Dev may share one approved non-Production D1 (migration targeting stays explicit and fail-closed), but there is no bypass.
+* **Why Queues and Service Bindings are stricter:** a consumer or dead-letter queue *consumes or writes* Production work (Wrangler creates a missing dead-letter queue automatically), and a Service Binding invokes the other Worker's code and data. A shared R2 bucket with different object-key prefixes provides *application-level* isolation only; it does **not** make the bucket read-only for Dev, and the Dev Worker's token can still touch Production objects. Queue sharing, if ever needed, requires a separate high-risk policy with exact resource and direction; none exists.
+* Schema reference: the Wrangler configuration docs (https://developers.cloudflare.com/workers/wrangler/configuration/); kinds not listed above are not audited and any binding kind we cannot verify is rejected rather than assumed safe.
+
+### Manual vs automatic Dev contract
+
+Split contract (new consumers; opt in by setting `dev_build_cmd`): `dev_build_cmd` builds only, `dev_deploy_cmd` publishes only, `dev_smoke_cmd` verifies only. Automatic Shared Dev and the manual `persistent-dev` dispatch then both run build → config audit → Dev D1 migration (`d1_migrations`) → publish → smoke; the manual run also requires `dev_worker_name` and `app_url_dev`, keeps the approved-ref gate and protected `<app>/dev` Environment, and cannot skip the build. A manual run is recorded in the last-good ledger **only after its smoke passes** (failures are recorded as failed); it has no automatic recovery.
+
+Legacy contract (`dev_build_cmd` empty, existing hybrid callers): the manual dispatch runs `dev_deploy_cmd` (which must build itself) and the optional `dev_smoke_cmd` exactly as before and is **never** written to the ledger, so automatic recovery can never mistake it for a known-good release. Migration plan: add `dev_build_cmd`, `dev_worker_name`, `app_url_dev` (and an audit-clean Dev config); no caller is forced to.
+
+### Recovery limits
+
+After a failed Shared Dev smoke the job redeploys the last verified SHA (from the Dev ledger, any branch). It rebinds the commit identity: occurrences of the failed run's SHA (full and 7-character) in `build_env_dev` and `app_version` are replaced with the last-good SHA; `app_version` values not derived from the commit SHA are kept and flagged with a warning. It then repeats build, Worker-identity/resource audit, publish and the full smoke. Only with `sha_path` set is the restored **commit identity** verified; without it the summary says "commit identity NOT verified". It never rolls back D1 (a schema newer than the restored code is possible), a caller whose build parameters embed the commit in ways other than the exact SHA cannot be rebound, and a failed recovery is reported as such; the run is always red. Manual runs have no recovery.
+
+### Required follow-up in Blog #448 (after this PR is approved)
+
+Not changed by this PR. Replace `dev_binding_allow: r2_buckets:SHINYI_MUYU_VOICE_CACHE` with `r2_buckets:SHINYI_MUYU_VOICE_CACHE=firstsun-blog-assets`; set `dev_deny_resources` if Dev must never touch other Production resources (it must **not** list `firstsun-blog-assets`); keep `preview_deny_resources` for Native Preview unchanged; set `sha_path` so recovery verifies the commit; keep the Voice prefixes `cache/shinyi-muyu/tts/prod/` and `.../preview/`; pin to the merged SHA/tag; and provision the `CLOUDFLARE_DEV_*` secrets before any pilot.
 
 ## Migration, concurrency, release and secrets
 

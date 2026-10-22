@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { dirname, resolve } from 'node:path';
 import {
   assertWranglerSupported, auditDevConfig, auditPreviewConfig, auditProdConfig, classifyEvent, extractPreviewUrl,
-  isStale, migrationPlan, previewIdentity, readConfig, resolveSharedDev, resolveTarget, sharedPreviewDevD1,
+  isStale, migrationPlan, previewIdentity, readConfig, rebindSha, resolveSharedDev, resolveTarget, sharedPreviewDevD1,
 } from './lib.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -64,6 +64,13 @@ try {
       }) });
       break;
     }
+    case 'rebind-env': {
+      // stdout = rewritten text of environment variable --var (raw); the count goes to stderr.
+      const r = rebindSha(process.env[opt('var')] ?? '', opt('from'), opt('to'));
+      process.stdout.write(r.text);
+      console.error(`rebound ${r.replacements} commit reference(s) in ${opt('var')}`);
+      break;
+    }
     case 'd1-shared': {
       out({ shared: String(sharedPreviewDevD1(readConfig(opt('config')), { binding: opt('binding'), devEnv: opt('dev-env', 'dev') })) });
       break;
@@ -80,7 +87,7 @@ try {
         if (!effective) throw new Error(`No effective config was generated and the source config has no env.${opt('dev-env', 'dev')}`);
         console.log(`::notice::No adapter-generated config; auditing source env.${opt('dev-env', 'dev')}`);
       }
-      const { errors } = auditDevConfig(effective, source, { worker: opt('worker'), denyResources: list(opt('deny')), allow: list(opt('allow')) });
+      const { errors } = auditDevConfig(effective, source, { worker: opt('worker'), denyResources: list(opt('deny')), allow: list(opt('allow')), prodUrl: opt('prod-url') });
       for (const e of errors) console.log(`::error::${e}`);
       if (errors.length) process.exit(1);
       out({ dev_config: 'ok' });
@@ -123,7 +130,7 @@ try {
       out({ stale: String(isStale({ runSha: opt('sha'), branchTipSha: opt('tip') })) });
       break;
     default:
-      console.error('usage: cli.mjs identity|wrangler-check|extract-url|classify|resolve|resolve-dev|d1-shared|dev-config-check|preflight|migration-config|effective-config|audit-prod|stale');
+      console.error('usage: cli.mjs identity|wrangler-check|extract-url|classify|resolve|resolve-dev|rebind-env|d1-shared|dev-config-check|preflight|migration-config|effective-config|audit-prod|stale');
       process.exit(2);
   }
 } catch (e) {

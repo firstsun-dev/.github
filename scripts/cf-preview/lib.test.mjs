@@ -273,28 +273,92 @@ test('migrationPlan(dev): reads env.<dev>.d1_databases; may equal the Preview D1
   assert.throws(() => migrationPlan({ ...DEVCFG, env: {} }, 'dev', { migrationsDirAbs: abs }), /No D1 binding.*env\.dev\.d1_databases/); // no top-level (Production) fallback
   assert.equal(migrationPlan({ ...DEVCFG, env: { qa: DEVCFG.env.dev } }, 'dev', { devEnv: 'qa', migrationsDirAbs: abs }).databaseId, 'TEST-ID');
 });
-test('auditDevConfig: effective config must target the Dev Worker and no Production resource', () => {
-  const ok = { name: 'blog-preview', d1_databases: [{ binding: 'DB', database_id: 'TEST-ID', database_name: 'blog-test' }], r2_buckets: [{ binding: 'B', bucket_name: 'dev-b' }] };
-  assert.deepEqual(auditDevConfig(ok, DEVCFG, { worker: 'blog-preview' }).errors, []);
-  assert.match(auditDevConfig({ ...ok, name: 'blog' }, DEVCFG, { worker: 'blog-preview' }).errors[0], /expected the Shared Dev Worker "blog-preview"/);
-  const prodD1 = { ...ok, d1_databases: [{ binding: 'DB', database_id: 'PROD-ID', database_name: 'blog-db' }] };
-  assert.ok(auditDevConfig(prodD1, DEVCFG, { worker: 'blog-preview' }).errors.some((e) => /Production resource PROD-ID/.test(e)));
-  const prodR2 = { ...ok, r2_buckets: [{ binding: 'B', bucket_name: 'prod-b' }] };
-  assert.ok(auditDevConfig(prodR2, DEVCFG, { worker: 'blog-preview' }).errors.some((e) => /prod-b/.test(e)));
-  assert.ok(auditDevConfig({ ...ok, r2_buckets: [{ binding: 'B', bucket_name: 'secret-b' }] }, DEVCFG, { denyResources: ['secret-b'] }).errors.length === 1);
+const PRODCFG = {
+  name: 'blog',
+  d1_databases: [{ binding: 'DB', database_name: 'blog-db', database_id: 'PROD-ID' }],
+  r2_buckets: [{ binding: 'VOICE', bucket_name: 'prod-b' }],
+  kv_namespaces: [{ binding: 'KV', id: 'kv-prod' }],
+  queues: { producers: [{ binding: 'Q', queue: 'jobs' }], consumers: [{ queue: 'jobs', dead_letter_queue: 'jobs-dlq' }] },
+  services: [{ binding: 'AUTH', service: 'auth-prod' }],
+  routes: [{ pattern: 'blog.example.com', custom_domain: true }],
+  ratelimits: [{ name: 'RL', namespace_id: '1101' }],
+};
+const devCfg = (over = {}) => ({ name: 'blog-preview', d1_databases: [{ binding: 'DB', database_id: 'TEST-ID', database_name: 'blog-test' }], ...over });
+const audit = (eff, o = {}) => auditDevConfig(eff, PRODCFG, { worker: 'blog-preview', ...o }).errors;
+const has = (errs, re) => errs.some((e) => re.test(e));
+const SHARE = ['r2_buckets:VOICE=prod-b'];
+const R2 = (name, binding = 'VOICE') => ({ r2_buckets: [{ binding, bucket_name: name }] });
+
+test('Dev audit: Worker identity and a clean Dev config', () => {
+  assert.deepEqual(audit(devCfg()), []);
+  assert.ok(has(audit({ ...devCfg(), name: 'blog' }), /expected the Shared Dev Worker "blog-preview"/));
+});
+test('Dev allowlist: exact approved R2 passes; a different bucket, binding or malformed policy fails', () => {
+  assert.deepEqual(audit(devCfg(R2('prod-b')), { allow: SHARE }), []);
+  assert.ok(has(audit(devCfg(R2('other-b')), { allow: SHARE }), /bound to other-b but the allowlist approves prod-b/)); // same binding, other bucket
+  assert.ok(has(audit(devCfg(R2('prod-b', 'OTHER')), { allow: SHARE }), /matches no binding/)); // approved binding missing
+  assert.ok(has(audit(devCfg(R2('prod-b', 'OTHER')), { allow: SHARE }), /OTHER.*Production resource prod-b|Production resource prod-b/)); // same bucket, unapproved binding
+  assert.ok(has(audit(devCfg(R2('prod-b'))), /Production resource prod-b/)); // no entry at all
+  assert.ok(has(audit(devCfg(), { allow: ['r2_buckets:VOICE'] }), /malformed/)); // legacy name-only format
+  assert.ok(has(audit(devCfg(), { allow: ['r2_buckets:VOICE=a', 'r2_buckets:VOICE=b'] }), /more than one entry/));
+  assert.ok(has(audit(devCfg(), { allow: ['bogus_kind:X=y'] }), /not supported/));
+  assert.ok(has(audit(devCfg(), { allow: ['r2_buckets:VOICE=prod-b'] }), /matches no binding/));
+});
+test('Dev allowlist: missing identity, hard deny precedence, D1 never approvable', () => {
+  assert.ok(has(audit(devCfg({ r2_buckets: [{ binding: 'VOICE' }] }), { allow: SHARE }), /identity is missing/));
+  assert.ok(has(audit(devCfg(R2('prod-b')), { allow: SHARE, denyResources: ['prod-b'] }), /hard-denied/)); // deny beats allow
+  assert.ok(has(audit(devCfg({ d1_databases: [{ binding: 'DB', database_id: 'PROD-ID', database_name: 'blog-db' }] }), { allow: ['d1_databases:DB=PROD-ID'] }), /cannot approve a D1/));
+  assert.ok(has(audit(devCfg({ d1_databases: [{ binding: 'DB', database_id: 'PROD-ID', database_name: 'blog-db' }] })), /Production D1 can never be shared/));
+  assert.deepEqual(audit(devCfg({ d1_databases: [{ binding: 'DB', database_id: 'PREV-SHARED', database_name: 'blog-test' }] })), []); // Preview/Dev non-production D1
+  assert.ok(has(audit(devCfg({ r2_buckets: [{ binding: 'VOICE', bucket_name: 'a' }, { binding: 'VOICE', bucket_name: 'b' }] })), /more than once/));
+});
+test('Dev allowlist: per-kind identity, no cross-kind or partial matches; unshareable kinds', () => {
+  assert.deepEqual(audit(devCfg({ kv_namespaces: [{ binding: 'KV', id: 'kv-prod' }] }), { allow: ['kv_namespaces:KV=kv-prod'] }), []);
+  assert.ok(has(audit(devCfg({ kv_namespaces: [{ binding: 'KV', id: 'kv-prod' }] }), { allow: ['kv_namespaces:KV=kv-other'] }), /identity mismatch/));
+  assert.ok(has(audit(devCfg({ hyperdrive: [{ binding: 'H', id: 'h1' }] }), { allow: ['hyperdrive:H=h1'] }), /not supported/));
+  const prodSecrets = { ...PRODCFG, secrets_store_secrets: [{ binding: 'S', store_id: 'st', secret_name: 'k' }] };
+  assert.ok(auditDevConfig(devCfg({ secrets_store_secrets: [{ binding: 'S', store_id: 'st', secret_name: 'k' }] }), prodSecrets, {}).errors.some((e) => /Production resource st\/k/.test(e)));
+  assert.deepEqual(auditDevConfig(devCfg({ secrets_store_secrets: [{ binding: 'S', store_id: 'st', secret_name: 'other' }] }), prodSecrets, {}).errors, []); // full identity, not store only
+  assert.ok(has(audit(devCfg({ secrets_store_secrets: [{ binding: 'S', store_id: 'st' }] })), /identity is missing/)); // partial identity
+  assert.ok(has(audit(devCfg({ ratelimits: [{ name: 'RL', namespace_id: 1101 }] })), /Production resource 1101/)); // rate-limit counters are shared per namespace
+});
+test('Dev audit: queues (producer, consumer, DLQ) must not be Production queues', () => {
+  const dq = (queues) => audit(devCfg({ queues }));
+  assert.deepEqual(dq({ producers: [{ binding: 'Q', queue: 'jobs-dev' }], consumers: [{ queue: 'jobs-dev', dead_letter_queue: 'jobs-dev-dlq' }] }), []);
+  assert.ok(has(dq({ producers: [{ binding: 'Q', queue: 'jobs' }] }), /producer "jobs" is a Production queue/));
+  assert.ok(has(dq({ consumers: [{ queue: 'jobs' }] }), /consumer "jobs" is a Production queue/));
+  assert.ok(has(dq({ consumers: [{ queue: 'jobs-dev', dead_letter_queue: 'jobs-dlq' }] }), /dead-letter "jobs-dlq" is a Production queue/));
+  assert.ok(has(dq({ producers: [{ binding: 'Q' }] }), /queue name is missing/));
+  assert.ok(has(audit(devCfg({ queues: { producers: [{ binding: 'Q', queue: 'jobs' }] } }), { allow: ['queues:Q=jobs'] }), /not supported/)); // no storage-style bypass
+});
+test('Dev audit: service bindings are default-deny and never Production; routes; durable objects; unsupported kinds', () => {
+  const sv = (services, o) => audit(devCfg({ services }), o);
+  assert.deepEqual(sv([{ binding: 'AUTH', service: 'auth-dev' }], { allow: ['services:AUTH=auth-dev'] }), []);
+  assert.ok(has(sv([{ binding: 'AUTH', service: 'auth-dev' }]), /not approved/));
+  assert.ok(has(sv([{ binding: 'AUTH', service: 'auth-prod' }], { allow: ['services:AUTH=auth-prod'] }), /Production\/denied Worker; this cannot be approved/));
+  assert.ok(has(sv([{ binding: 'SELF', service: 'blog' }], { allow: ['services:SELF=blog'] }), /Production/)); // the Production Worker itself
+  assert.ok(has(sv([{ binding: 'AUTH', service: 'auth-dev' }], { allow: ['services:AUTH=other'] }), /identity mismatch/));
+  assert.ok(has(sv([{ binding: 'AUTH' }]), /ambiguous/));
+  assert.ok(has(sv([{ service: 'auth-dev' }]), /ambiguous/));
+  assert.deepEqual(sv([{ binding: 'AUTH', service: 'auth', environment: 'dev' }], { allow: ['services:AUTH=auth#dev'] }), []);
+  assert.ok(has(sv([{ binding: 'AUTH', service: 'auth', environment: 'dev' }], { allow: ['services:AUTH=auth'] }), /identity mismatch/));
+  assert.ok(has(audit(devCfg({ routes: [{ pattern: 'blog.example.com', custom_domain: true }] })), /Production route/));
+  assert.ok(has(audit(devCfg({ route: 'https://prod.example.com/*' }), { prodUrl: 'https://prod.example.com' }), /Production route\/host/));
+  assert.deepEqual(audit(devCfg({ routes: [{ pattern: 'blog-preview.example.com', custom_domain: true }] }), { prodUrl: 'https://prod.example.com' }), []);
+  assert.ok(has(audit(devCfg({ durable_objects: { bindings: [{ name: 'D', class_name: 'C', script_name: 'blog' }] } })), /another Worker/));
+  assert.deepEqual(audit(devCfg({ durable_objects: { bindings: [{ name: 'D', class_name: 'C' }] } })), []);
+  assert.ok(has(audit(devCfg({ workflows: [{ name: 'w', binding: 'W', class_name: 'C' }] })), /not supported/));
+});
+test('Preview policy is independent: a Dev exception does not weaken Native Preview, a Preview denylist does not block Dev', () => {
+  const cfg = { ...PRODCFG, previews: { r2_buckets: [{ binding: 'VOICE', bucket_name: 'prod-b' }], d1_databases: [{ binding: 'DB', database_id: 'P', database_name: 'p' }] } };
+  // Native Preview still rejects the Production bucket whatever the Dev allowlist says.
+  assert.ok(auditPreviewConfig(cfg, { allow: [], denyResources: ['prod-b'] }).errors.some((e) => /Production|denylisted/.test(e)));
+  // The Dev audit takes only its own denylist, so a Preview-only deny entry is irrelevant to an approved Dev share.
+  assert.deepEqual(audit(devCfg(R2('prod-b')), { allow: SHARE, denyResources: ['some-preview-only-thing'] }), []);
 });
 test('sharedPreviewDevD1: same physical D1 detected; distinct or undeclared Preview is not shared', () => {
   assert.equal(sharedPreviewDevD1(DEVCFG), true);
   assert.equal(sharedPreviewDevD1({ ...DEVCFG, previews: {} }), false);
   assert.equal(sharedPreviewDevD1({ ...DEVCFG, env: { dev: { d1_databases: [{ binding: 'DB', database_name: 'other', database_id: 'X' }] } } }), false);
   assert.equal(sharedPreviewDevD1({ ...DEVCFG, env: {} }), false);
-});
-test('auditDevConfig: dev_binding_allow permits an explicit non-D1 shared binding only', () => {
-  const eff = { name: 'blog-preview', r2_buckets: [{ binding: 'B', bucket_name: 'prod-b' }] };
-  assert.equal(auditDevConfig(eff, DEVCFG, { worker: 'blog-preview' }).errors.length, 1);
-  assert.deepEqual(auditDevConfig(eff, DEVCFG, { worker: 'blog-preview', allow: ['r2_buckets:B'], denyResources: ['prod-b'] }).errors, []);
-  assert.equal(auditDevConfig(eff, DEVCFG, { worker: 'blog-preview', allow: ['r2_buckets:OTHER'] }).errors.length, 1);
-  const d1 = { name: 'blog-preview', d1_databases: [{ binding: 'DB', database_id: 'PROD-ID' }] };
-  assert.ok(auditDevConfig(d1, DEVCFG, { worker: 'blog-preview', allow: ['d1_databases:DB'] }).errors.some((e) => /cannot allow a D1/.test(e)));
-  assert.ok(auditDevConfig(d1, DEVCFG, { worker: 'blog-preview', allow: ['d1_databases:DB'] }).errors.some((e) => /Production resource PROD-ID/.test(e)));
 });

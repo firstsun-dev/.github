@@ -211,8 +211,10 @@ on:
         default: ''
       dev_deploy_cmd:
         description: >
-          Command deploying the Dev Worker from app_path. Used by the manual persistent-dev dispatch (it must build first)
-          and by Shared Dev, which runs it with `bash -eo pipefail` AFTER dev_build_cmd when that is set (then it must only publish).
+          Command deploying the Dev Worker from app_path. Split contract (set dev_build_cmd): dev_build_cmd builds only,
+          dev_deploy_cmd publishes only, dev_smoke_cmd verifies only; Shared Dev and the manual persistent-dev dispatch
+          both run build -> config audit -> migration -> publish -> smoke. Legacy contract (dev_build_cmd empty): the
+          manual dispatch runs dev_deploy_cmd (which must build) and the optional dev_smoke_cmd exactly as before.
         type: string
         default: ''
       dev_smoke_cmd:
@@ -224,7 +226,7 @@ on:
         type: string
         default: ''
       dev_build_cmd:
-        description: Optional Shared Dev build from app_path (with build_env_dev). Set it so a failed build stops before anything is published. Leave empty if dev_deploy_cmd builds itself.
+        description: Dev build from app_path (with build_env_dev), build only. Required by Shared Dev with d1_migrations; setting it also opts the manual persistent-dev dispatch into the split contract. Leave empty only for a legacy persistent-dev caller whose dev_deploy_cmd builds itself.
         type: string
         default: ''
       dev_wrangler_env:
@@ -233,8 +235,15 @@ on:
         default: dev
       dev_binding_allow:
         description: >
-          Space-separated kind:BINDING entries of the Dev config that may deliberately bind a Production resource
-          (e.g. "r2_buckets:SHINYI_MUYU_VOICE_CACHE" for a shared bucket isolated by key prefix). D1 can never be allowed.
+          Shared Dev resource-sharing approvals, whitespace/newline separated `kind:BINDING=exact-identity`
+          (r2_buckets=bucket_name, kv_namespaces=id, vectorize=index_name, analytics_engine_datasets=dataset,
+          services=worker[#environment]). Only the exact resource is approved; any other bucket/id/service, an unknown
+          kind, a D1, a malformed or duplicate entry, or an entry matching no Dev binding fails the audit.
+          Example: `r2_buckets:SHINYI_MUYU_VOICE_CACHE=firstsun-blog-assets`.
+        type: string
+        default: ''
+      dev_deny_resources:
+        description: Space-separated resource identities (bucket, id, queue, Worker) Shared Dev must never bind. Independent of preview_deny_resources; always wins over dev_binding_allow.
         type: string
         default: ''
       dev_worker_name:
@@ -1161,13 +1170,14 @@ jobs:
         env:
           CFG: ${{ inputs.wrangler_config }}
           WORKER: ${{ inputs.dev_worker_name }}
-          DENY: ${{ inputs.preview_deny_resources }}
+          DENY: ${{ inputs.dev_deny_resources }}
           DEV_ENV: ${{ inputs.dev_wrangler_env }}
           ALLOW: ${{ inputs.dev_binding_allow }}
+          PROD_URL: ${{ inputs.app_url_prod }}
         run: |
           TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
           EFFECTIVE="$(node "$TOOLS/cli.mjs" effective-config --dir . | sed -n 's/^effective_config=//p')"
-          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY" --dev-env "$DEV_ENV" --allow "$ALLOW"
+          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY" --dev-env "$DEV_ENV" --allow "$ALLOW" --prod-url "$PROD_URL"
       - name: Stale-SHA guard (before migration and publish)
         if: env.STALE != 'true'
         run: |
@@ -1267,12 +1277,15 @@ jobs:
           BUILD_CMD: ${{ inputs.dev_build_cmd }}
           DEPLOY_CMD: ${{ inputs.dev_deploy_cmd }}
           VITE_APP_ENV: dev
-          VITE_APP_VERSION: ${{ inputs.app_version }}
+          # Caller-expanded values embed the FAILED run's commit (build_env_dev via ${{ github.sha }}, app_version).
+          # They are rebound to the last-good SHA below; nothing here is reused unchanged.
+          APP_VERSION_IN: ${{ inputs.app_version }}
           CFG: ${{ inputs.wrangler_config }}
           WORKER: ${{ inputs.dev_worker_name }}
-          DENY: ${{ inputs.preview_deny_resources }}
+          DENY: ${{ inputs.dev_deny_resources }}
           DEV_ENV: ${{ inputs.dev_wrangler_env }}
           ALLOW: ${{ inputs.dev_binding_allow }}
+          PROD_URL: ${{ inputs.app_url_prod }}
           GOOD_SHA: ${{ steps.good.outputs.sha }}
           TARGET_URL: ${{ inputs.app_url_dev }}
           DEPLOY_TARGET: dev
@@ -1284,17 +1297,29 @@ jobs:
           SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
           NO_PROXY: '*'
         run: |
-          # Same gates as the normal publish, applied to the LAST-GOOD tree: build, Worker identity and
-          # Production-resource audit, publish, then the full smoke (probe, sha_path for the good SHA, dev_smoke_cmd).
+          # Same gates as the normal publish, applied to the LAST-GOOD tree and its own identity: rebound build
+          # environment and version, build, Worker identity / resource audit, publish, then the full smoke
+          # (probe, sha_path for the good SHA, dev_smoke_cmd). D1 is never rolled back.
           TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
           export TOOLS_DIR="$TOOLS"
+          . "$TOOLS/envfile.sh"
           pnpm install --frozen-lockfile
+          REBOUND_ENV="$(node "$TOOLS/cli.mjs" rebind-env --var BUILD_ENV --from "$RUN_SHA" --to "$GOOD_SHA")"
+          export REBOUND_ENV
+          node "$TOOLS/parse-env.mjs" REBOUND_ENV "$RUNNER_TEMP/dev-recover.env"
+          load_env_file "$RUNNER_TEMP/dev-recover.env"
+          rm -f "$RUNNER_TEMP/dev-recover.env"
+          export CLOUDFLARE_ENV="${CLOUDFLARE_ENV:-}"
+          VITE_APP_VERSION="$(APP_VERSION_IN="$APP_VERSION_IN" node "$TOOLS/cli.mjs" rebind-env --var APP_VERSION_IN --from "$RUN_SHA" --to "$GOOD_SHA")"
+          export VITE_APP_VERSION
+          [ -z "$APP_VERSION_IN" ] || [ "$APP_VERSION_IN" != "$VITE_APP_VERSION" ] || echo "::warning::app_version is not derived from the commit SHA; recovery keeps it as configured"
           [ -z "$BUILD_CMD" ] || bash -eo pipefail -c "$BUILD_CMD"
           EFFECTIVE="$(node "$TOOLS/cli.mjs" effective-config --dir . | sed -n 's/^effective_config=//p')"
-          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY" --dev-env "$DEV_ENV" --allow "$ALLOW"
+          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY" --dev-env "$DEV_ENV" --allow "$ALLOW" --prod-url "$PROD_URL"
           bash -eo pipefail -c "$DEPLOY_CMD"
           "$TOOLS/smoke.sh" >/dev/null
-          echo "### ♻️ Recovered and fully re-verified Shared Dev at last good commit \`$GOOD_SHA\`. Run remains FAILED for the bad commit. D1 migrations (if any) were NOT reverted." >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$SHA_PATH" ]; then LEVEL="commit identity verified at $SHA_PATH"; else LEVEL="smoke passed but commit identity NOT verified (set sha_path)"; fi
+          echo "### ♻️ Shared Dev redeployed from last good commit \`$GOOD_SHA\` — $LEVEL. Run remains FAILED for the bad commit. D1 migrations (if any) were NOT reverted." >> "$GITHUB_STEP_SUMMARY"
       - name: Dev recovery failed
         if: failure() && steps.good.outputs.sha != '' && steps.recover.outcome == 'failure'
         run: echo "### 🚨 Automatic recovery FAILED — Shared Dev serves unverified code. Push a fix from any branch." >> "$GITHUB_STEP_SUMMARY"
@@ -1427,9 +1452,19 @@ jobs:
     concurrency:
       group: cfv2-dev-${{ github.repository }}-${{ inputs.app_name }}
       cancel-in-progress: false
+    permissions:
+      contents: read
+      deployments: write # split contract only: Dev ledger entry, recorded verified ONLY after the smoke passes
     env:
+      GH_TOKEN: ${{ github.token }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEV_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_DEV_ACCOUNT_ID }}
+      BRANCH_REF: ${{ github.ref }}
+      RUN_SHA: ${{ github.sha }}
+      APP_NAME: ${{ inputs.app_name }}
+      LEDGER_ENV: ${{ inputs.app_name }}/dev/shared
+      BUILD_ENV: ${{ inputs.build_env_dev }}
+      SMOKE_ENV: ${{ inputs.smoke_env }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -1438,7 +1473,10 @@ jobs:
         with:
           setup-node: 'false'
           setup-pnpm: 'false'
+      # ---- Legacy contract (dev_build_cmd empty): unchanged. dev_deploy_cmd builds and publishes; never recorded
+      # in the Shared Dev last-good ledger, so automatic recovery can never treat it as a known-good release.
       - name: Deploy persistent Dev
+        if: inputs.dev_build_cmd == ''
         working-directory: ${{ inputs.app_path }}
         env:
           CMD: ${{ inputs.dev_deploy_cmd }}
@@ -1446,8 +1484,124 @@ jobs:
           [ -n "$CMD" ] || { echo "::error::dev_deploy_cmd required"; exit 1; }
           bash -c "$CMD"
       - name: Dev smoke (Cron/Queue-adjacent checks)
-        if: inputs.dev_smoke_cmd != ''
+        if: inputs.dev_build_cmd == '' && inputs.dev_smoke_cmd != ''
         working-directory: ${{ inputs.app_path }}
         env:
           CMD: ${{ inputs.dev_smoke_cmd }}
         run: bash -c "$CMD"
+      # ---- Split contract (dev_build_cmd set): the same sequence and gates as automatic Shared Dev, without
+      # automatic recovery. Build / publish / smoke are separate commands, so a manual run can neither skip the build
+      # nor be recorded as verified without a passing smoke.
+      - name: Fetch tooling
+        if: inputs.dev_build_cmd != ''
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: actions/cf-preview
+          persist-credentials: false
+      - name: Install tooling deps
+        if: inputs.dev_build_cmd != ''
+        run: cd "$TOOLS_DIR" && npm ci --ignore-scripts --no-audit --no-fund
+      - name: Validate manual Dev configuration and credentials (fail closed)
+        if: inputs.dev_build_cmd != ''
+        env:
+          DEPLOY_CMD: ${{ inputs.dev_deploy_cmd }}
+          DEV_URL: ${{ inputs.app_url_dev }}
+          DEV_WORKER: ${{ inputs.dev_worker_name }}
+        run: |
+          [ -n "$DEPLOY_CMD" ] || { echo "::error::dev_deploy_cmd required"; exit 1; }
+          [ -n "$DEV_URL" ] || { echo "::error::the split Dev contract requires app_url_dev (smoke target)"; exit 1; }
+          [ -n "$DEV_WORKER" ] || { echo "::error::the split Dev contract requires dev_worker_name"; exit 1; }
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::Dev credentials not provided; refusing to fall back to other credentials"; exit 1
+          fi
+      - name: Start Dev ledger entry (manual)
+        if: inputs.dev_build_cmd != ''
+        id: dep
+        run: |
+          PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg w "$APP_NAME" '{branch_ref:$ref,worker:$w,manual:true}')"
+          ID="$("$TOOLS_DIR/gh.sh" start "$LEDGER_ENV" "$RUN_SHA" "$PAYLOAD" "Persistent Dev (manual)")"
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          "$TOOLS_DIR/gh.sh" status "$ID" in_progress "" "Manual deploy of $RUN_SHA"
+      - name: Inject Dev build environment
+        if: inputs.dev_build_cmd != ''
+        run: node "$TOOLS_DIR/parse-env.mjs" BUILD_ENV "$GITHUB_ENV"
+      - name: Dev build
+        if: inputs.dev_build_cmd != ''
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CMD: ${{ inputs.dev_build_cmd }}
+          CLOUDFLARE_ENV: ${{ inputs.dev_wrangler_env }}
+          VITE_APP_ENV: dev
+          VITE_APP_VERSION: ${{ inputs.app_version }}
+        run: bash -eo pipefail -c "$CMD"
+      - name: Audit effective Wrangler config (Dev Worker identity, resource policy)
+        if: inputs.dev_build_cmd != ''
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CFG: ${{ inputs.wrangler_config }}
+          WORKER: ${{ inputs.dev_worker_name }}
+          DENY: ${{ inputs.dev_deny_resources }}
+          DEV_ENV: ${{ inputs.dev_wrangler_env }}
+          ALLOW: ${{ inputs.dev_binding_allow }}
+          PROD_URL: ${{ inputs.app_url_prod }}
+        run: |
+          TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
+          EFFECTIVE="$(node "$TOOLS/cli.mjs" effective-config --dir . | sed -n 's/^effective_config=//p')"
+          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY" --dev-env "$DEV_ENV" --allow "$ALLOW" --prod-url "$PROD_URL"
+      - name: Apply pending Dev migrations (Dev D1 only)
+        if: inputs.dev_build_cmd != '' && inputs.d1_migrations
+        env:
+          APP_DIR: ${{ github.workspace }}/${{ inputs.app_path }}
+          WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
+          D1_BINDING: ${{ inputs.d1_binding }}
+          DEV_ENV: ${{ inputs.dev_wrangler_env }}
+        run: |
+          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
+          "$TOOLS_DIR/migrate.sh" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Publish Dev
+        if: inputs.dev_build_cmd != ''
+        id: publish
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CMD: ${{ inputs.dev_deploy_cmd }}
+          VITE_APP_ENV: dev
+          VITE_APP_VERSION: ${{ inputs.app_version }}
+        run: bash -eo pipefail -c "$CMD"
+      - name: Inject smoke environment
+        if: inputs.dev_build_cmd != '' && steps.publish.outcome == 'success'
+        run: node "$TOOLS_DIR/parse-env.mjs" SMOKE_ENV "$GITHUB_ENV"
+      - name: Smoke — Dev URL (fails closed)
+        if: inputs.dev_build_cmd != '' && steps.publish.outcome == 'success'
+        id: smoke
+        working-directory: ${{ inputs.app_path }}
+        env:
+          TARGET_URL: ${{ inputs.app_url_dev }}
+          DEPLOY_TARGET: dev
+          TEST_ENV: dev
+          EXPECTED_SHA: ${{ github.sha }}
+          SMOKE_CMD: ${{ inputs.dev_smoke_cmd }}
+          SHA_PATH: ${{ inputs.sha_path }}
+          ACCESS_TARGETS: ${{ inputs.access_protected_targets }}
+          SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
+          SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
+          NO_PROXY: '*'
+        run: |
+          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
+          "$TOOLS_DIR/smoke.sh" | tee -a "$GITHUB_OUTPUT"
+      # The ONLY place a manual deployment becomes "known good": publish succeeded AND the smoke passed.
+      - name: Record verified manual deployment
+        if: inputs.dev_build_cmd != '' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'success'
+        env:
+          LEVEL: ${{ steps.smoke.outputs.smoke_level }}
+          URL: ${{ inputs.app_url_dev }}
+        run: |
+          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" success "$URL" "Manual deploy of $RUN_SHA verified ($LEVEL)"
+          echo "### ✅ Persistent Dev verified — \`$APP_NAME\` at \`$RUN_SHA\` ($LEVEL)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Record failed manual deployment
+        if: failure() && inputs.dev_build_cmd != '' && steps.dep.outputs.id != ''
+        run: |
+          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" failure "" "Manual deploy failed or unverified; NOT a known-good release" || true
+          echo "### ❌ Persistent Dev run failed — not recorded as known-good. Dev may serve unverified code; no automatic recovery for manual runs." >> "$GITHUB_STEP_SUMMARY"
