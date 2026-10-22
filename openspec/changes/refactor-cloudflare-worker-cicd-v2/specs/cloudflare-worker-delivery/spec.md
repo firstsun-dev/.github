@@ -1,5 +1,7 @@
 # Cloudflare Worker Delivery — v2 In-Place Refactor Delta Specification
 
+> **Amended by `add-cloudflare-shared-dev-channel` (PR #64):** the requirement "Remote D1 migrations SHALL run as a separate, target-bound job" is renamed and modified there — migration is an explicit step of the single Deploy engine, not a job. Wherever this document says `Migration` job, read "Migration step of Deploy".
+
 **Scope:** the in-place, breaking refactor of the v2 shared workflow (`_cf-worker-v2.yml`) and its consumer contract. v1/v1.5 are unchanged and no new major (`v3`) is introduced. Requirements from `redesign-cloudflare-worker-cicd-v2` remain in force for eligible Native Previews except where the refactored job topology and migration/build contracts explicitly supersede them; the old v2 interface is not preserved.
 
 ## ADDED Requirements
@@ -222,3 +224,28 @@ The refactored v2 SHALL preserve the previously shipped per-branch stable Native
 - **WHEN** Blog and Heaven ID migrate in separate reviewed PRs
 - **THEN** both SHALL demonstrate correct E2E/test build versus target deploy build, distinct Migration Job, stable multi-branch Previews, smoke/recovery and applicable special checks
 - **AND** the new immutable v2.x.y release and any move of floating `@v2` SHALL wait for verified pilot evidence.
+
+### Requirement: Verification levels distinguish published, liveness-verified and content-verified deployments
+
+The delivery engine SHALL report the smoke outcome as `liveness` (only the Cloudflare Access login answered), `content` (the application answered) or `content-sha` (content and the expected commit SHA verified). Only `content` and `content-sha` SHALL set `deployed_and_verified=true`, emit `verified_url`, record a `success` ledger status eligible for automatic recovery, or allow Release. A `liveness` outcome SHALL be reported as `published_unverified=true` with `published_url`, SHALL NOT be recorded as a known-good deployment, and SHALL NOT satisfy `sha_path` or `smoke_cmd` verification.
+
+#### Scenario: Production Access liveness only
+
+- **WHEN** Production is listed in `access_protected_targets` and only the Access login redirect answers
+- **THEN** the job succeeds with `smoke_level=liveness`, `deployed_and_verified=false` and a published-but-unverified summary
+- **AND** Release does not run
+
+#### Scenario: Authenticated content smoke
+
+- **WHEN** service-token headers supplied through `smoke_env` `PROBE_HEADERS` let the probe reach the application
+- **THEN** the level is `content` (or `content-sha` when `sha_path` matches) and the deployment is eligible as verified and known-good
+
+#### Scenario: Access service token authenticates smoke
+
+- **WHEN** `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` are both configured
+- **THEN** both headers are sent to the probe and the `sha_path` request without appearing in argv or logs
+- **AND** a single configured credential, or a token that is still redirected to Access, fails the smoke
+
+### Requirement: Invalid configuration and CI-only runs never touch shared deployment state
+
+An invalid `production-only` + `shared_dev_on_branch_push: true` configuration SHALL NOT reach publish, remote D1 migration or a Production version change. The PR lifecycle SHALL advertise only a content-verified Preview whose repository, application, branch ref and host Worker match. The shared non-production D1 concurrency group SHALL apply only to runs that can execute a non-production migration or deployment.

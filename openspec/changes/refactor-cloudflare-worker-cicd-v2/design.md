@@ -8,27 +8,31 @@
 
 ### Normal push DAG
 
+> **Amended by `add-cloudflare-shared-dev-channel` (PR #64):** the standalone `Migration` job described below is **gone**. Migration is an explicit *step* of the single delivery engine (`actions/cf-deploy`) inside `Deploy` / `Shared Dev`, after the build and effective-config audit and before the publish of the audited artifact. Everything below that says "Migration job" now reads "Migration step"; the requirements of that change take precedence.
+
 ```text
-Single Worker:          CI  ──┐
-                            ├── Migration ── Deploy ── Release (main only)
-                        E2E ──┘
+Single Worker:   Lint ∥ Typecheck ∥ Unit ∥ Integration ∥ Build Validation ∥ E2E
+                              └──────────────┬──────────────┘
+                     Deploy (target = prod | preview) ── Release (main only)
+                     Shared Dev (target = dev, optional; ordered after Deploy)
+                     each: build → audit → D1 check → stale → MIGRATE → stale → publish → smoke → verified | recover
 
 Monorepo:       Detect Changes
-                  ├── affected Worker A: CI ∥ E2E → Migration → Deploy
-                  └── affected Worker B: CI ∥ E2E → Migration → Deploy
+                  ├── affected Worker A: validation ∥ → Deploy (incl. Migration step)
+                  └── affected Worker B: validation ∥ → Deploy (incl. Migration step)
                                   required prod Deploys → Release
 ```
 
 **Revision (issue #61, supersedes the earlier combined-CI decision):** Lint, Typecheck, Unit Tests, Integration Tests, Build Validation and E2E are **six different jobs scheduled in parallel**, never one waiting on another. Each has its own checkout, dependency setup, env import (target build env, then `ci_env`), logs, duration and check conclusion, and can be re-run alone. They may build with different variables. E2E variants may form a matrix without preventing unrelated variants from finishing. Optional jobs (`lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `test_integration_cmd`, `test_e2e_cmd`) are skipped only when their command is empty; `build_cmd` is required. Mailpit starts only in Unit, Integration and E2E; browsers are installed only by the consumer's E2E commands. No shared mutable workspace, no build artifacts between jobs, no Test Gate / Plan / Prepare job. Cost: more concurrent runners and repeated setup (see docs/cf-worker-v2-refactor.md). `Detect` is a dedicated lightweight job only when needed for monorepo app selection.
 
-`Migration` starts after every *configured* validation job succeeds and rejects failure/cancellation and any unexpectedly skipped configured job; an optional job skipped because its command is empty must not block it. `Deploy` starts after a successful Migration or a confirmed no-D1/no-migration skip. A successful `Release` is allowed only after all relevant main-target deployments and smoke verifications have succeeded. A consumer may retain specialized optional main-only verification jobs, but they must have explicit ownership and must not duplicate ordinary E2E/build tests.
+`Deploy` (and `Shared Dev`) start after every *configured* validation job succeeds and reject failure/cancellation and any unexpectedly skipped configured job; an optional job skipped because its command is empty must not block them. The Migration step runs inside them only when `d1_migrations` is true. A successful `Release` is allowed only after all relevant main-target deployments and smoke verifications have succeeded. A consumer may retain specialized optional main-only verification jobs, but they must have explicit ownership and must not duplicate ordinary E2E/build tests.
 
 ### Events and trusted targets
 
 | Event | Expected action |
 |---|---|
-| Trusted, eligible non-main push | CI ∥ E2E → shared Preview Migration → Native Preview Deploy/smoke |
-| Trusted main push | CI ∥ E2E → Production Migration → Production Deploy/smoke → optional Release |
+| Trusted, eligible non-main push | CI ∥ E2E → Native Preview Deploy (build → audit → shared Preview D1 Migration step → publish → smoke) |
+| Trusted main push | CI ∥ E2E → Production Deploy (build → audit → Production D1 Migration step → publish → smoke) → optional Release |
 | Same-repo PR | Feedback/required checks without a competing second Preview publish or duplicate full push tests |
 | Fork PR | Credential-free tests only; no Preview/Production secrets or deploy |
 | Branch delete | Mark matching Deployment ledger inactive; **keep Native Preview and data**, per existing v2 owner policy |
@@ -69,13 +73,13 @@ Never depend on GitHub Build Artifacts between jobs. Use fast package caches onl
 
 **Critical concurrency condition:** GH Actions job-level group on Migration and a separate group on Deploy do not protect the gap between them. Select/validate a serialization strategy covering the whole state-mutating migration-to-deploy transaction for a given physical D1+Worker target. When safe cross-run coordination cannot be guaranteed, use conservative target-level pipeline serialization before rollout; CI and E2E within each run must still be parallel. Assess GitHub pending-run cancellation/queue semantics explicitly. If a D1 is shared across repositories or persistent Dev, use a cross-repo coordination mechanism or document and gate the exception. Protect Prod and Preview with different scopes.
 
-**Implementation choice (Phase 1, mocked-test evidence only):** no custom distributed lock. A job-level `concurrency` group cannot span Migration and Deploy, and the default pending slot silently cancels an older queued run (which would drop another branch's push on a shared Preview D1). The shared workflow therefore sets **workflow-level** `concurrency` with `queue: max` (FIFO, max 100 pending; extra runs are cancelled = fail-closed; incompatible with `cancel-in-progress: true`), so the whole run is the serialized unit and CI/E2E stay parallel inside it. The group identifies the **shared mutable resource**, not the branch: `<app>-prod`; one group for the shared Preview D1 (`d1_lock_scope`, default app name) when migrations exist; per-branch for D1-less Workers; a private group for PR/delete/tag/persistent-dev runs. The `cfv2-` prefix is static and `github.workflow` is not used, to avoid the documented caller/called-workflow group deadlock. A queued run that is no longer the branch tip applies no migration and publishes nothing.
+**Implementation choice (Phase 1, mocked-test evidence only):** no custom distributed lock. A job-level `concurrency` group cannot span Migration and Deploy, and the default pending slot silently cancels an older queued run (which would drop another branch's push on a shared Preview D1). The shared workflow therefore sets **workflow-level** `concurrency` with `queue: max` (FIFO, max 100 pending; extra runs are cancelled = fail-closed; incompatible with `cancel-in-progress: true`), so the whole run is the serialized unit and CI/E2E stay parallel inside it. The group identifies the **shared mutable resource**, not the branch: `cfv2-prod-<scope|app>`; one group for the shared non-Production D1 used by Preview and Shared Dev (`cfv2-nonprod-d1-<d1_lock_scope|app>`; the scope replaces `app_name` so apps sharing a D1 share the group) when migrations exist; per-branch for D1-less Workers; a private group for PR/delete/tag/persistent-dev runs. The `cfv2-` prefix is static and `github.workflow` is not used, to avoid the documented caller/called-workflow group deadlock. A queued run that is no longer the branch tip applies no migration and publishes nothing.
 
-Everything that can be validated without mutating remote state (trusted target and credentials, Preview identity and ledger ownership, source binding policy, exact migration target, branch tip) runs inside the Migration job **before** the first remote command; Deploy re-checks ownership and tip before publishing. There is no custom migration command override: the target D1 is always derived and validated from the source config.
+Everything that can be validated without mutating remote state (trusted target and credentials, Preview identity and ledger ownership, source binding policy, **the build and the audit of the effective config**, exact migration target and its equality with the deployed D1, branch tip) runs inside the Deploy job **before** the first remote command; the tip is checked again right before the migration and again right before the publish (a push can land during a long migration). There is no custom migration command override: the target D1 is always derived and validated from the source config.
 
 Release is gated on an explicit `deployed_and_verified` Deploy output (this run published its own SHA and smoke passed); a stale/skipped/failed/rolled-back Deploy never releases.
 
-Known limits (documented, not resolved): a repo-local group does not protect a D1 shared with another repository or persistent Dev; Environment approvals are asked for both Migration and Deploy and a run waiting for approval holds the group; top-level `concurrency` + `queue: max` in a *called* workflow was proven in a same-repository scratch experiment (FIFO, no overlap across two jobs of a run, no cancellation, independent keys not blocked; default single-pending cancelled intermediate runs), but the cross-repository `uses: org/.github/...@ref` case, queue-full behavior and Environment-approval interaction are still unproven, and `queue` is unknown to actionlint 1.7.12 (ignored via `.github/actionlint.yaml`); SQL checksum/drift detection is not implemented. Details and test evidence: `docs/cf-worker-v2-refactor.md` in the implementation PR (#58).
+Known limits (documented, not resolved): a repo-local group does not protect a D1 shared with another repository or persistent Dev; a run waiting for approval holds the group; top-level `concurrency` + `queue: max` in a *called* workflow was proven in a same-repository scratch experiment (FIFO, no overlap across two jobs of a run, no cancellation, independent keys not blocked; default single-pending cancelled intermediate runs), but the cross-repository `uses: org/.github/...@ref` case, queue-full behavior and Environment-approval interaction are still unproven, and `queue` is unknown to actionlint 1.7.12 (ignored via `.github/actionlint.yaml`); SQL checksum/drift detection is not implemented. Details and test evidence: `docs/cf-worker-v2-refactor.md` in the implementation PR (#58).
 
 ### Unified Deploy contract
 

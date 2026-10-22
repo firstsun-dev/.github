@@ -8,7 +8,19 @@ const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 // Credentials, runner/Actions internals and variables that change how the shell or Node loads code.
 const FORBIDDEN = /^(GITHUB_|RUNNER_|ACTIONS_|INPUT_|CLOUDFLARE_|LD_|DYLD_|GIT_|NPM_CONFIG_|PNPM_|BASH_|PATH$|HOME$|SHELL$|ENV$|IFS$|PS4$|CDPATH$|NODE_OPTIONS$|NODE_PATH$|NODE_EXTRA_CA_CERTS$|SMOKE_USERNAME$|SMOKE_PASSWORD$)/;
 
-export function parseEnvLines(text) {
+// Deployment-control and verification variables owned by the delivery engine. Application build/smoke env must
+// never be able to redirect a target (TARGET=prod), a D1 (DEV_ENV), an identity or a verification control.
+export const RESERVED = new Set([
+  'TARGET', 'MODE', 'DEV_ENV', 'GH_TOKEN', 'EXPECTED_SHA', 'RUN_SHA', 'GOOD_SHA', 'GOOD_URL', 'BRANCH', 'BRANCH_REF',
+  'STALE', 'TOOLS_DIR', 'APP_DIR', 'APP_NAME', 'APP_URL', 'HOST_WORKER', 'WORKER_NAME', 'CONFIG_PATH', 'STATE_DIR',
+  'LEDGER_ENV', 'PREVIEW_NAME', 'ENV_NAME', 'OUT_FILE', 'PREVIEW_ENV_FILE', 'SMOKE_ENV_FILE', 'BUILD_ENV_FILE',
+  'D1_BINDING', 'WRANGLER_CONFIG', 'TARGET_URL', 'DEPLOY_TARGET', 'TEST_ENV', 'ACCESS_TARGETS', 'SHA_PATH', 'SMOKE_CMD',
+  'BUILD_CMD', 'PUBLISH_CMD', 'ROLLBACK_TO', 'INPUTS_JSON', 'BUILD_ENV', 'SMOKE_ENV', 'CI_ENV', 'TARGET_BUILD_ENV',
+  'PREVIEW_SECRETS', 'VITE_APP_ENV', 'VITE_APP_VERSION', 'CF_AUDITED_CONFIG', 'PREVIEW_HOST_CHECK',
+]);
+
+/** `reserved: true` (the delivery engine: build_env_*, smoke_env, Preview secrets) also rejects RESERVED control names. */
+export function parseEnvLines(text, { reserved = false } = {}) {
   const pairs = [];
   const errors = [];
   String(text ?? '').split('\n').forEach((raw, i) => {
@@ -17,7 +29,7 @@ export function parseEnvLines(text) {
     const eq = line.indexOf('=');
     const name = eq > 0 ? line.slice(0, eq) : '';
     if (!NAME_RE.test(name)) { errors.push(`line ${i + 1}: expected NAME=VALUE with NAME matching [A-Za-z_][A-Za-z0-9_]*`); return; }
-    if (FORBIDDEN.test(name)) { errors.push(`line ${i + 1}: ${name} may not be set from caller env input`); return; }
+    if (FORBIDDEN.test(name) || (reserved && RESERVED.has(name))) { errors.push(`line ${i + 1}: ${name} may not be set from caller env input`); return; }
     const value = line.slice(eq + 1);
     // eslint-disable-next-line no-control-regex
     if (/[\u0000-\u0008\u000b-\u001f\u007f]/.test(value)) { errors.push(`line ${i + 1}: ${name} contains control characters`); return; }
@@ -26,20 +38,22 @@ export function parseEnvLines(text) {
   return { pairs, errors };
 }
 
-/** Entry points (argv): `<VAR> [<file>] [--mask]` import env text from $VAR into a file (default $GITHUB_ENV);
- *  `--emit0 <file>` re-validate a file written by the first form and print NUL-separated NAME=VALUE pairs. */
+/** Entry points (argv): `<VAR> [<file>] [--mask] [--reserved]` import env text from $VAR into a file (default $GITHUB_ENV);
+ *  `--emit0 <file> [--reserved]` re-validate a file written by the first form and print NUL-separated NAME=VALUE pairs.
+ *  `--reserved` is what the delivery engine always passes: application env may not set deployment-control names. */
 // Compare real paths: a symlinked checkout must not turn the importer into a silent no-op.
 if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
   const args = process.argv.slice(2);
   const mask = args.includes('--mask');
-  const rest = args.filter((a) => a !== '--mask');
+  const reserved = args.includes('--reserved');
+  const rest = args.filter((a) => a !== '--mask' && a !== '--reserved');
   if (rest[0] === '--emit0') {
-    const { pairs, errors } = parseEnvLines(readFileSync(rest[1], 'utf8'));
+    const { pairs, errors } = parseEnvLines(readFileSync(rest[1], 'utf8'), { reserved });
     if (errors.length) { for (const e of errors) console.error(`::error::${rest[1]}: ${e}`); process.exit(1); }
     process.stdout.write(pairs.map(([k, v]) => `${k}=${v}\0`).join(''));
   } else {
     const [varName, target] = rest;
-    const { pairs, errors } = parseEnvLines(process.env[varName]);
+    const { pairs, errors } = parseEnvLines(process.env[varName], { reserved });
     if (errors.length) {
       for (const e of errors) console.log(`::error::${varName}: ${e}`);
       process.exit(1);

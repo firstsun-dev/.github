@@ -1,6 +1,8 @@
 // Pure helpers for Cloudflare Worker CI/CD v2 (branch-owned Native Previews).
 // No I/O except readConfig(); everything else is deterministic and unit-tested.
-import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { dirname, join, resolve as resolvePath, relative } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 import { parse as parseJsonc } from 'jsonc-parser';
 
@@ -60,28 +62,70 @@ export function previewIdentity({ repo, worker, ref, hostWorker }) {
 
 export const PREVIEW_NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
-/** Validate `wrangler preview --json` output and return the stable URL. */
+/**
+ * Validate `wrangler preview --json` output and return the stable URL. Fails closed: a missing/malformed payload,
+ * a missing or EMPTY `preview.urls`, a non-string, non-https or otherwise invalid URL all throw (never an empty URL).
+ */
 export function extractPreviewUrl(json) {
   let data = json;
   if (typeof json === 'string') {
+    if (!json.trim()) throw new Error('`wrangler preview --json` produced no output (the Preview was not created or Wrangler failed before printing JSON)');
     try {
       data = JSON.parse(json);
     } catch {
       // wrangler may print log lines before the JSON document; take the last top-level object.
       const start = json.lastIndexOf('\n{');
-      data = JSON.parse(json.slice(start >= 0 ? start + 1 : json.indexOf('{')));
+      try {
+        data = JSON.parse(json.slice(start >= 0 ? start + 1 : json.indexOf('{')));
+      } catch {
+        throw new Error('`wrangler preview --json` output is not valid JSON; refusing to guess a Preview URL');
+      }
     }
   }
-  const url = data?.preview?.urls?.[0];
-  if (typeof url !== 'string') throw new Error('Unexpected wrangler preview --json shape: .preview.urls[0] missing');
+  if (!data || typeof data !== 'object' || !data.preview || typeof data.preview !== 'object') {
+    throw new Error(`Unexpected wrangler preview --json shape: no \`preview\` object (top-level keys: ${Object.keys(data ?? {}).slice(0, 8).join(', ') || 'none'})`);
+  }
+  const urls = data.preview.urls;
+  if (!Array.isArray(urls)) throw new Error('Unexpected wrangler preview --json shape: `preview.urls` is missing');
+  if (urls.length === 0) {
+    throw new Error('wrangler returned an EMPTY `preview.urls`: the host Worker has no Preview URL host. Enable Preview URLs for the host Worker (Workers & Pages > the Worker > Settings > Domains & Routes > Preview URLs, or `preview_urls = true` deployed to the Worker) or use an approved custom-domain Preview host; the Preview was NOT verified');
+  }
+  const url = urls[0];
+  if (typeof url !== 'string' || !url.trim()) throw new Error('`preview.urls[0]` is empty or not a string');
   let u;
   try {
     u = new URL(url);
   } catch {
-    throw new Error(`Preview URL is not a valid URL: ${url}`);
+    throw new Error('Preview URL is not a valid URL');
   }
-  if (u.protocol !== 'https:') throw new Error(`Preview URL must be https: ${url}`);
+  if (u.protocol !== 'https:') throw new Error(`Preview URL must be https: ${u.protocol}//${u.host}`);
   return u.origin + (u.pathname === '/' ? '' : u.pathname);
+}
+
+/**
+ * Read-only readiness check for the Worker that will HOST Native Previews: the Cloudflare Workers subdomain API
+ * reports `previews_enabled`. Returns { ok, level, message }. Only a definitive `previews_enabled === false`
+ * blocks (level 'block'); an unreadable answer (API/permission/404/network) is 'unknown' and is covered by the
+ * strict post-publish URL validation. Custom-domain Preview hosting cannot be derived from this flag and is
+ * opted out with preview_host_check: false.
+ */
+export async function previewHostReadiness(fetchFn, { accountId, token, worker, base = 'https://api.cloudflare.com/client/v4' }) {
+  if (!accountId || !token || !worker) return { ok: false, level: 'unknown', message: 'missing account, token or Worker name for the Preview host check' };
+  let res;
+  try {
+    res = await fetchFn(`${base}/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(worker)}/subdomain`, { headers: { Authorization: `Bearer ${token}` } });
+  } catch (e) {
+    return { ok: false, level: 'unknown', message: `Preview host check unavailable (${e.name ?? 'network error'})` };
+  }
+  if (!res.ok) return { ok: false, level: 'unknown', message: `Preview host check unavailable (HTTP ${res.status}); relying on post-publish URL validation` };
+  let body;
+  try { body = await res.json(); } catch { return { ok: false, level: 'unknown', message: 'Preview host check returned an unreadable body' }; }
+  const r = body?.result ?? {};
+  if (r.previews_enabled === true) return { ok: true, level: 'ok', message: `Worker ${worker} has Preview URLs enabled` };
+  if (r.previews_enabled === false) {
+    return { ok: false, level: 'block', message: `Worker "${worker}" has previews_enabled=false: no Preview URL host exists. Enable Preview URLs for that Worker (Settings > Domains & Routes > Preview URLs, or deploy it with \`preview_urls = true\`) — this pipeline never changes the Worker automatically. For custom-domain Preview hosting set preview_host_check: false.` };
+  }
+  return { ok: false, level: 'unknown', message: 'Preview host check: previews_enabled not reported' };
 }
 
 /**
@@ -249,10 +293,25 @@ export function resolveTarget({ event, ref, strategy, previewOnPush = true, devR
   return 'none';
 }
 
+/**
+ * Does this event deploy the SHARED persistent Dev Worker? 'dev' | 'none'.
+ * Independent of the Native Preview channel: only the Shared Dev switch matters. Never main (Production),
+ * never a PR / delete / tag, never the manual persistent-dev dispatch, never a production-only Worker.
+ */
+export function resolveSharedDev({ event, ref, strategy, sharedDevOnPush = false, dispatchTarget = '' }) {
+  if (!STRATEGIES.includes(strategy)) throw new Error(`Unknown deployment_strategy: ${strategy}`);
+  if (!sharedDevOnPush || strategy === 'production-only') return 'none';
+  if (!String(ref).startsWith('refs/heads/') || ref === 'refs/heads/main') return 'none';
+  if (event === 'push') return 'dev';
+  if (event === 'workflow_dispatch' && dispatchTarget !== 'persistent-dev') return 'dev';
+  return 'none';
+}
+
 /** D1 bindings the given target will use, straight from the project's SOURCE Wrangler config. */
-export function d1ForTarget(cfg, target) {
+export function d1ForTarget(cfg, target, { devEnv = 'dev' } = {}) {
   if (target === 'prod') return cfg.d1_databases ?? [];
   if (target === 'preview') return cfg.previews?.d1_databases ?? [];
+  if (target === 'dev') return cfg.env?.[devEnv]?.d1_databases ?? []; // the named Wrangler environment, never top-level
   throw new Error(`Unknown migration target: ${target}`);
 }
 
@@ -262,16 +321,24 @@ export function d1ForTarget(cfg, target) {
  * target has no D1, an ambiguous choice, no explicit id, or when the Preview and Production databases are
  * the same physical database.
  */
-export function migrationPlan(cfg, target, { binding = '', migrationsDirAbs }) {
-  const all = d1ForTarget(cfg, target);
+export function migrationPlan(cfg, target, { binding = '', migrationsDirAbs, devEnv = 'dev' }) {
+  const all = d1ForTarget(cfg, target, { devEnv });
   const pool = binding ? all.filter((b) => b.binding === binding) : all;
-  if (!pool.length) throw new Error(`No D1 binding${binding ? ` "${binding}"` : ''} declared for target ${target} (${target === 'preview' ? 'previews.d1_databases' : 'd1_databases'})`);
+  if (!pool.length) throw new Error(`No D1 binding${binding ? ` "${binding}"` : ''} declared for target ${target} (${target === 'preview' ? 'previews.d1_databases' : target === 'dev' ? `env.${devEnv}.d1_databases` : 'd1_databases'})`);
   if (pool.length > 1) throw new Error(`Several D1 bindings for target ${target}; set d1_binding to one of: ${pool.map((b) => b.binding).join(', ')}`);
   const db = pool[0];
   if (!db.database_id || !db.database_name) throw new Error(`D1 binding ${db.binding} needs explicit database_id and database_name for target ${target}`);
+  // Production is never shared with a non-Production target. Preview and Shared Dev MAY name the same physical
+  // D1 (both are non-Production); the run order and the workflow concurrency group keep their migrations apart.
   const other = d1ForTarget(cfg, target === 'prod' ? 'preview' : 'prod');
   if (other.some((o) => o.database_id === db.database_id || o.database_name === db.database_name)) {
     throw new Error(`Target ${target} D1 ${db.database_name} is also declared for ${target === 'prod' ? 'Preview' : 'Production'}; refusing to migrate a database shared across trust boundaries`);
+  }
+  if (target === 'prod') {
+    const dev = d1ForTarget(cfg, 'dev', { devEnv });
+    if (dev.some((o) => o.database_id === db.database_id || o.database_name === db.database_name)) {
+      throw new Error(`Target prod D1 ${db.database_name} is also declared for Dev; refusing to migrate a database shared across trust boundaries`);
+    }
   }
   return {
     binding: db.binding,
@@ -291,6 +358,16 @@ export function migrationPlan(cfg, target, { binding = '', migrationsDirAbs }) {
     },
   };
 }
+
+/** Do the Preview and Shared Dev targets name the same physical D1? (Previews not declared => false.) */
+export function sharedPreviewDevD1(cfg, { binding = '', devEnv = 'dev' } = {}) {
+  const pick = (list) => (binding ? list.filter((b) => b.binding === binding) : list);
+  const prev = pick(d1ForTarget(cfg, 'preview'));
+  const dev = pick(d1ForTarget(cfg, 'dev', { devEnv }));
+  return dev.some((d) => prev.some((p) => (d.database_id && d.database_id === p.database_id) || (d.database_name && d.database_name === p.database_name)));
+}
+
+export { auditDevConfig, parseDevAllow, DEV_SHAREABLE_KINDS } from './dev-policy.mjs';
 
 /** Resource ids declared at the top level of a config, per binding kind (flat set). */
 function topLevelResourceIds(cfg) {
@@ -315,4 +392,69 @@ export function auditProdConfig(effective, source) {
     if (previewIds.has(id)) errors.push(`Production config binds Preview resource ${id}`);
   }
   return { errors, warnings: [] };
+}
+
+/**
+ * Rebind commit identity in caller-provided text (e.g. build_env_dev, which the caller expanded with the FAILED
+ * run's SHA) to the SHA being restored. Replaces the full SHA and standalone 7-char short SHAs. Returns the new
+ * text and how many replacements were made.
+ */
+export function rebindSha(text, from, to) {
+  if (!/^[0-9a-f]{7,40}$/i.test(from) || !/^[0-9a-f]{7,40}$/i.test(to)) throw new Error('rebindSha needs hex SHAs');
+  let n = 0;
+  const swap = (re, rep) => { text = text.replace(re, () => { n += 1; return rep; }); };
+  swap(new RegExp(from, 'gi'), to);
+  swap(new RegExp(`\\b${from.slice(0, 7)}\\b`, 'gi'), to.slice(0, 7));
+  return { text, replacements: n };
+}
+
+/**
+ * The D1 the DEPLOYED Worker will bind must be the exact physical database the migration targets.
+ * `deployedCfg` is the audited config that will be published (adapter-generated effective config, or the source
+ * config when mode is 'source'); `source` is the project's source config used for migration targeting.
+ */
+export function checkDeployedD1(deployedCfg, source, target, { binding = '', devEnv = 'dev', mode = 'effective' } = {}) {
+  const plan = migrationPlan(source, target, { binding, devEnv, migrationsDirAbs: (d) => d });
+  let deployed;
+  if (mode === 'source') deployed = d1ForTarget(source, target, { devEnv });
+  else deployed = target === 'preview' ? (deployedCfg.previews?.d1_databases ?? []) : (deployedCfg.d1_databases ?? []);
+  const hit = deployed.find((b) => b.binding === plan.binding);
+  if (!hit) throw new Error(`The deployed config has no D1 binding "${plan.binding}" but migrations target ${plan.databaseName}; refusing to migrate or publish`);
+  if (hit.database_id !== plan.databaseId) {
+    throw new Error(`D1 mismatch: migrations target ${plan.databaseName} (${plan.databaseId}) but the deployed config binds ${plan.binding} to ${hit.database_name ?? '?'} (${hit.database_id}); refusing to migrate DB-A and deploy a Worker connected to DB-B`);
+  }
+  return { binding: plan.binding, databaseId: plan.databaseId };
+}
+
+/**
+ * Cheap fingerprint of the audited deployable: the config file itself, the Worker entry directory and the static
+ * assets directory it names (path + size + content hash per file; mtime is ignored, only a real change counts). Used to prove that a caller-supplied publish command
+ * did not rebuild or replace what the audit approved.
+ */
+export function artifactDigest(configPath) {
+  const h = createHash('sha256');
+  const cfgFile = resolvePath(configPath);
+  h.update('config\0'); h.update(readFileSync(cfgFile));
+  const cfg = readConfig(cfgFile);
+  const base = dirname(cfgFile);
+  const roots = [];
+  if (cfg.assets?.directory) roots.push(resolvePath(base, cfg.assets.directory));
+  if (cfg.main) roots.push(dirname(resolvePath(base, cfg.main)));
+  const walk = (dir, out) => {
+    if (!existsSync(dir)) return;
+    for (const name of readdirSync(dir).sort()) {
+      if (name === 'node_modules' || name === '.wrangler') continue;
+      const p = join(dir, name);
+      const st = statSync(p);
+      if (st.isDirectory()) walk(p, out);
+      else out.push(`${p}\0${st.size}\0${createHash('sha256').update(readFileSync(p)).digest('hex')}`);
+    }
+  };
+  for (const r of [...new Set(roots)].sort()) {
+    const files = [];
+    walk(r, files);
+    h.update(`root\0${relative(base, r)}\0`);
+    for (const f of files) h.update(f.replace(r, '') + '\n');
+  }
+  return h.digest('hex');
 }

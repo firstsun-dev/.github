@@ -3,7 +3,7 @@
 ## Phase 0 — specification only (this PR)
 
 - [x] Audit current v1/v2 shared job topology and selected consumers.
-- [x] Document agreed architecture: Detect (monorepo) → [Lint ∥ Typecheck ∥ Unit ∥ Integration ∥ Build Validation ∥ E2E] → Migration → Deploy → optional Release.
+- [x] Document agreed architecture: Detect (monorepo) → [Lint ∥ Typecheck ∥ Unit ∥ Integration ∥ Build Validation ∥ E2E] → Deploy (Migration is a step of Deploy; see add-cloudflare-shared-dev-channel) → optional Release.
 - [x] Document target-specific builds, env separation, artifact-free job handoff and shared Preview resources.
 - [x] Preserve previously approved Native Preview identity, retention, protected Hybrid Dev and production recovery. (Old v2 *interface* compatibility is explicitly not preserved.)
 - [x] Decision: refactor `_cf-worker-v2.yml` in place; no `_cf-worker-v3.yml`/`@v3`; breaking changes allowed; floating `@v2` not moved until consumers are ready.
@@ -57,7 +57,7 @@ This register establishes **ownership**, not completion. Do not reinterpret `[x]
 
 - [ ] Blog: pilot native previews for two feature branches, stable URLs, shared `firstsun-blog-db-preview` and dedicated preview Voice R2.
 - [ ] Blog: verify Astro-generated effective Wrangler config, `SITE_NOINDEX`, Analytics/Turnstile separation, local E2E build versus target Deploy build, and smoke.
-- [ ] Blog: validate same-SQL migrations on prod/preview D1 through independent Migration job; reject unsafe cross-branch migration history.
+- [ ] Blog: validate same-SQL migrations on prod/preview D1 through the Migration step of the Deploy engine; reject unsafe cross-branch migration history.
 - [ ] Heaven ID: approve or block use of `heaven-id-db-dev` by branch previews while protected Persistent Dev uses it.
 - [ ] Heaven ID: validate OAuth callbacks, origins/cookies, Test Client, Cron Dev isolation, Preview D1/R2 and exact-URL smoke.
 - [ ] Demonstrate two simultaneous branches with code isolation, same-branch update, migration/no-op/failure gates and recovery.

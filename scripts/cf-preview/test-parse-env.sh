@@ -32,4 +32,13 @@ printf 'PATH=/evil\n' > "$T/tampered"; node "$P" --emit0 "$T/tampered" >/dev/nul
 # a symlinked tools checkout must not turn the importer into a silent no-op
 ln -s "$ROOT/actions/cf-preview" "$T/link"; : > "$T/env"
 VARS='VIA=symlink' node "$T/link/parse-env.mjs" VARS "$T/env" >/dev/null && grep -qx 'VIA=symlink' "$T/env" && ok "works through a symlinked path (no silent no-op)" || bad "symlink no-op"
+
+# --reserved (the delivery engine): deployment-control names can never be set by build/smoke/Preview env.
+for n in TARGET DEV_ENV GH_TOKEN EXPECTED_SHA RUN_SHA D1_BINDING STATE_DIR TOOLS_DIR BUILD_CMD PUBLISH_CMD INPUTS_JSON CF_AUDITED_CONFIG; do
+  : > "$T/env"
+  if VARS="OK=1"$'\n'"$n=prod" node "$P" VARS "$T/env" --reserved >/dev/null 2>&1; then bad "reserved $n accepted"; else [ ! -s "$T/env" ] && ok "reserved control variable $n rejected (all-or-nothing)" || bad "partial write for $n"; fi
+done
+: > "$T/env"; VARS=$'TARGET=prod' node "$P" VARS "$T/env" >/dev/null 2>&1 && ok "validation jobs / E2E (no --reserved) keep their existing freedom" || bad "non-reserved mode regressed"
+# a tampered staged file cannot smuggle a reserved name past load_env_file (--emit0 --reserved)
+printf 'TARGET=prod\n' > "$T/tampered"; node "$P" --emit0 "$T/tampered" --reserved >/dev/null 2>&1 && bad "tampered reserved file accepted" || ok "--emit0 --reserved rejects a staged file that contains a control variable"
 exit $fail

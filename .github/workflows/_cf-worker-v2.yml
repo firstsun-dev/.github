@@ -1,27 +1,34 @@
 name: CF Worker Pipeline v2
 
 # ---------------------------------------------------------------------------
-# Cloudflare Worker CI/CD v2 — lean, parallel, target-aware delivery.
-# OpenSpec: openspec/changes/refactor-cloudflare-worker-cicd-v2 (PR #57), tracking #43.
-# Migration guide / interface: docs/cf-worker-v2-refactor.md
+# Cloudflare Worker CI/CD v2 — thin workflow, ONE reusable delivery engine.
+# OpenSpec: openspec/changes/refactor-cloudflare-worker-cicd-v2 (PR #57), openspec/changes/add-cloudflare-shared-dev-channel.
+# Interface / migration guide: docs/cf-worker-v2-refactor.md
 #
-#   [Detect Changes]  (monorepo only: the CALLER runs _detect-changes.yml and gates its calls)
-#          |
-#   +------+-------+-----------+-------------+------------------+------+
-#   Lint  Typecheck  Unit Tests  Integration   Build Validation   E2E     six independent jobs, all parallel, no
-#   +------+-------+-----------+-------------+------------------+------+  `needs` between them (own checkout/setup/logs)
-#          |
-#      Migration          dedicated job (d1_migrations: true); needs all six; Production or Preview D1 by target
-#          |
-#        Deploy           ONE job, target=prod|preview, builds independently, smoke + recovery
-#          |
-#      Release            optional, main only
+#   Lint  Typecheck  Unit Tests  Integration  Build Validation  E2E      six independent, parallel jobs (no `needs`
+#     \       \          |            |             /            /       between them) -> actions/cf-ci-check
+#      +-------+----------+------------+------------+-----------+
+#                         |                                      |
+#                 Deploy  target=prod|preview             Shared Dev  target=dev  (needs Deploy for ORDERING only)
+#                         |                                      |
+#                         +--------- actions/cf-deploy ----------+       the SAME engine for every target:
+#              build -> config audit -> D1 target check -> stale check -> migrate (optional step) -> stale check
+#                         -> publish the audited artifact -> smoke -> mark verified | recover
+#                         |
+#                      Release   optional, main only, after a VERIFIED Production deploy
+#
+# There is no Prepare/Plan/Test-Gate/Migration job: Migration is a step inside the engine, after the deployable
+# build and config audit and before the publish of that audited artifact. Event handlers outside the DAG:
+# `lifecycle` (PR comment / branch delete), `config-guard` (production-only + Shared Dev is rejected) and
+# `persistent-dev` (Hybrid, protected manual dispatch; the same engine in manual mode).
 #
 # An optional validation job (lint/typecheck/unit/integration/e2e) is skipped only when its command input is
-# empty; Migration/Deploy treat a CONFIGURED job that is skipped as a failure.
+# empty; Deploy and Shared Dev treat a CONFIGURED job that is skipped, failed or cancelled as a failure.
 #
-# Event-specific handlers outside the core DAG: `lifecycle` (PR comment / branch delete) and
-# `persistent-dev` (Hybrid, protected dispatch).
+# Local composite actions: a reusable workflow called from another repository resolves `uses: ./...` against the
+# CALLER's workspace and `uses:` cannot take an expression. Every job therefore checks out firstsun-dev/.github at
+# `tools_ref` into `.cf-tools` and references the actions as the static path `./.cf-tools/actions/<name>`.
+# `tools_ref` MUST equal the ref the caller pins this workflow at.
 #
 # Caller MUST trigger on: push (all branches), pull_request, delete, workflow_dispatch.
 # `delete` only fires from the DEFAULT branch's workflow file.
@@ -31,14 +38,29 @@ on:
   workflow_call:
     outputs:
       deploy_url:
-        description: URL that was deployed and smoke-tested (Preview URL or app_url_prod); empty when nothing was deployed
+        description: URL that was published and smoke-tested (Preview URL or app_url_prod); empty when nothing was deployed. May be published-but-unverified - gate on deploy_verified_url
         value: ${{ jobs.deploy.outputs.url }}
+      deploy_verified_url:
+        description: Same URL, only when content-level verification passed; empty for Access-liveness-only or failed deployments
+        value: ${{ jobs.deploy.outputs.verified_url }}
+      deploy_published_unverified:
+        description: true when deploy published a reachable but NOT content-verified deployment (Access liveness only)
+        value: ${{ jobs.deploy.outputs.published_unverified }}
       deploy_target:
         description: prod | preview
         value: ${{ jobs.deploy.outputs.target }}
       version_id:
         description: Production Worker version id (prod only)
         value: ${{ jobs.deploy.outputs.version_id }}
+      dev_url:
+        description: Shared Dev URL that was published and smoke-tested (app_url_dev); empty when Shared Dev did not deploy. May be published-but-unverified - gate on dev_verified_url
+        value: ${{ jobs.dev-deploy.outputs.url }}
+      dev_verified_url:
+        description: Shared Dev URL only when content-level verification passed
+        value: ${{ jobs.dev-deploy.outputs.verified_url }}
+      dev_published_unverified:
+        description: true when Shared Dev published a reachable but NOT content-verified deployment (Access liveness only)
+        value: ${{ jobs.dev-deploy.outputs.published_unverified }}
     inputs:
       tools_ref:
         description: >
@@ -61,8 +83,15 @@ on:
         type: string
         default: production-preview
       preview_on_branch_push:
+        description: Feature Native Preview — one stable Preview URL per non-main branch. Independent of shared_dev_on_branch_push.
         type: boolean
         default: true
+      shared_dev_on_branch_push:
+        description: >
+          Shared Dev — every non-main branch push deploys the ONE configured Dev Worker (app_url_dev); the last
+          verified deployment wins. Independent of preview_on_branch_push. Rejected with production-only.
+        type: boolean
+        default: false
       preview_worker_name:
         description: >
           Host Native Previews under this existing Worker instead of the config's `name`
@@ -130,6 +159,10 @@ on:
         description: Build-time env for the Preview build, one KEY=VALUE per line
         type: string
         default: ''
+      build_env_dev:
+        description: Build-time env for the Shared Dev build, one KEY=VALUE per line (never falls back to the Preview or Production env)
+        type: string
+        default: ''
       smoke_cmd:
         description: Smoke command from app_path (both targets); receives TARGET_URL, EXPECTED_SHA, DEPLOY_TARGET. Default is an HTTP 2xx probe.
         type: string
@@ -141,13 +174,22 @@ on:
       access_protected_targets:
         description: >
           Space-separated targets (preview and/or prod) where a redirect to Cloudflare Access counts as LIVENESS only
-          (content/SHA not verified). Any target not listed fails smoke on an Access redirect.
+          (published but NOT content/SHA-verified: no Release, not a known-good deployment). Any target not listed fails
+          smoke on an Access redirect. For content verification of an Access-protected target, send service-token
+          headers through smoke_env PROBE_HEADERS so the probe reaches the application itself.
         type: string
         default: preview
       sha_path:
-        description: Optional path (e.g. /version.json) that must contain the commit SHA once served
+        description: Optional path (e.g. /version.json) that must contain the commit SHA once served (smoke_level content-sha)
         type: string
         default: ''
+      preview_host_check:
+        description: >
+          Before a Native Preview publish, read-only check that the host Worker has previews_enabled (Cloudflare
+          Workers subdomain API). Set false for approved custom-domain Preview hosting, where that flag does not
+          apply; the strict post-publish URL validation always runs.
+        type: boolean
+        default: true
       preview_binding_allow:
         description: Space-separated approved high-risk Preview bindings, e.g. "services:ID hyperdrive:H"
         type: string
@@ -166,7 +208,10 @@ on:
         default: manual
       # ---- Migration ----
       d1_migrations:
-        description: The Worker has remote D1 migrations; enables the dedicated Migration job. Leave false for D1-less Workers.
+        description: >
+          The Worker has remote D1 migrations; enables the Migration STEP of the delivery engine (after the build and
+          config audit, before the publish). Production, Preview and Shared Dev apply the same project-owned SQL to
+          their own D1. Leave false for D1-less Workers.
         type: boolean
         default: false
       d1_binding:
@@ -175,9 +220,10 @@ on:
         default: ''
       d1_lock_scope:
         description: >
-          Identity of the PHYSICAL shared Preview D1 (default: app_name). Apps in this repository that share one
-          Preview D1 must use the same value so their runs are serialized together. Does not protect a D1 shared
-          with ANOTHER repository.
+          Identity of the PHYSICAL shared D1 (default: app_name). Apps in this repository that share one D1 must use
+          the same value so their runs are serialized together: it names the run-level concurrency group (separate
+          Production and non-Production groups) and the Shared Dev / persistent-Dev group. GitHub concurrency is
+          repository-scoped: it CANNOT lock a D1 shared with ANOTHER repository.
         type: string
         default: ''
       # ---- Release ----
@@ -191,10 +237,45 @@ on:
         type: string
         default: ''
       dev_deploy_cmd:
-        description: Command deploying the persistent Dev Worker (from app_path)
+        description: >
+          OPTIONAL publish-only command for the Dev Worker (default: `wrangler deploy --config <audited config>`).
+          The engine builds with dev_build_cmd (or build_cmd) and audits the effective config FIRST; this command runs
+          afterwards with CF_AUDITED_CONFIG exported, must publish THAT config (`wrangler deploy --config
+          "$CF_AUDITED_CONFIG"`) and must not rebuild: a changed config or deployable fails the run. Legacy manual
+          dispatch (dev_build_cmd empty): dev_deploy_cmd builds and publishes exactly as before.
         type: string
         default: ''
       dev_smoke_cmd:
+        description: Dev smoke command (persistent-dev and Shared Dev); Shared Dev also receives TARGET_URL=app_url_dev, EXPECTED_SHA, DEPLOY_TARGET=dev
+        type: string
+        default: ''
+      app_url_dev:
+        description: Stable Shared Dev URL (environment URL, smoke target). Required when shared_dev_on_branch_push is true.
+        type: string
+        default: ''
+      dev_build_cmd:
+        description: Dev build from app_path (with build_env_dev), build only; falls back to build_cmd when empty. REQUIRED with d1_migrations (the Dev build must succeed before the Dev D1 is migrated). Setting it also opts the manual persistent-dev dispatch into the engine. Leave empty only for a legacy persistent-dev caller whose dev_deploy_cmd builds itself.
+        type: string
+        default: ''
+      dev_wrangler_env:
+        description: Named Wrangler environment of the Shared Dev Worker (exported as CLOUDFLARE_ENV; its D1 is env.<name>.d1_databases)
+        type: string
+        default: dev
+      dev_binding_allow:
+        description: >
+          Shared Dev resource-sharing approvals, whitespace/newline separated `kind:BINDING=exact-identity`
+          (r2_buckets=bucket_name, kv_namespaces=id, vectorize=index_name, analytics_engine_datasets=dataset,
+          services=worker[#environment]). Only the exact resource is approved; any other bucket/id/service, an unknown
+          kind, a D1, a malformed or duplicate entry, or an entry matching no Dev binding fails the audit.
+          Example: `r2_buckets:SHINYI_MUYU_VOICE_CACHE=firstsun-blog-assets`.
+        type: string
+        default: ''
+      dev_deny_resources:
+        description: Space-separated resource identities (bucket, id, queue, Worker) Shared Dev must never bind. Independent of preview_deny_resources; always wins over dev_binding_allow.
+        type: string
+        default: ''
+      dev_worker_name:
+        description: Expected Worker name of the Shared Dev deployment; the Astro/adapter-generated effective Wrangler config must match it (e.g. blog-preview)
         type: string
         default: ''
       dispatch_target:
@@ -216,7 +297,7 @@ on:
       CLOUDFLARE_ACCOUNT_ID:
         required: false
       CLOUDFLARE_DEV_API_TOKEN:
-        description: Persistent Dev token (Hybrid only)
+        description: Dev token (Hybrid persistent-dev dispatch and Shared Dev); never the Production or Preview token
         required: false
       CLOUDFLARE_DEV_ACCOUNT_ID:
         required: false
@@ -231,25 +312,29 @@ on:
         description: Token for release_cmd (exported as GH_TOKEN); defaults to nothing, GITHUB_TOKEN is NOT used for releases
         required: false
 
-# Serialization of the whole Migration -> Deploy interval (GitHub `concurrency` cannot span two jobs, so the
-# whole RUN is the unit; CI and E2E still run in parallel inside a run). One group per piece of shared mutable
-# state, `queue: max` so a newer push does not cancel an older pending run (FIFO, up to 100; beyond that
-# GitHub cancels the extra run, which is fail-closed: it deploys nothing):
-#   main                              -> <app>/prod
-#   branch, d1_migrations: true       -> one group for the shared Preview D1 (d1_lock_scope, default app_name)
-#   branch, no D1                     -> per branch
-#   PR / delete / persistent-dev / anything else -> a private group (never queues behind a deploy)
-# The `cfv2-` prefix is static on purpose: never reuse it (or ${{ github.workflow }}) in a CALLER group, or the
-# caller and this called workflow deadlock each other. A repo-local group does NOT protect a D1 shared with
-# another repository. `queue` is not known to actionlint 1.7.12: see .github/actionlint.yaml.
+# One run-level concurrency group per piece of shared mutable state (GitHub `concurrency` cannot span two jobs, so
+# the whole RUN is the unit; CI and E2E still run in parallel inside a run). `queue: max` keeps FIFO instead of
+# cancelling an older pending run (beyond 100 GitHub cancels the extra run: fail-closed, it deploys nothing).
+# The identity is the RESOURCE, not the app: `d1_lock_scope` replaces app_name so apps that share one physical D1
+# share one group, and Production and non-Production are always different groups:
+#   main                               -> cfv2-prod-<d1_lock_scope|app_name>
+#   branch, d1_migrations, a non-main channel enabled (Preview and/or Shared Dev, strategy != production-only)
+#                                      -> cfv2-nonprod-d1-<d1_lock_scope|app_name>   (Preview AND Shared Dev D1)
+#   branch, Shared Dev on, no D1 lock  -> cfv2-shared-dev-<app_name>                  (the ONE Dev Worker)
+#   branch, both channels off          -> cfv2-<app_name>-preview-<branch>            (CI-only: no shared D1 serialization)
+#   PR / delete / persistent-dev / any other event -> a private group (never queues behind a deploy)
+# The Shared Dev and persistent-Dev jobs additionally share the job-level group cfv2-dev-<repo>-<scope|app_name>.
+# The `cfv2-` prefix is static on purpose: never reuse it (or ${{ github.workflow }}) in a CALLER group, or caller
+# and callee deadlock. A repo-local group does NOT protect a D1 shared with another repository.
+# `queue` is not known to actionlint 1.7.12: see .github/actionlint.yaml.
 concurrency:
-  group: ${{ ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && format('cfv2-{0}-{1}', inputs.app_name, github.ref == 'refs/heads/main' && 'prod' || (inputs.d1_migrations && format('preview-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || format('preview-{0}', github.ref_name))) || format('cfv2-run-{0}', github.run_id) }}
+  group: ${{ ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && (github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.preview_on_branch_push || inputs.shared_dev_on_branch_push) && inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && inputs.shared_dev_on_branch_push && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id) }}
   queue: max
 
 permissions:
   contents: read
 
-# bash -eo pipefail everywhere: `deploy.sh | tee` must not mask a failed wrangler.
+# bash -eo pipefail everywhere.
 defaults:
   run:
     shell: bash
@@ -262,256 +347,150 @@ env:
 
 jobs:
   # -------------------------------------------------------------------------
-  # Validation — six independent jobs (Lint, Typecheck, Unit Tests, Integration Tests, Build Validation, E2E).
-  # No `needs` between them: each is scheduled as soon as the caller invokes this workflow, has its own
-  # checkout / dependency setup / env import / logs / duration / check conclusion, and can be re-run alone.
-  # An optional job whose command input is empty is skipped on purpose; Migration and Deploy accept that skip
-  # ONLY for an empty command (a configured job that ends skipped blocks them). `build_cmd` is required.
-  # None of them receives Cloudflare credentials; no job uploads or downloads a build artifact (Build
-  # Validation builds for validation only, Deploy builds again for its real target).
-  # Same-repo PRs are covered by the push run of the same SHA; fork PRs run these credential-free.
-  # Mailpit starts only where tests can need it (Unit, Integration), never in Lint / Typecheck / Build.
+  # Validation — six independent jobs, no `needs` between them: each has its own checkout / setup / logs / check
+  # conclusion and can be re-run alone. Bodies are actions/cf-ci-check. None receives Cloudflare credentials and
+  # none uploads a build artifact (Build Validation builds for validation only; the engine builds again for its
+  # real target). Same-repo PRs are covered by the push run of the same SHA; fork PRs run these credential-free.
   # -------------------------------------------------------------------------
   lint:
     name: Lint
     if: inputs.lint_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
-    env:
-      VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      VITE_APP_VERSION: ${{ inputs.app_version }}
-      TARGET_BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
-      CI_ENV: ${{ inputs.ci_env }}
     steps:
       - uses: actions/checkout@v6
-      - name: Fetch env-import tool
+      - name: Fetch CI action and env-import tool
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview/parse-env.mjs
+          sparse-checkout: |
+            actions/cf-ci-check
+            actions/cf-preview/parse-env.mjs
           sparse-checkout-cone-mode: false
-      - name: Import validation env (target env, then ci_env)
-        run: |
-          node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
-          node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
-          rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope
-      - uses: firstsun-dev/.github/actions/setup@v1
+          persist-credentials: false
+      - uses: ./.cf-tools/actions/cf-ci-check
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Lint
-        id: check
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.lint_cmd }}
-        run: bash -c "$CMD"
-      - name: Summary
-        if: always()
-        env:
-          OUTCOME: ${{ steps.check.outcome }}
-          CMD: ${{ inputs.lint_cmd }}
-        run: |
-          {
-            echo "### Lint: $OUTCOME"
-            echo '`'"$CMD"'`'
-          } >> "$GITHUB_STEP_SUMMARY"
-
+          title: Lint
+          cmd: ${{ inputs.lint_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
   typecheck:
     name: Typecheck
     if: inputs.typecheck_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
-    env:
-      VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      VITE_APP_VERSION: ${{ inputs.app_version }}
-      TARGET_BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
-      CI_ENV: ${{ inputs.ci_env }}
     steps:
       - uses: actions/checkout@v6
-      - name: Fetch env-import tool
+      - name: Fetch CI action and env-import tool
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview/parse-env.mjs
+          sparse-checkout: |
+            actions/cf-ci-check
+            actions/cf-preview/parse-env.mjs
           sparse-checkout-cone-mode: false
-      - name: Import validation env (target env, then ci_env)
-        run: |
-          node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
-          node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
-          rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope
-      - uses: firstsun-dev/.github/actions/setup@v1
+          persist-credentials: false
+      - uses: ./.cf-tools/actions/cf-ci-check
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Typecheck
-        id: check
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.typecheck_cmd }}
-        run: bash -c "$CMD"
-      - name: Summary
-        if: always()
-        env:
-          OUTCOME: ${{ steps.check.outcome }}
-          CMD: ${{ inputs.typecheck_cmd }}
-        run: |
-          {
-            echo "### Typecheck: $OUTCOME"
-            echo '`'"$CMD"'`'
-          } >> "$GITHUB_STEP_SUMMARY"
-
+          title: Typecheck
+          cmd: ${{ inputs.typecheck_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
   unit:
     name: Unit Tests
     if: inputs.test_unit_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
-    env:
-      VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      VITE_APP_VERSION: ${{ inputs.app_version }}
-      TARGET_BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
-      CI_ENV: ${{ inputs.ci_env }}
     steps:
       - uses: actions/checkout@v6
-      - name: Fetch env-import tool
+      - name: Fetch CI action and env-import tool
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview/parse-env.mjs
+          sparse-checkout: |
+            actions/cf-ci-check
+            actions/cf-preview/parse-env.mjs
           sparse-checkout-cone-mode: false
-      - name: Import validation env (target env, then ci_env)
-        run: |
-          node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
-          node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
-          rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope
-      - uses: firstsun-dev/.github/actions/setup@v1
+          persist-credentials: false
+      - uses: ./.cf-tools/actions/cf-ci-check
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Start Mailpit
-        if: inputs.use_mailpit
-        uses: firstsun-dev/.github/actions/mailpit@v1
-      - name: Unit tests
-        id: check
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.test_unit_cmd }}
-        run: bash -c "$CMD"
-      - name: Summary
-        if: always()
-        env:
-          OUTCOME: ${{ steps.check.outcome }}
-          CMD: ${{ inputs.test_unit_cmd }}
-        run: |
-          {
-            echo "### Unit Tests: $OUTCOME"
-            echo '`'"$CMD"'`'
-          } >> "$GITHUB_STEP_SUMMARY"
-
+          title: Unit Tests
+          cmd: ${{ inputs.test_unit_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
+          use_mailpit: ${{ inputs.use_mailpit }}
   integration:
     name: Integration Tests
     if: inputs.test_integration_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
-    env:
-      VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      VITE_APP_VERSION: ${{ inputs.app_version }}
-      TARGET_BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
-      CI_ENV: ${{ inputs.ci_env }}
     steps:
       - uses: actions/checkout@v6
-      - name: Fetch env-import tool
+      - name: Fetch CI action and env-import tool
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview/parse-env.mjs
+          sparse-checkout: |
+            actions/cf-ci-check
+            actions/cf-preview/parse-env.mjs
           sparse-checkout-cone-mode: false
-      - name: Import validation env (target env, then ci_env)
-        run: |
-          node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
-          node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
-          rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope
-      - uses: firstsun-dev/.github/actions/setup@v1
+          persist-credentials: false
+      - uses: ./.cf-tools/actions/cf-ci-check
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Start Mailpit
-        if: inputs.use_mailpit
-        uses: firstsun-dev/.github/actions/mailpit@v1
-      - name: Integration tests
-        id: check
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.test_integration_cmd }}
-        run: bash -c "$CMD"
-      - name: Summary
-        if: always()
-        env:
-          OUTCOME: ${{ steps.check.outcome }}
-          CMD: ${{ inputs.test_integration_cmd }}
-        run: |
-          {
-            echo "### Integration Tests: $OUTCOME"
-            echo '`'"$CMD"'`'
-          } >> "$GITHUB_STEP_SUMMARY"
-
+          title: Integration Tests
+          cmd: ${{ inputs.test_integration_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
+          use_mailpit: ${{ inputs.use_mailpit }}
   build:
     name: Build Validation
     if: github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
-    env:
-      VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      VITE_APP_VERSION: ${{ inputs.app_version }}
-      TARGET_BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
-      CI_ENV: ${{ inputs.ci_env }}
     steps:
       - uses: actions/checkout@v6
-      - name: Fetch env-import tool
+      - name: Fetch CI action and env-import tool
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview/parse-env.mjs
+          sparse-checkout: |
+            actions/cf-ci-check
+            actions/cf-preview/parse-env.mjs
           sparse-checkout-cone-mode: false
-      - name: Import validation env (target env, then ci_env)
-        run: |
-          node "$TOOLS_DIR/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
-          node "$TOOLS_DIR/parse-env.mjs" CI_ENV "$GITHUB_ENV"
-          rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope
-      - uses: firstsun-dev/.github/actions/setup@v1
+          persist-credentials: false
+      - uses: ./.cf-tools/actions/cf-ci-check
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Build validation (target-aware, nothing is uploaded)
-        id: check
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.build_cmd }}
-        run: bash -c "$CMD"
-      - name: Summary
-        if: always()
-        env:
-          OUTCOME: ${{ steps.check.outcome }}
-          CMD: ${{ inputs.build_cmd }}
-        run: |
-          {
-            echo "### Build Validation: $OUTCOME"
-            echo '`'"$CMD"'`'
-          } >> "$GITHUB_STEP_SUMMARY"
+          title: Build Validation
+          cmd: ${{ inputs.build_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
 
-  # -------------------------------------------------------------------------
-  # E2E — parallel to CI. Own setup and own TEST build (local URLs, mock services); the Deploy job
-  # never reuses it. Never receives Cloudflare credentials.
-  # -------------------------------------------------------------------------
+  # E2E — own setup and own TEST build (local URLs, mock services); never reused for a deployment.
   e2e:
     name: E2E
     if: inputs.test_e2e_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
@@ -575,394 +554,134 @@ jobs:
           retention-days: 3
 
   # -------------------------------------------------------------------------
-  # Migration — dedicated job, only when d1_migrations is true. Runs after CI and E2E.
-  # Every precondition that needs no remote mutation runs BEFORE the first remote command:
-  # target/credentials, Preview identity + ledger ownership, source binding policy, migration target,
-  # branch tip. Serialization with other runs comes from the workflow-level concurrency group.
+  # Deploy — the ONE Production / Native Preview job. target = prod (main) | preview (other branches); the engine
+  # (actions/cf-deploy) builds, audits, validates the exact D1 target, migrates (optional step), publishes the
+  # audited artifact, smokes, and recovers. Only the credentials of THIS target exist in the job env; there is no
+  # fallback. `deployed_and_verified` is true ONLY when this run published its own SHA and the smoke passed.
   # -------------------------------------------------------------------------
-  migrate:
-    name: Migration
+  deploy:
+    name: Deploy
     needs: [lint, typecheck, unit, integration, build, e2e]
-    # always(): optional jobs are skipped when their command is empty; implicit success() would skip Migration.
-    # A CONFIGURED job that did not run (skipped) does not pass: it must have succeeded.
-    if: always() && inputs.d1_migrations && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
+    # Fail closed: an invalid strategy/channel combination (see `config-guard`, which reports it) never reaches the
+    # Cloudflare publish, the remote D1 migration or a Production version change. engine.sh `init` repeats the check.
+    # always(): skipped optional jobs (empty command) must not skip Deploy, but a failed / cancelled / unexpectedly
+    # skipped CONFIGURED one must block it.
+    if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && !(inputs.deployment_strategy == 'production-only' && inputs.shared_dev_on_branch_push) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
-    environment: ${{ github.ref == 'refs/heads/main' && format('{0}/prod', inputs.app_name) || format('{0}/preview', inputs.app_name) }}
+    timeout-minutes: 45
+    # One Environment per app and target; Production authorization = its protection rules + the main-only credentials.
+    environment:
+      name: ${{ github.ref == 'refs/heads/main' && format('{0}/prod', inputs.app_name) || format('{0}/preview', inputs.app_name) }}
+      url: ${{ steps.engine.outputs.url }}
     permissions:
       contents: read
-      deployments: read # ledger ownership lookup
+      deployments: write
+      pull-requests: write
     outputs:
-      superseded: ${{ steps.fresh.outputs.stale }}
-      pending: ${{ steps.apply.outputs.pending }}
+      url: ${{ steps.engine.outputs.url }}
+      target: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+      version_id: ${{ steps.engine.outputs.version_id }}
+      deployed_and_verified: ${{ steps.engine.outputs.deployed_and_verified || 'false' }}
+      smoke_level: ${{ steps.engine.outputs.smoke_level }}
+      published_url: ${{ steps.engine.outputs.published_url }}
+      verified_url: ${{ steps.engine.outputs.verified_url }}
+      published_unverified: ${{ steps.engine.outputs.published_unverified || 'false' }}
+      migration: ${{ steps.engine.outputs.migration }}
     env:
       GH_TOKEN: ${{ github.token }}
-      TARGET: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      BRANCH: ${{ github.ref_name }}
-      BRANCH_REF: ${{ github.ref }}
-      RUN_SHA: ${{ github.sha }}
-      APP_NAME: ${{ inputs.app_name }}
-      HOST_WORKER: ${{ inputs.preview_worker_name != '' && inputs.preview_worker_name || inputs.app_name }}
-      # Each credential is populated ONLY for its own target and never falls back to the other one.
       CLOUDFLARE_API_TOKEN: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_API_TOKEN) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_API_TOKEN) || '' }}
       CLOUDFLARE_ACCOUNT_ID: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_ACCOUNT_ID) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID) || '' }}
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
-      - name: Fetch tooling
+      - name: Fetch delivery tooling
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
           persist-credentials: false
-      - uses: firstsun-dev/.github/actions/setup@v1
+      - id: engine
+        uses: ./.cf-tools/actions/cf-deploy
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Install tooling deps
-        run: cd "$TOOLS_DIR" && npm ci --ignore-scripts --no-audit --no-fund
-      # ---- preconditions: nothing below this line until "Apply" touches remote state ----
-      - name: Verify trusted target and credentials (fail closed)
-        env:
-          EVENT: ${{ github.event_name }}
-          STRATEGY: ${{ inputs.deployment_strategy }}
-          PREVIEW_ON: ${{ inputs.preview_on_branch_push }}
-          DISPATCH: ${{ inputs.dispatch_target }}
-        run: |
-          RESOLVED="$(node "$TOOLS_DIR/cli.mjs" resolve --event "$EVENT" --ref "$BRANCH_REF" --strategy "$STRATEGY" \
-            --preview-on-push "$PREVIEW_ON" --dispatch-target "$DISPATCH" | sed -n 's/^target=//p')"
-          [ "$RESOLVED" = "$TARGET" ] || { echo "::error::target mismatch (resolved '$RESOLVED', job '$TARGET'); refusing to migrate"; exit 1; }
-          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "::error::$TARGET credentials not provided; refusing to fall back to other credentials"; exit 1
-          fi
-      - name: Preview identity and ledger ownership (collision fails here)
-        id: identity
-        if: env.TARGET == 'preview'
-        run: |
-          "$TOOLS_DIR/guard.sh" identity | tee -a "$GITHUB_ENV"
-      - name: Preflight source config — Preview binding / auth isolation
-        if: env.TARGET == 'preview'
-        working-directory: ${{ inputs.app_path }}
-        env:
-          ALLOW: ${{ inputs.preview_binding_allow }}
-          DENY: ${{ inputs.preview_deny_resources }}
-          CFG: ${{ inputs.wrangler_config }}
-        run: node "$GITHUB_WORKSPACE/$TOOLS_DIR/cli.mjs" preflight --config "$CFG" --allow "$ALLOW" --deny "$DENY"
-      - name: Confirm the exact migration target (read-only config check)
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CFG: ${{ inputs.wrangler_config }}
-          BINDING: ${{ inputs.d1_binding }}
-        run: node "$GITHUB_WORKSPACE/$TOOLS_DIR/cli.mjs" migration-config --config "$CFG" --target "$TARGET" --binding "$BINDING" --out "$RUNNER_TEMP/migrate-check.json"
-      - name: Stale-SHA guard (branch must still be at this commit)
-        id: fresh
-        run: |
-          "$TOOLS_DIR/guard.sh" fresh | tee -a "$GITHUB_OUTPUT"
-      # ---- the only remote mutation ----
-      - name: Apply pending migrations (this target's D1 only)
-        id: apply
-        if: steps.fresh.outputs.stale != 'true'
-        env:
-          APP_DIR: ${{ github.workspace }}/${{ inputs.app_path }}
-          WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
-          D1_BINDING: ${{ inputs.d1_binding }}
-        run: |
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          "$TOOLS_DIR/migrate.sh" | tee -a "$GITHUB_OUTPUT"
+          target: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+          inputs_json: ${{ toJSON(inputs) }}
+          preview_secrets: ${{ github.ref != 'refs/heads/main' && secrets.PREVIEW_SECRETS || '' }}
+          smoke_username: ${{ secrets.SMOKE_USERNAME }}
+          smoke_password: ${{ secrets.SMOKE_PASSWORD }}
 
   # -------------------------------------------------------------------------
-  # Deploy — the single deploy implementation. target = prod (main) | preview (other branches).
-  # Credentials for the other target are never populated. Builds independently; no build artifacts.
-  # `deployed_and_verified` is true ONLY when this run published its own SHA and smoke passed.
+  # Shared Dev — optional, independent of Native Preview (own switch, own Dev credentials, own Environment). The
+  # SAME engine with target = dev: every non-main branch push updates the ONE Dev Worker; the last verified
+  # deployment wins. `needs: deploy` is ORDERING ONLY (Preview and Dev may share one physical D1, so their
+  # migrations must never overlap); Deploy's result is ignored except by the engine's shared-D1 guard. Branch
+  # deletion and disabling the switch never touch the Dev Worker. Not used by the manual persistent-dev path.
   # -------------------------------------------------------------------------
-  deploy:
-    name: Deploy
-    needs: [lint, typecheck, unit, integration, build, e2e, migrate]
-    # always(): skipped optional jobs / migrate (empty command, D1-less Worker) must not skip Deploy, but a
-    # failed/cancelled or unexpectedly skipped one must block it. An optional job may only be skipped when its
-    # command is empty, and Migration only when d1_migrations is off.
-    if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && (needs.migrate.result == 'success' || (needs.migrate.result == 'skipped' && !inputs.d1_migrations)) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
+  dev-deploy:
+    name: Shared Dev
+    needs: [lint, typecheck, unit, integration, build, e2e, deploy]
+    if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && inputs.shared_dev_on_branch_push && inputs.deployment_strategy != 'production-only' && github.ref_type == 'branch' && github.ref != 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev'))
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 40
-    # One shared environment per app and target. Production authorization = this environment's protection
-    # rules + the main-only credential expression below. The per-branch ledger lives in `<app>/preview/<slug>`.
+    timeout-minutes: 45
     environment:
-      name: ${{ github.ref == 'refs/heads/main' && format('{0}/prod', inputs.app_name) || format('{0}/preview', inputs.app_name) }}
-      url: ${{ steps.publish.outputs.url }}
+      name: ${{ inputs.app_name }}/dev
+      url: ${{ steps.engine.outputs.url }}
+    # Same group as the manual persistent-dev job: automatic and manual Dev deployments never overlap. Keyed by the
+    # shared-D1 scope when set, distinct from the run-level groups, so caller and callee cannot deadlock.
+    concurrency:
+      group: cfv2-dev-${{ github.repository }}-${{ inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name }}
+      cancel-in-progress: false
     permissions:
       contents: read
-      deployments: write
-      pull-requests: write
+      deployments: write # Dev ledger (last known-good SHA for recovery)
     outputs:
-      url: ${{ steps.publish.outputs.url }}
-      target: ${{ env.TARGET }}
-      version_id: ${{ steps.publish.outputs.version_id }}
-      deployed_and_verified: ${{ steps.verified.outputs.deployed_and_verified || 'false' }}
-      smoke_level: ${{ steps.verified.outputs.smoke_level || '' }}
+      url: ${{ steps.engine.outputs.url }}
+      deployed_and_verified: ${{ steps.engine.outputs.deployed_and_verified || 'false' }}
+      smoke_level: ${{ steps.engine.outputs.smoke_level }}
+      published_url: ${{ steps.engine.outputs.published_url }}
+      verified_url: ${{ steps.engine.outputs.verified_url }}
+      published_unverified: ${{ steps.engine.outputs.published_unverified || 'false' }}
     env:
       GH_TOKEN: ${{ github.token }}
-      TARGET: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      BRANCH: ${{ github.ref_name }}
-      BRANCH_REF: ${{ github.ref }}
-      RUN_SHA: ${{ github.sha }}
-      APP_NAME: ${{ inputs.app_name }}
-      HOST_WORKER: ${{ inputs.preview_worker_name != '' && inputs.preview_worker_name || inputs.app_name }}
-      CLOUDFLARE_API_TOKEN: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_API_TOKEN) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_API_TOKEN) || '' }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_ACCOUNT_ID) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID) || '' }}
-      BUILD_ENV: ${{ (github.ref == 'refs/heads/main' && inputs.build_env_prod) || (github.ref != 'refs/heads/main' && inputs.build_env_preview) || '' }}
-      SMOKE_ENV: ${{ inputs.smoke_env }}
+      # Dev credentials ONLY; there is no fallback to the Preview or Production token.
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEV_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_DEV_ACCOUNT_ID }}
     steps:
-      # Early skip for a superseded run (API only). Fails closed if the tip cannot be resolved.
-      - name: Stale-SHA guard (start)
-        run: |
-          TIP="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH" -q .object.sha)" || { echo "::error::cannot resolve branch tip"; exit 1; }
-          [ -n "$TIP" ] || { echo "::error::cannot resolve branch tip"; exit 1; }
-          if [ "$TIP" != "$RUN_SHA" ]; then
-            echo "::notice::Branch tip $TIP != $RUN_SHA; a newer push owns this target. Skipping (nothing deployed)."
-            echo "STALE=true" >> "$GITHUB_ENV"
-          fi
-      - name: Checkout exact SHA
-        if: env.STALE != 'true'
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Fetch tooling
+      - name: Fetch delivery tooling
         uses: actions/checkout@v6
         with:
           repository: firstsun-dev/.github
           ref: ${{ inputs.tools_ref }}
           path: .cf-tools
-          sparse-checkout: actions/cf-preview
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
           persist-credentials: false
-      - name: Setup dependencies
-        if: env.STALE != 'true'
-        uses: firstsun-dev/.github/actions/setup@v1
+      - id: engine
+        uses: ./.cf-tools/actions/cf-deploy
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Install tooling deps
-        if: env.STALE != 'true'
-        run: cd "$TOOLS_DIR" && npm ci --ignore-scripts --no-audit --no-fund
-      - name: Validate trusted ref, target and credentials (fail closed)
-        if: env.STALE != 'true'
-        working-directory: ${{ inputs.app_path }}
-        env:
-          EVENT: ${{ github.event_name }}
-          STRATEGY: ${{ inputs.deployment_strategy }}
-          PREVIEW_ON: ${{ inputs.preview_on_branch_push }}
-          DISPATCH: ${{ inputs.dispatch_target }}
-          POLICY: ${{ inputs.production_rollback_policy }}
-        run: |
-          TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          case "$STRATEGY" in production-preview|hybrid|production-only) ;; *) echo "::error::bad deployment_strategy"; exit 1;; esac
-          case "$POLICY" in automatic|manual|disabled) ;; *) echo "::error::bad production_rollback_policy"; exit 1;; esac
-          RESOLVED="$(node "$TOOLS/cli.mjs" resolve --event "$EVENT" --ref "$BRANCH_REF" --strategy "$STRATEGY" \
-            --preview-on-push "$PREVIEW_ON" --dispatch-target "$DISPATCH" | sed -n 's/^target=//p')"
-          [ "$RESOLVED" = "$TARGET" ] || { echo "::error::target mismatch (resolved '$RESOLVED', job '$TARGET'); refusing to deploy"; exit 1; }
-          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "::error::$TARGET credentials not provided; refusing to fall back to other credentials"; exit 1
-          fi
-          if [ "$TARGET" = preview ]; then
-            VER="$(pnpm exec wrangler --version | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-            echo "Project-local Wrangler: $VER"
-            node "$TOOLS/cli.mjs" wrangler-check --version "$VER"
-          fi
-          echo "PREVIEW_ENV_FILE=$RUNNER_TEMP/preview.env" >> "$GITHUB_ENV"
-          echo "OUT_FILE=$RUNNER_TEMP/preview.json" >> "$GITHUB_ENV"
-      - id: identity
-        name: Preview identity and name-collision check (re-checked after Migration)
-        if: env.STALE != 'true' && env.TARGET == 'preview'
-        run: |
-          "$TOOLS_DIR/guard.sh" identity | tee -a "$GITHUB_ENV"
-      - name: Preflight source config — Preview binding / auth isolation
-        if: env.STALE != 'true' && env.TARGET == 'preview'
-        working-directory: ${{ inputs.app_path }}
-        env:
-          ALLOW: ${{ inputs.preview_binding_allow }}
-          DENY: ${{ inputs.preview_deny_resources }}
-          CFG: ${{ inputs.wrangler_config }}
-        run: node "$GITHUB_WORKSPACE/$TOOLS_DIR/cli.mjs" preflight --config "$CFG" --allow "$ALLOW" --deny "$DENY"
-      # Preview secrets are DATA: validated, masked, written owner-only, and later exported through quoted
-      # variables (envfile.sh). They are never sourced or evaluated as shell, and only the Preview build and
-      # smoke processes see them.
-      - name: Stage Preview-only secrets (validated, masked)
-        if: env.STALE != 'true' && env.TARGET == 'preview'
-        env:
-          PREVIEW_SECRETS: ${{ secrets.PREVIEW_SECRETS }}
-        run: |
-          umask 077
-          node "$TOOLS_DIR/parse-env.mjs" PREVIEW_SECRETS "$PREVIEW_ENV_FILE" --mask
-      - name: Start Deployment (Preview ledger)
-        if: env.STALE != 'true' && env.TARGET == 'preview'
-        id: dep
-        run: |
-          PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg n "$PREVIEW_NAME" --arg w "$APP_NAME" '{branch_ref:$ref,preview_name:$n,worker:$w}')"
-          ID="$("$TOOLS_DIR/gh.sh" start "$ENV_NAME" "$RUN_SHA" "$PAYLOAD")"
-          echo "id=$ID" >> "$GITHUB_OUTPUT"
-          "$TOOLS_DIR/gh.sh" status "$ID" in_progress "" "Publishing $RUN_SHA"
-      - name: Stale-SHA guard (before publish)
-        if: env.STALE != 'true'
-        run: |
-          if [ "$("$TOOLS_DIR/guard.sh" fresh)" != "stale=false" ]; then
-            echo "::notice::Superseded before publish; not touching the target (nothing deployed)."
-            echo "STALE=true" >> "$GITHUB_ENV"
-          fi
-      - name: Inject target build environment
-        if: env.STALE != 'true'
-        run: node "$TOOLS_DIR/parse-env.mjs" BUILD_ENV "$GITHUB_ENV"
-      - name: Build, validate effective Wrangler config, publish
-        if: env.STALE != 'true'
-        id: publish
-        env:
-          APP_DIR: ${{ github.workspace }}/${{ inputs.app_path }}
-          BUILD_CMD: ${{ inputs.build_cmd }}
-          WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
-          VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-          VITE_APP_VERSION: ${{ inputs.app_version }}
-          PREVIEW_ALLOW: ${{ inputs.preview_binding_allow }}
-          PREVIEW_DENY: ${{ inputs.preview_deny_resources }}
-          WORKER_NAME: ${{ inputs.preview_worker_name }}
-          APP_URL_PROD: ${{ inputs.app_url_prod }}
-          COMMIT_MSG: ${{ github.event.head_commit.message }}
-          APP_VERSION: ${{ inputs.app_version }}
-        run: |
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          "$TOOLS_DIR/deploy.sh" | tee -a "$GITHUB_OUTPUT"
-      - name: Inject smoke environment
-        if: env.STALE != 'true' && steps.publish.outcome == 'success'
-        run: node "$TOOLS_DIR/parse-env.mjs" SMOKE_ENV "$GITHUB_ENV"
-      - name: Smoke — exact deployed URL (fails closed)
-        if: env.STALE != 'true' && steps.publish.outcome == 'success'
-        id: smoke
-        working-directory: ${{ inputs.app_path }}
-        env:
-          TARGET_URL: ${{ steps.publish.outputs.url }}
-          DEPLOY_TARGET: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-          TEST_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-          EXPECTED_SHA: ${{ github.sha }}
-          SMOKE_CMD: ${{ inputs.smoke_cmd }}
-          SHA_PATH: ${{ inputs.sha_path }}
-          ACCESS_TARGETS: ${{ inputs.access_protected_targets }}
-          SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
-          SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
-          NO_PROXY: '*'
-        run: |
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          "$TOOLS_DIR/smoke.sh" | tee -a "$GITHUB_OUTPUT"
-      # The ONLY place deployed_and_verified becomes true: this run published its own SHA and smoke passed.
-      - name: Mark deployed and verified
-        if: env.STALE != 'true' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'success'
-        id: verified
-        env:
-          LEVEL: ${{ steps.smoke.outputs.smoke_level }}
-        run: |
-          { echo "deployed_and_verified=true"; echo "smoke_level=$LEVEL"; } >> "$GITHUB_OUTPUT"
-      - name: Report success
-        if: steps.verified.outputs.deployed_and_verified == 'true'
-        env:
-          URL: ${{ steps.publish.outputs.url }}
-          VID: ${{ steps.publish.outputs.version_id }}
-          PREV: ${{ steps.publish.outputs.previous_version_id }}
-          LEVEL: ${{ steps.smoke.outputs.smoke_level }}
-          POLICY: ${{ inputs.production_rollback_policy }}
-        run: |
-          if [ "$TARGET" = preview ]; then
-            "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" success "$URL" "Serving $RUN_SHA ($LEVEL)"
-            "$TOOLS_DIR/gh.sh" comment "$BRANCH" "$APP_NAME" "$URL" "$RUN_SHA" || echo "::warning::PR comment skipped"
-            echo "::notice title=Preview URL ($APP_NAME)::$URL"
-            {
-              echo "### ✅ Preview — \`$APP_NAME\` (verification: $LEVEL)"
-              echo "- URL: $URL"
-              echo "- Branch: \`$BRANCH\` · identity \`$PREVIEW_NAME\`"
-              echo "- Served commit: \`$RUN_SHA\` · [run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            {
-              echo "### ✅ Production — \`$APP_NAME\` (verification: $LEVEL)"
-              echo "- Version: \`$VID\` · previous: \`$PREV\`"
-              echo "- Rollback policy: \`$POLICY\`. A Worker rollback does NOT revert D1 migrations or external side effects."
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-      # ---- Post-publish failure: the target may now serve unverified code. ----
-      - name: Preview — mark unverified
-        if: failure() && env.TARGET == 'preview' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
-        run: |
-          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" failure "${{ steps.publish.outputs.url }}" "Smoke failed — Preview UNVERIFIED"
-          echo "### ❌ Preview smoke failed — URL is **unverified**: ${{ steps.publish.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
-      - name: Preview recovery — find last known-good SHA
-        if: failure() && env.TARGET == 'preview' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
-        id: good
-        run: |
-          GOOD="$("$TOOLS_DIR/gh.sh" last-good "$ENV_NAME" "${{ steps.dep.outputs.id }}" || true)"
-          echo "sha=$GOOD" >> "$GITHUB_OUTPUT"
-          if [ -z "$GOOD" ]; then
-            echo "::error::No known-good deployment for this Preview. Fix forward by pushing a new commit. (Deleting the branch does NOT remove the Native Preview; see the manual delete command in the branch-delete summary.)"
-            echo "### ⚠️ No prior verified deployment — manual recovery required: push a fix. Deleting the branch keeps the Preview." >> "$GITHUB_STEP_SUMMARY"
-          fi
-      - name: Preview recovery — checkout last good
-        if: failure() && steps.good.outputs.sha != ''
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ steps.good.outputs.sha }}
-          path: recover
-          persist-credentials: false
-      - name: Preview recovery — redeploy last good and verify
-        if: failure() && steps.good.outputs.sha != ''
-        id: recover
-        env:
-          APP_DIR: ${{ github.workspace }}/recover/${{ inputs.app_path }}
-          BUILD_CMD: ${{ inputs.build_cmd }}
-          WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
-          WORKER_NAME: ${{ inputs.preview_worker_name }}
-          # Same build/preflight environment as the normal publish (BUILD_ENV is already in the job env), or
-          # adapters re-add Preview-incompatible bindings (found by the heaven-www recovery drill).
-          VITE_APP_ENV: preview
-          VITE_APP_VERSION: ${{ inputs.app_version }}
-          PREVIEW_ALLOW: ${{ inputs.preview_binding_allow }}
-          PREVIEW_DENY: ${{ inputs.preview_deny_resources }}
-        run: |
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          (cd "$APP_DIR" && pnpm install --frozen-lockfile)
-          URL="$("$TOOLS_DIR/deploy.sh" | sed -n 's/^url=//p')"
-          TARGET_URL="$URL" "$TOOLS_DIR/probe.sh"
-          echo "### ♻️ Recovered Preview to last good commit \`${{ steps.good.outputs.sha }}\` ($URL). Run remains FAILED for the bad commit." >> "$GITHUB_STEP_SUMMARY"
-      - name: Preview recovery failed
-        if: failure() && steps.good.outputs.sha != '' && steps.recover.outcome == 'failure'
-        run: echo "### 🚨 Automatic recovery FAILED — Preview serves unverified code. Push a fix (deleting the branch keeps the Preview)." >> "$GITHUB_STEP_SUMMARY"
-      - name: Preview — failed before publish
-        if: failure() && env.TARGET == 'preview' && steps.dep.outputs.id != '' && steps.publish.outcome != 'success'
-        run: |
-          "$TOOLS_DIR/gh.sh" status "${{ steps.dep.outputs.id }}" error "" "Failed before publish; previous Preview unchanged" || true
-          echo "### ❌ Failed before publish — existing Preview unchanged." >> "$GITHUB_STEP_SUMMARY"
-      - name: Production recovery (policy-driven; D1 is never rolled back)
-        if: failure() && env.TARGET == 'prod' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
-        env:
-          POLICY: ${{ inputs.production_rollback_policy }}
-          PREV_ID: ${{ steps.publish.outputs.previous_version_id }}
-          APP_DIR: ${{ github.workspace }}/${{ inputs.app_path }}
-          WRANGLER_CONFIG: ${{ inputs.wrangler_config }}
-        run: |
-          export TOOLS_DIR="$GITHUB_WORKSPACE/$TOOLS_DIR"
-          if [ "$POLICY" = automatic ] && [ -n "$PREV_ID" ]; then
-            # Same Wrangler config / Worker identity resolution as the publish (deploy.sh ROLLBACK_TO).
-            ROLLBACK_TO="$PREV_ID" "$TOOLS_DIR/deploy.sh"
-            echo "### ♻️ Rolled back to \`$PREV_ID\`. D1 migrations (if any) were NOT reverted. The run stays FAILED and no Release runs." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "### 🚨 Production smoke FAILED (policy: $POLICY). Manual rollback: \`wrangler versions deploy ${PREV_ID:-<prev>}@100 --yes\` after confirming schema compatibility." >> "$GITHUB_STEP_SUMMARY"
-          fi
-          exit 1   # keep the run red regardless of policy
-      - name: Remove staged Preview secrets
-        if: always()
-        run: rm -f "$PREVIEW_ENV_FILE" "$OUT_FILE"
+          target: dev
+          inputs_json: ${{ toJSON(inputs) }}
+          smoke_username: ${{ secrets.SMOKE_USERNAME }}
+          smoke_password: ${{ secrets.SMOKE_PASSWORD }}
+          sibling_result: ${{ needs.deploy.result }}
+          sibling_migration: ${{ needs.deploy.outputs.migration }}
 
   # -------------------------------------------------------------------------
-  # Release — optional, main only, only after THIS run deployed its own SHA and verified it.
+  # Release — optional, main only, only after THIS run deployed its own SHA to Production and verified it.
   # -------------------------------------------------------------------------
   release:
     name: Release
@@ -987,6 +706,21 @@ jobs:
         env:
           CMD: ${{ inputs.release_cmd }}
         run: bash -c "$CMD"
+
+  # -------------------------------------------------------------------------
+  # Config guard — a production-only Worker must never expose a Dev deployment. Fails the run on ANY event so a
+  # misconfigured caller is visible, instead of silently skipping. (A production-only Worker keeps ignoring
+  # preview_on_branch_push, whose default is true, for backward compatibility.)
+  # -------------------------------------------------------------------------
+  config-guard:
+    name: Config guard
+    if: inputs.deployment_strategy == 'production-only' && inputs.shared_dev_on_branch_push
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 2
+    steps:
+      - run: |
+          echo "::error::deployment_strategy: production-only cannot be combined with shared_dev_on_branch_push: true (a production-only Worker must not expose an unauthorized Dev deployment). Set shared_dev_on_branch_push: false or change the strategy."
+          exit 1
 
   # -------------------------------------------------------------------------
   # Lifecycle — event-specific handler outside the core DAG. Never deploys, no Cloudflare credentials.
@@ -1030,15 +764,17 @@ jobs:
           NAME="$(node "$TOOLS_DIR/cli.mjs" identity --repo "$GITHUB_REPOSITORY" --worker "$APP" --host-worker "$WORKER_NAME" --ref "refs/heads/$BRANCH" | sed -n 's/^preview_name=//p')"
           [[ "$NAME" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "::error::unsafe name"; exit 1; }
           { echo "PREVIEW_NAME=$NAME"; echo "ENV_NAME=$APP/preview/$NAME"; } >> "$GITHUB_ENV"
-      - name: Comment existing Preview URL on the PR
+      - name: Comment the existing VERIFIED Preview URL on the PR
         if: env.SKIP != 'true' && github.event_name == 'pull_request'
+        env:
+          APP: ${{ inputs.app_name }}
         run: |
-          ID="$(gh api "repos/$GITHUB_REPOSITORY/deployments?environment=$(printf %s "$ENV_NAME" | jq -sRr @uri)&per_page=1" -q '.[0].id // empty')"
-          [ -n "$ID" ] || { echo "No branch Preview yet; the next push creates it."; exit 0; }
-          read -r STATE URL < <(gh api "repos/$GITHUB_REPOSITORY/deployments/$ID/statuses?per_page=1" -q '.[0] | "\(.state) \(.environment_url)"')
-          SHA="$(gh api "repos/$GITHUB_REPOSITORY/deployments/$ID" -q .sha)"
-          [ "$STATE" = success ] || { echo "Latest Preview deployment is $STATE; not advertising."; exit 0; }
-          "$TOOLS_DIR/gh.sh" comment "$BRANCH" "${{ inputs.app_name }}" "$URL" "$SHA"
+          # Host-bound known-good lookup: same repository, application, branch ref and HOST Worker, https URL and a
+          # content-level verified success. An old host (e.g. blog-preview), another branch or a liveness-only
+          # deployment is never advertised.
+          ROW="$("$TOOLS_DIR/gh.sh" last-good-preview "$ENV_NAME" "" "refs/heads/$BRANCH" "$WORKER_NAME" "$APP" || true)"
+          [ -n "$ROW" ] || { echo "No verified Preview for this branch on host Worker $WORKER_NAME; PR comment unchanged."; exit 0; }
+          "$TOOLS_DIR/gh.sh" comment "$BRANCH" "$APP" "${ROW#* }" "${ROW%% *}"
       # Policy (owner decision): deleting a branch does NOT delete its Native Preview. The Preview and its stable
       # URL are kept (Cloudflare cannot remove only the stable URL: Preview `urls` is read-only and
       # `wrangler preview delete` removes the Preview with all deployments). Only the GitHub ledger is retired.
@@ -1063,29 +799,39 @@ jobs:
 
   # -------------------------------------------------------------------------
   # Protected persistent Dev (Hybrid) — explicit dispatch on the approved ref only. Never a side effect of a
-  # feature-branch push.
+  # feature-branch push. With dev_build_cmd it is the SAME engine in manual mode (build -> audit -> migration ->
+  # publish -> smoke -> ledger; no automatic recovery). Without it, the legacy two-command contract is unchanged.
   # -------------------------------------------------------------------------
   persistent-dev:
     name: Persistent Dev (Hybrid)
     if: github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     environment: ${{ inputs.app_name }}/dev
     concurrency:
-      group: cfv2-dev-${{ github.repository }}-${{ inputs.app_name }}
+      group: cfv2-dev-${{ github.repository }}-${{ inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name }}
       cancel-in-progress: false
+    permissions:
+      contents: read
+      deployments: write # engine mode only: Dev ledger entry, recorded verified ONLY after the smoke passes
     env:
+      GH_TOKEN: ${{ github.token }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEV_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_DEV_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v6
         with:
+          fetch-depth: 0
           persist-credentials: false
+      # ---- Legacy contract (dev_build_cmd empty): dev_deploy_cmd builds and publishes; never recorded in the Shared
+      # Dev last-good ledger, so automatic recovery can never treat it as a known-good release.
       - uses: firstsun-dev/.github/actions/setup@v1
+        if: inputs.dev_build_cmd == ''
         with:
           setup-node: 'false'
           setup-pnpm: 'false'
       - name: Deploy persistent Dev
+        if: inputs.dev_build_cmd == ''
         working-directory: ${{ inputs.app_path }}
         env:
           CMD: ${{ inputs.dev_deploy_cmd }}
@@ -1093,8 +839,30 @@ jobs:
           [ -n "$CMD" ] || { echo "::error::dev_deploy_cmd required"; exit 1; }
           bash -c "$CMD"
       - name: Dev smoke (Cron/Queue-adjacent checks)
-        if: inputs.dev_smoke_cmd != ''
+        if: inputs.dev_build_cmd == '' && inputs.dev_smoke_cmd != ''
         working-directory: ${{ inputs.app_path }}
         env:
           CMD: ${{ inputs.dev_smoke_cmd }}
         run: bash -c "$CMD"
+      # ---- Engine contract (dev_build_cmd set).
+      - name: Fetch delivery tooling
+        if: inputs.dev_build_cmd != ''
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: engine
+        if: inputs.dev_build_cmd != ''
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: dev
+          mode: manual
+          inputs_json: ${{ toJSON(inputs) }}
+          smoke_username: ${{ secrets.SMOKE_USERNAME }}
+          smoke_password: ${{ secrets.SMOKE_PASSWORD }}
