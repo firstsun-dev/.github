@@ -52,7 +52,7 @@ Detect Changes (monorepo only — the CALLER runs _detect-changes.yml and gates 
 | Migration | `d1_migrations`, `d1_binding`, `d1_lock_scope` (no command override) |
 | Release | `release_cmd` (+ secret `RELEASE_TOKEN`) |
 | Hybrid | `persistent_dev_ref`, `dev_deploy_cmd`, `dev_smoke_cmd`, `dispatch_target` |
-| Shared Dev | `shared_dev_on_branch_push`, `app_url_dev`, `dev_deploy_cmd`, `dev_smoke_cmd`, `build_env_dev`, `dev_build_cmd`, `dev_wrangler_env` (default `dev`), `dev_worker_name`; reuses `d1_migrations`, `d1_binding`, `sha_path`, `smoke_env`, `access_protected_targets`, `preview_deny_resources` |
+| Shared Dev | `shared_dev_on_branch_push`, `app_url_dev`, `dev_deploy_cmd`, `dev_smoke_cmd`, `build_env_dev`, `dev_build_cmd`, `dev_wrangler_env` (default `dev`), `dev_worker_name`, `dev_binding_allow`; reuses `d1_migrations`, `d1_binding`, `sha_path`, `smoke_env`, `access_protected_targets`, `preview_deny_resources` |
 
 Outputs: `deploy_url`, `deploy_target`, `version_id` (prod only), `dev_url` (Shared Dev). The internal `deployed_and_verified` Deploy output is what gates Release. Secrets: `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` (prod), `CLOUDFLARE_PREVIEW_API_TOKEN/ACCOUNT_ID`, `CLOUDFLARE_DEV_*`, `PREVIEW_SECRETS`, `SMOKE_USERNAME/PASSWORD`, `RELEASE_TOKEN`.
 
@@ -94,6 +94,7 @@ Two independent switches decide what a non-main push deploys. Neither requires t
 * A failed build, audit or stale run never changes the running Dev Worker or its D1 (Preview migrates before it builds; Dev builds first because Dev has no separate Migration job).
 * Migration reuses `migrate.sh` with `TARGET=dev`: D1 = `env.<dev_wrangler_env>.d1_databases`, never top-level (Production); no fallback. The Preview D1 and the Dev D1 **may** be the same physical database (Blog); Production's may not. `migrations apply` is pending-only, and the job `needs` Migration/Deploy purely for ordering (their results are ignored), plus the shared concurrency group, so two channels never migrate one D1 at the same time.
 * `dev_worker_name` is **required**, and the audit runs on every Shared Dev run: the adapter-generated effective config (`.wrangler/deploy/config.json`), or if none was generated the source `env.<dev_wrangler_env>` block, must have `name == dev_worker_name` and bind none of the source config's top-level (Production) resources or `preview_deny_resources`.
+* `dev_binding_allow` (`kind:BINDING`, e.g. `r2_buckets:SHINYI_MUYU_VOICE_CACHE`) lets the Dev config keep a deliberately shared non-D1 Production resource (Blog's voice cache bucket, isolated by key prefix); a D1 can never be allowed.
 * With `d1_migrations`, `dev_build_cmd` is **required**, so the Dev build always succeeds before the Dev D1 is migrated.
 * **Shared-D1 guard:** if the Preview and Dev D1 are the same physical database and the Preview Migration failed or was cancelled, Shared Dev stops before building or migrating (D1 state unknown). With distinct D1s or Preview off, Dev still deploys.
 * Credentials: `CLOUDFLARE_DEV_API_TOKEN` / `CLOUDFLARE_DEV_ACCOUNT_ID` only, in the `<app>/dev` Environment. No Production/Preview token or `PREVIEW_SECRETS` is referenced; a missing Dev token fails closed.

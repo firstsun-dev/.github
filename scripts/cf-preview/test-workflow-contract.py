@@ -446,4 +446,6 @@ check("requires dev_worker_name" in val["run"], "Shared Dev requires dev_worker_
 aud = byname["Audit effective Wrangler config (Dev Worker identity, no Production resources)"]
 check(aud["if"] == "env.STALE != 'true'" and "dev-config-check" in aud["run"], "the Worker identity / resource audit is unconditional for every non-stale Shared Dev run")
 
+check("dev_binding_allow" in inputs_def and "--allow" in aud["run"] and "--allow" in rr, "dev_binding_allow reaches both the normal audit and the recovery audit")
+
 sys.exit(fail)

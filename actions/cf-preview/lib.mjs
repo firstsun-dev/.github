@@ -327,13 +327,19 @@ export function sharedPreviewDevD1(cfg, { binding = '', devEnv = 'dev' } = {}) {
  * Audit the EFFECTIVE (adapter-generated) config of a Shared Dev build: it must target the expected Dev Worker
  * and must not bind any Production resource (top-level resources of the SOURCE config, plus denylist).
  */
-export function auditDevConfig(effective, source, { worker = '', denyResources = [] } = {}) {
+export function auditDevConfig(effective, source, { worker = '', denyResources = [], allow = [] } = {}) {
   const errors = [];
+  const allowed = new Set(allow);
+  for (const a of allowed) {
+    if (!/^[a-z0-9_]+:[A-Za-z0-9_.-]+$/.test(a)) errors.push(`dev_binding_allow entry "${a}" must look like kind:BINDING`);
+    else if (a.startsWith('d1_databases:')) errors.push(`dev_binding_allow cannot allow a D1 database (${a}): Shared Dev never shares a D1 with Production`);
+  }
   if (worker && effective.name !== worker) errors.push(`effective Wrangler config targets Worker "${effective.name}", expected the Shared Dev Worker "${worker}"`);
   const prod = topLevelResourceIds(source);
   const deny = new Set(denyResources);
   for (const [kind, ident] of Object.entries(RESOURCE_KINDS)) {
     for (const b of effective[kind] ?? []) {
+      if (allowed.has(`${kind}:${bindingKey(kind, b)}`) && kind !== 'd1_databases') continue; // explicit, documented exception
       for (const id of ident(b).filter(Boolean)) {
         if (prod.has(id)) errors.push(`${kind}:${bindingKey(kind, b)}: Shared Dev binds the Production resource ${id}`);
         else if (deny.has(id)) errors.push(`${kind}:${bindingKey(kind, b)}: Shared Dev binds denylisted Production resource ${id}`);

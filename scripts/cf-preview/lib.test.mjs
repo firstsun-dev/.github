@@ -289,3 +289,12 @@ test('sharedPreviewDevD1: same physical D1 detected; distinct or undeclared Prev
   assert.equal(sharedPreviewDevD1({ ...DEVCFG, env: { dev: { d1_databases: [{ binding: 'DB', database_name: 'other', database_id: 'X' }] } } }), false);
   assert.equal(sharedPreviewDevD1({ ...DEVCFG, env: {} }), false);
 });
+test('auditDevConfig: dev_binding_allow permits an explicit non-D1 shared binding only', () => {
+  const eff = { name: 'blog-preview', r2_buckets: [{ binding: 'B', bucket_name: 'prod-b' }] };
+  assert.equal(auditDevConfig(eff, DEVCFG, { worker: 'blog-preview' }).errors.length, 1);
+  assert.deepEqual(auditDevConfig(eff, DEVCFG, { worker: 'blog-preview', allow: ['r2_buckets:B'], denyResources: ['prod-b'] }).errors, []);
+  assert.equal(auditDevConfig(eff, DEVCFG, { worker: 'blog-preview', allow: ['r2_buckets:OTHER'] }).errors.length, 1);
+  const d1 = { name: 'blog-preview', d1_databases: [{ binding: 'DB', database_id: 'PROD-ID' }] };
+  assert.ok(auditDevConfig(d1, DEVCFG, { worker: 'blog-preview', allow: ['d1_databases:DB'] }).errors.some((e) => /cannot allow a D1/.test(e)));
+  assert.ok(auditDevConfig(d1, DEVCFG, { worker: 'blog-preview', allow: ['d1_databases:DB'] }).errors.some((e) => /Production resource PROD-ID/.test(e)));
+});

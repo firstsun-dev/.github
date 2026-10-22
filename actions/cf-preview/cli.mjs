@@ -80,7 +80,7 @@ try {
         if (!effective) throw new Error(`No effective config was generated and the source config has no env.${opt('dev-env', 'dev')}`);
         console.log(`::notice::No adapter-generated config; auditing source env.${opt('dev-env', 'dev')}`);
       }
-      const { errors } = auditDevConfig(effective, source, { worker: opt('worker'), denyResources: list(opt('deny')) });
+      const { errors } = auditDevConfig(effective, source, { worker: opt('worker'), denyResources: list(opt('deny')), allow: list(opt('allow')) });
       for (const e of errors) console.log(`::error::${e}`);
       if (errors.length) process.exit(1);
       out({ dev_config: 'ok' });

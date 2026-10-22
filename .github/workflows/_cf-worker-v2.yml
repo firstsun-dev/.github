@@ -231,6 +231,12 @@ on:
         description: Named Wrangler environment of the Shared Dev Worker (exported as CLOUDFLARE_ENV; its D1 is env.<name>.d1_databases)
         type: string
         default: dev
+      dev_binding_allow:
+        description: >
+          Space-separated kind:BINDING entries of the Dev config that may deliberately bind a Production resource
+          (e.g. "r2_buckets:SHINYI_MUYU_VOICE_CACHE" for a shared bucket isolated by key prefix). D1 can never be allowed.
+        type: string
+        default: ''
       dev_worker_name:
         description: Expected Worker name of the Shared Dev deployment; the Astro/adapter-generated effective Wrangler config must match it (e.g. blog-preview)
         type: string
@@ -1157,10 +1163,11 @@ jobs:
           WORKER: ${{ inputs.dev_worker_name }}
           DENY: ${{ inputs.preview_deny_resources }}
           DEV_ENV: ${{ inputs.dev_wrangler_env }}
+          ALLOW: ${{ inputs.dev_binding_allow }}
         run: |
           TOOLS="$GITHUB_WORKSPACE/$TOOLS_DIR"
           EFFECTIVE="$(node "$TOOLS/cli.mjs" effective-config --dir . | sed -n 's/^effective_config=//p')"
-          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY" --dev-env "$DEV_ENV"
+          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY" --dev-env "$DEV_ENV" --allow "$ALLOW"
       - name: Stale-SHA guard (before migration and publish)
         if: env.STALE != 'true'
         run: |
@@ -1265,6 +1272,7 @@ jobs:
           WORKER: ${{ inputs.dev_worker_name }}
           DENY: ${{ inputs.preview_deny_resources }}
           DEV_ENV: ${{ inputs.dev_wrangler_env }}
+          ALLOW: ${{ inputs.dev_binding_allow }}
           GOOD_SHA: ${{ steps.good.outputs.sha }}
           TARGET_URL: ${{ inputs.app_url_dev }}
           DEPLOY_TARGET: dev
@@ -1283,7 +1291,7 @@ jobs:
           pnpm install --frozen-lockfile
           [ -z "$BUILD_CMD" ] || bash -eo pipefail -c "$BUILD_CMD"
           EFFECTIVE="$(node "$TOOLS/cli.mjs" effective-config --dir . | sed -n 's/^effective_config=//p')"
-          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY" --dev-env "$DEV_ENV"
+          node "$TOOLS/cli.mjs" dev-config-check --effective "$EFFECTIVE" --source "$CFG" --worker "$WORKER" --deny "$DENY" --dev-env "$DEV_ENV" --allow "$ALLOW"
           bash -eo pipefail -c "$DEPLOY_CMD"
           "$TOOLS/smoke.sh" >/dev/null
           echo "### ♻️ Recovered and fully re-verified Shared Dev at last good commit \`$GOOD_SHA\`. Run remains FAILED for the bad commit. D1 migrations (if any) were NOT reverted." >> "$GITHUB_STEP_SUMMARY"
