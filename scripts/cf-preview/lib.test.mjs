@@ -109,6 +109,23 @@ test('preflight: denylist', () => {
   g.previews.r2_buckets[0].bucket_name = 'general-bucket';
   assert.equal(auditPreviewConfig(g, { denyResources: ['general-bucket'] }).errors.length, 1);
 });
+test('preflight: exact kind:BINDING=identity allow shares one Production R2 bucket, nothing else', () => {
+  const g = good();
+  g.previews.r2_buckets[0].bucket_name = 'prod-bucket';
+  const entry = 'r2_buckets:ASSETS_R2=prod-bucket';
+  assert.equal(auditPreviewConfig(g).errors.length, 1);
+  assert.deepEqual(auditPreviewConfig(g, { allow: [entry] }).errors, []);
+  // the allow entry also waives the denylist for that exact binding/identity
+  assert.deepEqual(auditPreviewConfig(g, { allow: [entry], denyResources: ['prod-bucket'] }).errors, []);
+  // a different bucket under the same binding, or the same bucket under another binding, is not approved
+  assert.equal(auditPreviewConfig(g, { allow: ['r2_buckets:ASSETS_R2=other-bucket'] }).errors.length, 1);
+  assert.equal(auditPreviewConfig(g, { allow: ['r2_buckets:OTHER=prod-bucket'] }).errors.length, 1);
+});
+test('preflight: a Production D1 can never be approved for sharing', () => {
+  const g = good();
+  g.previews.d1_databases[0].database_id = 'prod-id';
+  assert.equal(auditPreviewConfig(g, { allow: ['d1_databases:DB=prod-id'] }).errors.length, 1);
+});
 test('preflight: service/hyperdrive/secrets-store need explicit allow', () => {
   const g = good();
   g.services = [{ binding: 'ID', service: 'heaven-id' }];
