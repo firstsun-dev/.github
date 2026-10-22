@@ -30,8 +30,10 @@ G="$ROOT/actions/cf-preview/gh.sh"
 
 # ---- last-good-preview: identity-bound lookup (repo, app, branch ref, HOST Worker, success, https URL) ----
 dep() { printf '{"id":%s,"sha":"%s","payload":{"repo":"o/r","branch_ref":"refs/heads/feat/a","host_worker":"%s","worker":"www"%s}}' "$1" "$2" "$3" "${4:-}"; }
-export LP_JSON="[$(dep 5 newest-wrong-host blog-preview),$(dep 4 right-host-failed blog),$(dep 3 right-host-nourl blog),$(dep 2 right-host-good blog),$(dep 1 older-good blog)]"
-export LP_ST_5="success https://feat-a-blog-preview.x.workers.dev" LP_ST_4="failure https://u.example.com" LP_ST_3="success " LP_ST_2="success https://feat-a-blog.x.workers.dev" LP_ST_1="success https://old.example.com"
+LP_JSON="[$(dep 5 newest-wrong-host blog-preview),$(dep 4 right-host-failed blog),$(dep 3 right-host-nourl blog),$(dep 2 right-host-good blog),$(dep 1 older-good blog)]"
+export LP_JSON
+LP_ST_5="success https://feat-a-blog-preview.x.workers.dev" LP_ST_4="failure https://u.example.com" LP_ST_3="success " LP_ST_2="success https://feat-a-blog.x.workers.dev" LP_ST_1="success https://old.example.com"
+export LP_ST_5 LP_ST_4 LP_ST_3 LP_ST_2 LP_ST_1
 LP() { "$G" last-good-preview "www/preview/feat-a" "${1:-0}" refs/heads/feat/a "${2:-blog}" www; }
 [ "$(LP 0)" = "right-host-good https://feat-a-blog.x.workers.dev" ] && ok "last-good-preview: skips another host Worker, failed, and URL-less deployments" || bad "last-good-preview basic: $(LP 0)"
 [ "$(LP 2)" = "older-good https://old.example.com" ] && ok "last-good-preview: honours the excluded (current) deployment" || bad "exclude"
@@ -39,7 +41,7 @@ LP() { "$G" last-good-preview "www/preview/feat-a" "${1:-0}" refs/heads/feat/a "
 [ -z "$(LP 0 someone-else)" ] && ok "last-good-preview: unknown host Worker has no eligible deployment" || bad "unknown host"
 [ -z "$("$G" last-good-preview "www/preview/feat-a" 0 refs/heads/other blog www)" ] && ok "last-good-preview: another branch ref is not eligible" || bad "branch"
 [ -z "$("$G" last-good-preview "www/preview/feat-a" 0 refs/heads/feat/a blog other-app)" ] && ok "last-good-preview: another application is not eligible" || bad "app"
-export LP_JSON="[{\"id\":2,\"sha\":\"legacy\",\"payload\":{\"branch_ref\":\"refs/heads/feat/a\",\"worker\":\"www\"}}]"
+LP_JSON="[{\"id\":2,\"sha\":\"legacy\",\"payload\":{\"branch_ref\":\"refs/heads/feat/a\",\"worker\":\"www\"}}]"
 [ -z "$(LP 0)" ] && ok "last-good-preview: legacy records without host_worker/repo are never eligible" || bad "legacy"
 
 : > "$T/log"; "$G" comment feat/a www https://u.dev abc1234 >/dev/null
