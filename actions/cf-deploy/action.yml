@@ -57,6 +57,10 @@ outputs:
 runs:
   using: composite
   steps:
+    # Must run before `init`: engine.sh init calls cli.mjs, which imports `smol-toml` from this directory.
+    - name: Install tooling deps
+      shell: bash
+      run: cd "$GITHUB_ACTION_PATH/../cf-preview" && npm ci --ignore-scripts --no-audit --no-fund
     - name: Initialise (bind target, validate credentials and env as data)
       id: init
       shell: bash
@@ -75,10 +79,6 @@ runs:
       with:
         setup-node: 'false'
         setup-pnpm: 'false'
-    - name: Install tooling deps
-      if: env.STALE != 'true'
-      shell: bash
-      run: cd "$GITHUB_ACTION_PATH/../cf-preview" && npm ci --ignore-scripts --no-audit --no-fund
     - name: Prepare (Wrangler version, Preview identity and ledger, ledger entry)
       if: env.STALE != 'true'
       shell: bash
