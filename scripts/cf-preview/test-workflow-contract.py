@@ -279,6 +279,9 @@ for n, i, s in action_uses:
           f"{n}: firstsun-dev/.github is checked out at tools_ref into .cf-tools, including actions/{name}, BEFORE `uses: {s['uses']}`")
     first_ck = next(i_ for i_, p in enumerate(jobs[n]["steps"]) if str(p.get("uses", "")).startswith("actions/checkout"))
     check(jobs[n]["steps"][first_ck].get("with", {}).get("path") is None or n == "persistent-dev", f"{n}: the app checkout (workspace root) happens before the tooling checkout")
+_ci = open("actions/cf-ci-check/action.yml").read()
+check("rm -rf .cf-tools" not in _ci and "'.cf-tools/actions/cf-ci-check/action.yml' -delete" in _ci,
+      "cf-ci-check never deletes its own action.yml (the runner re-reads it for the post step; Blog run 39722027184 failed that way)")
 check(all("cf-preview" in (s["with"].get("sparse-checkout", "") if s.get("with") else "") for s in jobs["deploy"]["steps"] if s.get("with", {}).get("path") == ".cf-tools"), "Deploy fetches the engine scripts (actions/cf-preview) together with the action")
 pins = [s["uses"] for j in jobs.values() for s in j.get("steps", []) if str(s.get("uses", "")).startswith("firstsun-dev/.github/")]
 check(all(re.fullmatch(r"firstsun-dev/\.github/actions/[a-z0-9-]+@v1", u) for u in pins), "remaining remote references are the existing pinned shared actions (setup / mailpit @v1)")

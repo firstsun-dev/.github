@@ -40,7 +40,9 @@ runs:
       run: |
         node "$GITHUB_ACTION_PATH/../cf-preview/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
         node "$GITHUB_ACTION_PATH/../cf-preview/parse-env.mjs" CI_ENV "$GITHUB_ENV"
-        rm -rf .cf-tools   # keep the tool checkout out of lint/typecheck scope (no later step needs it)
+        # Keep the tool checkout out of lint/typecheck scope, but NEVER delete this action's own action.yml: the runner
+        # re-reads it for the post step of the nested `setup` action ("Can't find action.yml" fails the job otherwise).
+        find .cf-tools -type f ! -path '.cf-tools/.git/*' ! -path '.cf-tools/actions/cf-ci-check/action.yml' -delete
     - uses: firstsun-dev/.github/actions/setup@v1
       with:
         setup-node: 'false'
