@@ -54,7 +54,7 @@ case "$TARGET" in
     fi;;
   prod)
     if [ "$MODE" = effective ]; then
-      node "$TOOLS_DIR/cli.mjs" audit-prod --effective "$CONFIG_PATH" --source "$APP_DIR/$CFG" >&2
+      node "$TOOLS_DIR/cli.mjs" audit-prod --effective "$CONFIG_PATH" --source "$APP_DIR/$CFG" --allow "${PREVIEW_ALLOW:-}" >&2
     fi;;
   dev)
     # Worker identity + resource policy of the Dev config that will be published (mode=source audits env.<DEV_ENV>).

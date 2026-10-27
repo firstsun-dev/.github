@@ -224,6 +224,27 @@ test('auditProdConfig: generated Production config must not bind Preview resourc
   assert.equal(auditProdConfig({ r2_buckets: [{ binding: 'X', bucket_name: 'prev-b' }] }, src).errors.length, 1);
 });
 
+test('auditProdConfig: an exact preview_binding_allow entry approves a shared storage resource', () => {
+  const src = { r2_buckets: [{ binding: 'CACHE', bucket_name: 'shared' }],
+    previews: { r2_buckets: [{ binding: 'CACHE', bucket_name: 'shared' }] } };
+  const prod = { r2_buckets: [{ binding: 'CACHE', bucket_name: 'shared' }] };
+  assert.equal(auditProdConfig(prod, src).errors.length, 1);
+  assert.deepEqual(auditProdConfig(prod, src, { allow: ['r2_buckets:CACHE=shared'] }).errors, []);
+  // the approval is per binding and per resource
+  assert.equal(auditProdConfig(prod, src, { allow: ['r2_buckets:OTHER=shared'] }).errors.length, 1);
+  assert.equal(auditProdConfig(prod, src, { allow: ['r2_buckets:CACHE=elsewhere'] }).errors.length, 1);
+  // other Preview resources are still caught while one is approved
+  const src2 = { ...src, previews: { r2_buckets: [...src.previews.r2_buckets, { binding: 'B', bucket_name: 'prev-b' }] } };
+  const bad = { r2_buckets: [...prod.r2_buckets, { binding: 'X', bucket_name: 'prev-b' }] };
+  assert.match(auditProdConfig(bad, src2, { allow: ['r2_buckets:CACHE=shared'] }).errors[0], /Preview resource prev-b/);
+});
+
+test('auditProdConfig: D1 can never be approved as shared with Production', () => {
+  const src = { d1_databases: [{ binding: 'DB', database_id: 'ID' }], previews: { d1_databases: [{ binding: 'DB', database_id: 'ID' }] } };
+  const prod = { d1_databases: [{ binding: 'DB', database_id: 'ID' }] };
+  assert.equal(auditProdConfig(prod, src, { allow: ['d1_databases:DB=ID'] }).errors.length, 1);
+});
+
 test('parseEnvLines: KEY=VALUE only, comments/blank skipped, unsafe input rejected', () => {
   assert.deepEqual(parseEnvLines('A=1\n\n# c\nB=x=y\r\nC=').pairs, [['A', '1'], ['B', 'x=y'], ['C', '']]);
   for (const bad of ['1A=x', 'A B=x', 'novalue', '=x', 'A=$(id)\u0000z', 'A-B=1']) {

@@ -386,13 +386,23 @@ function topLevelResourceIds(cfg) {
 
 /**
  * Production must never bind a Preview resource. `source` is the project's wrangler config, `effective`
- * the build-generated one (Astro/other adapters can add bindings the source lacks).
+ * the build-generated one (Astro/other adapters can add bindings the source lacks). `allow` is the same
+ * preview_binding_allow list auditPreviewConfig honours: an exact "kind:BINDING=identity" entry for a shareable
+ * storage kind (never D1) approves that one Preview binding sharing that one Production resource, so it is not
+ * counted as a Preview-only resource here.
  */
-export function auditProdConfig(effective, source) {
+export function auditProdConfig(effective, source, { allow = [] } = {}) {
   const errors = [];
+  const allowed = new Set(allow);
   const previewIds = new Set();
   for (const [kind, ident] of Object.entries(RESOURCE_KINDS)) {
-    for (const b of source.previews?.[kind] ?? []) ident(b).filter(Boolean).forEach((id) => previewIds.add(id));
+    for (const b of source.previews?.[kind] ?? []) {
+      const key = `${kind}:${bindingKey(kind, b)}`;
+      ident(b).filter(Boolean).forEach((id) => {
+        if (DEV_SHAREABLE_KINDS.includes(kind) && allowed.has(`${key}=${id}`)) return;
+        previewIds.add(id);
+      });
+    }
   }
   for (const id of topLevelResourceIds(effective)) {
     if (previewIds.has(id)) errors.push(`Production config binds Preview resource ${id}`);
