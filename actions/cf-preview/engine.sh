@@ -180,7 +180,7 @@ case "$PHASE" in
   smoke)
     ctx
     URL="$(target_url)"; [ "$TARGET" != preview ] || URL="${PUBLISHED_URL:-}"
-    TARGET_URL="$URL" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="$RUN_SHA" SMOKE_CMD="$(target_smoke_cmd)" SHA_PATH="$(inp sha_path)" \
+    TARGET_URL="$URL" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="$RUN_SHA" SMOKE_CMD="$(target_smoke_cmd)" SMOKE_CWD="$APP_DIR" SHA_PATH="$(inp sha_path)" \
       PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" \
       ACCESS_TARGETS="$(inp access_protected_targets)" SMOKE_ENV_FILE="$S/smoke.env" PREVIEW_ENV_FILE="$S/preview.env" NO_PROXY='*' \
       "$TOOLS_DIR/smoke.sh";;
@@ -293,7 +293,7 @@ case "$PHASE" in
 
   recover-verify)
     ctx
-    TARGET_URL="${RECOVERED_URL:?}" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="${GOOD_SHA:?}" SMOKE_CMD="$(target_smoke_cmd)" SHA_PATH="$(inp sha_path)" \
+    TARGET_URL="${RECOVERED_URL:?}" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="${GOOD_SHA:?}" SMOKE_CMD="$(target_smoke_cmd)" SMOKE_CWD="$APP_DIR" SHA_PATH="$(inp sha_path)" \
       PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" \
       ACCESS_TARGETS="$(inp access_protected_targets)" SMOKE_ENV_FILE="$S/smoke.env" PREVIEW_ENV_FILE="$S/preview.env" NO_PROXY='*' "$TOOLS_DIR/smoke.sh";;
 
