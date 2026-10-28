@@ -179,6 +179,19 @@ on:
           headers through smoke_env PROBE_HEADERS so the probe reaches the application itself.
         type: string
         default: preview
+      probe_path:
+        description: >
+          Path the built-in liveness probe requests on the deployed URL (default `/`). Use when the Worker has no
+          route at `/` (e.g. an API-only Worker). Must start with `/`. Applies to Production, Preview and Dev.
+        type: string
+        default: /
+      probe_expect_status:
+        description: >
+          Exact HTTP status the probe must see at probe_path (e.g. `405` for a POST-only route). Empty = any 2xx. A
+          redirect to Cloudflare Access is still handled by access_protected_targets. Pair it with smoke_cmd for
+          application-level assertions.
+        type: string
+        default: ''
       sha_path:
         description: Optional path (e.g. /version.json) that must contain the commit SHA once served (smoke_level content-sha)
         type: string
