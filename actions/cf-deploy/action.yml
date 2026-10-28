@@ -4,11 +4,13 @@ description: >
   phase of actions/cf-preview/engine.sh; this file only sequences them, per `stage`:
     all       Shared Dev / persistent Dev, ONE job: build -> audit -> D1 target check -> stale check -> migrate ->
               stale check -> publish -> smoke -> mark verified | last-known-good recovery
+    deploy    Shared Dev only, opt-in (pipeline_phase): the `all` job WITHOUT smoke and recovery. A later `verify` job smokes
+              it and a `rollback` job recovers it, so a cross-service smoke can wait for another Worker's deployment.
     migrate   Migration job (prod | preview): build + audit + D1 target check + stale check + migrate. Publishes nothing.
     publish   Deploy job   (prod | preview): build + audit + stale check + publish the audited artifact. Runs no smoke.
-    verify    Smoke job    (prod | preview): smoke the published URL; mark verified | unverified. NO Cloudflare credentials.
-    rollback  Rollback job (prod | preview): prod = fail-closed Worker rollback to the previous version + re-smoke;
-              preview = redeploy the last known-good Preview + re-smoke.
+    verify    Smoke job    (prod | preview | dev): smoke the published URL; mark verified | unverified. NO Cloudflare credentials.
+    rollback  Rollback job (prod | preview | dev): prod = fail-closed Worker rollback to the previous version + re-smoke;
+              preview | dev = redeploy the last known-good deployment + re-smoke.
   Jobs share only validated DATA (deploy_outputs / migration_outputs / smoke_outputs), never runner files. The CALLER
   job owns the Environment, permissions, concurrency and which Cloudflare credentials exist (CLOUDFLARE_API_TOKEN /
   CLOUDFLARE_ACCOUNT_ID in the job env). The caller must have checked out the app at the run SHA and then this
@@ -18,7 +20,7 @@ inputs:
     description: prod | preview | dev. Bound once by the engine; application env can never change it.
     required: true
   stage:
-    description: all | migrate | publish | verify | rollback (see description). dev only supports all; prod and preview never run as all.
+    description: all | deploy | migrate | publish | verify | rollback (see description). dev supports all, deploy, verify, rollback; prod and preview support migrate, publish, verify, rollback.
     default: all
   mode:
     description: auto (branch / main push, with automatic recovery) | manual (persistent Dev dispatch, no recovery)
@@ -48,7 +50,16 @@ inputs:
   smoke_outputs:
     description: toJSON(needs.smoke.outputs) - hand-off to the rollback stage
     default: '{}'
+  call_inputs_json:
+    description: Deferred verification only - toJSON(inputs) of the VERIFY call, compared with the deploy call's identity inputs (inputs_json)
+    default: ''
+  upstream_gate:
+    description: Verify stage only - result of the job this verification must wait for (success | skipped = satisfied; anything else blocks, fail closed). Empty = no gate.
+    default: ''
 outputs:
+  gate_blocked:
+    description: true when the verify stage refused to run because a required upstream job did not succeed (no smoke ran; not attributable to this Worker, so no rollback)
+    value: ${{ steps.gate.outputs.blocked || 'false' }}
   url:
     description: Published URL (kept for existing consumers; verified or not - see verified_url / published_unverified)
     value: ${{ steps.verified.outputs.url || steps.publish.outputs.url || steps.hydrate.outputs.url }}
@@ -118,6 +129,7 @@ runs:
         ENGINE_STAGE: ${{ inputs.stage }}
         ENGINE_MODE: ${{ inputs.mode }}
         INPUTS_JSON: ${{ inputs.inputs_json }}
+        CALL_INPUTS_JSON: ${{ inputs.call_inputs_json }}
         PREVIEW_SECRETS: ${{ inputs.target == 'preview' && inputs.preview_secrets || '' }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" init'
     - name: Hand-off from the previous jobs (validated data)
@@ -129,6 +141,19 @@ runs:
         HANDOFF_MIGRATION: ${{ inputs.migration_outputs }}
         HANDOFF_SMOKE: ${{ inputs.smoke_outputs }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" hydrate | tee -a "$GITHUB_OUTPUT"'
+    # Cross-service gate (deferred verification): a required upstream job (e.g. another Worker's deployment + smoke) must
+    # have succeeded, or been skipped because it was not affected (the existing verified environment is used). Anything
+    # else - failed, cancelled, unknown - means this deployment cannot be verified: it is marked unverified and the job
+    # fails. It is not rolled back (the cause is upstream, not this Worker); Release stays blocked.
+    - name: Cross-service gate (upstream must have succeeded or been skipped)
+      id: gate
+      if: inputs.stage == 'verify' && inputs.upstream_gate != '' && inputs.upstream_gate != 'success' && inputs.upstream_gate != 'skipped'
+      shell: bash
+      env:
+        UPSTREAM_GATE: ${{ inputs.upstream_gate }}
+      run: |
+        "$GITHUB_ACTION_PATH/../cf-preview/engine.sh" gate-blocked | tee -a "$GITHUB_OUTPUT"
+        exit 1
     - name: Stale-SHA guard (start)
       if: inputs.stage != 'verify' && inputs.stage != 'rollback'
       shell: bash
@@ -161,23 +186,23 @@ runs:
         PREVIEW_JOB_RESULT: ${{ inputs.sibling_result }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" d1-guard'
     - name: Stale-SHA guard (before migration)
-      if: env.STALE != 'true' && (inputs.stage == 'all' || inputs.stage == 'migrate')
+      if: env.STALE != 'true' && (inputs.stage == 'all' || inputs.stage == 'deploy' || inputs.stage == 'migrate')
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" guard before-migration'
     - name: Apply pending D1 migrations (this target only)
       id: migrate
-      if: env.STALE != 'true' && (inputs.stage == 'all' || inputs.stage == 'migrate')
+      if: env.STALE != 'true' && (inputs.stage == 'all' || inputs.stage == 'deploy' || inputs.stage == 'migrate')
       shell: bash
       env:
         ENGINE_TARGET: ${{ inputs.target }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" migrate | tee -a "$GITHUB_OUTPUT"'
     - name: Stale-SHA guard (after migration, before publish)
-      if: env.STALE != 'true' && (inputs.stage == 'all' || inputs.stage == 'publish')
+      if: env.STALE != 'true' && (inputs.stage == 'all' || inputs.stage == 'deploy' || inputs.stage == 'publish')
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" guard before-publish'
     - name: Publish the audited artifact
       id: publish
-      if: env.STALE != 'true' && (inputs.stage == 'all' || inputs.stage == 'publish')
+      if: env.STALE != 'true' && (inputs.stage == 'all' || inputs.stage == 'deploy' || inputs.stage == 'publish')
       shell: bash
       env:
         ENGINE_TARGET: ${{ inputs.target }}
@@ -204,7 +229,7 @@ runs:
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" verified | tee -a "$GITHUB_OUTPUT"'
     - name: Report migration state
       id: migration_state
-      if: always() && (inputs.stage == 'all' || inputs.stage == 'migrate')
+      if: always() && (inputs.stage == 'all' || inputs.stage == 'deploy' || inputs.stage == 'migrate')
       shell: bash
       env:
         OUTCOME: ${{ steps.migrate.outcome }}
@@ -217,7 +242,7 @@ runs:
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" fail-migrate'
     - name: Failed before or during publish
-      if: failure() && (inputs.stage == 'all' || inputs.stage == 'publish') && steps.init.outcome == 'success' && steps.publish.outcome != 'success' && env.STALE != 'true'
+      if: failure() && (inputs.stage == 'all' || inputs.stage == 'deploy' || inputs.stage == 'publish') && steps.init.outcome == 'success' && steps.publish.outcome != 'success' && env.STALE != 'true'
       shell: bash
       env:
         PREVIEW_MUTATED: ${{ steps.publish.outputs.preview_mutated }}
@@ -235,7 +260,7 @@ runs:
     # Production version). stage all (Shared Dev): runs inside the failed job; stage rollback (Preview): its own job.
     - name: Recovery - find the last known-good deployment of this target
       id: good
-      if: (failure() && inputs.stage == 'all' && inputs.mode == 'auto' && inputs.target != 'prod' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure') || (success() && inputs.stage == 'rollback' && inputs.target == 'preview')
+      if: (failure() && inputs.stage == 'all' && inputs.mode == 'auto' && inputs.target != 'prod' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure') || (success() && inputs.stage == 'rollback' && inputs.target != 'prod')
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" recover-find | tee -a "$GITHUB_OUTPUT"'
     - name: Recovery - checkout last good

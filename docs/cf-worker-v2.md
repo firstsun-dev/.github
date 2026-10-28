@@ -109,6 +109,9 @@ Notes
 | `preview_binding_allow`, `preview_deny_resources` | explicit approvals / forbidden Production resources for the binding audit |
 | `preview_worker_name` | host Previews under another existing Worker (see below) |
 | `production_rollback_policy` | `automatic` \| `manual` \| `disabled` |
+| `pipeline_phase` | `all` (default, unchanged single call) \| `deploy` \| `verify`. Opt-in two-call split for a Smoke that must wait for another Worker's job; see *Deferred verification* in docs/cf-worker-v2-refactor.md |
+| `phase_state` | verify call only: the deploy call's `phase_state` output, passed unchanged (validated data) |
+| `upstream_gate` | verify call only: `needs.<other>.result`; `success`/`skipped` satisfy it, anything else blocks the verification (no smoke, no rollback, Release blocked) |
 | `preview_provision_cmd`, `preview_migrate_cmd` | optional hooks run before publish (resources must be Preview-only) |
 | `preview_cleanup_cmd` | **deprecated and ignored** |
 

@@ -92,8 +92,9 @@ text_all = open(WF).read()
 
 # ---------------------------------------------------------------- 1. topology: thin workflow, one engine
 DELIVERY = ["migration", "deploy", "smoke", "rollback"]
-check(set(jobs) == set(VALIDATION) | set(DELIVERY) | {DEVJOB, "release", "config-guard", "lifecycle", "persistent-dev"},
-      "job set is the six validation jobs, Migration -> Deploy -> Smoke -> Rollback, Shared Dev, Release + config-guard/lifecycle/persistent-dev handlers")
+DEVVERIFY = ["dev-verify", "dev-rollback"]
+check(set(jobs) == set(VALIDATION) | set(DELIVERY) | {DEVJOB, "release", "config-guard", "lifecycle", "persistent-dev"} | set(DEVVERIFY),
+      "job set is the six validation jobs, Migration -> Deploy -> Smoke -> Rollback, Shared Dev (+ its deferred smoke / revert), Release + config-guard/lifecycle/persistent-dev handlers")
 for gone in ("ci", "plan", "test", "test-unit", "test-integration", "test-e2e", "prepare", "migrate", "test-gate", "gate", "preview", "production",
              "production-verify", "production-recovery", "pr-link", "cleanup", "verify", "revert"):
     check(gone not in jobs, f"obsolete job '{gone}' is gone (no Prepare / Plan / Test Gate job; the v1 names live on as the display names Smoke Tests / Revert on Verify Failure)")
@@ -114,19 +115,22 @@ check(needs_of("smoke") == ["deploy"], "Smoke Tests need Deploy")
 check(set(needs_of("rollback")) == {"migration", "deploy", "smoke"}, "Revert on Verify Failure needs Migration (D1 state), Deploy (what to restore) and Smoke Tests (why)")
 check(set(needs_of(DEVJOB)) == set(VALIDATION) | set(DELIVERY), "Shared Dev needs the six validation jobs (+ the Preview delivery jobs for ordering only)")
 check(set(needs_of("release")) == {"deploy", "smoke", "rollback"}, "Release needs Deploy, Smoke Tests and Rollback (Shared Dev never gates or triggers it)")
-check(len(text_all.splitlines()) <= 1150, f"the workflow is thin ({len(text_all.splitlines())} lines; the former monolith had 1681)")
+check(len(text_all.splitlines()) <= 1400, f"the workflow is thin ({len(text_all.splitlines())} lines; the former monolith had 1681)")
 
 # ---------------------------------------------------------------- 2. one deployment implementation
 ENGINE_USE = "./.cf-tools/actions/cf-deploy"
 engine_jobs = {n: [s for s in j.get("steps", []) if s.get("uses") == ENGINE_USE] for n, j in jobs.items()}
-check({n for n, s in engine_jobs.items() if s} == set(DELIVERY) | {DEVJOB, "persistent-dev"} and all(len(s) == 1 for s in engine_jobs.values() if s),
-      "Migration, Deploy, Smoke, Rollback, Shared Dev and the manual persistent Dev each call the SAME delivery engine action exactly once (no second deployment implementation)")
+check({n for n, s in engine_jobs.items() if s} == set(DELIVERY) | {DEVJOB, "persistent-dev"} | set(DEVVERIFY) and all(len(s) == 1 for s in engine_jobs.values() if s),
+      "Migration, Deploy, Smoke, Rollback, Shared Dev (+ deferred smoke / revert) and the manual persistent Dev each call the SAME delivery engine action exactly once (no second deployment implementation)")
 eng = {n: s[0] for n, s in engine_jobs.items() if s}
-check({n: eng[n]["with"]["stage"] for n in DELIVERY} == {"migration": "migrate", "deploy": "publish", "smoke": "verify", "rollback": "rollback"} and "stage" not in eng[DEVJOB]["with"],
-      "each delivery job selects its engine stage (migrate / publish / verify / rollback); Shared Dev keeps the single-job engine")
+check({n: eng[n]["with"]["stage"] for n in DELIVERY} == {"migration": "migrate", "deploy": "publish", "smoke": "verify", "rollback": "rollback"} and eng[DEVJOB]["with"]["stage"] == "${{ inputs.pipeline_phase == 'deploy' && 'deploy' || 'all' }}"
+      and eng["dev-verify"]["with"]["stage"] == "verify" and eng["dev-rollback"]["with"]["stage"] == "rollback",
+      "each delivery job selects its engine stage (migrate / publish / verify / rollback); Shared Dev keeps the single-job engine (stage all) unless pipeline_phase is deploy")
 check(all(eng[n]["with"]["target"] == "${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}" for n in DELIVERY), "Production / Preview jobs: target = prod on main, preview otherwise (same binding in every job)")
 check(eng[DEVJOB]["with"]["target"] == "dev" and eng["persistent-dev"]["with"]["target"] == "dev" and eng["persistent-dev"]["with"]["mode"] == "manual", "Shared Dev and persistent Dev bind target=dev; persistent Dev runs in manual mode")
-check(all(eng[n]["with"]["inputs_json"] == "${{ toJSON(inputs) }}" for n in eng), "engine inputs are passed as one JSON data blob, not interpolated into scripts")
+VERIFY_BLOB = "${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}"
+check(all(eng[n]["with"]["inputs_json"] in ("${{ toJSON(inputs) }}", VERIFY_BLOB, "${{ toJSON(fromJSON(inputs.phase_state).inputs) }}") for n in eng)
+      and all(eng[n]["with"]["inputs_json"] == VERIFY_BLOB for n in ("smoke", "rollback")), "engine inputs are passed as one JSON data blob, not interpolated into scripts (the deferred verify call reads the DEPLOY call's blob)")
 IMPL = re.compile(r"wrangler|migrate\.sh|publish\.sh|build\.sh|engine\.sh|deploy\.sh|smoke\.sh|d1 migrations|versions (upload|deploy)")
 for n, j in jobs.items():
     runs_txt = "\n".join(ln for s in j.get("steps", []) for ln in s.get("run", "").splitlines() if "echo" not in ln)  # summary text may name commands
@@ -389,7 +393,7 @@ check("build_env_prod" in ci_steps[0]["env"]["TARGET_BUILD_ENV"] and "build_env_
 e2e_text = yaml.dump(jobs["e2e"])
 check("test_e2e_build_cmd" in e2e_text and "test_e2e_env" in e2e_text and "inputs.build_cmd" not in e2e_text, "E2E builds with its own test build command and env")
 uploads = [(j, s) for j, job in jobs.items() for s in job.get("steps", []) if "upload-artifact" in str(s.get("uses", ""))]
-check("download-artifact" not in text_all and sorted(j for j, _ in uploads) == ["e2e", "smoke"], "no build artifact hand-off between jobs; the only uploads are the failure-only E2E and smoke reports")
+check("download-artifact" not in text_all and sorted(j for j, _ in uploads) == ["dev-verify", "e2e", "smoke"], "no build artifact hand-off between jobs; the only uploads are the failure-only E2E and smoke reports")
 for j_, u in uploads:
     check(u.get("if") == "failure()" and u.get("continue-on-error") is True and 0 < u["with"]["retention-days"] <= 7, f"{j_} report: failure-only, never fails the job, short retention")
 check(not any(k in inputs_def for k in ("preview_build_cmd", "preview_provision_cmd", "preview_migrate_cmd", "preview_cleanup_cmd", "preview_smoke_cmd", "preview_smoke_env", "verify_cmd", "migrate_cmd_prod", "migrate_cmd_preview")), "obsolete v2 inputs are removed; no custom migration command exists (the target D1 check cannot be bypassed)")
@@ -415,9 +419,9 @@ mig = astep("Apply pending D1 migrations")
 check("engine.sh\" migrate" in mig["run"] and mig["env"]["ENGINE_TARGET"] == "${{ inputs.target }}", "Migration is ONE explicit engine step, bound to the composite target input (not to application env)")
 check(sum(1 for s in ASTEPS if 'engine.sh" migrate' in s.get("run", "")) == 1, "the migration is invoked from exactly one step of the engine")
 STAGE_IF = lambda name: astep(name)["if"]
-check("inputs.stage == 'all' || inputs.stage == 'migrate'" in STAGE_IF("Apply pending D1 migrations") and "publish" not in STAGE_IF("Apply pending D1 migrations").replace("before publish", ""),
+check("inputs.stage == 'all' || inputs.stage == 'deploy' || inputs.stage == 'migrate'" in STAGE_IF("Apply pending D1 migrations") and "publish" not in STAGE_IF("Apply pending D1 migrations").replace("before publish", ""),
       "engine: migrations run only in stage migrate (Migration job) or all (Shared Dev), never in the Deploy / Smoke / Rollback stages")
-check("inputs.stage == 'all' || inputs.stage == 'publish'" in STAGE_IF("Publish the audited artifact") and "inputs.stage == 'all' || inputs.stage == 'publish'" in STAGE_IF("Stale-SHA guard (after migration"),
+check("inputs.stage == 'all' || inputs.stage == 'deploy' || inputs.stage == 'publish'" in STAGE_IF("Publish the audited artifact") and "inputs.stage == 'all' || inputs.stage == 'deploy' || inputs.stage == 'publish'" in STAGE_IF("Stale-SHA guard (after migration"),
       "engine: publishing (and its last stale check) runs only in stage publish (Deploy job) or all (Shared Dev)")
 for n in ("Build and audit", "Validate the exact migration target", "Prepare"):
     check("inputs.stage != 'verify' && inputs.stage != 'rollback'" in STAGE_IF(n), f"engine: '{n}' never runs in the Smoke / Rollback stages")
@@ -445,7 +449,7 @@ fin = astep("Rollback - fail unless")
 check("steps.rbfinal.outputs.ok != 'true'" in fin["if"] and "exit 1" in fin["run"], "engine: the Rollback job stays RED unless the previous deployment was restored AND content-verified")
 check(aidx("Rollback - restore") < aidx("Rollback - re-run") < aidx("Rollback - verdict") < aidx("Rollback - fail unless"), "engine: rollback -> re-smoke -> verdict -> fail-unless-verified")
 rf = astep("Recovery - find")
-check("inputs.mode == 'auto'" in rf["if"] and "inputs.target != 'prod'" in rf["if"] and "steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'" in rf["if"] and "inputs.stage == 'rollback' && inputs.target == 'preview'" in rf["if"],
+check("inputs.mode == 'auto'" in rf["if"] and "inputs.target != 'prod'" in rf["if"] and "steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'" in rf["if"] and "inputs.stage == 'rollback' && inputs.target != 'prod'" in rf["if"],
       "engine: automatic Preview/Dev recovery only in auto mode, only after a published URL failed smoke (Shared Dev: same job; Preview: the Rollback job), never for Production")
 check("recover-run" in astep("Recovery - rebuild")["run"] and "migrate" not in astep("Recovery - rebuild")["run"], "engine: recovery rebuilds, audits and republishes the last good SHA and never migrates (D1 is never rolled back)")
 check(astep("Recovery - verify")["env"]["GOOD_SHA"] == "${{ steps.good.outputs.sha }}" and "recover-verify" in astep("Recovery - verify")["run"], "engine: the restored deployment is verified against the LAST-GOOD sha")
@@ -502,12 +506,12 @@ check(not {"CLOUDFLARE_DEV_API_TOKEN", "CLOUDFLARE_DEV_ACCOUNT_ID"} & set(doc[Tr
 check({"deploy_url", "deploy_target", "version_id", "dev_url"} <= set(doc[True]["workflow_call"]["outputs"]), "outputs: deploy_url, deploy_target, version_id, dev_url are preserved (existing consumers)")
 OUTS = doc[True]["workflow_call"]["outputs"]
 check(set(OUTS) == {"deploy_url", "deploy_target", "version_id", "dev_url", "deploy_verified_url", "deploy_published_unverified", "dev_verified_url", "dev_published_unverified",
-                    "deploy_verified", "deploy_smoke_level", "previous_version_id", "migration_status", "rollback_result"}, "outputs: every pre-existing output is kept; the rest are additive (verified flag, smoke level, previous version, migration status, rollback result)")
-check(OUTS["deploy_url"]["value"] == "${{ jobs.deploy.outputs.url }}" and OUTS["deploy_target"]["value"] == "${{ jobs.deploy.outputs.target }}" and OUTS["version_id"]["value"] == "${{ jobs.deploy.outputs.version_id }}",
+                    "deploy_verified", "deploy_smoke_level", "previous_version_id", "migration_status", "rollback_result", "deploy_gate_blocked", "phase_state"}, "outputs: every pre-existing output is kept; the rest are additive (verified flag, smoke level, previous version, migration status, rollback result)")
+check(OUTS["deploy_url"]["value"].startswith("${{ jobs.deploy.outputs.url ||") and OUTS["deploy_target"]["value"].startswith("${{ jobs.deploy.outputs.target ||") and OUTS["version_id"]["value"].startswith("${{ jobs.deploy.outputs.version_id ||"),
       "outputs: deploy_url / deploy_target / version_id keep their meaning (published URL, target, Production version) - now sourced from the Deploy job")
 check(OUTS["deploy_verified_url"]["value"] == "${{ jobs.smoke.outputs.verified_url }}" and OUTS["deploy_verified"]["value"] == "${{ jobs.smoke.outputs.deployed_and_verified }}", "outputs: deploy_verified_url / deploy_verified come from the Smoke job (the only place a deployment becomes verified)")
 pd = jobs["persistent-dev"]
-check(pd["if"] == "github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref" and pd["environment"] == "${{ inputs.app_name }}/dev",
+check(pd["if"] == "inputs.pipeline_phase != 'verify' && github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref" and pd["environment"] == "${{ inputs.app_name }}/dev",
       "persistent-dev keeps the approved-ref gate and protected Environment")
 legacy = [x for x in pd["steps"] if x.get("if", "").startswith("inputs.dev_build_cmd == ''")]
 engine_side = [x for x in pd["steps"] if x.get("if") == "inputs.dev_build_cmd != ''"]
@@ -520,5 +524,75 @@ check('gh.sh" retire' in retire["run"] and "Branch exists again" in retire["run"
 all_run = "\n".join(s_.get("run", "") for j in jobs.values() for s_ in j.get("steps", [])) + "\n".join(s.get("run", "") for s in ASTEPS)
 check("wrangler delete" not in all_run, "no job deletes a Worker; branch deletion retains the Shared Dev Worker and Native Previews")
 check(not re.search(r"CLOUDFLARE_DEV|dev-deploy|shared_dev|app_url_dev|dev_deploy_cmd", yaml.dump(jobs["lifecycle"])), "branch-delete lifecycle never references Dev")
+
+# ---------------------------------------------------------------- pipeline_phase: deferred verification (opt-in, default unchanged)
+import json as _json  # noqa: E402
+
+PINPUTS = doc[True]["workflow_call"]["inputs"]
+check(PINPUTS["pipeline_phase"]["default"] == "all" and PINPUTS["phase_state"]["default"] == "{}" and PINPUTS["upstream_gate"]["default"] == "",
+      "pipeline_phase: opt-in - the default is `all` (the unchanged single call), phase_state defaults to an empty object, upstream_gate to no gate")
+check(all(i["default"] == "" for i in [PINPUTS["upstream_gate"]]) and not any(i.get("required") for n, i in PINPUTS.items() if n in ("pipeline_phase", "phase_state", "upstream_gate")),
+      "pipeline_phase: no new required input (existing callers keep working)")
+
+
+def state(published="true", target="prod", dev_published="false", group="cfv2-prod-app"):
+    return _json.dumps({"inputs": dict(DEFAULT_INPUTS), "deploy": {"published": published, "target": target, "url": "https://x.example"},
+                        "migration": {}, "dev": {"published": dev_published, "url": "https://dev.example"}, "group": group})
+
+
+def vp(job, phase="verify", **kw):
+    inputs = dict(kw.pop("inputs", {}), pipeline_phase=phase)
+    inputs.setdefault("phase_state", state())
+    return runs(job, scenario(**dict(dict(event="push", ref=MAIN, inputs=inputs, needs=kw.pop("needs", {})), **kw)))
+
+
+green_after_deploy = dep_needs()
+for job in ("smoke", "rollback", "release"):
+    check(not runs(job, scenario("push", MAIN, {"pipeline_phase": "deploy", "release_cmd": "x"}, dep_needs(smoke="failure", verified="false") if job == "rollback" else dep_needs())),
+          f"deploy phase: {job} never runs in the deploy call (verification belongs to the verify call)")
+check(runs("smoke", scenario("push", MAIN, {"pipeline_phase": "all"}, dep_needs())), "all phase (default): Smoke Tests run exactly as before")
+check(runs("deploy", scenario("push", MAIN, {"pipeline_phase": "deploy"}, GREEN)) and runs("lint", scenario("push", MAIN, {"pipeline_phase": "deploy"}, GREEN)),
+      "deploy phase: CI / E2E, Migration and Deploy run independently of the other Worker (no needs on it)")
+check(runs(DEVJOB, scenario("push", FEAT, {"pipeline_phase": "deploy", "deployment_strategy": "hybrid", "shared_dev_on_branch_push": True}, GREEN)),
+      "deploy phase: Shared Dev migrates and publishes (stage deploy) as soon as its own CI / E2E passed")
+for job in VALIDATION + ["migration", "deploy", DEVJOB, "config-guard", "lifecycle", "persistent-dev"]:
+    ctxv = scenario("push", MAIN, {"pipeline_phase": "verify", "phase_state": state(), "deployment_strategy": "production-only", "shared_dev_on_branch_push": True, "d1_migrations": True}, GREEN)
+    check(not runs(job, ctxv), f"verify phase: {job} never runs (no CI, Migration, Deploy or publish in the verify call)")
+check(vp("smoke", needs={"deploy": {"result": "skipped", "outputs": {}}}), "verify phase: Smoke Tests run from the hand-off even though Deploy is not part of this call")
+check(not vp("smoke", inputs={"phase_state": state(published="false")}, needs={"deploy": {"result": "skipped", "outputs": {}}}), "verify phase: nothing was published -> no smoke (stale / superseded deploy)")
+check(not vp("smoke", inputs={"phase_state": "{}"}, needs={"deploy": {"result": "skipped", "outputs": {}}}), "verify phase: an empty hand-off verifies nothing (fail closed)")
+check(not vp("smoke", phase="all", needs={"deploy": {"result": "skipped", "outputs": {}}}, inputs={"phase_state": state()}), "all phase: a phase_state is ignored - Smoke still needs this call's own Deploy")
+rb = lambda **kw: vp("rollback", needs={"smoke": {"result": kw.get("smoke", "failure"), "outputs": {"gate_blocked": kw.get("gate", "false")}}, "deploy": {"result": "skipped", "outputs": {}}, "migration": {"result": "skipped", "outputs": {}}},
+                     inputs=kw.get("inputs", {"production_rollback_policy": "automatic"}))
+check(rb(), "verify phase: a failed Smoke Tests job triggers the rollback (policy automatic)")
+check(not rb(gate="true"), "verify phase: a BLOCKED cross-service gate never triggers a rollback (the failure is not attributable to this Worker)")
+check(not rb(smoke="success"), "verify phase: no rollback after a passed smoke")
+check(not rb(inputs={"production_rollback_policy": "manual"}), "verify phase: Production policy manual still prevents the automatic rollback")
+rel = lambda **kw: vp("release", needs={"smoke": {"result": kw.get("smoke", "success"), "outputs": {"deployed_and_verified": kw.get("ver", "true")}}, "rollback": {"result": kw.get("rb", "skipped"), "outputs": {}},
+                                       "deploy": {"result": "skipped", "outputs": {}}}, inputs={"release_cmd": "pnpm release", "phase_state": state(target=kw.get("target", "prod"))})
+check(rel(), "verify phase: Release runs after a verified Production smoke of the handed-over deployment")
+check(not rel(ver="false") and not rel(smoke="failure") and not rel(rb="success") and not rel(target="preview") and not rel(smoke="skipped"),
+      "verify phase: Release never runs for an unverified / failed / rolled-back / skipped smoke or a Preview deployment")
+check(not runs("release", scenario("push", MAIN, {"pipeline_phase": "verify", "release_cmd": "x", "phase_state": "{}"}, dep_needs())), "verify phase: Release cannot be released by this call's own (skipped) Deploy outputs, only by the hand-off")
+dv = lambda **kw: runs("dev-verify", scenario("push", FEAT, dict(pipeline_phase=kw.get("phase", "verify"), phase_state=state(dev_published=kw.get("dev", "true"))), {}))
+check(dv() and not dv(dev="false") and not dv(phase="all") and not dv(phase="deploy"), "dev-verify: only in the verify call, only when Shared Dev actually published")
+dr = lambda **kw: runs("dev-rollback", scenario("push", FEAT, {"pipeline_phase": "verify", "phase_state": state(dev_published="true")}, {"dev-verify": {"result": kw.get("r", "failure"), "outputs": {"gate_blocked": kw.get("gate", "false")}}}))
+check(dr() and not dr(gate="true") and not dr(r="success") and not dr(r="skipped"), "dev-rollback: only after a failed Shared Dev smoke, never after a blocked cross-service gate")
+check(doc[True]["workflow_call"]["outputs"]["phase_state"]["value"].count("toJSON(inputs)") == 1 and jobs["dev-rollback"]["concurrency"]["cancel-in-progress"] is False
+      and jobs["dev-rollback"]["concurrency"]["group"].startswith("cfv2-dev-${{ github.repository }}-"), "dev-rollback shares the Shared Dev job-level concurrency group")
+grp_expr = re.search(r"concurrency:\n  group: \$\{\{ (.*) \}\}\n  queue: max", text_all).group(1)
+base_expr = grp_expr.split("|| (", 1)[1].rsplit(")", 1)[0]
+check(grp_expr.startswith("inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).group || (") and base_expr in doc[True]["workflow_call"]["outputs"]["phase_state"]["value"],
+      "concurrency: the verify call joins the SAME group the deploy call held (handed over in phase_state, computed from the same expression)")
+# engine / action wiring
+gate = astep("Cross-service gate")
+check(gate["id"] == "gate" and "inputs.stage == 'verify'" in gate["if"] and "'success'" in gate["if"] and "'skipped'" in gate["if"] and "exit 1" in gate["run"] and aidx("Cross-service gate") < aidx("Stale-SHA guard (start)")
+      and DEPLOY_ACTION["outputs"]["gate_blocked"]["value"].startswith("${{ steps.gate.outputs.blocked"),
+      "engine: the cross-service gate runs before any smoke, accepts only success | skipped, fails the job otherwise and reports gate_blocked")
+for n in ("smoke", "dev-verify"):
+    w = eng[n]["with"]
+    check("upstream_gate" in w and "call_inputs_json" in w and n in jobs, f"{n}: passes the gate result and its own inputs (identity check) to the engine")
+check(not any("secrets." in str(st.get("with", {}).get(k, "")) and "CLOUDFLARE" in str(st.get("with", {}).get(k, "")) for j in ("smoke", "dev-verify") for st in jobs[j]["steps"] for k in st.get("with", {}))
+      and "CLOUDFLARE_API_TOKEN" not in yaml.dump(jobs["dev-verify"]) and "CLOUDFLARE_API_TOKEN" not in yaml.dump(jobs["smoke"]), "smoke jobs (Production / Preview / Shared Dev) never receive Cloudflare credentials")
 
 sys.exit(fail)

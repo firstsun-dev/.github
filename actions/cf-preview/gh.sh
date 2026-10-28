@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GitHub Deployment ledger + PR feedback for branch Previews. Needs GH_TOKEN, GITHUB_REPOSITORY.
-# Subcommands: start | status | mark-env-deployment | last-good | last-good-preview | comment | environments | owner | retire | purge
+# Subcommands: start | status | mark-env-deployment | newest-id | last-good | last-good-preview | comment | environments | owner | retire | purge
 set -euo pipefail
 R="${GITHUB_REPOSITORY:?}"
 cmd="${1:?}"; shift
@@ -39,6 +39,9 @@ JSON
     id="$(gh api "repos/$R/deployments?environment=$(printf %s "$1" | jq -sRr @uri)&sha=$2&per_page=1" -q '.[0].id // empty')"
     [ -n "$id" ] || { echo "no deployment of $1 at $2" >&2; exit 1; }
     gh api "repos/$R/deployments/$id/statuses" -f state="$3" -f log_url="${GITHUB_SERVER_URL:-https://github.com}/$R/actions/runs/${GITHUB_RUN_ID:-0}" -f description="$4" >/dev/null
+    ;;
+  newest-id) # <env> -> id of the NEWEST deployment of <env> (any state), or nothing
+    gh api "repos/$R/deployments?environment=$(printf %s "$1" | jq -sRr @uri)&per_page=1" -q '.[0].id // empty'
     ;;
   last-good) # <env> [exclude-id] -> sha of newest deployment whose latest status is success
     for row in $(gh api "repos/$R/deployments?environment=$(printf %s "$1" | jq -sRr @uri)&per_page=30" -q '.[] | "\(.id):\(.sha)"'); do

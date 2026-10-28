@@ -25,7 +25,27 @@ class Ctx(dict):
         return cur
 
 
-TOKEN = re.compile(r"\s*(?:('(?:[^']|'')*')|(&&|\|\||==|!=)|(!)|([(),])|([A-Za-z_][\w.\-]*)(\()?)")
+TOKEN = re.compile(r"\s*(?:('(?:[^']|'')*')|(&&|\|\||==|!=)|(!)|([(),])|([A-Za-z_][\w.\-]*)(\()?|(\.[A-Za-z_][\w\-]*))")
+
+
+class J(dict):
+    """fromJSON() result: dotted property access, a missing property is '' (GitHub null)."""
+
+    def __getattr__(self, k):
+        return _wrap(self.get(k, ""))
+
+
+class Null(str):
+    """GitHub null: any property of it is null again."""
+
+    def __getattr__(self, k):
+        return Null()
+
+
+def _wrap(v):
+    if isinstance(v, dict):
+        return J(v)
+    return Null() if v == "" else v
 
 
 def to_python(expr):
@@ -37,8 +57,10 @@ def to_python(expr):
                 break
             raise ValueError(f"cannot tokenize at: {expr[pos:pos+40]!r}")
         pos = m.end()
-        s, op, bang, punct, ident, call = m.groups()
-        if s is not None:
+        s, op, bang, punct, ident, call, prop = m.groups()
+        if prop:
+            out.append(prop)
+        elif s is not None:
             out.append(repr(s[1:-1].replace("''", "'")))
         elif op:
             out.append({"&&": " and ", "||": " or "}.get(op, op))
@@ -66,7 +88,7 @@ def ev(expr, ctx, failed=False):
         "F_cancelled": lambda: False,
         "F_format": lambda f, *a: re.sub(r"\{(\d+)\}", lambda m: str(a[int(m.group(1))]), f),
         "F_contains": lambda a, b: str(b) in (a if isinstance(a, (list, tuple)) else str(a)),
-        "F_fromjson": lambda s: s,
+        "F_fromjson": lambda s: _wrap(json.loads(s)),
         "F_tojson": lambda v: json.dumps(v),
     }
     env = dict(funcs, C=ctx.get_path)

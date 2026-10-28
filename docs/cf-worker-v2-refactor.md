@@ -70,6 +70,51 @@ The Smoke job is red in every failure case, so a rolled-back deployment is never
 
 **Environment protection:** `Migration`, `Deploy` and `Revert on Verify Failure` reference the `<app>/prod|preview` Environment (they change Production / Preview resources). Required-reviewer rules therefore prompt once per such job; prefer branch rules / wait timers on that Environment. `Smoke Tests` references none and holds no Cloudflare credentials.
 
+### Deferred verification (`pipeline_phase`) — a Smoke that waits for ANOTHER Worker
+
+A job inside one reusable-workflow call cannot `needs` a job of a different call, so "Heaven ID's OIDC smoke must wait for the
+Test Client's deployment + smoke, but nothing else of Heaven ID may" is not expressible with one call. The shared workflow
+therefore supports an **opt-in** split into two calls of the same file (default `pipeline_phase: all` = the unchanged single call;
+no existing caller changes):
+
+```
+detect ─┬─ A (deploy call):   CI ‖ E2E ─► Migration ─► Deploy ─► (Shared Dev: migrate+publish)      output: phase_state
+        │                                                              │
+        ├─ B (other Worker):  CI ‖ E2E ─► Migration ─► Deploy ─► Smoke Tests ─► (Revert) ─┐          result
+        │                                                              │                  │
+        └─ A' (verify call, needs A AND B):  Smoke Tests ─► Revert on Verify Failure ─► Release verdict
+```
+
+| `pipeline_phase` | jobs that run |
+|---|---|
+| `all` (default) | everything, as before |
+| `deploy` | six validation jobs, Migration, Deploy, Shared Dev (stage `deploy` = migrate + publish, **no smoke, no recovery**), handlers. Smoke, Rollback, Release never run. Output `phase_state` is the hand-off. |
+| `verify` | `smoke`, `rollback`, `release`, `dev-verify`, `dev-rollback` only. No CI, Migration, Deploy or publish. |
+
+* **Hand-off = data.** `phase_state` (workflow output of the deploy call) is `{inputs, deploy, migration, dev, group}`:
+  the deploy call's inputs, its job outputs and its concurrency group. The verify call passes it unchanged; the engine takes
+  its inputs from `phase_state.inputs`, so the verify call only repeats `app_name`, `app_path`, `tools_ref`, `runner`,
+  `production_rollback_policy` (+ `release_cmd`, the secrets). `engine.sh init` compares `app_name`, `app_path`,
+  `production_rollback_policy` and `tools_ref` of the verify call with the blob and **refuses a mismatch**. `hydrate` still
+  validates every field by regex and refuses a hand-off published from another SHA.
+* **Cross-service gate (`upstream_gate`).** The caller passes `needs.<other>.result`. `success` or `skipped` (the other Worker is
+  unchanged: its existing verified environment is used) satisfy it. Anything else (failed, cancelled, unknown) makes the
+  verify stage run `gate-blocked` **before any smoke**: the deployment is marked UNVERIFIED (Environment deployment / ledger),
+  the job fails, `gate_blocked=true`, **Release is blocked and no rollback runs** — the failure is not attributable to
+  this Worker, so a healthy deployment is not reverted; the manual commands are printed instead.
+* **A failed smoke of this Worker** behaves exactly as in the single call (Production: `production_rollback_policy`, fail-closed
+  rollback + re-smoke; Shared Dev: last-known-good recovery + re-smoke; the smoke job stays red).
+* **Concurrency.** The verify call joins the deploy call's run-level group (`phase_state.group`), but the group is *released
+  between the two calls* (GitHub cannot hold one across calls). The remaining window is covered by existing fail-closed guards:
+  content-SHA smoke (a deployment someone else published meanwhile is not "ours" → unverified), Production rollback requires the
+  live version to still be the one this run deployed, Shared Dev recovery requires that no NEWER Dev deployment has started
+  (`gh.sh newest-id`) and takes the Dev job-level group. Worst case under rapid pushes: a spurious red run, never an overwritten
+  newer deployment.
+* **Compatibility risk to document in the caller:** the first Worker is published *before* the second one is verified, so the
+  second must work with the previous and the new version of the first (N / N-1).
+* **Secrets/size:** `phase_state` is a job output (≤ 1 MB); a secret value inside any input would be masked and the hand-off
+  refused (fail closed) — pass secrets as `secrets`, not inputs.
+
 ### Responsibilities (who owns what)
 
 | Layer | Owns | Files |

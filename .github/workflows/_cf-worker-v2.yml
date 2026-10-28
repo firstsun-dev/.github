@@ -48,7 +48,7 @@ on:
     outputs:
       deploy_url:
         description: URL that was published (Preview URL or app_url_prod); empty when nothing was deployed. May be published-but-unverified or rolled back - gate on deploy_verified_url
-        value: ${{ jobs.deploy.outputs.url }}
+        value: ${{ jobs.deploy.outputs.url || fromJSON(inputs.phase_state).deploy.url }}
       deploy_verified_url:
         description: Same URL, only when the Smoke job passed content-level verification; empty for Access-liveness-only, failed, rolled-back or skipped deployments
         value: ${{ jobs.smoke.outputs.verified_url }}
@@ -63,28 +63,34 @@ on:
         value: ${{ jobs.smoke.outputs.smoke_level }}
       deploy_target:
         description: prod | preview
-        value: ${{ jobs.deploy.outputs.target }}
+        value: ${{ jobs.deploy.outputs.target || fromJSON(inputs.phase_state).deploy.target }}
       version_id:
         description: Production Worker version id (prod only)
-        value: ${{ jobs.deploy.outputs.version_id }}
+        value: ${{ jobs.deploy.outputs.version_id || fromJSON(inputs.phase_state).deploy.version_id }}
       previous_version_id:
         description: Production Worker version that was live before this run's publish (prod only; the rollback target)
-        value: ${{ jobs.deploy.outputs.previous_version_id }}
+        value: ${{ jobs.deploy.outputs.previous_version_id || fromJSON(inputs.phase_state).deploy.previous_version_id }}
       migration_status:
         description: applied | failed | none (Migration job; none when d1_migrations is false)
-        value: ${{ jobs.migration.outputs.migration }}
+        value: ${{ jobs.migration.outputs.migration || fromJSON(inputs.phase_state).migration.migration }}
       rollback_result:
         description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed | no_known_good; empty when no rollback ran. Anything but empty is a FAILED run
-        value: ${{ jobs.rollback.outputs.rollback_result }}
+        value: ${{ jobs.rollback.outputs.rollback_result || jobs.dev-rollback.outputs.rollback_result }}
       dev_url:
         description: Shared Dev URL that was published and smoke-tested (app_url_dev); empty when Shared Dev did not deploy. May be published-but-unverified - gate on dev_verified_url
-        value: ${{ jobs.dev-deploy.outputs.url }}
+        value: ${{ jobs.dev-verify.outputs.url || jobs.dev-deploy.outputs.url }}
       dev_verified_url:
         description: Shared Dev URL only when content-level verification passed
-        value: ${{ jobs.dev-deploy.outputs.verified_url }}
+        value: ${{ jobs.dev-verify.outputs.verified_url || jobs.dev-deploy.outputs.verified_url }}
       dev_published_unverified:
         description: true when Shared Dev published a reachable but NOT content-verified deployment (Access liveness only)
-        value: ${{ jobs.dev-deploy.outputs.published_unverified }}
+        value: ${{ jobs.dev-verify.outputs.published_unverified || jobs.dev-deploy.outputs.published_unverified }}
+      deploy_gate_blocked:
+        description: true when the cross-service gate (upstream_gate) blocked the verification - the deployment is published but NOT verified and was not rolled back (pipeline_phase verify)
+        value: ${{ jobs.smoke.outputs.gate_blocked == 'true' || jobs.dev-verify.outputs.gate_blocked == 'true' }}
+      phase_state:
+        description: pipeline_phase deploy - the validated hand-off (inputs, Deploy / Migration / Shared Dev outputs, concurrency group) for the verify call. Pass it unchanged as phase_state
+        value: ${{ format('{{"inputs":{0},"deploy":{1},"migration":{2},"dev":{3},"group":"{4}"}}', toJSON(inputs), toJSON(jobs.deploy.outputs), toJSON(jobs.migration.outputs), toJSON(jobs.dev-deploy.outputs), ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && (github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.preview_on_branch_push || inputs.shared_dev_on_branch_push) && inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && inputs.shared_dev_on_branch_push && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id)) }}
     inputs:
       tools_ref:
         description: >
@@ -329,6 +335,23 @@ on:
         description: Pass github.event.inputs.target from the caller; "persistent-dev" triggers the protected Dev path
         type: string
         default: ''
+      pipeline_phase:
+        description: >
+          all (default) | deploy | verify. Opt-in split for a Worker whose Smoke must wait for ANOTHER Worker's job (a job
+          inside a reusable workflow cannot `needs` a job of a different call). `deploy` = CI/E2E, Migration, Deploy
+          and Shared Dev publish; NO smoke, rollback or release; its `phase_state` output is the hand-off. `verify` = a
+          SECOND call (same workflow, `needs` the deploy call and the other Worker's call) that runs only Smoke,
+          Rollback, Shared Dev smoke / recovery and Release. The default `all` is the unchanged single call.
+        type: string
+        default: all
+      phase_state:
+        description: pipeline_phase verify only - the `phase_state` output of the deploy call, passed unchanged. Validated as data; the engine inputs come from it, so a verify call repeats only app_name, app_path, tools_ref, runner, production_rollback_policy, release_cmd and the secrets.
+        type: string
+        default: '{}'
+      upstream_gate:
+        description: pipeline_phase verify only - `needs.<job>.result` of the job the cross-service smoke depends on. success or skipped (unchanged Worker, existing verified environment) satisfies it; anything else blocks the verification, fail closed (no rollback)
+        type: string
+        default: ''
       runner:
         type: string
         default: linux
@@ -370,7 +393,7 @@ on:
 # and callee deadlock. A repo-local group does NOT protect a D1 shared with another repository.
 # `queue` is not known to actionlint 1.7.12: see .github/actionlint.yaml.
 concurrency:
-  group: ${{ ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && (github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.preview_on_branch_push || inputs.shared_dev_on_branch_push) && inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && inputs.shared_dev_on_branch_push && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id) }}
+  group: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).group || (((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && (github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.preview_on_branch_push || inputs.shared_dev_on_branch_push) && inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && inputs.shared_dev_on_branch_push && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id)) }}
   queue: max
 
 permissions:
@@ -396,7 +419,7 @@ jobs:
   # -------------------------------------------------------------------------
   lint:
     name: Lint
-    if: inputs.lint_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
+    if: inputs.lint_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     steps:
@@ -423,7 +446,7 @@ jobs:
           app_version: ${{ inputs.app_version }}
   typecheck:
     name: Typecheck
-    if: inputs.typecheck_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
+    if: inputs.typecheck_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     steps:
@@ -450,7 +473,7 @@ jobs:
           app_version: ${{ inputs.app_version }}
   unit:
     name: Unit Tests
-    if: inputs.test_unit_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
+    if: inputs.test_unit_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     steps:
@@ -478,7 +501,7 @@ jobs:
           use_mailpit: ${{ inputs.use_mailpit }}
   integration:
     name: Integration Tests
-    if: inputs.test_integration_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
+    if: inputs.test_integration_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     steps:
@@ -506,7 +529,7 @@ jobs:
           use_mailpit: ${{ inputs.use_mailpit }}
   build:
     name: Build Validation
-    if: github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
+    if: github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     steps:
@@ -535,7 +558,7 @@ jobs:
   # E2E — own setup and own TEST build (local URLs, mock services); never reused for a deployment.
   e2e:
     name: E2E
-    if: inputs.test_e2e_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
+    if: inputs.test_e2e_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     strategy:
       fail-fast: false
       matrix:
@@ -604,7 +627,7 @@ jobs:
   migration:
     name: Migration
     needs: [lint, typecheck, unit, integration, build, e2e]
-    if: always() && inputs.d1_migrations && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && !(inputs.deployment_strategy == 'production-only' && inputs.shared_dev_on_branch_push) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
+    if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && !(inputs.deployment_strategy == 'production-only' && inputs.shared_dev_on_branch_push) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     environment:
@@ -658,7 +681,7 @@ jobs:
     # Cloudflare publish or a Production version change. engine.sh `init` repeats the check.
     # always(): skipped optional jobs (empty command) must not skip Deploy, but a failed / cancelled / unexpectedly
     # skipped CONFIGURED one must block it, and so must a Migration that did not succeed.
-    if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && (needs.migration.result == 'success' || (needs.migration.result == 'skipped' && !inputs.d1_migrations)) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && !(inputs.deployment_strategy == 'production-only' && inputs.shared_dev_on_branch_push) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
+    if: always() && inputs.pipeline_phase != 'verify' && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && (needs.migration.result == 'success' || (needs.migration.result == 'skipped' && !inputs.d1_migrations)) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && !(inputs.deployment_strategy == 'production-only' && inputs.shared_dev_on_branch_push) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     # One Environment per app and target; Production authorization = its protection rules + the main-only credentials.
@@ -720,7 +743,7 @@ jobs:
   smoke:
     name: Smoke Tests
     needs: [deploy]
-    if: always() && needs.deploy.result == 'success' && needs.deploy.outputs.published == 'true'
+    if: always() && inputs.pipeline_phase != 'deploy' && ((inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.published == 'true') || (inputs.pipeline_phase != 'verify' && needs.deploy.result == 'success' && needs.deploy.outputs.published == 'true'))
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     permissions:
@@ -732,6 +755,7 @@ jobs:
       deployed_and_verified: ${{ steps.engine.outputs.deployed_and_verified || 'false' }}
       smoke_level: ${{ steps.engine.outputs.smoke_level }}
       published_unverified: ${{ steps.engine.outputs.published_unverified || 'false' }}
+      gate_blocked: ${{ steps.engine.outputs.gate_blocked || 'false' }}
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -755,11 +779,13 @@ jobs:
         with:
           target: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
           stage: verify
-          inputs_json: ${{ toJSON(inputs) }}
+          inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
+          call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
           preview_secrets: ${{ github.ref != 'refs/heads/main' && secrets.PREVIEW_SECRETS || '' }}
           smoke_username: ${{ secrets.SMOKE_USERNAME }}
           smoke_password: ${{ secrets.SMOKE_PASSWORD }}
-          deploy_outputs: ${{ toJSON(needs.deploy.outputs) }}
+          deploy_outputs: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).deploy) || toJSON(needs.deploy.outputs) }}
+          upstream_gate: ${{ inputs.pipeline_phase == 'verify' && inputs.upstream_gate || '' }}
       # Failure-only evidence with short retention; never a delivery dependency.
       - name: Upload smoke report (failure only)
         uses: actions/upload-artifact@v7
@@ -786,7 +812,7 @@ jobs:
   rollback:
     name: Revert on Verify Failure
     needs: [migration, deploy, smoke]
-    if: always() && needs.smoke.result == 'failure' && needs.deploy.outputs.published == 'true' && (github.ref != 'refs/heads/main' || inputs.production_rollback_policy == 'automatic')
+    if: always() && inputs.pipeline_phase != 'deploy' && needs.smoke.result == 'failure' && needs.smoke.outputs.gate_blocked != 'true' && ((inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.published == 'true') || (inputs.pipeline_phase != 'verify' && needs.deploy.result == 'success' && needs.deploy.outputs.published == 'true')) && (github.ref != 'refs/heads/main' || inputs.production_rollback_policy == 'automatic')
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     environment:
@@ -823,12 +849,13 @@ jobs:
         with:
           target: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
           stage: rollback
-          inputs_json: ${{ toJSON(inputs) }}
+          inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
+          call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
           preview_secrets: ${{ github.ref != 'refs/heads/main' && secrets.PREVIEW_SECRETS || '' }}
           smoke_username: ${{ secrets.SMOKE_USERNAME }}
           smoke_password: ${{ secrets.SMOKE_PASSWORD }}
-          deploy_outputs: ${{ toJSON(needs.deploy.outputs) }}
-          migration_outputs: ${{ toJSON(needs.migration.outputs) }}
+          deploy_outputs: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).deploy) || toJSON(needs.deploy.outputs) }}
+          migration_outputs: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).migration) || toJSON(needs.migration.outputs) }}
           smoke_outputs: ${{ toJSON(needs.smoke.outputs) }}
 
   # -------------------------------------------------------------------------
@@ -841,7 +868,7 @@ jobs:
   dev-deploy:
     name: Shared Dev
     needs: [lint, typecheck, unit, integration, build, e2e, migration, deploy, smoke, rollback]
-    if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && inputs.shared_dev_on_branch_push && inputs.deployment_strategy != 'production-only' && github.ref_type == 'branch' && github.ref != 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev'))
+    if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && inputs.pipeline_phase != 'verify' && inputs.shared_dev_on_branch_push && inputs.deployment_strategy != 'production-only' && github.ref_type == 'branch' && github.ref != 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev'))
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     environment:
@@ -862,6 +889,10 @@ jobs:
       published_url: ${{ steps.engine.outputs.published_url }}
       verified_url: ${{ steps.engine.outputs.verified_url }}
       published_unverified: ${{ steps.engine.outputs.published_unverified || 'false' }}
+      # Hand-off of the deferred verification (pipeline_phase deploy -> verify)
+      published: ${{ steps.engine.outputs.published }}
+      published_sha: ${{ steps.engine.outputs.published_sha }}
+      ledger_id: ${{ steps.engine.outputs.ledger_id }}
     env:
       GH_TOKEN: ${{ github.token }}
       # Dev reuses the account token while keeping Dev target and binding checks.
@@ -888,11 +919,126 @@ jobs:
         uses: ./.cf-tools/actions/cf-deploy
         with:
           target: dev
+          stage: ${{ inputs.pipeline_phase == 'deploy' && 'deploy' || 'all' }}
           inputs_json: ${{ toJSON(inputs) }}
           smoke_username: ${{ secrets.SMOKE_USERNAME }}
           smoke_password: ${{ secrets.SMOKE_PASSWORD }}
           sibling_result: ${{ needs.migration.result }}
           sibling_migration: ${{ needs.migration.outputs.migration }}
+
+  # -------------------------------------------------------------------------
+  # Shared Dev Smoke Tests / Shared Dev Revert — pipeline_phase verify only: the deferred second half of Shared Dev.
+  # The Shared Dev job (pipeline_phase deploy) migrated and published and stopped there. These two jobs run in the
+  # SECOND call, after the other Worker's deployment, and use the same engine stages as Production / Preview:
+  #   verify   : smoke the published Dev URL (cross-service smoke_cmd included); mark verified | unverified
+  #   rollback : only after a FAILED smoke of THIS deployment (never after a blocked cross-service gate): redeploy the
+  #              last known-good Dev deployment and re-smoke it. It first checks that no NEWER Dev deployment has started
+  #              (the Dev group was released between the two calls) - it never replaces another run's deployment.
+  # -------------------------------------------------------------------------
+  dev-verify:
+    name: Shared Dev Smoke Tests
+    if: always() && inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).dev.published == 'true'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      deployments: write
+    outputs:
+      url: ${{ steps.engine.outputs.url }}
+      verified_url: ${{ steps.engine.outputs.verified_url }}
+      deployed_and_verified: ${{ steps.engine.outputs.deployed_and_verified || 'false' }}
+      smoke_level: ${{ steps.engine.outputs.smoke_level }}
+      published_unverified: ${{ steps.engine.outputs.published_unverified || 'false' }}
+      gate_blocked: ${{ steps.engine.outputs.gate_blocked || 'false' }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Fetch delivery tooling
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: engine
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: dev
+          stage: verify
+          inputs_json: ${{ toJSON(fromJSON(inputs.phase_state).inputs) }}
+          call_inputs_json: ${{ toJSON(inputs) }}
+          smoke_username: ${{ secrets.SMOKE_USERNAME }}
+          smoke_password: ${{ secrets.SMOKE_PASSWORD }}
+          deploy_outputs: ${{ toJSON(fromJSON(inputs.phase_state).dev) }}
+          upstream_gate: ${{ inputs.upstream_gate }}
+      - name: Upload smoke report (failure only)
+        uses: actions/upload-artifact@v7
+        if: failure()
+        continue-on-error: true
+        with:
+          name: smoke-report-dev-${{ inputs.app_name }}-${{ github.run_id }}
+          path: |
+            ${{ inputs.app_path }}/playwright-report/
+            ${{ inputs.app_path }}/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  dev-rollback:
+    name: Shared Dev Revert on Verify Failure
+    needs: [dev-verify]
+    if: always() && needs.dev-verify.result == 'failure' && needs.dev-verify.outputs.gate_blocked != 'true'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    environment:
+      name: ${{ inputs.app_name }}/dev
+    # Same group as the Shared Dev deploy job and the manual persistent-dev job.
+    concurrency:
+      group: cfv2-dev-${{ github.repository }}-${{ fromJSON(inputs.phase_state).inputs.d1_lock_scope != '' && fromJSON(inputs.phase_state).inputs.d1_lock_scope || inputs.app_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      deployments: write
+    outputs:
+      rollback_result: ${{ steps.engine.outputs.rollback_result }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch delivery tooling
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: engine
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: dev
+          stage: rollback
+          inputs_json: ${{ toJSON(fromJSON(inputs.phase_state).inputs) }}
+          call_inputs_json: ${{ toJSON(inputs) }}
+          smoke_username: ${{ secrets.SMOKE_USERNAME }}
+          smoke_password: ${{ secrets.SMOKE_PASSWORD }}
+          deploy_outputs: ${{ toJSON(fromJSON(inputs.phase_state).dev) }}
 
   # -------------------------------------------------------------------------
   # Release — optional, main only, only after THIS run deployed its own SHA to Production, the Smoke job verified it at
@@ -901,7 +1047,7 @@ jobs:
   release:
     name: Release
     needs: [deploy, smoke, rollback]
-    if: always() && inputs.release_cmd != '' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && inputs.dispatch_target != 'persistent-dev' && needs.deploy.result == 'success' && needs.deploy.outputs.target == 'prod' && needs.smoke.result == 'success' && needs.smoke.outputs.deployed_and_verified == 'true' && needs.rollback.result == 'skipped'
+    if: always() && inputs.release_cmd != '' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'deploy' && ((inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.target == 'prod') || (inputs.pipeline_phase != 'verify' && needs.deploy.result == 'success' && needs.deploy.outputs.target == 'prod')) && needs.smoke.result == 'success' && needs.smoke.outputs.deployed_and_verified == 'true' && needs.rollback.result == 'skipped'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 20
     permissions:
@@ -929,7 +1075,7 @@ jobs:
   # -------------------------------------------------------------------------
   config-guard:
     name: Config guard
-    if: inputs.deployment_strategy == 'production-only' && inputs.shared_dev_on_branch_push
+    if: inputs.pipeline_phase != 'verify' && inputs.deployment_strategy == 'production-only' && inputs.shared_dev_on_branch_push
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 2
     steps:
@@ -944,7 +1090,7 @@ jobs:
   # -------------------------------------------------------------------------
   lifecycle:
     name: Preview lifecycle
-    if: inputs.deployment_strategy != 'production-only' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'delete' && github.event.ref_type == 'branch'))
+    if: inputs.pipeline_phase != 'verify' && inputs.deployment_strategy != 'production-only' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'delete' && github.event.ref_type == 'branch'))
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     concurrency:
@@ -1019,7 +1165,7 @@ jobs:
   # -------------------------------------------------------------------------
   persistent-dev:
     name: Persistent Dev (Hybrid)
-    if: github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref
+    if: inputs.pipeline_phase != 'verify' && github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     environment: ${{ inputs.app_name }}/dev
