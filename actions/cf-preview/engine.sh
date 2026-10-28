@@ -8,7 +8,9 @@
 # Stages (ENGINE_STAGE, set once in `init`): `all` = every phase in ONE job (Shared Dev, persistent Dev); the Production /
 # Preview path is split across jobs that each re-run `init` (same inputs, same target binding) and exchange only
 # validated DATA through `hydrate` - never runner files: migrate (Migration job), publish (Deploy job), verify (Smoke
-# job, no Cloudflare credentials) and rollback (Rollback job).
+# job, no Cloudflare credentials) and rollback (Rollback job). Shared Dev may opt in to the same split
+# (`deploy` = migrate + publish in ONE job, then `verify` / `rollback`): a caller that must run a cross-service smoke
+# AFTER another Worker's deployment (workflow input pipeline_phase) verifies the published Dev deployment later.
 #
 # State ($STATE_DIR, default $RUNNER_TEMP/cfv2, 0700): inputs.json, target, mode, build.env / smoke.env /
 # preview.env (validated KEY=VALUE data), config.* and artifact.sha (from build.sh), ledger_id, preview_name, ...
@@ -74,13 +76,27 @@ case "$PHASE" in
     printf '%s' "${INPUTS_JSON:?}" > "$IN"; jq -e 'type == "object"' "$IN" >/dev/null || die "inputs_json is not an object"
     T="${ENGINE_TARGET:?}"; M="${ENGINE_MODE:-auto}"; STAGE="${ENGINE_STAGE:-all}"
     case "$T" in prod|preview|dev) ;; *) die "bad engine target: $T";; esac
-    case "$STAGE" in all|migrate|publish|verify|rollback) ;; *) die "bad engine stage: $STAGE";; esac
-    # Production / Preview are always split; Shared Dev and persistent Dev keep the single-job engine.
-    if [ "$T" = dev ]; then [ "$STAGE" = all ] || die "Shared Dev runs as one job (stage all), got '$STAGE'"
-    else [ "$STAGE" != all ] || die "$T must run as split stages (migrate/publish/verify/rollback), not 'all'"; fi
+    case "$STAGE" in all|deploy|migrate|publish|verify|rollback) ;; *) die "bad engine stage: $STAGE";; esac
+    # Production / Preview are always split. Shared Dev and persistent Dev default to the single-job engine (all); Shared Dev
+    # alone may split into deploy (migrate + publish, no smoke, no recovery) -> verify -> rollback (pipeline_phase).
+    if [ "$T" = dev ]; then
+      case "$STAGE" in all|deploy|verify|rollback) ;; *) die "Shared Dev stage must be all, deploy, verify or rollback, got '$STAGE'";; esac
+    else
+      case "$STAGE" in migrate|publish|verify|rollback) ;; *) die "$T must run as split stages (migrate/publish/verify/rollback), got '$STAGE'";; esac
+    fi
     printf '%s' "$STAGE" > "$S/stage"
     case "$M" in auto|manual) ;; *) die "bad engine mode: $M";; esac
     [ "$M" = auto ] || [ "$T" = dev ] || die "manual mode is only for the persistent Dev target"
+    [ "$M" = auto ] || [ "$STAGE" = all ] || die "manual Dev runs as one job (stage all)"
+    # Deferred verification (pipeline_phase verify): the engine inputs are the DEPLOY call's inputs, handed over as data.
+    # The verify call passes its own copy of the identity inputs; they must be identical or nothing is acted on.
+    if [ -n "${CALL_INPUTS_JSON:-}" ]; then
+      printf '%s' "$CALL_INPUTS_JSON" | jq -e 'type == "object"' >/dev/null || die "call inputs are not an object"
+      for k in app_name app_path production_rollback_policy tools_ref; do
+        [ "$(printf '%s' "$CALL_INPUTS_JSON" | jq -r --arg k "$k" '.[$k] | if . == null then "" else tostring end')" = "$(inp "$k")" ] \
+          || die "verify call input '$k' differs from the deploy call that produced the hand-off; refusing to verify another deployment"
+      done
+    fi
     printf '%s' "$T" > "$S/target"; printf '%s' "$M" > "$S/mode"
     ctx
     STRATEGY="$(inp deployment_strategy)"; POLICY="$(inp production_rollback_policy)"
@@ -233,13 +249,27 @@ case "$PHASE" in
     [ -z "$H_PUBSHA" ] || [ "$H_PUBSHA" = "$RUN_SHA" ] || die "hand-off was published from $H_PUBSHA, this run is $RUN_SHA; refusing to act on another deployment"
     [ "$TARGET" = prod ] || [ -n "$H_URL" ] || die "$TARGET hand-off has no published URL"
     printf '%s' "$H_LEDGER" > "$S/ledger_id"; printf '%s' "$H_PNAME" > "$S/preview_name"
-    case "$TARGET" in preview) printf '%s' "$APP_NAME/preview/$H_PNAME" > "$S/ledger_env";; esac
+    case "$TARGET" in preview) printf '%s' "$APP_NAME/preview/$H_PNAME" > "$S/ledger_env";; dev) printf '%s' "$APP_NAME/dev/shared" > "$S/ledger_env";; esac
     [ "$TARGET" != preview ] || [ -n "$H_PNAME" ] || die "preview hand-off has no Preview identity"
     setenv PUBLISHED_URL "$H_URL"; setenv VERSION_ID "$H_VER"; setenv PREVIOUS_VERSION_ID "$H_PREV"
     setenv AUDITED_WORKER "$H_WORKER"; setenv D1_PENDING "$H_PENDING"; setenv D1_SCAN "$H_SCAN"; setenv HANDOFF_SMOKE_LEVEL "$H_LEVEL"
     echo "hydrated: target=$TARGET url=${H_URL:-<none>} version=${H_VER:-?} previous=${H_PREV:-?} migration=${H_MIG:-?}/schema_changed=${H_PENDING:-?}/${H_SCAN:-?}" >&2
     echo "published=true"; echo "url=$H_URL"; echo "version_id=$H_VER"; echo "previous_version_id=$H_PREV"; echo "worker_name=$H_WORKER"
     echo "ledger_id=$H_LEDGER"; echo "preview_name=$H_PNAME"; echo "published_sha=$RUN_SHA";;
+
+  gate-blocked) # a required cross-service dependency did not succeed: this deployment CANNOT be verified (fail closed)
+    ctx
+    URL="${PUBLISHED_URL:-$(target_url)}"
+    echo "::error::Cross-service verification blocked: the required upstream job finished '${UPSTREAM_GATE:-?}'. $TARGET $URL (commit $RUN_SHA) is published but NOT verified; Release is blocked." >&2
+    summary "### ❌ Cross-service smoke blocked — the upstream job it depends on finished \`${UPSTREAM_GATE:-?}\`. $TARGET \`$URL\` (commit \`$RUN_SHA\`) is **published but unverified**; Release is blocked."
+    if [ "$TARGET" = prod ]; then
+      summary "- No automatic rollback: the failure is not attributable to this Worker. Fix or re-run the upstream job, then re-run the verification, or roll back manually: \`wrangler versions deploy ${PREVIOUS_VERSION_ID:-<previous-version-id>}@100 --name ${AUDITED_WORKER:-<worker>} --yes\` (only after confirming the previous version runs on the CURRENT D1 schema; migration this run: schema_changed=${D1_PENDING:-?}, scan=${D1_SCAN:-?})."
+    else
+      [ -z "$LEDGER_ID" ] || "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" failure "$URL" "Cross-service smoke blocked (upstream ${UPSTREAM_GATE:-?}) — $TARGET UNVERIFIED" || true
+      summary "- No automatic recovery: the failure is not attributable to this Worker. Fix or re-run the upstream job."
+    fi
+    "$TOOLS_DIR/gh.sh" mark-env-deployment "$APP_NAME/$TARGET" "$RUN_SHA" failure "Cross-service smoke blocked — UNVERIFIED (served $RUN_SHA)" || echo "::warning::could not annotate the Environment deployment as unverified" >&2
+    echo "blocked=true";;
 
   smoke)
     ctx
@@ -328,6 +358,12 @@ case "$PHASE" in
       preview) ROW="$("$TOOLS_DIR/gh.sh" last-good-preview "$(rd ledger_env)" "$LEDGER_ID" "$BRANCH_REF" "$HOST_WORKER" "$APP_NAME" || true)";;
       dev) ROW="$("$TOOLS_DIR/gh.sh" last-good-dev "$(rd ledger_env)" "$LEDGER_ID" "$HOST_WORKER" "$APP_NAME" || true)";;
     esac
+    # Deferred Shared Dev (stage rollback): the Dev group was released between deploy and rollback, so ANOTHER branch may
+    # have started a newer Dev deployment meanwhile. Recovery must never replace it.
+    if [ -n "$ROW" ] && [ "$TARGET" = dev ] && [ "$(rd stage)" = rollback ] && [ "$("$TOOLS_DIR/gh.sh" newest-id "$(rd ledger_env)")" != "$LEDGER_ID" ]; then
+      summary "### ⚠️ Recovery skipped — a newer Shared Dev deployment started after this one; it owns the Dev Worker."
+      ROW=""
+    fi
     # Never act on a superseded run: a newer push of this branch will redeploy, and recovery must not replace it.
     if [ -n "$ROW" ] && [ "$("$TOOLS_DIR/guard.sh" fresh)" != "stale=false" ]; then
       summary "### ⚠️ Recovery skipped — a newer push of this branch superseded this run; its own run owns the target."

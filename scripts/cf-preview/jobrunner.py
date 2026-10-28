@@ -32,6 +32,7 @@ case "$a" in
   *"payload.branch_ref"*) echo "${STUB_OWNER_REF:-}";;
   *"deployments"*"-X POST"*"--input -"*) cat >> "$STUB_LOG"; echo 4242;;
   *"&sha="*"per_page=1"*) echo "${STUB_ENV_DEPLOY_ID:-5151}";;
+  *"per_page=1"*"id // empty"*) echo "${STUB_NEWEST:-4242}";;
   *"per_page=30"*" -q "*) [ -n "${STUB_LASTGOOD:-}" ] && echo "9:$STUB_LASTGOOD";;
   *"per_page=30"*) printf '%s' "${STUB_DEPLOYMENTS:-[]}";;
   *"deployments/9/statuses"*) echo success;;

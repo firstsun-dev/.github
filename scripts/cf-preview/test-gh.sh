@@ -9,6 +9,7 @@ echo "gh $*" >> "$STUB_LOG"
 a="$*"
 case "$a" in
   *"&sha="*"per_page=1"*) [ "${NO_ENV_DEPLOY:-}" = 1 ] || echo 55;;
+  *"per_page=1"*"id // empty"*) [ "${NO_ENV_DEPLOY:-}" = 1 ] || echo 77;;
   *"deployments?environment"*"per_page=30"*" -q "*) printf '3:cccc\n2:bbbb\n1:aaaa\n';;
   *"deployments?environment"*"per_page=30"*) printf '%s' "$LP_JSON";;
   *"/statuses?per_page=1"*"environment_url"*) id="${a#*deployments/}"; id="${id%%/*}"; eval "echo \"\${LP_ST_$id:-failure }\"";;
@@ -70,6 +71,10 @@ grep -q -- '-X DELETE' "$T/log" && bad "retire must not delete deployments" || o
 
 [ "$(OWNER_REF=refs/heads/feat/a "$G" owner app/preview/feat-a)" = refs/heads/feat/a ] && ok "owner returns the owning full ref" || bad "owner"
 [ -z "$("$G" owner app/preview/new)" ] && ok "owner is empty for a new name" || bad "owner empty"
+# ---- newest-id: the newest deployment of an environment (deferred Shared Dev recovery refuses to replace a newer one)
+: > "$T/log"; [ "$("$G" newest-id app/dev/shared)" = 77 ] && grep -q 'deployments?environment=app%2Fdev%2Fshared&per_page=1' "$T/log" && ok "newest-id returns the newest deployment id of exactly that environment" || bad "newest-id"
+[ -z "$(NO_ENV_DEPLOY=1 "$G" newest-id app/dev/shared)" ] && ok "newest-id is empty when the environment has no deployment" || bad "newest-id empty"
+
 # ---- mark-env-deployment: annotate the Environment deployment GitHub created for the Deploy job
 : > "$T/log"; "$G" mark-env-deployment app/prod abc1234 failure "Smoke failed — UNVERIFIED" >/dev/null
 grep -q 'deployments?environment=app%2Fprod&sha=abc1234' "$T/log" && grep -q 'deployments/55/statuses -f state=failure' "$T/log" && ok "mark-env-deployment appends the status to the deployment of that environment AND sha" || bad "mark-env-deployment"

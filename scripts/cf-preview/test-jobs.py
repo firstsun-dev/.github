@@ -730,4 +730,134 @@ check(res_of(r)["rollback"] == "failure" and "versions deploy" not in r["log"] a
 r = deploy(FEAT, env={"STUB_PROBES": "500 ;200 ", "STUB_DEPLOYMENTS": good_dep()}, inputs=AUTO)
 check(res_of(r)["rollback"] == "success" and r["outputs"]["rollback_result"] == "restored_verified" and "versions deploy" not in r["log"] and r["result"] == "failure", "Preview recovery in the Rollback job: last-known-good redeployed + verified; run stays failed; no Production rollback command")
 
+# ---------------------------------------------------------------- pipeline_phase: deferred verification (two calls)
+# A Worker whose Smoke must wait for ANOTHER Worker's job runs the same workflow twice: the deploy call (CI/E2E, Migration,
+# Deploy / Shared Dev publish) and the verify call (Smoke, Rollback, Shared Dev smoke / recovery). Every job below runs in a
+# FRESH workspace; the only thing the verify call receives is the phase_state data blob.
+SKIPPED = {"result": "skipped", "outputs": {}}
+
+
+def deferred(ref=MAIN, inputs=None, env=None, gate="success", call_over=None, deploy_env=None):
+    base = dict(inputs or {})
+    secrets = PROD_SECRETS if ref == MAIN else PREV_SECRETS
+    d = run_chain(ref, dict(base, pipeline_phase="deploy"), env=deploy_env)
+    blob = dict(ctx(ref, dict(base, pipeline_phase="deploy"), secrets)["inputs"])
+    state = json.dumps({"inputs": blob, "deploy": d["jobs"]["deploy"]["outputs"], "migration": d["jobs"]["migration"]["outputs"], "dev": {}, "group": "g"})
+    vin = dict(base, pipeline_phase="verify", phase_state=state, upstream_gate=gate)
+    vin.update(call_over or {})
+    res, logs, summ, steps = {}, [], [], []
+    for name in ("smoke", "rollback"):
+        c = ctx(ref, vin, secrets, dict({"deploy": SKIPPED, "migration": SKIPPED}, **res))
+        if not ev(doc["jobs"][name]["if"], c):
+            res[name] = dict(SKIPPED)
+            continue
+        senv = {"STUB_TIPS": SHA}
+        senv.update(env or {})
+        if ";" in senv.get("STUB_PROBES", ""):
+            first, rest = senv["STUB_PROBES"].split(";", 1)
+            senv["STUB_PROBES"] = first if name == "smoke" else rest
+        if name == "rollback":
+            senv.setdefault("STUB_ACTIVE", "new-2")
+        r = run_job(doc, name, c, make_workspace(APP_TOML), senv)
+        res[name] = {"result": r["result"], "outputs": r["outputs"]}
+        logs.append(r["log"]); summ.append(r["summary"]); steps.extend(r["steps"])
+    return {"deploy": d, "jobs": res, "log": "".join(logs), "summary": "".join(summ), "steps": steps, "vin": vin, "state": state}
+
+
+def verify_release(v, inputs=None):
+    needs = {"deploy": SKIPPED, "smoke": v["jobs"]["smoke"], "rollback": v["jobs"]["rollback"]}
+    return bool(ev(doc["jobs"]["release"]["if"], ctx(MAIN, dict(v["vin"], release_cmd="pnpm release", **(inputs or {})), PROD_SECRETS, needs)))
+
+
+AUTO_P = {"production_rollback_policy": "automatic"}
+v = deferred(inputs=AUTO_P)
+d = v["deploy"]
+check(d["result"] == "success" and published(d) and d["jobs"]["smoke"]["result"] == "skipped" and d["jobs"]["rollback"]["result"] == "skipped" and d["outputs"]["deployed_and_verified"] == "false",
+      "deferred (deploy call): CI-gated Deploy publishes and STOPS - no smoke, no rollback, nothing is verified yet")
+check(v["jobs"]["smoke"]["result"] == "success" and v["jobs"]["smoke"]["outputs"]["deployed_and_verified"] == "true" and v["jobs"]["rollback"]["result"] == "skipped" and v["jobs"]["smoke"]["outputs"]["gate_blocked"] == "false",
+      "deferred (verify call): the Smoke job verifies the handed-over deployment from the phase_state data alone (fresh workspace, no Deploy job in the call)")
+check(verify_release(v), "deferred: Release runs only from the verify call's verified smoke")
+check(v["jobs"]["smoke"]["outputs"]["verified_url"] == "https://app.example.com", "deferred: the verified URL is the one the Deploy job published")
+for g in ("skipped", ""):
+    vv = deferred(inputs=AUTO_P, gate=g)
+    check(vv["jobs"]["smoke"]["result"] == "success" and vv["jobs"]["smoke"]["outputs"]["deployed_and_verified"] == "true", f"cross-service gate '{g or '(none)'}': satisfied (unchanged Worker uses the existing verified environment)")
+for g in ("failure", "cancelled", "weird"):
+    vv = deferred(inputs=AUTO_P, gate=g)
+    sm = vv["jobs"]["smoke"]
+    check(sm["result"] == "failure" and sm["outputs"]["gate_blocked"] == "true" and sm["outputs"]["deployed_and_verified"] == "false" and vv["jobs"]["rollback"]["result"] == "skipped"
+          and "versions deploy" not in vv["log"] and step(vv, "Smoke the exact deployed URL (fails closed)") in (None, "skipped") and "Cross-service smoke blocked" in vv["summary"] and not verify_release(vv),
+          f"cross-service gate '{g}': the smoke does NOT run, the job is red, nothing is verified, NO rollback, Release blocked")
+check("wrangler versions deploy prev-1@100 --name app --yes" in deferred(inputs=AUTO_P, gate="failure")["summary"], "gate blocked: the manual rollback command is printed, nothing is changed automatically")
+vv = deferred(inputs=AUTO_P, env={"STUB_PROBES": "500 ;200 "})
+check(vv["jobs"]["smoke"]["result"] == "failure" and vv["jobs"]["smoke"]["outputs"]["gate_blocked"] == "false" and vv["jobs"]["rollback"]["result"] == "success"
+      and vv["jobs"]["rollback"]["outputs"]["rollback_result"] == "restored_verified" and "versions deploy prev-1@100" in vv["log"] and not verify_release(vv),
+      "deferred: a failed Production smoke triggers the fail-closed rollback in the verify call; it restores + re-verifies, the Smoke job stays red, Release blocked")
+vv = deferred(inputs={"production_rollback_policy": "manual"}, env={"STUB_PROBES": "500 "})
+check(vv["jobs"]["smoke"]["result"] == "failure" and vv["jobs"]["rollback"]["result"] == "skipped" and "versions deploy" not in vv["log"] and "wrangler versions deploy prev-1@100 --name app --yes" in vv["summary"],
+      "deferred: policy manual - failed smoke rolls nothing back and prints the manual commands")
+vv = deferred(inputs=AUTO_P, env={"STUB_PROBES": "500 ;200 ", "STUB_ACTIVE": "someone-else"})
+check(vv["jobs"]["rollback"]["result"] == "failure" and "versions deploy" not in vv["log"], "deferred: another run published meanwhile (the live version is not ours) - the rollback is BLOCKED, never overwrites it")
+vv = deferred(inputs=dict(AUTO_P, **D1), env={"STUB_PROBES": "500 ;200 "})
+check(vv["jobs"]["rollback"]["result"] == "failure" and "versions deploy" not in vv["log"], "deferred: D1 migrations were applied - the D1 compatibility fail-closed rule still blocks the rollback")
+for key, val in (("app_name", "other"), ("app_path", "apps/other"), ("production_rollback_policy", "manual"), ("tools_ref", "other-ref")):
+    vv = deferred(inputs=AUTO_P, call_over={key: val})
+    check(vv["jobs"]["smoke"]["result"] in ("failure", "skipped") and vv["jobs"]["smoke"]["outputs"].get("deployed_and_verified") != "true" and not verify_release(vv),
+          f"deferred: a verify call whose {key} differs from the deploy call's verifies nothing (identity check)")
+vv = deferred(inputs=AUTO_P, call_over={"phase_state": "{}"})
+check(vv["jobs"]["smoke"]["result"] == "skipped" and vv["jobs"]["rollback"]["result"] == "skipped" and not verify_release(vv), "deferred: an empty hand-off verifies nothing")
+vv = deferred(inputs=AUTO_P, call_over={"phase_state": json.dumps({"inputs": {"app_name": "app"}, "deploy": {"published": "true", "url": "http://insecure.example", "published_sha": "0" * 40}, "migration": {}, "dev": {}})})
+check(vv["jobs"]["smoke"]["result"] == "failure" and not verify_release(vv), "deferred: a malformed / foreign hand-off (wrong SHA, non-https URL, other inputs) is refused as data")
+
+# Shared Dev: deploy call publishes (stage deploy), verify call smokes, rollback recovers
+def dev_deferred(inputs=None, env=None, gate="success", dev_over=None):
+    di = dict(DEV_INPUTS, **(inputs or {}))
+    ws = make_workspace(DEV_TOML)
+    c1 = ctx(FEAT, dict(di, pipeline_phase="deploy"), PROD_SECRETS, {"migration": SKIPPED})
+    r1 = run_job(doc, "dev-deploy", c1, ws, {"STUB_TIPS": SHA})
+    state = json.dumps({"inputs": dict(c1["inputs"]), "deploy": {}, "migration": {}, "dev": dict(r1["outputs"], **(dev_over or {})), "group": "g"})
+    vin = dict(di, pipeline_phase="verify", phase_state=state, upstream_gate=gate)
+    out = {"deploy": r1, "jobs": {}, "log": r1["log"], "summary": r1["summary"], "steps": list(r1["steps"])}
+    res = {}
+    for name in ("dev-verify", "dev-rollback"):
+        c = ctx(FEAT, vin, PROD_SECRETS, dict(res))
+        if not ev(doc["jobs"][name]["if"], c):
+            res[name] = dict(SKIPPED)
+            continue
+        senv = {"STUB_TIPS": SHA}
+        senv.update(env or {})
+        if ";" in senv.get("STUB_PROBES", ""):
+            first, rest = senv["STUB_PROBES"].split(";", 1)
+            senv["STUB_PROBES"] = first if name == "dev-verify" else rest
+        r = run_job(doc, name, c, make_workspace(DEV_TOML), senv)
+        res[name] = {"result": r["result"], "outputs": r["outputs"], "log": r["log"], "summary": r["summary"]}
+        out["log"] += "\n#" + name + "\n" + r["log"]; out["summary"] += r["summary"]; out["steps"].extend(r["steps"])
+    out["jobs"] = res
+    return out
+
+
+dv_ = dev_deferred()
+r1 = dv_["deploy"]
+check(r1["result"] == "success" and r1["outputs"]["published"] == "true" and r1["outputs"]["ledger_id"] == "4242" and "PUBLISH" in r1["log"] and "state=success" not in r1["log"]
+      and r1["outputs"]["deployed_and_verified"] == "false" and step(r1, "Smoke the exact deployed URL (fails closed)") in (None, "skipped"),
+      "deferred Shared Dev (deploy call): migrates / publishes and stops - no smoke, no ledger success, the ledger id is handed over")
+check(dv_["jobs"]["dev-verify"]["result"] == "success" and dv_["jobs"]["dev-verify"]["outputs"]["deployed_and_verified"] == "true" and dv_["jobs"]["dev-verify"]["outputs"]["verified_url"] == "https://dev.example.com"
+      and "state=success" in dv_["jobs"]["dev-verify"]["log"] and dv_["jobs"]["dev-rollback"]["result"] == "skipped",
+      "deferred Shared Dev (verify call): smoke verifies the published Dev URL and records the ledger success")
+dv_ = dev_deferred(env=dict(GD, STUB_PROBES="500 ;200 "))
+check(dv_["jobs"]["dev-verify"]["result"] == "failure" and dv_["jobs"]["dev-verify"]["outputs"]["gate_blocked"] == "false" and dv_["jobs"]["dev-rollback"]["result"] == "success"
+      and dv_["jobs"]["dev-rollback"]["outputs"]["rollback_result"] == "restored_verified" and "PUBLISH" in dv_["jobs"]["dev-rollback"]["log"] and f"commit={GOOD}" in dv_["jobs"]["dev-rollback"]["log"],
+      "deferred Shared Dev: a failed smoke recovers the last known-good Dev deployment (rebuilt at the LAST-GOOD sha) and re-verifies it; the smoke job stays red")
+dv_ = dev_deferred(env=dict(GD, STUB_PROBES="500 ;200 ", STUB_NEWEST="9999"))
+check(dv_["jobs"]["dev-rollback"]["result"] == "failure" and "PUBLISH" not in dv_["jobs"]["dev-rollback"]["log"] and "newer Shared Dev deployment" in dv_["jobs"]["dev-rollback"]["summary"],
+      "deferred Shared Dev: a NEWER Dev deployment started since (another branch) - recovery is skipped, it never replaces it")
+for g in ("failure", "cancelled"):
+    dv_ = dev_deferred(env=dict(GD, STUB_PROBES="200 "), gate=g)
+    check(dv_["jobs"]["dev-verify"]["result"] == "failure" and dv_["jobs"]["dev-verify"]["outputs"]["gate_blocked"] == "true" and dv_["jobs"]["dev-rollback"]["result"] == "skipped"
+          and "Cross-service smoke blocked" in dv_["jobs"]["dev-verify"]["summary"] and "state=failure" in dv_["jobs"]["dev-verify"]["log"] and "PUBLISH" not in dv_["jobs"]["dev-verify"]["log"],
+          f"deferred Shared Dev: gate '{g}' blocks the verification, marks the deployment unverified and does not recover")
+dv_ = dev_deferred(dev_over={"published": "false"})
+check(dv_["jobs"]["dev-verify"]["result"] == "skipped", "deferred Shared Dev: nothing published - nothing to verify")
+r = dev(inputs=dict(pipeline_phase="all"))
+check(r["result"] == "success" and r["outputs"]["deployed_and_verified"] == "true", "default phase (all): Shared Dev is the unchanged single job (publish + smoke in one)")
+
 sys.exit(fail)
