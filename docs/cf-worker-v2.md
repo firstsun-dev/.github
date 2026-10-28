@@ -173,7 +173,7 @@ There is no automatic reclaim; Previews accumulate until removed manually. A rep
 
 ## Security
 
-* Preview jobs receive only `CLOUDFLARE_PREVIEW_*`; Production credentials exist only in the production job; Dev credentials only in `persistent-dev` (protected `<app>/dev` environment).
+* Production and Dev jobs use the same `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` pair by owner decision. Preview keeps its `CLOUDFLARE_PREVIEW_*` credentials. Dev still uses its own `<app>/dev` Environment, Worker identity and binding guardrails.
 * Fork PRs get no deployment job and no secrets.
 * `production-only` never creates a Preview (use for `anas-mcp`: its authentication depends on Cloudflare Access at the custom domain).
 * Native Preview hostnames may sit behind Cloudflare Access (Blog's do): anonymous requests see only the Access login.
