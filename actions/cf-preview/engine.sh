@@ -12,7 +12,9 @@
 # composite input, not from the environment) and re-read from state by every phase.
 set -euo pipefail
 PHASE="${1:?phase}"
-TOOLS_DIR="${TOOLS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# Absolute on purpose: the workflow passes it relative to the workspace root, but every stage `cd "$APP_DIR"` (a
+# nested app_path such as apps/api) before using it.
+TOOLS_DIR="$(cd "${TOOLS_DIR:-$(dirname "${BASH_SOURCE[0]}")}" && pwd)"
 export TOOLS_DIR
 S="${STATE_DIR:-${RUNNER_TEMP:?RUNNER_TEMP or STATE_DIR required}/cfv2}"
 IN="$S/inputs.json"

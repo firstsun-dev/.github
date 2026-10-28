@@ -24,6 +24,7 @@ if [ "$TARGET" = preview ]; then
   fi
 fi
 
+TOOLS_DIR="$(cd "$TOOLS_DIR" && pwd)"  # absolute before `cd "$APP_DIR"` (a relative path breaks for nested app_path)
 cd "$APP_DIR"
 # shellcheck source=envfile.sh
 . "$TOOLS_DIR/envfile.sh"

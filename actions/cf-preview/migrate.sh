@@ -11,6 +11,7 @@
 set -euo pipefail
 : "${TARGET:?}" "${APP_DIR:?}" "${TOOLS_DIR:?}"
 case "$TARGET" in prod|preview|dev) ;; *) echo "::error::bad TARGET: $TARGET" >&2; exit 1;; esac
+TOOLS_DIR="$(cd "$TOOLS_DIR" && pwd)"  # absolute before `cd "$APP_DIR"` (a relative path breaks for nested app_path)
 cd "$APP_DIR"
 
 # The project's OWN pinned Wrangler runs the migration: refuse versions older than this pipeline supports.
