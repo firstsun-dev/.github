@@ -40,7 +40,7 @@ There is **no Prepare, Plan, Test-Gate or Migration job**. Migration is one expl
 | Concern | prod | preview | dev |
 |---|---|---|---|
 | Trigger | main push / dispatch | non-main push (`preview_on_branch_push`) | non-main push (`shared_dev_on_branch_push`); manual: protected dispatch |
-| Credentials in the job env | `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` | `CLOUDFLARE_PREVIEW_*` (+ `PREVIEW_SECRETS`) | `CLOUDFLARE_DEV_*` |
+| Credentials in the job env | `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` | `CLOUDFLARE_PREVIEW_*` (+ `PREVIEW_SECRETS`) | `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` (same account token as Production) |
 | Environment | `<app>/prod` | `<app>/preview` | `<app>/dev` |
 | Build env / vars | `build_env_prod` | `build_env_preview` | `build_env_dev`, `dev_build_cmd`, `CLOUDFLARE_ENV=dev_wrangler_env` |
 | D1 (same project SQL) | top-level `d1_databases` | `previews.d1_databases` | `env.<dev_wrangler_env>.d1_databases` |
@@ -86,7 +86,7 @@ A reusable workflow called from another repository resolves `uses: ./...` agains
 | Hybrid | `persistent_dev_ref`, `dev_deploy_cmd`, `dev_smoke_cmd`, `dispatch_target` |
 | Shared Dev | `shared_dev_on_branch_push`, `app_url_dev`, `dev_deploy_cmd`, `dev_smoke_cmd`, `build_env_dev`, `dev_build_cmd`, `dev_wrangler_env` (default `dev`), `dev_worker_name`, `dev_binding_allow`, `dev_deny_resources`; reuses `d1_migrations`, `d1_binding`, `sha_path`, `smoke_env`, `access_protected_targets`, `preview_deny_resources` |
 
-Outputs: `deploy_url`, `deploy_target`, `version_id` (prod only), `dev_url` (Shared Dev). The internal `deployed_and_verified` Deploy output is what gates Release. Secrets: `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` (prod), `CLOUDFLARE_PREVIEW_API_TOKEN/ACCOUNT_ID`, `CLOUDFLARE_DEV_*`, `PREVIEW_SECRETS`, `SMOKE_USERNAME/PASSWORD`, `RELEASE_TOKEN`.
+Outputs: `deploy_url`, `deploy_target`, `version_id` (prod only), `dev_url` (Shared Dev). The internal `deployed_and_verified` Deploy output is what gates Release. Secrets: `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` (prod), `CLOUDFLARE_PREVIEW_API_TOKEN/ACCOUNT_ID`, `PREVIEW_SECRETS`, `SMOKE_USERNAME/PASSWORD`, `RELEASE_TOKEN`.
 
 `*_env` inputs are `KEY=VALUE` lines imported by `actions/cf-preview/parse-env.mjs` **from an environment variable** (never interpolated into a script). It rejects malformed lines and refuses `CLOUDFLARE_*`, `GITHUB_*`, `RUNNER_*`, `PATH`, `NODE_OPTIONS`, `LD_*`, `BASH_ENV`, `GIT_*`, `SMOKE_*` credentials, etc.; all-or-nothing. Application variable names remain consumer-owned. Command inputs are passed through `env:` and run with `bash -c "$CMD"`.
 
@@ -130,7 +130,7 @@ Two independent switches decide what a non-main push deploys. Neither requires t
 * **Same D1.** `cli.mjs d1-consistency` requires the D1 binding of the config that will be published (effective config, or the source for an un-flattened config) to have the same physical `database_id` as the validated migration target. A mismatch fails before the migration and the publish: DB-A is never migrated while a Worker bound to DB-B is deployed.
 * With `d1_migrations`, `dev_build_cmd` is **required**, so the Dev build always succeeds before the Dev D1 is migrated.
 * **Shared-D1 guard:** if the Preview and Dev D1 are the same physical database and the Preview Deploy job reported its migration `failed` (or was cancelled), Shared Dev stops before touching anything (D1 state unknown). With distinct D1s, Preview off, or a Preview failure after a successful migration (e.g. a failed smoke), Dev still deploys; a Preview failure never blocks Dev otherwise.
-* Credentials: `CLOUDFLARE_DEV_API_TOKEN` / `CLOUDFLARE_DEV_ACCOUNT_ID` only, in the `<app>/dev` Environment. No Production/Preview token or `PREVIEW_SECRETS` is referenced; a missing Dev token fails closed.
+* Credentials: Dev reuses `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` in the `<app>/dev` Environment. Preview credentials and `PREVIEW_SECRETS` are not read in Dev. Missing account credentials fail closed; Dev Worker, environment and resource audits remain separate.
 * Smoke fails the job. Recovery: the job records a ledger entry `<app>/dev/shared`; after a failed smoke it redeploys the last verified SHA (from any branch) with the same build, Worker-identity/resource audit and full smoke (probe, `sha_path` for that SHA, `dev_smoke_cmd`), or states **manual recovery required** when none exists. Recovery is skipped when a newer push already owns the branch. The run stays red either way, and a successful recovery never marks the failed SHA verified.
 * Concurrency: workflow-level group (below) queues all branches; the job also uses `cfv2-dev-<repo>-<d1_lock_scope or app_name>`, the same group as `persistent-dev`, so automatic and manual Dev deployments never overlap. It differs from the workflow-level groups, so there is no caller/callee deadlock.
 * Retention: branch deletion and disabling a switch deploy or delete nothing; no job deletes a Worker.
@@ -183,7 +183,7 @@ After a failed Shared Dev smoke the job redeploys the last verified SHA (from th
 
 ### Required follow-up in Blog #448 (after this PR is approved)
 
-Not changed by this PR. Replace `dev_binding_allow: r2_buckets:SHINYI_MUYU_VOICE_CACHE` with `r2_buckets:SHINYI_MUYU_VOICE_CACHE=firstsun-blog-assets`; set `dev_deny_resources` if Dev must never touch other Production resources (it must **not** list `firstsun-blog-assets`); keep `preview_deny_resources` for Native Preview unchanged; set `sha_path` so recovery verifies the commit; keep the Voice prefixes `cache/shinyi-muyu/tts/prod/` and `.../preview/`; pin to the merged SHA/tag; and provision the `CLOUDFLARE_DEV_*` secrets before any pilot.
+Not changed by this PR. Replace `dev_binding_allow: r2_buckets:SHINYI_MUYU_VOICE_CACHE` with `r2_buckets:SHINYI_MUYU_VOICE_CACHE=firstsun-blog-assets`; set `dev_deny_resources` if Dev must never touch other Production resources (it must **not** list `firstsun-blog-assets`); keep `preview_deny_resources` for Native Preview unchanged; set `sha_path` so recovery verifies the commit; keep the Voice prefixes `cache/shinyi-muyu/tts/prod/` and `.../preview/`; pin to the merged SHA/tag; and use the existing account token for Dev deployments.
 
 ## Post-incident hardening (Blog run 39708495349)
 
@@ -239,7 +239,7 @@ Fail-closed (`smoke.sh`): no URL ⇒ fail; the probe requests `probe_path` (defa
 
 ## Security review (summary)
 
-* Credentials: each Cloudflare credential in the Deploy job is `(main && prod-secret) || (not main && preview-secret) || ''`, in Shared Dev only the `CLOUDFLARE_DEV_*` pair; the other targets' secrets are never read and a missing secret never falls back. The composite engine action contains no credentials. CI, E2E and lifecycle contain no secrets. All jobs except Release are read-only on repository contents; the lock's `contents: write` is gone.
+* Credentials: each Cloudflare credential in the Deploy job is `(main && prod-secret) || (not main && preview-secret) || ''`, in Shared Dev and persistent-Dev the same account credential pair is used as Production; Preview credentials are never read there and missing credentials never fall back. The composite engine action contains no credentials. CI, E2E and lifecycle contain no secrets. All jobs except Release are read-only on repository contents; the lock's `contents: write` is gone.
 * Authorization: Deploy / Shared Dev run only for push/dispatch on a branch ref; the engine re-resolves the target (`cli.mjs resolve`) and fails on mismatch; Production uses the protected `<app>/prod` Environment (one approval: Migration is a step of the same job).
 * Fork PRs: CI/E2E only, no secrets, no migrate/deploy/lifecycle.
 * Injection: env inputs are data (`parse-env.mjs`, reserved names rejected for the engine); commands come from `env:` via `bash -c "$CMD"`; no `${{ }}` inside any `run:` of the workflow or the composite actions (contract-tested); deploy checkouts use `persist-credentials: false`.
