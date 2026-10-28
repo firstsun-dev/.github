@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { dirname, resolve } from 'node:path';
 import {
   assertWranglerSupported, auditDevConfig, previewHostReadiness, auditPreviewConfig, auditProdConfig, classifyEvent, extractPreviewUrl,
-  isStale, migrationPlan, previewIdentity, readConfig, rebindSha, artifactDigest, checkDeployedD1, resolveSharedDev, resolveTarget, sharedPreviewDevD1,
+  isStale, migrationPlan, workerName, classifyMigrationSql, previewIdentity, readConfig, rebindSha, artifactDigest, checkDeployedD1, resolveSharedDev, resolveTarget, sharedPreviewDevD1,
 } from './lib.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -147,11 +147,25 @@ try {
       out({ audit_prod: 'ok' });
       break;
     }
+    case 'worker-name':
+      out({ worker_name: workerName(readConfig(opt('config'))) });
+      break;
+    case 'migration-scan': {
+      // --dir <migrations dir> --files "<a.sql b.sql>": files must exist inside the dir. An unreadable or empty
+      // set is NOT additive (fail closed): the caller treats it as unknown.
+      const dir = resolve(opt('dir'));
+      const files = list(opt('files')).filter((f) => /^[\w.-]+\.sql$/.test(f));
+      if (!files.length) { out({ d1_scan: 'unknown', d1_scan_reason: 'no pending migration file names could be determined' }); break; }
+      const texts = files.map((f) => readFileSync(resolve(dir, f), 'utf8'));
+      const r = classifyMigrationSql(texts);
+      out({ d1_scan: r.level, d1_scan_reason: r.reasons.slice(0, 3).join(' | ') || 'only additive statements' });
+      break;
+    }
     case 'stale':
       out({ stale: String(isStale({ runSha: opt('sha'), branchTipSha: opt('tip') })) });
       break;
     default:
-      console.error('usage: cli.mjs identity|wrangler-check|extract-url|preview-host-check|classify|resolve|resolve-dev|rebind-env|artifact-digest|d1-consistency|d1-shared|dev-config-check|preflight|migration-config|effective-config|audit-prod|stale');
+      console.error('usage: cli.mjs identity|wrangler-check|extract-url|preview-host-check|classify|resolve|resolve-dev|rebind-env|artifact-digest|d1-consistency|d1-shared|dev-config-check|preflight|migration-config|effective-config|audit-prod|worker-name|migration-scan|stale');
       process.exit(2);
   }
 } catch (e) {

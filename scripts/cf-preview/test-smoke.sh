@@ -37,6 +37,11 @@ STUB_OUT="$ACC" ACCESS_TARGETS=preview run >/dev/null && bad "Access approved fo
 SHA_PATH=/v STUB_SHA_BODY=abcdef1 run >/dev/null && ok "SHA endpoint matches" || bad "sha match"
 SHA_PATH=/v STUB_SHA_BODY=zzzzzzz run >/dev/null && bad "SHA mismatch accepted" || ok "SHA mismatch fails"
 SHA_PATH=/v STUB_SHA_FAIL=1 run >/dev/null && bad "missing SHA endpoint ignored" || ok "configured SHA endpoint missing fails"
+# ---- post-rollback verification: the restored commit is unknown (EXPECTED_SHA empty) -> the endpoint must stop serving the FAILED commit
+[ "$(EXPECTED_SHA='' ABSENT_SHA=abcdef1234567 SHA_PATH=/v STUB_SHA_BODY=1111111 run)" = smoke_level=content ] && ok "post-rollback: endpoint no longer serves the failed commit -> content (not content-sha)" || bad "absent sha ok"
+EXPECTED_SHA='' ABSENT_SHA=abcdef1234567 SHA_PATH=/v STUB_SHA_BODY=abcdef1 run >/dev/null && bad "post-rollback: failed commit still served was accepted" || ok "post-rollback: still serving the failed commit fails"
+EXPECTED_SHA='' ABSENT_SHA=abcdef1234567 SHA_PATH=/v STUB_SHA_FAIL=1 run >/dev/null && bad "post-rollback: unreadable SHA endpoint counted as 'gone'" || ok "post-rollback: an unreadable SHA endpoint fails (never counted as 'gone')"
+[ "$(EXPECTED_SHA=1111111 ABSENT_SHA=abcdef1234567 SHA_PATH=/v STUB_SHA_BODY=1111111 run)" = smoke_level=content-sha ] && ok "post-rollback with the restored commit known -> content-sha" || bad "restored sha known"
 mkdir "$T/app"; touch "$T/app/marker.txt"
 SMOKE_CMD='test -f marker.txt' SMOKE_CWD="$T/app" run >/dev/null && ok "smoke_cmd runs from SMOKE_CWD (app_path)" || bad "smoke cwd"
 SMOKE_CMD='test -f marker.txt' run >/dev/null && bad "smoke_cmd found app file without SMOKE_CWD" || ok "without SMOKE_CWD the cwd is unchanged"

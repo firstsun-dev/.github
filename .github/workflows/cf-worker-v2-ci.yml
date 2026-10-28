@@ -26,7 +26,7 @@ permissions:
 jobs:
   contract:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -46,7 +46,7 @@ jobs:
         run: scripts/cf-preview/test-migrate.sh
       - name: Smoke verification, fail-closed (stub curl)
         run: scripts/cf-preview/test-smoke.sh
-      - name: Execute the real Deploy / Shared Dev / persistent-Dev jobs incl. the composite engine with stubs (migration step order, stale runs, recovery, env-override protection, Release gate)
+      - name: Execute the real Migration -> Deploy -> Smoke -> Rollback chain (each job in a fresh workspace) plus Shared Dev / persistent-Dev with the composite engine and stubs (stale runs, fail-closed rollback, D1 compatibility, recovery, env-override protection, Release gate)
         run: python3 scripts/cf-preview/test-jobs.py
       - name: Env import is data, not code
         run: scripts/cf-preview/test-parse-env.sh

@@ -8,22 +8,31 @@ name: CF Worker Pipeline v2
 #   Lint  Typecheck  Unit Tests  Integration  Build Validation  E2E      six independent, parallel jobs (no `needs`
 #     \       \          |            |             /            /       between them) -> actions/cf-ci-check
 #      +-------+----------+------------+------------+-----------+
-#                         |                                      |
-#                 Deploy  target=prod|preview             Shared Dev  target=dev  (needs Deploy for ORDERING only)
-#                         |                                      |
-#                         +--------- actions/cf-deploy ----------+       the SAME engine for every target:
-#              build -> config audit -> D1 target check -> stale check -> migrate (optional step) -> stale check
-#                         -> publish the audited artifact -> smoke -> mark verified | recover
 #                         |
-#                      Release   optional, main only, after a VERIFIED Production deploy
+#                  Migration   (d1_migrations only: target D1, after the build + config audit)
+#                         |
+#                  Deploy      publishes the audited artifact, nothing else
+#                         |
+#                  Smoke Tests probes THIS deployment (URL, commit SHA when available); marks it verified | unverified
+#                         |\
+#                         | +-- failure --> Revert on Verify Failure (prod: fail-closed Worker rollback + re-smoke, policy
+#                         |                  `automatic`; preview: last-known-good redeploy) -- the run stays FAILED
+#                      Release   optional, main only, only after a VERIFIED Production deploy
+#                 Shared Dev  target=dev  (needs the Preview jobs for ORDERING only; still ONE job)
 #
-# There is no Prepare/Plan/Test-Gate/Migration job: Migration is a step inside the engine, after the deployable
-# build and config audit and before the publish of that audited artifact. Event handlers outside the DAG:
-# `lifecycle` (PR comment / branch delete), `config-guard` (production-only + Shared Dev is rejected) and
-# `persistent-dev` (Hybrid, protected manual dispatch; the same engine in manual mode).
+# ONE delivery engine (actions/cf-deploy -> engine.sh) serves every job; `stage` selects the phases of each job:
+#   migrate  : build -> config audit -> D1 target check -> stale check -> migrate
+#   publish  : build -> config audit -> stale check -> publish the audited artifact
+#   verify   : smoke -> mark verified | unverified          (no Cloudflare credentials)
+#   rollback : prod: policy / previous version / D1 compatibility / still-our-deployment checks -> rollback -> re-smoke
+#              preview: redeploy the last known-good Preview -> re-smoke
+# The jobs share only validated DATA (job outputs), never runner files. The run-level concurrency group below spans
+# all of them, so no other run can touch the Worker between Publish and the end of Smoke / Rollback.
+# Event handlers outside the DAG: `lifecycle` (PR comment / branch delete), `config-guard` (production-only + Shared
+# Dev is rejected) and `persistent-dev` (Hybrid, protected manual dispatch; the same engine in one job, manual mode).
 #
 # An optional validation job (lint/typecheck/unit/integration/e2e) is skipped only when its command input is
-# empty; Deploy and Shared Dev treat a CONFIGURED job that is skipped, failed or cancelled as a failure.
+# empty; Migration, Deploy and Shared Dev treat a CONFIGURED job that is skipped, failed or cancelled as a failure.
 #
 # Local composite actions: a reusable workflow called from another repository resolves `uses: ./...` against the
 # CALLER's workspace and `uses:` cannot take an expression. Every job therefore checks out firstsun-dev/.github at
@@ -38,20 +47,35 @@ on:
   workflow_call:
     outputs:
       deploy_url:
-        description: URL that was published and smoke-tested (Preview URL or app_url_prod); empty when nothing was deployed. May be published-but-unverified - gate on deploy_verified_url
+        description: URL that was published (Preview URL or app_url_prod); empty when nothing was deployed. May be published-but-unverified or rolled back - gate on deploy_verified_url
         value: ${{ jobs.deploy.outputs.url }}
       deploy_verified_url:
-        description: Same URL, only when content-level verification passed; empty for Access-liveness-only or failed deployments
-        value: ${{ jobs.deploy.outputs.verified_url }}
+        description: Same URL, only when the Smoke job passed content-level verification; empty for Access-liveness-only, failed, rolled-back or skipped deployments
+        value: ${{ jobs.smoke.outputs.verified_url }}
       deploy_published_unverified:
-        description: true when deploy published a reachable but NOT content-verified deployment (Access liveness only)
-        value: ${{ jobs.deploy.outputs.published_unverified }}
+        description: true when the deployment is reachable but NOT content-verified (Access liveness only)
+        value: ${{ jobs.smoke.outputs.published_unverified }}
+      deploy_verified:
+        description: true ONLY when this run published its own SHA and its Smoke job passed at content level
+        value: ${{ jobs.smoke.outputs.deployed_and_verified }}
+      deploy_smoke_level:
+        description: liveness | content | content-sha (verification level of the Smoke job; empty when it did not run)
+        value: ${{ jobs.smoke.outputs.smoke_level }}
       deploy_target:
         description: prod | preview
         value: ${{ jobs.deploy.outputs.target }}
       version_id:
         description: Production Worker version id (prod only)
         value: ${{ jobs.deploy.outputs.version_id }}
+      previous_version_id:
+        description: Production Worker version that was live before this run's publish (prod only; the rollback target)
+        value: ${{ jobs.deploy.outputs.previous_version_id }}
+      migration_status:
+        description: applied | failed | none (Migration job; none when d1_migrations is false)
+        value: ${{ jobs.migration.outputs.migration }}
+      rollback_result:
+        description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed | no_known_good; empty when no rollback ran. Anything but empty is a FAILED run
+        value: ${{ jobs.rollback.outputs.rollback_result }}
       dev_url:
         description: Shared Dev URL that was published and smoke-tested (app_url_dev); empty when Shared Dev did not deploy. May be published-but-unverified - gate on dev_verified_url
         value: ${{ jobs.dev-deploy.outputs.url }}
@@ -239,6 +263,16 @@ on:
           repository-scoped: it CANNOT lock a D1 shared with ANOTHER repository.
         type: string
         default: ''
+      d1_rollback_compat:
+        description: >
+          Expand/contract attestation for AUTOMATIC Production rollback (production_rollback_policy: automatic). A Worker
+          rollback never reverts D1. `expand-contract` = the previous Worker version keeps working on the schema this
+          run migrates to (migrations are additive, destructive changes ship one release later). With any other value
+          (default `unknown`) a rollback after a run that APPLIED D1 migrations is blocked (fail closed; manual commands
+          are printed); the engine additionally refuses it when the applied SQL is not provably additive. Without
+          pending migrations the rollback is unaffected.
+        type: string
+        default: unknown
       # ---- Release ----
       release_cmd:
         description: Optional main-only release command (e.g. semantic-release), run after a verified Production deploy
@@ -562,39 +596,25 @@ jobs:
           retention-days: 3
 
   # -------------------------------------------------------------------------
-  # Deploy — the ONE Production / Native Preview job. target = prod (main) | preview (other branches); the engine
-  # (actions/cf-deploy) builds, audits, validates the exact D1 target, migrates (optional step), publishes the
-  # audited artifact, smokes, and recovers. Only the credentials of THIS target exist in the job env; there is no
-  # fallback. `deployed_and_verified` is true ONLY when this run published its own SHA and the smoke passed.
+  # Migration — D1 only (d1_migrations). Same engine (stage migrate): build -> config audit -> exact D1 target
+  # check -> stale check -> apply pending migrations of THIS target's D1. Publishes nothing, so a failed migration
+  # leaves the live Worker untouched; Deploy and everything after it is skipped. Needs the Environment: it changes
+  # the Production D1 and is authorised like the deploy. A skipped Migration (d1_migrations: false) never blocks Deploy.
   # -------------------------------------------------------------------------
-  deploy:
-    name: Deploy
+  migration:
+    name: Migration
     needs: [lint, typecheck, unit, integration, build, e2e]
-    # Fail closed: an invalid strategy/channel combination (see `config-guard`, which reports it) never reaches the
-    # Cloudflare publish, the remote D1 migration or a Production version change. engine.sh `init` repeats the check.
-    # always(): skipped optional jobs (empty command) must not skip Deploy, but a failed / cancelled / unexpectedly
-    # skipped CONFIGURED one must block it.
-    if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && !(inputs.deployment_strategy == 'production-only' && inputs.shared_dev_on_branch_push) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
+    if: always() && inputs.d1_migrations && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && !(inputs.deployment_strategy == 'production-only' && inputs.shared_dev_on_branch_push) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
-    # One Environment per app and target; Production authorization = its protection rules + the main-only credentials.
     environment:
       name: ${{ github.ref == 'refs/heads/main' && format('{0}/prod', inputs.app_name) || format('{0}/preview', inputs.app_name) }}
-      url: ${{ steps.engine.outputs.url }}
     permissions:
       contents: read
-      deployments: write
-      pull-requests: write
     outputs:
-      url: ${{ steps.engine.outputs.url }}
-      target: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
-      version_id: ${{ steps.engine.outputs.version_id }}
-      deployed_and_verified: ${{ steps.engine.outputs.deployed_and_verified || 'false' }}
-      smoke_level: ${{ steps.engine.outputs.smoke_level }}
-      published_url: ${{ steps.engine.outputs.published_url }}
-      verified_url: ${{ steps.engine.outputs.verified_url }}
-      published_unverified: ${{ steps.engine.outputs.published_unverified || 'false' }}
       migration: ${{ steps.engine.outputs.migration }}
+      schema_changed: ${{ steps.engine.outputs.schema_changed }}
+      d1_scan: ${{ steps.engine.outputs.d1_scan }}
     env:
       GH_TOKEN: ${{ github.token }}
       CLOUDFLARE_API_TOKEN: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_API_TOKEN) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_API_TOKEN) || '' }}
@@ -620,21 +640,207 @@ jobs:
         uses: ./.cf-tools/actions/cf-deploy
         with:
           target: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+          stage: migrate
+          inputs_json: ${{ toJSON(inputs) }}
+          preview_secrets: ${{ github.ref != 'refs/heads/main' && secrets.PREVIEW_SECRETS || '' }}
+
+  # -------------------------------------------------------------------------
+  # Deploy — publishes the audited artifact (stage publish): the ONE Production / Native Preview publish. target =
+  # prod (main) | preview (other branches). Builds again from the same SHA, repeats the config audit, the D1 target
+  # check and the stale-SHA guards, then publishes. It does NOT verify anything: a green Deploy means "published".
+  # `published` is the hand-off flag of Smoke and Rollback; the version ids, Worker identity and Preview ledger id are
+  # handed over as job outputs. Only the credentials of THIS target exist in the job env; there is no fallback.
+  # -------------------------------------------------------------------------
+  deploy:
+    name: Deploy
+    needs: [lint, typecheck, unit, integration, build, e2e, migration]
+    # Fail closed: an invalid strategy/channel combination (see `config-guard`, which reports it) never reaches the
+    # Cloudflare publish or a Production version change. engine.sh `init` repeats the check.
+    # always(): skipped optional jobs (empty command) must not skip Deploy, but a failed / cancelled / unexpectedly
+    # skipped CONFIGURED one must block it, and so must a Migration that did not succeed.
+    if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && (needs.migration.result == 'success' || (needs.migration.result == 'skipped' && !inputs.d1_migrations)) && github.ref_type == 'branch' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && !(inputs.deployment_strategy == 'production-only' && inputs.shared_dev_on_branch_push) && (github.ref == 'refs/heads/main' || (inputs.deployment_strategy != 'production-only' && inputs.preview_on_branch_push))
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    # One Environment per app and target; Production authorization = its protection rules + the main-only credentials.
+    environment:
+      name: ${{ github.ref == 'refs/heads/main' && format('{0}/prod', inputs.app_name) || format('{0}/preview', inputs.app_name) }}
+      url: ${{ steps.engine.outputs.url }}
+    permissions:
+      contents: read
+      deployments: write
+      pull-requests: write
+    outputs:
+      url: ${{ steps.engine.outputs.url }}
+      target: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+      published: ${{ steps.engine.outputs.published }}
+      published_sha: ${{ steps.engine.outputs.published_sha }}
+      version_id: ${{ steps.engine.outputs.version_id }}
+      previous_version_id: ${{ steps.engine.outputs.previous_version_id }}
+      worker_name: ${{ steps.engine.outputs.worker_name }}
+      ledger_id: ${{ steps.engine.outputs.ledger_id }}
+      preview_name: ${{ steps.engine.outputs.preview_name }}
+      migration: ${{ needs.migration.outputs.migration }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_API_TOKEN) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_API_TOKEN) || '' }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_ACCOUNT_ID) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID) || '' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch delivery tooling
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: engine
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+          stage: publish
+          inputs_json: ${{ toJSON(inputs) }}
+          preview_secrets: ${{ github.ref != 'refs/heads/main' && secrets.PREVIEW_SECRETS || '' }}
+
+  # -------------------------------------------------------------------------
+  # Smoke Tests — verifies THIS deployment (stage verify): the published URL, the commit SHA when sha_path is set, and
+  # smoke_cmd (run from app_path, with TARGET_URL / EXPECTED_SHA / DEPLOY_TARGET). The verification level is explicit:
+  # content-sha (commit SHA proven) > content (application responded) > liveness (Cloudflare Access login reachable
+  # only: published but NOT verified). A failure marks the deployment UNVERIFIED (GitHub Environment deployment +
+  # Preview ledger), blocks Release and triggers Rollback. No Cloudflare credentials in this job. Runs only when
+  # Deploy actually published (a stale / superseded run publishes nothing, so there is nothing to smoke).
+  # -------------------------------------------------------------------------
+  smoke:
+    name: Smoke Tests
+    needs: [deploy]
+    if: always() && needs.deploy.result == 'success' && needs.deploy.outputs.published == 'true'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      deployments: write
+      pull-requests: write
+    outputs:
+      verified_url: ${{ steps.engine.outputs.verified_url }}
+      deployed_and_verified: ${{ steps.engine.outputs.deployed_and_verified || 'false' }}
+      smoke_level: ${{ steps.engine.outputs.smoke_level }}
+      published_unverified: ${{ steps.engine.outputs.published_unverified || 'false' }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Fetch delivery tooling
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: engine
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+          stage: verify
           inputs_json: ${{ toJSON(inputs) }}
           preview_secrets: ${{ github.ref != 'refs/heads/main' && secrets.PREVIEW_SECRETS || '' }}
           smoke_username: ${{ secrets.SMOKE_USERNAME }}
           smoke_password: ${{ secrets.SMOKE_PASSWORD }}
+          deploy_outputs: ${{ toJSON(needs.deploy.outputs) }}
+      # Failure-only evidence with short retention; never a delivery dependency.
+      - name: Upload smoke report (failure only)
+        uses: actions/upload-artifact@v7
+        if: failure()
+        continue-on-error: true
+        with:
+          name: smoke-report-${{ inputs.app_name }}-${{ github.run_id }}
+          path: |
+            ${{ inputs.app_path }}/playwright-report/
+            ${{ inputs.app_path }}/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # Revert on Verify Failure — only after a FAILED Smoke Tests job of a deployment this run published (stage rollback).
+  #   prod   : policy `automatic` only (manual / disabled: the Smoke job already printed the manual commands). Fail
+  #            closed: needs a recorded previous version, an attested/additive D1 change when this run migrated, and the
+  #            failed version still being the live one; then re-smokes the restored Production.
+  #   preview: redeploys the last known-good Preview of this branch and host Worker (never a Production version).
+  # The job is green ONLY when the previous deployment was restored and content-verified. A blocked or failed rollback
+  # keeps it red and prints the manual recovery commands. The Smoke job is red in every case, so a rolled-back deployment
+  # is never reported as successful and Release stays blocked. D1 is never rolled back.
+  # -------------------------------------------------------------------------
+  rollback:
+    name: Revert on Verify Failure
+    needs: [migration, deploy, smoke]
+    if: always() && needs.smoke.result == 'failure' && needs.deploy.outputs.published == 'true' && (github.ref != 'refs/heads/main' || inputs.production_rollback_policy == 'automatic')
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    environment:
+      name: ${{ github.ref == 'refs/heads/main' && format('{0}/prod', inputs.app_name) || format('{0}/preview', inputs.app_name) }}
+    permissions:
+      contents: read
+      deployments: write
+      pull-requests: write
+    outputs:
+      rollback_result: ${{ steps.engine.outputs.rollback_result }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_API_TOKEN) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_API_TOKEN) || '' }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_ACCOUNT_ID) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID) || '' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch delivery tooling
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: engine
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+          stage: rollback
+          inputs_json: ${{ toJSON(inputs) }}
+          preview_secrets: ${{ github.ref != 'refs/heads/main' && secrets.PREVIEW_SECRETS || '' }}
+          smoke_username: ${{ secrets.SMOKE_USERNAME }}
+          smoke_password: ${{ secrets.SMOKE_PASSWORD }}
+          deploy_outputs: ${{ toJSON(needs.deploy.outputs) }}
+          migration_outputs: ${{ toJSON(needs.migration.outputs) }}
+          smoke_outputs: ${{ toJSON(needs.smoke.outputs) }}
 
   # -------------------------------------------------------------------------
   # Shared Dev — optional, independent of Native Preview (own switch, Dev resources and Environment). The
   # SAME engine with target = dev: every non-main branch push updates the ONE Dev Worker; the last verified
-  # deployment wins. `needs: deploy` is ORDERING ONLY (Preview and Dev may share one physical D1, so their
-  # migrations must never overlap); Deploy's result is ignored except by the engine's shared-D1 guard. Branch
+  # deployment wins. `needs` on the Preview jobs is ORDERING ONLY (Preview and Dev may share one physical D1, so their
+  # migrations must never overlap); their results are ignored except by the engine's shared-D1 guard (Migration state). Branch
   # deletion and disabling the switch never touch the Dev Worker. Not used by the manual persistent-dev path.
   # -------------------------------------------------------------------------
   dev-deploy:
     name: Shared Dev
-    needs: [lint, typecheck, unit, integration, build, e2e, deploy]
+    needs: [lint, typecheck, unit, integration, build, e2e, migration, deploy, smoke, rollback]
     if: always() && (needs.lint.result == 'success' || (needs.lint.result == 'skipped' && inputs.lint_cmd == '')) && (needs.typecheck.result == 'success' || (needs.typecheck.result == 'skipped' && inputs.typecheck_cmd == '')) && (needs.unit.result == 'success' || (needs.unit.result == 'skipped' && inputs.test_unit_cmd == '')) && (needs.integration.result == 'success' || (needs.integration.result == 'skipped' && inputs.test_integration_cmd == '')) && needs.build.result == 'success' && (needs.e2e.result == 'success' || (needs.e2e.result == 'skipped' && inputs.test_e2e_cmd == '')) && inputs.shared_dev_on_branch_push && inputs.deployment_strategy != 'production-only' && github.ref_type == 'branch' && github.ref != 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev'))
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
@@ -685,16 +891,17 @@ jobs:
           inputs_json: ${{ toJSON(inputs) }}
           smoke_username: ${{ secrets.SMOKE_USERNAME }}
           smoke_password: ${{ secrets.SMOKE_PASSWORD }}
-          sibling_result: ${{ needs.deploy.result }}
-          sibling_migration: ${{ needs.deploy.outputs.migration }}
+          sibling_result: ${{ needs.migration.result }}
+          sibling_migration: ${{ needs.migration.outputs.migration }}
 
   # -------------------------------------------------------------------------
-  # Release — optional, main only, only after THIS run deployed its own SHA to Production and verified it.
+  # Release — optional, main only, only after THIS run deployed its own SHA to Production, the Smoke job verified it at
+  # content level and no Rollback ran.
   # -------------------------------------------------------------------------
   release:
     name: Release
-    needs: [deploy]
-    if: always() && inputs.release_cmd != '' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && inputs.dispatch_target != 'persistent-dev' && needs.deploy.result == 'success' && needs.deploy.outputs.deployed_and_verified == 'true' && needs.deploy.outputs.target == 'prod'
+    needs: [deploy, smoke, rollback]
+    if: always() && inputs.release_cmd != '' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && inputs.dispatch_target != 'persistent-dev' && needs.deploy.result == 'success' && needs.deploy.outputs.target == 'prod' && needs.smoke.result == 'success' && needs.smoke.outputs.deployed_and_verified == 'true' && needs.rollback.result == 'skipped'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 20
     permissions:

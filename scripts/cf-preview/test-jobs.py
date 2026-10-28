@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Executes the REAL steps of the Deploy, Shared Dev and persistent-Dev jobs — including the composite delivery
-engine (actions/cf-deploy -> actions/cf-preview/engine.sh) — against stub gh/pnpm/curl, and feeds the results into
-the next job's `if:`. Covers what the static contract test cannot: Migration is a step in the Deploy job and runs only
-after build + audit, stale runs never reach Release, a failed migration or smoke never publishes/verifies,
-application env cannot redirect the target, nothing remote is touched before the guards pass.
+"""Executes the REAL steps of the Migration, Deploy, Smoke Tests, Rollback, Shared Dev and persistent-Dev jobs —
+including the composite delivery engine (actions/cf-deploy -> actions/cf-preview/engine.sh) — against stub
+gh/pnpm/curl, and feeds the results of each job into the next job's `if:` and `needs.*.outputs`. EVERY job runs in a
+FRESH workspace (a different runner): anything the chain needs must travel through job outputs, never through local
+files. Covers what the static contract test cannot: Migration runs only after build + audit and before Deploy, stale
+runs never reach Smoke/Release, a failed migration or smoke never publishes/verifies, the Rollback job is conditional
+and fail-closed, application env cannot redirect the target, nothing remote is touched before the guards pass.
 Mocked: no Cloudflare, no GitHub. See docs/cf-worker-v2-refactor.md for what this does NOT prove."""
 import json
+import os
 import sys
 
 import yaml
 
 sys.path.insert(0, "scripts/cf-preview")
-from ghexpr import Ctx, ev  # noqa: E402
+from ghexpr import Ctx, ev, strip_expr  # noqa: E402
 from jobrunner import APP_TOML, make_workspace, run_job  # noqa: E402
 
 WF = ".github/workflows/_cf-worker-v2.yml"
@@ -44,16 +47,55 @@ PREV_SECRETS = {"CLOUDFLARE_PREVIEW_API_TOKEN": "VT", "CLOUDFLARE_PREVIEW_ACCOUN
 D1 = {"d1_migrations": True}
 
 
-def deploy(ref=MAIN, inputs=None, secrets=None, env=None, toml=APP_TOML, needs=None):
-    ws = make_workspace(toml)
-    r = run_job(doc, "deploy", ctx(ref, inputs, secrets if secrets is not None else (PROD_SECRETS if ref == MAIN else PREV_SECRETS), needs),
-                ws, dict({"STUB_TIPS": SHA}, **(env or {})))
-    r["ws"] = ws
-    return r
+CHAIN = ("migration", "deploy", "smoke", "rollback")
+
+
+def run_chain(ref=MAIN, inputs=None, secrets=None, env=None, toml=APP_TOML, env_by_job=None, event="push", needs_over=None, files=None):
+    """Runs Migration -> Deploy -> Smoke -> Rollback like the scheduler would: each job's `if:` is evaluated against the
+    real results/outputs of its `needs`, and each executed job gets a FRESH workspace (no shared runner state)."""
+    secrets = secrets if secrets is not None else (PROD_SECRETS if ref == MAIN else PREV_SECRETS)
+    i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", tools_ref="x", preview_host_check=False)
+    i.update(inputs or {})
+    needs = {j: {"result": ("success" if i.get(c, "") else "skipped"), "outputs": {}} for j, c in
+             (("lint", "lint_cmd"), ("typecheck", "typecheck_cmd"), ("unit", "test_unit_cmd"), ("integration", "test_integration_cmd"), ("e2e", "test_e2e_cmd"))}
+    needs["build"] = {"result": "success", "outputs": {}}
+    needs.update({k: {"result": v, "outputs": {}} for k, v in (needs_over or {}).items()})
+    res, logs, summ, steps, wss = {}, [], [], [], {}
+    for name in CHAIN:
+        c = ctx(ref, inputs, secrets, dict(needs, **res), event)
+        if not ev(doc["jobs"][name]["if"], c):
+            res[name] = {"result": "skipped", "outputs": {}}
+            continue
+        ws = make_workspace(toml, files)
+        senv = {"STUB_TIPS": SHA}
+        senv.update(env or {})
+        senv.update((env_by_job or {}).get(name, {}))
+        # STUB_PROBES is a sequence ("first;second;..."): Smoke Tests consume the first answer, the Rollback job (another
+        # runner, fresh counter) the rest - or the last answer again when there is none.
+        if ";" in (env or {}).get("STUB_PROBES", "") and "STUB_PROBES" not in (env_by_job or {}).get(name, {}):
+            first, rest = env["STUB_PROBES"].split(";", 1)
+            senv["STUB_PROBES"] = first if name == "smoke" else rest
+        if name == "rollback":
+            senv.setdefault("STUB_ACTIVE", "new-2")  # the live Production version after the Deploy job published new-2
+        r = run_job(doc, name, c, ws, senv, verbose=bool(os.environ.get("CHAIN_VERBOSE") and name in os.environ["CHAIN_VERBOSE"].split(",")))
+        res[name] = {"result": r["result"], "outputs": r["outputs"]}
+        logs.append(r["log"]); summ.append(r["summary"]); steps.extend(r["steps"]); wss[name] = ws
+    dep, sm, mg = res["deploy"]["outputs"], res["smoke"]["outputs"], res["migration"]["outputs"]
+    out = {"url": dep.get("url", ""), "published_url": dep.get("url", ""), "target": dep.get("target", ""), "version_id": dep.get("version_id", ""),
+           "deployed_and_verified": sm.get("deployed_and_verified") or "false", "smoke_level": sm.get("smoke_level", ""), "verified_url": sm.get("verified_url", ""),
+           "published_unverified": sm.get("published_unverified") or "false", "migration": mg.get("migration", ""),
+           "rollback_result": res["rollback"]["outputs"].get("rollback_result", "")}
+    failed = any(v["result"] == "failure" for v in res.values())
+    last = next(w for n, w in reversed(list(wss.items())) if n in ("deploy", "migration")) if ("deploy" in wss or "migration" in wss) else make_workspace(toml)
+    return {"result": "failure" if failed else "success", "outputs": out, "steps": steps, "log": "".join(logs), "summary": "".join(summ),
+            "ws": wss.get("deploy", last), "wss": wss, "jobs": res, "needs": res}
+
+
+deploy = run_chain
 
 
 def release_runs(r, inputs=None):
-    c = ctx(MAIN, dict({"release_cmd": "pnpm release"}, **(inputs or {})), needs={"deploy": {"result": r["result"], "outputs": r["outputs"]}})
+    c = ctx(MAIN, dict({"release_cmd": "pnpm release"}, **(inputs or {})), needs=r["needs"])
     return bool(ev(doc["jobs"]["release"]["if"], c))
 
 
@@ -62,7 +104,12 @@ def published(r):
 
 
 def step(r, name):
-    return dict(r["steps"]).get(f"engine / {name}")
+    """Outcome of an engine step across the whole chain: the job where it actually ran wins over 'skipped' elsewhere."""
+    seen = [o for n, o in r["steps"] if n == f"engine / {name}"]
+    for pref in ("failure", "success"):
+        if pref in seen:
+            return pref
+    return seen[-1] if seen else None
 
 
 def migrated(r):
@@ -70,7 +117,11 @@ def migrated(r):
 
 
 def mig_file(r, target):
-    return open(r["ws"] / "w" / ".wrangler" / f"migrate.{target}.json").read()
+    for j in ("migration", "deploy"):
+        f = r.get("wss", {}).get(j, r["ws"]) / "w" / ".wrangler" / f"migrate.{target}.json"
+        if f.exists():
+            return f.read_text()
+    raise FileNotFoundError(target)
 
 
 # ======================================================================= Deploy: Production + Release gate
@@ -96,16 +147,22 @@ check(r["result"] == "failure" and r["outputs"]["deployed_and_verified"] == "fal
 check("versions deploy prev-1@100" not in r["log"] and "Production smoke FAILED" in r["summary"], "policy manual: no automatic rollback, manual instructions in the summary")
 check(not release_runs(r), "prod smoke failure -> Release does NOT run")
 
-r = deploy(inputs={"production_rollback_policy": "automatic"}, env={"STUB_PROBES": "500 "})
+r = deploy(inputs={"production_rollback_policy": "automatic"}, env={"STUB_PROBES": "500 ;200 "})
 check(r["result"] == "failure" and r["outputs"]["deployed_and_verified"] == "false", "prod smoke failure + rollback: job stays red, not verified (smoke failure stays visible although recovery succeeded)")
 rb = [l for l in r["log"].splitlines() if "versions deploy prev-1@100" in l]
 up = [l for l in r["log"].splitlines() if "versions upload" in l]
 cfg = lambda line: line.split("--config ")[1].split()[0]
-check(len(rb) == 1 and "--config" in rb[0] and cfg(rb[0]) == cfg(up[0]), "rollback uses the SAME audited Wrangler config as the publish")
-check("NOT reverted" in r["summary"] and "Rolled back" in r["summary"], "rollback summary states D1 was not reverted")
+rbcfg = json.load(open(cfg(rb[0]))) if rb and "--config" in rb[0] and os.path.exists(cfg(rb[0])) else None
+check(len(rb) == 1 and "--config" in rb[0] and cfg(rb[0]) != cfg(up[0]), "the Rollback job uses its own minimal config (it never rebuilds), not the Deploy job's audited config file (another runner)")
+check(r["jobs"]["deploy"]["outputs"].get("worker_name") == "app" and "--config" in rb[0], "the rollback identity (Worker name `app`) travelled from the Deploy job as a job output")
+check("NOT reverted" in r["summary"] and "rolled back to `prev-1` and verified" in r["summary"], "rollback summary states D1 was not reverted")
+check(r["jobs"]["rollback"]["result"] == "success" and r["outputs"]["rollback_result"] == "restored_verified" and r["jobs"]["smoke"]["result"] == "failure", "rollback restored + verified: the Rollback job is green but the SMOKE job (and so the run) stays red")
+check(r["outputs"]["deployed_and_verified"] == "false" and r["outputs"]["verified_url"] == "", "a rolled-back deployment is never reported as verified")
 check(not release_runs(r), "prod rollback -> Release does NOT run")
-r = deploy(inputs={"production_rollback_policy": "automatic"}, env={"STUB_PROBES": "500 ", "STUB_ROLLBACK_FAIL": "1"})
-check(r["result"] == "failure" and "rollback to `prev-1` FAILED" in r["summary"] and "Rolled back" not in r["summary"], "a FAILED automatic rollback is reported as failed, never as rolled back")
+r = deploy(inputs={"production_rollback_policy": "automatic"}, env={"STUB_PROBES": "500 ;200 ", "STUB_ROLLBACK_FAIL": "1"})
+check(r["result"] == "failure" and r["jobs"]["rollback"]["result"] == "failure" and "rollback to `prev-1` FAILED" in r["summary"] and "rolled back to" not in r["summary"] and "wrangler versions deploy prev-1@100 --name app --yes" in r["summary"],
+      "a FAILED automatic rollback: Rollback job red, reported as failed (never as rolled back), manual recovery command printed")
+check(r["outputs"]["rollback_result"] == "failed" and not release_runs(r), "a failed rollback blocks Release and exposes rollback_result=failed")
 
 r = deploy(inputs={"app_url_prod": ""})
 check(r["result"] == "failure" and r["outputs"]["deployed_and_verified"] == "false" and step(r, "Smoke the exact deployed URL (fails closed)") == "failure", "prod without a smoke URL FAILS at the smoke step (no silent success)")
@@ -198,7 +255,7 @@ check(r["result"] == "failure" and "restored to last good" not in r["summary"] a
 r = deploy(FEAT, inputs=dict(PREV_IN, sha_path="/version.json"), env={"STUB_PROBES": "500 ;200 ", "STUB_DEPLOYMENTS": good_dep(), "STUB_SHA_BODY": GOOD[:7]})
 check("restored to last good commit" in r["summary"], "recovery serving the last-good commit identity is verified")
 # a newer push superseded this run while the smoke was failing: recovery must not replace the newer deployment
-r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ", "STUB_DEPLOYMENTS": good_dep(), "STUB_TIPS": f"{SHA},{SHA},{SHA},{OTHER}"})
+r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ", "STUB_DEPLOYMENTS": good_dep()}, env_by_job={"rollback": {"STUB_TIPS": OTHER}})
 check(r["result"] == "failure" and r["log"].count("preview --name feat-x") == 1 and "superseded" in r["summary"], "recovery is skipped when a newer push owns the branch (it never replaces a newer deployment)")
 # the empty-URL incident, executed through the real engine
 for raw, label in (('{"preview":{"urls":[]}}', "empty preview.urls"), ('{"preview":{}}', "missing urls"), ("garbage", "malformed JSON"), ("", "no output")):
@@ -240,9 +297,9 @@ check(m["result"] == "success" and not migrated(m) and not published(m) and m["o
 m = deploy(FEAT, inputs=D1, env={"STUB_TIPS": "GONE"})
 check(m["result"] == "failure" and not migrated(m), "deleted branch: fails closed, no migration")
 # P2: a push that lands DURING the (long) migration must not let the old code be published afterwards
-m = deploy(FEAT, inputs=D1, env={"STUB_TIPS": f"{SHA},{SHA},{OTHER}"})
+m = deploy(FEAT, inputs=D1, env_by_job={"deploy": {"STUB_TIPS": OTHER}})
 check(m["result"] == "success" and migrated(m) and not published(m) and m["outputs"]["deployed_and_verified"] == "false", "branch advanced DURING the migration: re-checked right before publish, old code is NOT published")
-check(step(m, "Stale-SHA guard (after migration, before publish)") == "success" and step(m, "Publish the audited artifact") == "skipped" and step(m, "Smoke the exact deployed URL (fails closed)") == "skipped", "post-migration stale run skips publish, smoke and verification")
+check(step(m, "Stale-SHA guard (start)") == "success" and step(m, "Publish the audited artifact") == "skipped" and step(m, "Smoke the exact deployed URL (fails closed)") == "skipped" and m["jobs"]["smoke"]["result"] == "skipped", "post-migration stale run skips publish and the Smoke job (nothing was published, so nothing is smoked or verified)")
 bad = APP_TOML.replace('database_id = "PREV-ID"', 'database_id = "PROD-ID"').replace('database_name = "prev-db"', 'database_name = "prod-db"')
 m = deploy(FEAT, inputs=D1, toml=bad)
 check(m["result"] == "failure" and not migrated(m) and not published(m), "Preview D1 identical to Production D1: fails before any migration (preflight / target check)")
@@ -341,7 +398,7 @@ DEV_INPUTS = {
 
 def dev(inputs=None, env=None, toml=DEV_TOML, needs=None, secrets=None, ref=FEAT):
     ws = make_workspace(toml)
-    n = needs if needs is not None else {"deploy": {"result": "skipped", "outputs": {}}}
+    n = needs if needs is not None else {"migration": {"result": "skipped", "outputs": {}}}
     r = run_job(doc, "dev-deploy", ctx(ref, dict(DEV_INPUTS, **(inputs or {})), PROD_SECRETS if secrets is None else secrets, n),
                 ws, dict({"STUB_TIPS": SHA}, **(env or {})))
     r["ws"] = ws
@@ -437,37 +494,42 @@ r = dev(env={"STUB_TIPS": f"{SHA},{SHA},{OTHER}"}, inputs=D1)
 check(r["result"] == "success" and ran(r, "migrations apply") and not ran(r, "PUBLISH"), "branch advanced during the Dev migration: old code is not published")
 
 # Shared-D1 guard: Preview and Dev sharing one database
-fail_dep = {"deploy": {"result": "failure", "outputs": {"migration": "failed"}}}
+fail_dep = {"migration": {"result": "failure", "outputs": {"migration": "failed"}}}
 r = dev(inputs=D1, needs=fail_dep)
 check(r["result"] == "failure" and not ran(r, "migrations apply") and not ran(r, "PUBLISH"), "Preview migration failed on the SHARED D1: Dev migrates and publishes nothing")
-r = dev(inputs=D1, needs={"deploy": {"result": "cancelled", "outputs": {"migration": ""}}})
+r = dev(inputs=D1, needs={"migration": {"result": "cancelled", "outputs": {"migration": ""}}})
 check(r["result"] == "failure" and not ran(r, "PUBLISH"), "...also when the Preview job was cancelled")
 distinct = DEV_TOML.replace('database_name = "shared-db"\ndatabase_id = "SHARED-ID"\n[env.dev]', 'database_name = "preview-only-db"\ndatabase_id = "PREVIEW-ONLY"\n[env.dev]')
 assert distinct != DEV_TOML
 r = dev(inputs=D1, needs=fail_dep, toml=distinct)
 check(r["result"] == "success" and ran(r, "PUBLISH"), "Preview migration failed but the D1s differ: Shared Dev is independent and deploys")
-r = dev(inputs=D1, needs={"deploy": {"result": "failure", "outputs": {"migration": "applied"}}})
+r = dev(inputs=D1, needs={"migration": {"result": "failure", "outputs": {"migration": "applied"}}})
 check(r["result"] == "success" and ran(r, "PUBLISH"), "Preview deploy failed AFTER a successful shared-D1 migration (e.g. smoke): Dev proceeds")
-r = dev(inputs=D1, needs={"deploy": {"result": "success", "outputs": {"migration": "applied"}}})
+r = dev(inputs=D1, needs={"migration": {"result": "success", "outputs": {"migration": "applied"}}})
 check(r["result"] == "success", "Preview migration succeeded on the shared D1: Dev proceeds (ordered after it)")
 
 # Preview and Dev sharing one physical D1, end to end: Preview deploy first, then Dev ordered after it
 SHARED_TOML = APP_TOML.replace('database_name = "prev-db"\ndatabase_id = "PREV-ID"', 'database_name = "shared-db"\ndatabase_id = "SHARED-ID"') + \
     '[env.dev]\nname = "app-dev"\n[[env.dev.d1_databases]]\nbinding = "DB"\ndatabase_name = "shared-db"\ndatabase_id = "SHARED-ID"\n'
 pv = deploy(FEAT, inputs=D1, toml=SHARED_TOML)
-dv = dev(inputs=dict(D1, dev_binding_allow=""), toml=SHARED_TOML, needs={"deploy": {"result": pv["result"], "outputs": pv["outputs"]}})
+dv = dev(inputs=dict(D1, dev_binding_allow=""), toml=SHARED_TOML, needs={"migration": pv["jobs"]["migration"]})
 check(pv["result"] == "success" and dv["result"] == "success" and "SHARED-ID" in mig_file(pv, "preview") and "SHARED-ID" in mig_file(dv, "dev") and pv["outputs"]["migration"] == "applied",
       "Preview and Dev sharing one D1 both migrate the same database, one after the other")
 pf = deploy(FEAT, inputs=D1, toml=SHARED_TOML, env={"STUB_APPLY_FAIL": "1"})
-df = dev(inputs=dict(D1, dev_binding_allow=""), toml=SHARED_TOML, needs={"deploy": {"result": pf["result"], "outputs": pf["outputs"]}})
+df = dev(inputs=dict(D1, dev_binding_allow=""), toml=SHARED_TOML, needs={"migration": pf["jobs"]["migration"]})
 check(pf["outputs"]["migration"] == "failed" and df["result"] == "failure" and not ran(df, "migrations apply") and not ran(df, "PUBLISH"), "shared D1: a failed Preview migration (job output) stops the Dev migration and publish")
 
 r = dev(inputs={"dev_deploy_cmd": ""})
 check(r["result"] == "success" and "wrangler deploy --config " in r["log"] and "wrangler.toml --env dev" in r["log"] and r["log"].index("BUILD") < r["log"].index("wrangler deploy"), "Shared Dev built-in publish (no dev_deploy_cmd): wrangler deploy gets the audited --config (and the named env for a source config), after the build")
 
 # Config guard, on the REAL deployment path: the engine refuses before any remote command
-r = deploy(MAIN, inputs={"deployment_strategy": "production-only", "shared_dev_on_branch_push": True})
-check(r["result"] == "failure" and not published(r) and "wrangler versions" not in r["log"] and "migrations apply" not in r["log"] and "-X POST" not in r["log"], "production-only + Shared Dev: the engine fails at init, before build, migration, publish or any ledger write")
+BADCFG = {"deployment_strategy": "production-only", "shared_dev_on_branch_push": True}
+r = deploy(MAIN, inputs=BADCFG)
+check(r["jobs"]["migration"]["result"] == r["jobs"]["deploy"]["result"] == "skipped" and r["log"] == "", "production-only + Shared Dev: no delivery job is even scheduled (no build, migration, publish)")
+for stage_job in ("migration", "deploy"):  # defence in depth: even if a job were forced to run, the engine refuses at init
+    ws_ = make_workspace()
+    fr = run_job(doc, stage_job, ctx(MAIN, dict(BADCFG, d1_migrations=True), PROD_SECRETS, {}), ws_, {"STUB_TIPS": SHA})
+    check(fr["result"] == "failure" and not published(fr) and "wrangler versions" not in fr["log"] and "migrations apply" not in fr["log"] and "-X POST" not in fr["log"], f"production-only + Shared Dev: the {stage_job} stage fails at engine init, before build, migration, publish or any ledger write")
 r = deploy(MAIN, inputs={"deployment_strategy": "production-only", "preview_on_branch_push": True}, env={"STUB_PROBES": "200 "})
 check(r["result"] == "success" and published(r) and r["outputs"]["deployed_and_verified"] == "true", "production-only + default Preview=true: accepted, Production deploys")
 
@@ -552,5 +614,120 @@ r = manual(toml=DEV_TOML.replace('name = "app-dev"', 'name = "app"'))
 check(r["result"] == "failure" and not ran(r, "PUBLISH"), "engine contract: manual run applies the same config audit")
 r = manual(inputs={"persistent_dev_ref": "refs/heads/other"})
 check(r["result"] == "failure" and not ran(r, "PUBLISH"), "engine contract: manual run from a ref other than persistent_dev_ref is refused by the engine too")
+
+# ======================================================================= Migration -> Deploy -> Smoke -> Rollback chain
+# Every job below ran in its OWN fresh workspace: the hand-off (URL, version ids, Worker identity, ledger id, migration
+# facts, smoke level) travelled through job outputs only.
+AUTO = {"production_rollback_policy": "automatic"}
+ADD_SQL = {"migrations/0001.sql": "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);\nALTER TABLE notes ADD COLUMN tag TEXT;\n"}
+DROP_SQL = {"migrations/0001.sql": "ALTER TABLE notes DROP COLUMN body;\n"}
+res_of = lambda r: {k: v["result"] for k, v in r["jobs"].items()}
+NOTHING = {"migration": "skipped", "deploy": "skipped", "smoke": "skipped", "rollback": "skipped"}
+
+# 1/2. CI / E2E failure -> nothing downstream, nothing remote
+for failing in ("lint", "unit", "build", "e2e"):
+    r = deploy(MAIN, inputs=dict(D1, lint_cmd="l", test_unit_cmd="u", test_e2e_cmd="e", **AUTO), needs_over={failing: "failure"})
+    check(res_of(r) == NOTHING and r["log"] == "" and not release_runs(r), f"CI: failed {failing} -> Migration, Deploy, Smoke and Rollback are all skipped; nothing remote is touched; no Release")
+# 3. migration failure
+r = deploy(MAIN, inputs=dict(D1, **AUTO), env={"STUB_APPLY_FAIL": "1"})
+check(res_of(r) == {"migration": "failure", "deploy": "skipped", "smoke": "skipped", "rollback": "skipped"} and not published(r) and not release_runs(r), "Migration failure -> Deploy, Smoke and Rollback skipped, nothing published, Release blocked")
+check("D1 migration failed" in r["summary"] and r["outputs"]["migration"] == "failed", "a failed migration is reported explicitly (migration_status=failed, summary)")
+# 4. deploy failure
+r = deploy(MAIN, inputs=AUTO, env={"STUB_UPLOAD_FAIL": "1"})
+check(res_of(r) == {"migration": "skipped", "deploy": "failure", "smoke": "skipped", "rollback": "skipped"} and not release_runs(r), "Deploy failure -> Smoke and Rollback skipped (nothing was published to verify or revert), Release blocked")
+r = deploy(FEAT, env={"STUB_PREVIEW_FAIL": "1"})
+check(res_of(r)["deploy"] == "failure" and res_of(r)["smoke"] == "skipped" and res_of(r)["rollback"] == "skipped", "Preview publish failure -> Smoke and Rollback skipped")
+# 5. smoke success -> rollback skipped, release allowed
+r = deploy(MAIN, inputs=dict(D1, **AUTO), env={"STUB_PROBES": "200 "})
+check(res_of(r) == {"migration": "success", "deploy": "success", "smoke": "success", "rollback": "skipped"} and r["result"] == "success" and release_runs(r), "Smoke success -> Rollback skipped, run green, Release allowed")
+check(r["jobs"]["deploy"]["outputs"]["published"] == "true" and r["outputs"]["deployed_and_verified"] == "true" and r["jobs"]["deploy"]["outputs"].get("deployed_and_verified") is None, "Deploy only reports `published`; `verified` exists only after the Smoke job")
+check(r["jobs"]["smoke"]["outputs"]["smoke_level"] == "content", "the verification level is explicit (content)")
+check("deployments/5151/statuses" not in r["log"], "a verified Production deployment keeps GitHub's own success status (no unverified annotation)")
+# 6. production smoke failure -> automatic rollback (restored, verified), release blocked
+r = deploy(MAIN, inputs=dict(AUTO, sha_path="/version.json"), env={"STUB_PROBES": "200 ;200 ", "STUB_SHA_BODY": OTHER[:7]},
+           env_by_job={"rollback": {"STUB_SHA_BODY": "", "STUB_PREV_MESSAGE": "[1111111] previous"}})
+check(res_of(r)["smoke"] == "failure" and "wrangler versions view prev-1" in r["log"], "post-rollback smoke resolves the previous version's commit from its deployment message")
+r = deploy(MAIN, inputs=dict(AUTO, sha_path="/version.json"), env={"STUB_PROBES": "200 ;200 ", "STUB_SHA_BODY": OTHER[:7]}, env_by_job={"rollback": {"STUB_SHA_BODY": "1111111"}})
+check(res_of(r) == {"migration": "skipped", "deploy": "success", "smoke": "failure", "rollback": "success"} and r["outputs"]["rollback_result"] == "restored_verified",
+      "Production smoke fails on the wrong commit; rollback restores prev-1; the restored deployment no longer serves the failed commit -> restored_verified")
+check(r["outputs"]["smoke_level"] == "" and r["outputs"]["deployed_and_verified"] == "false" and not release_runs(r) and r["result"] == "failure", "a successful rollback still leaves the run FAILED, the deployment unverified and Release blocked")
+check("deployments/5151/statuses -f state=failure" in r["log"] and "UNVERIFIED" in r["log"], "the failed deployment is annotated UNVERIFIED on its GitHub Environment deployment")
+check("deployments/5151/statuses -f state=inactive" in r["log"], "after a verified rollback the failed Environment deployment is marked inactive (superseded by the restored version)")
+# rollback runs once, only the previous version of THIS Worker, from a runner that never built anything
+check(r["log"].count("wrangler versions deploy prev-1@100") == 1 and "BUILD" not in "".join(l for l in r["log"].splitlines() if "prev-1@100" in l), "exactly one rollback, to the previous version id recorded by Deploy")
+check(not any(f.startswith("dist") for f in os.listdir(r["wss"]["rollback"] / "w")), "the Rollback job builds nothing (a failing build can never block a rollback)")
+# 7. rollback failure -> failed run, loud
+r = deploy(MAIN, inputs=AUTO, env={"STUB_PROBES": "500 ;200 ", "STUB_ROLLBACK_FAIL": "1"})
+check(res_of(r)["rollback"] == "failure" and r["outputs"]["rollback_result"] == "failed" and "Roll back manually" in r["summary"], "Rollback failure -> job red, rollback_result=failed, manual command in the summary")
+# restored but the post-rollback smoke fails -> not green
+r = deploy(MAIN, inputs=AUTO, env={"STUB_PROBES": "500 ;500 "})
+check(res_of(r)["rollback"] == "failure" and r["outputs"]["rollback_result"] == "restored_unhealthy" and "post-rollback smoke FAILED" in r["summary"], "rolled back but the restored Production fails the smoke -> restored_unhealthy, job red, loud summary")
+r = deploy(MAIN, inputs=dict(AUTO, access_protected_targets="preview prod"), env={"STUB_PROBES": "500 ;302 https://t.cloudflareaccess.com/cdn-cgi/access/login/x"})
+check(res_of(r)["rollback"] == "failure" and r["outputs"]["rollback_result"] == "restored_unverified", "restored Production reachable only through Access liveness -> restored_unverified, job red (never reported as verified)")
+# 8. previous version missing -> fail safe, never pretend
+r = deploy(MAIN, inputs=AUTO, env={"STUB_PROBES": "500 ", "STUB_NO_PREV": "1"})
+check(res_of(r)["rollback"] == "failure" and r["outputs"]["rollback_result"] == "blocked" and "wrangler versions deploy" not in r["log"].replace("versions deploy new-2", ""), "no previous version id -> NO rollback attempted, Rollback job red, rollback_result=blocked")
+check("No previous Worker version id was recorded" in r["summary"] and "STILL serves the unverified version" in r["summary"], "the summary says Production still serves the unverified version (no fake success)")
+# policy manual / disabled: no Rollback job, manual command in the Smoke job summary
+for pol in ("manual", "disabled"):
+    r = deploy(MAIN, inputs={"production_rollback_policy": pol}, env={"STUB_PROBES": "500 "})
+    check(res_of(r)["rollback"] == "skipped" and res_of(r)["smoke"] == "failure" and "wrangler versions deploy prev-1@100 --name app --yes" in r["summary"] and "versions deploy prev-1" not in r["log"], f"policy {pol}: nothing rolled back, manual command printed by the Smoke job, run red")
+# 9. D1 compatibility (Expand / Contract), fail closed
+bad_cases = [
+    ("migrations applied, d1_rollback_compat unattested (default)", dict(D1, **AUTO), ADD_SQL, "d1_unattested"),
+    ("attested expand-contract but the SQL is destructive", dict(D1, **AUTO, d1_rollback_compat="expand-contract"), DROP_SQL, "d1_not_additive"),
+    ("attested expand-contract but the SQL is not provably additive (data rewrite)", dict(D1, **AUTO, d1_rollback_compat="expand-contract"), {"migrations/0001.sql": "UPDATE notes SET body = '';"}, "d1_not_additive"),
+]
+for label, inp, files, code in bad_cases:
+    r = deploy(MAIN, inputs=inp, files=files, env={"STUB_PROBES": "500 "})
+    check(res_of(r)["rollback"] == "failure" and r["outputs"]["rollback_result"] == "blocked" and "versions deploy prev-1" not in r["log"] and f"({code})" in r["summary"], f"D1 incompatible - {label}: rollback BLOCKED (fail closed), no Worker change, manual command printed")
+r = deploy(MAIN, inputs=dict(D1, **AUTO), files=ADD_SQL, env={"STUB_PROBES": "500 ", "STUB_PENDING_FILES": "0001.sql"}, env_by_job={"rollback": {"STUB_PROBES": "200 "}})
+check(r["outputs"]["rollback_result"] == "blocked", "additive SQL alone is NOT proof: without the expand-contract attestation the rollback stays blocked")
+r = deploy(MAIN, inputs=dict(D1, **AUTO, d1_rollback_compat="expand-contract"), files=ADD_SQL, env={"STUB_PROBES": "500 ;200 "})
+check(r["jobs"]["migration"]["outputs"]["d1_scan"] == "additive" and r["outputs"]["rollback_result"] == "restored_verified" and "versions deploy prev-1@100" in r["log"], "attested expand-contract + provably additive SQL -> rollback proceeds and is verified")
+r = deploy(MAIN, inputs=dict(D1, **AUTO, d1_rollback_compat="expand-contract"), files=ADD_SQL, env={"STUB_PROBES": "500 ", "STUB_PENDING_FILES": ""})
+check(r["jobs"]["migration"]["outputs"]["d1_scan"] == "unknown" and r["outputs"]["rollback_result"] == "blocked", "pending migration files that cannot be determined -> scan `unknown` -> rollback blocked (fail closed)")
+r = deploy(MAIN, inputs=dict(D1, **AUTO), env={"STUB_PROBES": "500 ;200 ", "STUB_PENDING": "0"})
+check(r["jobs"]["migration"]["outputs"]["schema_changed"] != "true" and r["outputs"]["rollback_result"] == "restored_verified", "d1_migrations on but NOTHING pending this run: the schema is unchanged, rollback needs no attestation")
+r = deploy(MAIN, inputs=AUTO, env={"STUB_PROBES": "500 ;200 "})
+check(r["outputs"]["rollback_result"] == "restored_verified", "a Worker without D1 migrations rolls back without any D1 condition")
+# 10. PR event never deploys
+for ev_ref, head in (("refs/pull/1/merge", "o/r"),):
+    r = deploy(ev_ref, inputs=dict(D1, **AUTO), event="pull_request")
+    check(res_of(r) == NOTHING and r["log"] == "", "PR event: no Migration, Deploy, Smoke or Rollback (no Production or Preview deployment)")
+r = deploy(MAIN, inputs=dict(D1, **AUTO), event="delete")
+check(res_of(r) == NOTHING, "branch delete: no delivery job")
+# 11. stale SHA
+r = deploy(MAIN, inputs=dict(D1, **AUTO), env_by_job={"deploy": {"STUB_TIPS": OTHER}})
+check(res_of(r) == {"migration": "success", "deploy": "success", "smoke": "skipped", "rollback": "skipped"} and not published(r) and not release_runs(r), "main moved on after Migration: Deploy publishes nothing, Smoke and Rollback are skipped, Release blocked")
+r = deploy(MAIN, inputs=AUTO, env={"STUB_PROBES": "500 "}, env_by_job={"rollback": {"STUB_ACTIVE": "someone-elses-version"}})
+check(r["outputs"]["rollback_result"] == "blocked" and "versions deploy prev-1" not in r["log"] and "live_version_changed" in r["summary"], "the live version is no longer the one THIS run deployed -> rollback refused (never replaces another deployment)")
+# hand-off is DATA and validated
+ws_ = make_workspace()
+bad = ctx(MAIN, dict(AUTO), PROD_SECRETS, {"deploy": {"result": "success", "outputs": {"published": "true", "url": "http://evil.example/x", "version_id": "new-2", "previous_version_id": "prev-1", "worker_name": "app"}},
+                                              "smoke": {"result": "failure", "outputs": {}}, "migration": {"result": "skipped", "outputs": {}}})
+fr = run_job(doc, "rollback", bad, ws_, {"STUB_TIPS": SHA, "STUB_ACTIVE": "new-2"})
+check(fr["result"] == "failure" and "versions deploy" not in fr["log"] and step(fr, "Hand-off from the previous jobs (validated data)") == "failure", "a malformed hand-off (non-https URL) is refused at hydrate, before anything is changed")
+for key, val in (("version_id", "x; rm -rf /"), ("previous_version_id", "$(touch PWNED)"), ("worker_name", "App Name"), ("published_sha", OTHER)):
+    outs = {"published": "true", "url": "https://app.example.com", "version_id": "new-2", "previous_version_id": "prev-1", "worker_name": "app"}
+    outs[key] = val
+    ws_ = make_workspace()
+    fr = run_job(doc, "rollback", ctx(MAIN, dict(AUTO), PROD_SECRETS, {"deploy": {"result": "success", "outputs": outs}, "smoke": {"result": "failure", "outputs": {}}, "migration": {"result": "skipped", "outputs": {}}}), ws_, {"STUB_TIPS": SHA, "STUB_ACTIVE": "new-2"})
+    check(fr["result"] == "failure" and "versions deploy" not in fr["log"] and not (ws_ / "w" / "PWNED").exists(), f"hand-off {key}={val!r} is refused as data (no rollback, no execution)")
+ws_ = make_workspace()
+smoke_needs_ = {"deploy": {"result": "success", "outputs": {"published": "true", "url": "https://app.example.com", "target": "prod", "published_sha": SHA}}}
+fr = run_job(doc, "smoke", ctx(MAIN, {}, PROD_SECRETS, smoke_needs_), ws_, {"STUB_TIPS": SHA, "STUB_PROBES": "200 "})
+check(fr["result"] == "success" and "CLOUDFLARE" not in " ".join(k for k in doc["jobs"]["smoke"].get("env", {})), "the Smoke job runs with no Cloudflare credentials in its env and still verifies (the probe needs none)")
+ws_ = make_workspace()
+fr = run_job(doc, "smoke", ctx(MAIN, {}, PROD_SECRETS, smoke_needs_), ws_, {"STUB_TIPS": SHA, "STUB_PROBES": "200 ", "CLOUDFLARE_API_TOKEN": "leaked", "CLOUDFLARE_ACCOUNT_ID": "leaked"})
+check(fr["result"] == "failure" and step(fr, "Initialise (bind target and stage, validate credentials and env as data)") == "failure", "the Smoke stage refuses to start if Cloudflare credentials ever reach it (least privilege enforced by the engine)")
+# Preview: ledger id and identity travel between jobs; recovery stays Preview-only
+r = deploy(FEAT, env={"STUB_PROBES": "200 "})
+check(res_of(r) == {"migration": "skipped", "deploy": "success", "smoke": "success", "rollback": "skipped"} and r["jobs"]["deploy"]["outputs"]["ledger_id"] == "4242", "Preview chain: the ledger id is created by Deploy and handed to Smoke")
+check("deployments/4242/statuses -f state=success" in r["log"] and r["jobs"]["deploy"]["outputs"]["preview_name"] == "feat-x", "Preview: Smoke marks THE ledger entry of this run success (no second entry), identity feat-x handed over")
+r = deploy(FEAT, env={"STUB_PROBES": "500 "}, inputs=AUTO)
+check(res_of(r)["rollback"] == "failure" and "versions deploy" not in r["log"] and r["outputs"]["rollback_result"] == "no_known_good", "Preview + no known-good deployment: the Rollback job never touches Production versions (policy automatic is irrelevant) and fails loudly")
+r = deploy(FEAT, env={"STUB_PROBES": "500 ;200 ", "STUB_DEPLOYMENTS": good_dep()}, inputs=AUTO)
+check(res_of(r)["rollback"] == "success" and r["outputs"]["rollback_result"] == "restored_verified" and "versions deploy" not in r["log"] and r["result"] == "failure", "Preview recovery in the Rollback job: last-known-good redeployed + verified; run stays failed; no Production rollback command")
 
 sys.exit(fail)

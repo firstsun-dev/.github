@@ -10,22 +10,65 @@ Detect Changes (monorepo only — the CALLER runs _detect-changes.yml and gates 
  ┌──────┬───────────┬──────┬─────────────┬──────────────────┬─────┐
  Lint  Typecheck  Unit Tests  Integration Tests  Build Validation  E2E     six independent jobs, no `needs` between them
  └──────┴───────────┴──────┴─────────────┴──────────────────┴─────┘        (actions/cf-ci-check; E2E has its own body)
-        │                                           │
-     Deploy                                   Shared Dev  (optional; `needs: Deploy` for ORDERING only)
- target = prod | preview                         target = dev
-        │                                           │
-        └──────────── actions/cf-deploy ────────────┘      ONE delivery engine (engine.sh) for every target:
-   init → stale → setup → prepare → BUILD + audit → exact D1 target check → stale → MIGRATE (step) → stale
-        → PUBLISH the audited artifact → smoke → mark verified | recover
         │
-    Release                optional (release_cmd), main only, after a VERIFIED Production deploy
+   Migration            only with d1_migrations: build + audit + exact D1 target check + stale check + migrate (stage migrate)
+        │
+     Deploy             target = prod | preview: build + audit + stale check + PUBLISH the audited artifact (stage publish)
+        │
+  Smoke Tests           probes THIS deployment (URL, commit SHA, smoke_cmd); verified | unverified (stage verify, no CF credentials)
+        ├── success ──► Release            optional (release_cmd), main only, after a VERIFIED Production deploy
+        └── failure ──► Revert on Verify Failure   (stage rollback; conditional) → the run stays FAILED, Release is blocked
+                          prod    : policy `automatic` only; fail-closed Worker rollback + re-smoke
+                          preview : last-known-good redeploy + re-smoke
+                                                  Shared Dev  (optional; target = dev; ONE job; `needs` the Preview jobs for ORDERING only)
+
+ every job calls actions/cf-deploy → ONE delivery engine (engine.sh); `stage` picks the phases:
+   migrate  : init → stale → setup → prepare → BUILD + audit → exact D1 target check → stale → MIGRATE
+   publish  : init → stale → setup → prepare (ledger) → BUILD + audit → D1 target check → stale → PUBLISH
+   verify   : init → hydrate hand-off → setup → smoke → mark verified | mark UNVERIFIED
+   rollback : init → hydrate hand-off → setup → prod: guards → rollback → re-smoke | preview: recover-find → rebuild last good → re-smoke
+   all      : Shared Dev / persistent Dev only — the former single-job sequence, unchanged
 
  outside the core DAG:  lifecycle (same-repo PR comment / branch-delete ledger retire)
                         config-guard (production-only + Shared Dev is rejected)
                         persistent-dev (Hybrid, protected workflow_dispatch on the approved ref; the same engine, mode=manual)
 ```
 
-There is **no Prepare, Plan, Test-Gate or Migration job**. Migration is one explicit step of the engine, executed only after the deployable was built and the effective Wrangler config was audited, and before the audited artifact is published.
+There is **no Prepare, Plan or Test-Gate job**. Migration is its own job again (v1 parity), but it keeps the v2 order *inside* it: the deployable is built and the effective Wrangler config audited and the exact D1 target validated BEFORE the schema is touched, and the migration publishes nothing. Deploy then repeats build + audit from the same SHA and publishes. Smoke and Rollback are separate jobs so the DAG shows whether a deployment was verified or reverted.
+
+### Migration → Deploy → Smoke → Rollback (job split)
+
+**State between jobs** is data only, never runner files: each job re-runs the engine's `init` (same `inputs_json`, same target binding, same credential isolation) and the Smoke / Rollback stages `hydrate` a hand-off that is validated field by field (https URL, `[A-Za-z0-9-]` version ids, Worker-name and Preview-name patterns, enum for the migration facts, `published_sha == GITHUB_SHA`) before anything uses it.
+
+| Fact | Produced by | Consumed by |
+|---|---|---|
+| target (`prod`/`preview`) | every job derives it from `github.ref` (never from output) | all |
+| `published`, `published_sha` | Deploy | Smoke, Rollback, Release (a stale run publishes nothing → Smoke/Rollback skipped) |
+| deploy URL (`url`) | Deploy | Smoke (Preview), workflow output `deploy_url` |
+| `version_id`, `previous_version_id` | Deploy | Smoke (summary), Rollback (target + "is it still our deployment") |
+| `worker_name` (audited config) | Deploy | Rollback (rollback identity; the job builds nothing) |
+| `ledger_id`, `preview_name` | Deploy | Smoke (ledger status), Rollback (known-good lookup) |
+| `migration`, `schema_changed`, `d1_scan` | Migration | Deploy (`migration` output), Rollback (D1 decision), Shared Dev guard |
+| verification (`deployed_and_verified`, `smoke_level`, `verified_url`) | Smoke | Release, workflow outputs |
+| rollback verdict (`rollback_result`) | Rollback | workflow output |
+
+**Concurrency:** the workflow-level `cfv2-*` group spans the whole run, so no other run can publish or roll back the same Worker between *Publish* and the end of *Smoke / Rollback* (`queue: max`, FIFO). Splitting the jobs added no job-level group (a nested group could deadlock with it). The stale-SHA guards (start / before migration / before publish) and the D1 locks are unchanged; Deploy re-checks the branch tip, so a push that lands during the migration still prevents the old code from being published.
+
+**Verification levels** (explicit, `smoke_level`): `content-sha` (the served commit SHA equals this commit) > `content` (the application answered the probe + `smoke_cmd`) > `liveness` (Cloudflare Access login reachable only: *published but NOT verified*). Only the first two make `deploy_verified` true. A failed smoke marks the deployment **unverified**: the Environment deployment GitHub created for the Deploy job (which only means "published") gets a `failure` status, and the Preview ledger entry is set to `failure`.
+
+**Production rollback is fail-closed.** `production_rollback_policy: automatic` runs the Rollback job after a failed Smoke. It changes nothing unless ALL hold, otherwise it prints the manual command and stays red (`rollback_result=blocked`):
+1. a previous Worker version id was recorded (a first deployment, or an unreadable deployment list, is never "rolled back");
+2. the version currently live is still the one THIS run deployed (nobody deployed out of band, no newer run);
+3. D1: if this run **applied** migrations, `d1_rollback_compat: expand-contract` must be set (caller's Expand/Contract attestation) AND the applied SQL must be statically provable additive (`CREATE TABLE/INDEX`, `ADD COLUMN` that is nullable or defaulted, `INSERT`). Anything else — `DROP`, `RENAME`, `UPDATE/DELETE`, a `NOT NULL` column without default, a constraint old code may violate, an unreadable file list — blocks. With nothing pending the schema is unchanged and no attestation is needed. **D1 is never reverted.**
+4. After `wrangler versions deploy <prev>@100` the restored Production is smoked again: the previous commit when it can be read from the version message, otherwise "no longer serves the failed commit". Only `restored_verified` turns the Rollback job green.
+
+The Smoke job is red in every failure case, so a rolled-back deployment is never reported as successful and Release stays blocked. `rollback_result` is `restored_verified | restored_unverified | restored_unhealthy | blocked | failed | no_known_good`; everything except an empty value is a failed run. Policies `manual` (default) and `disabled` skip the Rollback job; the Smoke job prints the manual command.
+
+**Preview / Shared Dev** keep their last-known-good recovery (same eligibility rules: same repository, application, branch, host Worker; never a Production version). For Preview it now runs in the Rollback job; Shared Dev still recovers inside its single job.
+
+**Required status checks:** the job display names are `Migration`, `Deploy`, `Smoke Tests`, `Revert on Verify Failure` (+ the unchanged validation names). Repositories that require specific check names should add the new ones; `Migration` and `Revert on Verify Failure` are *skipped* (not failed) when not applicable.
+
+**Environment protection:** `Migration`, `Deploy` and `Revert on Verify Failure` reference the `<app>/prod|preview` Environment (they change Production / Preview resources). Required-reviewer rules therefore prompt once per such job; prefer branch rules / wait timers on that Environment. `Smoke Tests` references none and holds no Cloudflare credentials.
 
 ### Responsibilities (who owns what)
 
@@ -66,7 +109,7 @@ A reusable workflow called from another repository resolves `uses: ./...` agains
 
 * Every validation job: own checkout, `setup` action (existing dependency cache), env import, logs, a short Step Summary, no Cloudflare credentials, no shared workspace, no artifacts (only the E2E failure report, 3 days). Browsers are installed only by a consumer's E2E commands; Mailpit starts only in Unit, Integration and E2E.
 * **Skip rules.** An optional job is `skipped` on purpose only when its command input is empty. Migration and Deploy accept `skipped` for an optional job *only* in that case; a configured job that ends `skipped`, `failure` or `cancelled` blocks them, and `Build Validation` must be `success`. No Test Gate job and no `continue-on-error`.
-* **Deploy** needs the six validation jobs (a CONFIGURED one that is skipped, failed or cancelled blocks it). There is no Migration job: when `d1_migrations` is true the engine's **Migration step** runs inside Deploy (and Shared Dev) after the build, the effective-config audit, the exact-D1-target check and a stale check, and before a second stale check and the publish. A failed migration fails the job and nothing is published.
+* **Migration** and **Deploy** need the six validation jobs (a CONFIGURED one that is skipped, failed or cancelled blocks them); Deploy also needs Migration (`success`, or `skipped` when `d1_migrations` is false). When `d1_migrations` is true the **Migration job** (and Shared Dev's single job) builds, audits the effective config, validates the exact D1 target and runs a stale check before applying migrations; Deploy follows. A failed migration fails the job and nothing is published. **Smoke Tests** need a Deploy that published; **Revert on Verify Failure** runs only after a failed smoke.
 * **Deploy** (engine): target re-resolved from the event and bound once, credentials present (fail closed), stale-SHA guard, exact-SHA checkout, setup, target build env, **build**, source and **effective (adapter-generated)** Wrangler config audit, exact D1 target check, stale check, **migrate**, stale check, publish **of the audited config only**, real URL, smoke (Access-aware), Deployment status, recovery.
 * Same-repo PRs do not re-run validation (the push run of the same SHA covers them); fork PRs run it credential-free. No job other than `lifecycle` ever runs on a PR with write capabilities.
 * **Runner overhead.** One run now needs up to 5 validation jobs + the E2E matrix concurrently (e.g. 5 + 4 = 9 runners for Blog) instead of 1 + 4, and each repeats checkout and dependency install (cache hits make this cheap, never share a mutable workspace). Peak memory per runner is unchanged; peak *runner count* roughly doubles on a self-hosted pool. Mitigations: leave unused command inputs empty (the job is skipped, not a no-op runner), keep the pool large enough for the largest consumer's fan-out, and do not serialize checks. `queue: max` still serializes whole runs per resource group, so fan-out only multiplies within a run.
@@ -94,7 +137,7 @@ Outputs: `deploy_url`, `deploy_target`, `version_id` (prod only), `dev_url` (Sha
 
 | Removed | Replacement |
 |---|---|
-| jobs `plan`, `test-unit`, `test-integration`, `test-e2e`, `test` (gate), `preview`, `production`, `production-verify`, `production-recovery`, `pr-link`, `cleanup`, and (PR #64 refactor) the standalone `migrate` job | `lint`, `typecheck`, `unit`, `integration`, `build`, `e2e`, `deploy` (incl. the Migration step), `dev-deploy`, `release`, `lifecycle` |
+| jobs `plan`, `test-unit`, `test-integration`, `test-e2e`, `test` (gate), `preview`, `production`, `production-verify`, `production-recovery`, `pr-link`, `cleanup`, and (PR #64 refactor) the standalone `migrate` job | `lint`, `typecheck`, `unit`, `integration`, `build`, `e2e`, `migration`, `deploy` (publish only), `smoke`, `rollback`, `dev-deploy`, `release`, `lifecycle` |
 | `preview_build_cmd` | one `build_cmd`; targets differ via `build_env_prod` / `build_env_preview` |
 | `preview_provision_cmd`, `preview_cleanup_cmd` (already ignored) | removed: shared durable Preview resources with explicit `previews` bindings |
 | `preview_migrate_cmd`, `migrate_cmd_prod` | `d1_migrations: true` (the engine's Migration step). **No command override**: a custom command could skip the target-D1 check, so the built-in `wrangler d1 migrations` path is the only one |
@@ -200,7 +243,7 @@ The first live Blog run published a Native Preview with **no URL**, then ran smo
 ### Migration safety rules
 * **Target D1.** `migrate.sh` always derives the target from the *source* Wrangler config: Production = top-level `d1_databases`, Preview = `previews.d1_databases` (never `env.dev`). It requires explicit `database_id`/`database_name`, one unambiguous binding (`d1_binding` when several), Preview ≠ Production database, and a migrations directory containing `.sql` files, then writes a minimal config naming only that D1 (all `migrations_*` settings such as `migrations_table`/`migrations_pattern` are carried over; `migrations_dir` is made absolute). There is no way to bypass this with a custom command.
 * **Pending-only, no-op safe.** `wrangler d1 migrations list` must exit 0 (state readable, target reachable) and `apply` is itself pending-only. The "No migrations to apply" text only skips a no-op `apply`; correctness does not depend on parsing it.
-* **Order inside the job (migration is a step, not a job):** `init` (target bound, credentials) → stale check → `prepare` (Wrangler version, Preview identity and **ledger ownership**, source binding policy) → **build + audit of the effective config** → exact D1 target check (read-only; the deployed D1 must be the migrated D1) → stale check → **`migrate.sh`** → stale check → publish. Schema is never changed before a deployable build and a valid target configuration exist; a deleted/superseded branch applies nothing, and a push that lands *during* a long migration is detected by the final stale check so old code is not published over a newer deployment.
+* **Order inside the Migration job (Shared Dev: inside its single job):** `init` (target bound, credentials) → stale check → `prepare` (Wrangler version, Preview identity and **ledger ownership**, source binding policy) → **build + audit of the effective config** → exact D1 target check (read-only; the deployed D1 must be the migrated D1) → stale check → **`migrate.sh`** → stale check → publish. Schema is never changed before a deployable build and a valid target configuration exist; a deleted/superseded branch applies nothing, and a push that lands *during* a long migration is detected by the final stale check so old code is not published over a newer deployment.
 * Failed migration ⇒ the job fails and nothing is published or verified (so Release cannot run); PRs never reach it; Worker recovery never rolls D1 back. Production, Preview and Dev apply the same project-owned SQL to their own D1.
 * **The target cannot be redirected by application env.** `migrate.sh` is invoked by the engine with the target bound from the composite `target` input and the state written at `init`; `build_env_*`, `smoke_env` and `PREVIEW_SECRETS` are parsed with `--reserved`, which rejects every deployment-control name (`TARGET`, `DEV_ENV`, `GH_TOKEN`, `EXPECTED_SHA`, `RUN_SHA`, `D1_BINDING`, `STATE_DIR`, `BUILD_CMD`, `PUBLISH_CMD`, `INPUTS_JSON`, `CF_AUDITED_CONFIG`, `VITE_APP_ENV`/`VERSION`, ... see `parse-env.mjs` `RESERVED`) in addition to the credential/loader names; application env is loaded only inside the process that needs it and is never written to `GITHUB_ENV`. A build command that itself appends `TARGET=prod` to `GITHUB_ENV` still cannot move the migration (tested).
 * **Not implemented (do not assume):** SQL checksum/drift detection or rejection of incompatible histories when several branches share the Preview D1. A branch that edits an already-applied migration, or two branches adding conflicting schema, is not detected; forward-compatible schema changes remain a convention.

@@ -474,3 +474,53 @@ export function artifactDigest(configPath) {
   }
   return h.digest('hex');
 }
+
+/** Worker name of an (audited) config; refuses anything that is not a plain Workers script name. */
+export function workerName(cfg) {
+  const n = cfg?.name;
+  if (typeof n !== 'string' || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(n)) throw new Error(`Wrangler config has no safe Worker name (got ${JSON.stringify(n ?? null)})`);
+  return n;
+}
+
+/** Splits SQL on `;` outside single-quoted strings; whitespace is collapsed. */
+function splitSqlStatements(sql) {
+  const out = [];
+  let cur = '';
+  let quoted = false;
+  for (const ch of sql) {
+    if (ch === "'") quoted = !quoted;
+    if (ch === ';' && !quoted) { out.push(cur); cur = ''; } else cur += ch;
+  }
+  out.push(cur);
+  return out.map((x) => x.trim().replace(/\s+/g, ' ')).filter(Boolean);
+}
+
+/**
+ * Can the PREVIOUS Worker version keep running on the schema after these (already applied, never reverted) D1
+ * migrations? Static and conservative: only statements that cannot break old code count as "additive" (new tables,
+ * new indexes, nullable / defaulted ADD COLUMN, plain INSERT). Anything else (DROP, RENAME, UPDATE/DELETE, UNIQUE
+ * index, NOT NULL column without DEFAULT, unknown statement) is "non-additive". It can never PROVE compatibility;
+ * the caller must additionally attest expand/contract discipline (d1_rollback_compat).
+ * @param {string[]} sqlTexts contents of the pending migration files
+ * @returns {{level: 'additive'|'non-additive', reasons: string[]}}
+ */
+export function classifyMigrationSql(sqlTexts) {
+  const reasons = [];
+  for (const raw of sqlTexts) {
+    const sql = raw.replace(/--[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
+    for (const stmt of splitSqlStatements(sql)) {
+      const u = stmt.toUpperCase();
+      if (/^CREATE TABLE( IF NOT EXISTS)? /.test(u)) continue;
+      if (/^CREATE INDEX( IF NOT EXISTS)? /.test(u)) continue;
+      if (/^INSERT( OR IGNORE)? INTO /.test(u)) continue;
+      const add = /^ALTER TABLE \S+ ADD( COLUMN)? /.exec(u);
+      if (add) {
+        if (/\bNOT NULL\b/.test(u) && !/\bDEFAULT\b/.test(u)) reasons.push(`ADD COLUMN NOT NULL without DEFAULT: ${stmt.slice(0, 80)}`);
+        else if (/\b(REFERENCES|UNIQUE|PRIMARY KEY)\b/.test(u)) reasons.push(`ADD COLUMN with a constraint old code may violate: ${stmt.slice(0, 80)}`);
+        continue;
+      }
+      reasons.push(`non-additive statement: ${stmt.slice(0, 80)}`);
+    }
+  }
+  return { level: reasons.length ? 'non-additive' : 'additive', reasons };
+}

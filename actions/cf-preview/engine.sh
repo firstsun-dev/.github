@@ -5,6 +5,11 @@
 # actions/cf-deploy/action.yml calls one phase per step; every phase reads the workflow inputs from the validated
 # inputs.json written by `init`, so no workflow text is interpolated into a script.
 #
+# Stages (ENGINE_STAGE, set once in `init`): `all` = every phase in ONE job (Shared Dev, persistent Dev); the Production /
+# Preview path is split across jobs that each re-run `init` (same inputs, same target binding) and exchange only
+# validated DATA through `hydrate` - never runner files: migrate (Migration job), publish (Deploy job), verify (Smoke
+# job, no Cloudflare credentials) and rollback (Rollback job).
+#
 # State ($STATE_DIR, default $RUNNER_TEMP/cfv2, 0700): inputs.json, target, mode, build.env / smoke.env /
 # preview.env (validated KEY=VALUE data), config.* and artifact.sha (from build.sh), ledger_id, preview_name, ...
 # Application env (build_env_*, smoke_env, preview secrets) is only ever loaded inside the process that needs it and
@@ -67,8 +72,13 @@ case "$PHASE" in
   init)
     mkdir -p "$S"; chmod 700 "$S"; umask 077
     printf '%s' "${INPUTS_JSON:?}" > "$IN"; jq -e 'type == "object"' "$IN" >/dev/null || die "inputs_json is not an object"
-    T="${ENGINE_TARGET:?}"; M="${ENGINE_MODE:-auto}"
+    T="${ENGINE_TARGET:?}"; M="${ENGINE_MODE:-auto}"; STAGE="${ENGINE_STAGE:-all}"
     case "$T" in prod|preview|dev) ;; *) die "bad engine target: $T";; esac
+    case "$STAGE" in all|migrate|publish|verify|rollback) ;; *) die "bad engine stage: $STAGE";; esac
+    # Production / Preview are always split; Shared Dev and persistent Dev keep the single-job engine.
+    if [ "$T" = dev ]; then [ "$STAGE" = all ] || die "Shared Dev runs as one job (stage all), got '$STAGE'"
+    else [ "$STAGE" != all ] || die "$T must run as split stages (migrate/publish/verify/rollback), not 'all'"; fi
+    printf '%s' "$STAGE" > "$S/stage"
     case "$M" in auto|manual) ;; *) die "bad engine mode: $M";; esac
     [ "$M" = auto ] || [ "$T" = dev ] || die "manual mode is only for the persistent Dev target"
     printf '%s' "$T" > "$S/target"; printf '%s' "$M" > "$S/mode"
@@ -91,7 +101,12 @@ case "$PHASE" in
       [ "$R" = "$T" ] || die "target mismatch (resolved '$R', engine '$T'); refusing to deploy"
     fi
     # Each credential belongs to exactly one target; the job passes only that one and there is no fallback.
-    [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || die "$T credentials not provided; refusing to fall back to other credentials"
+    # The Smoke job (stage verify) never receives Cloudflare credentials: it only probes the published URL.
+    if [ "$STAGE" != verify ]; then
+      [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || die "$T credentials not provided; refusing to fall back to other credentials"
+    elif [ -n "${CLOUDFLARE_API_TOKEN:-}${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+      die "the Smoke stage must not receive Cloudflare credentials"
+    fi
     if [ "$T" = dev ]; then
       [ -n "$(inp dev_worker_name)" ] || die "Shared Dev requires dev_worker_name (the Dev Worker identity is always verified)"
       [ -n "$(inp app_url_dev)" ] || die "Shared Dev requires app_url_dev (a Dev deployment without a probe is not verified)"
@@ -128,7 +143,8 @@ case "$PHASE" in
       PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg w "$APP_NAME" --arg d "$HOST_WORKER" --arg r "$GITHUB_REPOSITORY" --arg m "$MODE" '{branch_ref:$ref,worker:$w,dev_worker:$d,repo:$r,mode:$m}')"
       DESC="Shared Dev ($MODE)"
     fi
-    if [ "$TARGET" != prod ]; then
+    # The Migration job runs the identity / preflight checks but opens no ledger entry (the Deploy job owns it).
+    if [ "$TARGET" != prod ] && [ "${PREPARE_LEDGER:-true}" = true ]; then
       ID="$("$TOOLS_DIR/gh.sh" start "$(rd ledger_env)" "$RUN_SHA" "$PAYLOAD" "$DESC")"
       printf '%s' "$ID" > "$S/ledger_id"
       "$TOOLS_DIR/gh.sh" status "$ID" in_progress "" "Deploying $RUN_SHA from $BRANCH"
@@ -166,16 +182,64 @@ case "$PHASE" in
     [ "${ENGINE_TARGET:?}" = "$TARGET" ] || die "target mismatch at migration (state '$TARGET', step '$ENGINE_TARGET')"
     OUT="$(TARGET="$TARGET" APP_DIR="$APP_DIR" WRANGLER_CONFIG="$WRANGLER_CONFIG" D1_BINDING="$D1_BINDING" DEV_ENV="$DEV_ENV" "$TOOLS_DIR/migrate.sh")"
     printf '%s\n' "$OUT"
-    printf '%s' "$(printf '%s\n' "$OUT" | sed -n 's/^pending=//p')" > "$S/migration"
+    PENDING="$(printf '%s\n' "$OUT" | sed -n 's/^pending=//p')"
+    printf '%s' "$PENDING" > "$S/migration"
+    echo "schema_changed=$PENDING"
     echo "migration=applied";;
+
+  fail-migrate) # the Migration job failed: nothing was published; the remote D1 state is whatever wrangler left
+    ctx
+    summary "### ❌ $TARGET D1 migration failed or was cancelled — nothing was published and the Worker is unchanged. The D1 may be partially migrated: inspect it before pushing again (migrations are never reverted automatically)."
+    ;;
 
   publish)
     ctx
     [ "${ENGINE_TARGET:?}" = "$TARGET" ] || die "target mismatch at publish"
+    # Resolve the audited Worker name BEFORE publishing: the Rollback job restores by name, so a config without a
+    # safe name must stop here, while nothing is changed yet.
+    AUDITED_NAME=""
+    if [ "$TARGET" = prod ]; then AUDITED_NAME="$(node "$TOOLS_DIR/cli.mjs" worker-name --config "$(rd config.path)" | sed -n 's/^worker_name=//p')"; [ -n "$AUDITED_NAME" ] || die "no safe Worker name in the audited config; refusing to publish"; fi
     COMMIT_MSG=""; [ -z "${GITHUB_EVENT_PATH:-}" ] || [ ! -f "$GITHUB_EVENT_PATH" ] || COMMIT_MSG="$(jq -r '.head_commit.message // ""' "$GITHUB_EVENT_PATH")"
     APP_URL="$(target_url)" OUT_FILE="$S/preview.json" APP_VERSION="$(inp app_version)" COMMIT_MSG="$COMMIT_MSG" \
       WORKER_NAME="$(inp preview_worker_name)" PUBLISH_CMD="$([ "$TARGET" = dev ] && inp dev_deploy_cmd || true)" \
-      "$TOOLS_DIR/publish.sh";;
+      "$TOOLS_DIR/publish.sh"
+    # Reached only when publish.sh succeeded: the hand-off of this deployment to the Smoke / Rollback jobs.
+    echo "published=true"; echo "published_sha=$RUN_SHA"; echo "ledger_id=$LEDGER_ID"; echo "preview_name=$PREVIEW_NAME"
+    echo "worker_name=$AUDITED_NAME";;
+
+  hydrate) # Smoke / Rollback jobs: validated hand-off from the Migration / Deploy / Smoke jobs (data, never runner files)
+    ctx
+    D="$(printf '%s' "${HANDOFF_DEPLOY:-}" | jq -c 'if type == "object" then . else {} end' 2>/dev/null || echo '{}')"
+    M="$(printf '%s' "${HANDOFF_MIGRATION:-}" | jq -c 'if type == "object" then . else {} end' 2>/dev/null || echo '{}')"
+    K="$(printf '%s' "${HANDOFF_SMOKE:-}" | jq -c 'if type == "object" then . else {} end' 2>/dev/null || echo '{}')"
+    val() { # <json> <key> <regex>: value must match (or be empty), else the hand-off is refused
+      local v; v="$(printf '%s' "$1" | jq -r --arg k "$2" '.[$k] | if . == null then "" else tostring end')"
+      [[ "$v" =~ $3 ]] || die "hand-off '$2' is malformed; refusing to continue"
+      printf '%s' "$v"
+    }
+    H_URL="$(val "$D" url '^(https://[^[:space:]]+)?$')"
+    H_VER="$(val "$D" version_id '^[A-Za-z0-9-]*$')"
+    H_PREV="$(val "$D" previous_version_id '^[A-Za-z0-9-]*$')"
+    H_WORKER="$(val "$D" worker_name '^([a-z0-9][a-z0-9-]{0,62})?$')"
+    H_LEDGER="$(val "$D" ledger_id '^[0-9]*$')"
+    H_PNAME="$(val "$D" preview_name '^([a-z0-9]+(-[a-z0-9]+)*)?$')"
+    H_PUB="$(val "$D" published '^(true|false)?$')"
+    H_PUBSHA="$(val "$D" published_sha '^([0-9a-f]{7,40})?$')"
+    H_PENDING="$(val "$M" schema_changed '^(true|false)?$')"
+    H_SCAN="$(val "$M" d1_scan '^(none|additive|non-additive|unknown)?$')"
+    H_MIG="$(val "$M" migration '^(applied|failed|none)?$')"
+    H_LEVEL="$(val "$K" smoke_level '^(liveness|content|content-sha)?$')"
+    [ "$H_PUB" = true ] || die "the Deploy job did not report a published deployment; nothing to verify or roll back"
+    [ -z "$H_PUBSHA" ] || [ "$H_PUBSHA" = "$RUN_SHA" ] || die "hand-off was published from $H_PUBSHA, this run is $RUN_SHA; refusing to act on another deployment"
+    [ "$TARGET" = prod ] || [ -n "$H_URL" ] || die "$TARGET hand-off has no published URL"
+    printf '%s' "$H_LEDGER" > "$S/ledger_id"; printf '%s' "$H_PNAME" > "$S/preview_name"
+    case "$TARGET" in preview) printf '%s' "$APP_NAME/preview/$H_PNAME" > "$S/ledger_env";; esac
+    [ "$TARGET" != preview ] || [ -n "$H_PNAME" ] || die "preview hand-off has no Preview identity"
+    setenv PUBLISHED_URL "$H_URL"; setenv VERSION_ID "$H_VER"; setenv PREVIOUS_VERSION_ID "$H_PREV"
+    setenv AUDITED_WORKER "$H_WORKER"; setenv D1_PENDING "$H_PENDING"; setenv D1_SCAN "$H_SCAN"; setenv HANDOFF_SMOKE_LEVEL "$H_LEVEL"
+    echo "hydrated: target=$TARGET url=${H_URL:-<none>} version=${H_VER:-?} previous=${H_PREV:-?} migration=${H_MIG:-?}/schema_changed=${H_PENDING:-?}/${H_SCAN:-?}" >&2
+    echo "published=true"; echo "url=$H_URL"; echo "version_id=$H_VER"; echo "previous_version_id=$H_PREV"; echo "worker_name=$H_WORKER"
+    echo "ledger_id=$H_LEDGER"; echo "preview_name=$H_PNAME"; echo "published_sha=$RUN_SHA";;
 
   smoke)
     ctx
@@ -244,7 +308,18 @@ case "$PHASE" in
     if [ "$TARGET" != prod ]; then
       "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" failure "$URL" "Smoke failed — $TARGET UNVERIFIED"
       summary "### ❌ $TARGET smoke failed — $URL is **unverified** (serves $RUN_SHA)."
-    fi;;
+    else
+      POLICY="$(inp production_rollback_policy)"
+      summary "### ❌ Production smoke FAILED — $URL is **unverified** (serves $RUN_SHA, version \`${VERSION_ID:-?}\`). Release is blocked."
+      if [ "$POLICY" = automatic ]; then
+        summary "- The Rollback job (policy \`automatic\`) decides next; it refuses an unsafe rollback and then prints the manual recovery commands."
+      else
+        summary "- Rollback policy is \`$POLICY\`: nothing is rolled back automatically. Manual rollback (only after confirming the previous Worker version runs on the CURRENT D1 schema; migration this run: schema_changed=${D1_PENDING:-?}, scan=${D1_SCAN:-?}):"
+        summary "  \`wrangler versions deploy ${PREVIOUS_VERSION_ID:-<previous-version-id>}@100 --name ${AUDITED_WORKER:-<worker>} --yes\`"
+      fi
+    fi
+    # The Environment deployment GitHub created for the Deploy job is "success" (it published). Record that it is NOT verified.
+    "$TOOLS_DIR/gh.sh" mark-env-deployment "$APP_NAME/$TARGET" "$RUN_SHA" failure "Smoke failed — UNVERIFIED (served $RUN_SHA)" || echo "::warning::could not annotate the Environment deployment as unverified" >&2;;
 
   recover-find)
     ctx
@@ -275,7 +350,8 @@ case "$PHASE" in
     export APP_DIR_OVERRIDE="$GITHUB_WORKSPACE/recover/$APP_PATH"
     APP_DIR="$APP_DIR_OVERRIDE"
     R="$S/recover"; mkdir -p "$R"; chmod 700 "$R"
-    export CFV2_REBIND_ENV; CFV2_REBIND_ENV="$(cat "$S/build.env")"
+    # parse-env writes no file for an empty build env: that is a valid (empty) environment, not an error.
+    export CFV2_REBIND_ENV; CFV2_REBIND_ENV="$(rd build.env)"
     CFV2_REBIND_ENV="$(node "$TOOLS_DIR/cli.mjs" rebind-env --var CFV2_REBIND_ENV --from "$RUN_SHA" --to "$GOOD_SHA")"
     node "$TOOLS_DIR/parse-env.mjs" CFV2_REBIND_ENV "$R/build.env" --reserved >/dev/null
     VERSION="$(APP_VERSION_IN="$(inp app_version)" node "$TOOLS_DIR/cli.mjs" rebind-env --var APP_VERSION_IN --from "$RUN_SHA" --to "$GOOD_SHA")"
@@ -313,19 +389,79 @@ case "$PHASE" in
       summary "- Commit identity was NOT verified (set sha_path)."
     fi;;
 
-  prod-recover)
+  prod-rollback) # Rollback job, Production: fail-closed. Prints rollback_result=rolled_back|blocked|failed (always exits 0)
     ctx
-    POLICY="$(inp production_rollback_policy)"
-    if [ "$POLICY" = automatic ] && [ -n "${PREVIOUS_VERSION_ID:-}" ]; then
-      if ROLLBACK_TO="$PREVIOUS_VERSION_ID" "$TOOLS_DIR/publish.sh" >&2; then
-        summary "### ♻️ Rolled back to \`$PREVIOUS_VERSION_ID\`. D1 migrations (if any) were NOT reverted. The run stays FAILED and no Release runs."
-      else
-        summary "### 🚨 Automatic rollback to \`$PREVIOUS_VERSION_ID\` FAILED — Production may serve the unverified version. Roll back manually: \`wrangler versions deploy $PREVIOUS_VERSION_ID@100 --yes\`."
-      fi
-    else
-      summary "### 🚨 Production smoke FAILED (policy: $POLICY). Manual rollback: \`wrangler versions deploy ${PREVIOUS_VERSION_ID:-<prev>}@100 --yes\` after confirming schema compatibility."
+    [ "$TARGET" = prod ] || die "prod-rollback is Production only"
+    POLICY="$(inp production_rollback_policy)"; PREV="${PREVIOUS_VERSION_ID:-}"; NEW="${VERSION_ID:-}"; W="${AUDITED_WORKER:-}"
+    MANUAL="wrangler versions deploy ${PREV:-<previous-version-id>}@100 --name ${W:-<worker>} --yes"
+    blocked() { # <code> <why>
+      echo "rollback_result=blocked"; echo "rollback_reason=$1"
+      summary "### 🚨 Automatic rollback BLOCKED ($1) — Production STILL serves the unverified version \`${NEW:-?}\` ($RUN_SHA)."
+      summary "- $2"
+      summary "- Manual recovery, after confirming the previous version runs on the current D1 schema: \`$MANUAL\`"
+      exit 0
+    }
+    [ "$POLICY" = automatic ] || blocked policy "production_rollback_policy is '$POLICY'."
+    [ -n "$PREV" ] || blocked no_previous_version "No previous Worker version id was recorded (first deployment, or the deployment list was unreadable); there is nothing safe to roll back to."
+    [ -n "$NEW" ] && [ -n "$W" ] || blocked no_identity "The deployed version id or Worker name was not handed over."
+    [ "$PREV" != "$NEW" ] || blocked same_version "The previous and the new version id are identical."
+    if [ "${D1_PENDING:-}" = true ]; then
+      # A Worker rollback never reverts D1. This run changed the schema: the previous version must be PROVEN to cope.
+      [ "$(inp d1_rollback_compat)" = expand-contract ] || blocked d1_unattested "This run applied D1 migrations and d1_rollback_compat is not 'expand-contract': compatibility of the previous Worker version with the new schema is unproven."
+      [ "${D1_SCAN:-}" = additive ] || blocked d1_not_additive "This run applied D1 migrations that are not provably additive (scan: ${D1_SCAN:-unknown}); the previous Worker version may not work on the new schema."
     fi
-    exit 1;;   # keep the run red regardless of policy
+    RB="$S/rollback"; mkdir -p "$RB"; node -e 'const [n,f]=process.argv.slice(1);require("fs").writeFileSync(f,JSON.stringify({name:n,compatibility_date:"2025-01-01"}))' "$W" "$RB/wrangler.json"
+    LIVE="$(cd "$APP_DIR" && pnpm exec wrangler deployments list --config "$RB/wrangler.json" --json 2>/dev/null \
+      | jq -r 'sort_by(.created_on) | reverse | .[0].versions | max_by(.percentage // 0) | .version_id // empty' 2>/dev/null || echo "")"
+    # Never roll back a deployment that is no longer ours (someone deployed out of band): fail closed.
+    [ "$LIVE" = "$NEW" ] || blocked live_version_changed "The live version is '${LIVE:-unknown}', not the version \`$NEW\` this run deployed; refusing to replace someone else's deployment."
+    if (cd "$APP_DIR" && pnpm exec wrangler versions deploy "$PREV@100" --config "$RB/wrangler.json" --message "Revert: smoke failed on $RUN_SHA" --yes) >&2; then
+      echo "rollback_result=rolled_back"; echo "rollback_reason=rolled back to $PREV"
+    else
+      echo "rollback_result=failed"; echo "rollback_reason=wrangler versions deploy failed"
+      summary "### 🚨 Automatic rollback to \`$PREV\` FAILED — Production may serve the unverified version \`$NEW\`. Roll back manually: \`$MANUAL\`."
+    fi;;
+
+  prod-rollback-verify) # smoke the RESTORED deployment: previous commit when resolvable, else "no longer serves the failed commit"
+    ctx
+    RB="$S/rollback"; PREV_SHA=""
+    VIEW="$(cd "$APP_DIR" && pnpm exec wrangler versions view "${PREVIOUS_VERSION_ID:?}" --config "$RB/wrangler.json" --json 2>/dev/null || true)"
+    PREV_SHA="$(printf '%s' "$VIEW" | jq -r '.annotations["workers/message"] // .message // empty' 2>/dev/null | grep -oE '^\[[0-9a-f]{7}\]' | tr -d '[]' | head -1 || true)"
+    [ -z "$PREV_SHA" ] || PREV_SHA="$(cd "$APP_DIR" && git rev-parse --verify --quiet "$PREV_SHA^{commit}" 2>/dev/null || echo "$PREV_SHA")"
+    echo "previous_commit=$PREV_SHA"
+    TARGET_URL="$(target_url)" DEPLOY_TARGET=prod TEST_ENV=prod EXPECTED_SHA="$PREV_SHA" ABSENT_SHA="$RUN_SHA" SMOKE_CMD="$(target_smoke_cmd)" SMOKE_CWD="$APP_DIR" SHA_PATH="$(inp sha_path)" \
+      PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" ACCESS_TARGETS="$(inp access_protected_targets)" \
+      SMOKE_ENV_FILE="$S/smoke.env" PREVIEW_ENV_FILE="$S/preview.env" NO_PROXY='*' "$TOOLS_DIR/smoke.sh";;
+
+  rollback-finish) # final, target-independent verdict of the Rollback job (ok=true only when restored AND content-verified)
+    ctx
+    R=""; LEVEL=""
+    if [ "$TARGET" = prod ]; then
+      case "${RB_RESULT:-}" in
+        rolled_back)
+          if [ "${RB_VERIFY:-}" = success ]; then
+            case "${RB_LEVEL:-}" in
+              content|content-sha) R=restored_verified; LEVEL="$RB_LEVEL";;
+              *) R=restored_unverified; LEVEL="${RB_LEVEL:-}";;
+            esac
+          else R=restored_unhealthy; fi;;
+        blocked) R=blocked;;
+        *) R=failed;;
+      esac
+      case "$R" in
+        restored_verified)
+          summary "### ♻️ Production rolled back to \`${PREVIOUS_VERSION_ID:-?}\` and verified ($LEVEL). The run stays **FAILED** for $RUN_SHA and Release is blocked. D1 migrations (if any) were NOT reverted."
+          "$TOOLS_DIR/gh.sh" mark-env-deployment "$APP_NAME/$TARGET" "$RUN_SHA" inactive "Rolled back to ${PREVIOUS_VERSION_ID:-previous} after a failed smoke" || true;;
+        restored_unverified) summary "### ⚠️ Production rolled back to \`${PREVIOUS_VERSION_ID:-?}\` but only liveness could be observed (${LEVEL:-no level}): the restored deployment is NOT content-verified. Run FAILED.";;
+        restored_unhealthy) summary "### 🚨 Production was rolled back to \`${PREVIOUS_VERSION_ID:-?}\` but the post-rollback smoke FAILED — Production may be unhealthy. Investigate now. Run FAILED.";;
+      esac
+    else
+      if [ -z "${GOOD_SHA:-}" ]; then R=no_known_good
+      elif [ "${RECOVERED:-}" = success ] && [ "${VERIFIED:-}" = success ]; then
+        case "${SMOKE_LEVEL:-}" in content|content-sha) R=restored_verified; LEVEL="$SMOKE_LEVEL";; *) R=restored_unverified; LEVEL="${SMOKE_LEVEL:-}";; esac
+      else R=failed; fi
+    fi
+    echo "result=$R"; echo "level=$LEVEL"; echo "ok=$([ "$R" = restored_verified ] && echo true || echo false)";;
 
   cleanup)
     rm -rf "${STATE_DIR:-${RUNNER_TEMP:-/tmp}/cfv2}" 2>/dev/null || true;;
