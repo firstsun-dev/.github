@@ -1,15 +1,25 @@
 name: CF Worker delivery engine
 description: >
-  The ONE deployment implementation of Cloudflare Worker CI/CD v2, for target = prod | preview | dev:
-  Build -> effective-config audit -> exact D1 target check -> stale check -> migrate (optional) -> stale check ->
-  publish the audited artifact -> smoke -> mark verified | recover. Every step is a phase of
-  actions/cf-preview/engine.sh; this file only sequences them. The CALLER job owns the Environment, permissions,
-  concurrency and which Cloudflare credentials exist (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID in the job env).
-  The caller must have checked out the app at the run SHA and then this repository's `actions/` at `.cf-tools`.
+  The ONE deployment implementation of Cloudflare Worker CI/CD v2, for target = prod | preview | dev. Every step is a
+  phase of actions/cf-preview/engine.sh; this file only sequences them, per `stage`:
+    all       Shared Dev / persistent Dev, ONE job: build -> audit -> D1 target check -> stale check -> migrate ->
+              stale check -> publish -> smoke -> mark verified | last-known-good recovery
+    migrate   Migration job (prod | preview): build + audit + D1 target check + stale check + migrate. Publishes nothing.
+    publish   Deploy job   (prod | preview): build + audit + stale check + publish the audited artifact. Runs no smoke.
+    verify    Smoke job    (prod | preview): smoke the published URL; mark verified | unverified. NO Cloudflare credentials.
+    rollback  Rollback job (prod | preview): prod = fail-closed Worker rollback to the previous version + re-smoke;
+              preview = redeploy the last known-good Preview + re-smoke.
+  Jobs share only validated DATA (deploy_outputs / migration_outputs / smoke_outputs), never runner files. The CALLER
+  job owns the Environment, permissions, concurrency and which Cloudflare credentials exist (CLOUDFLARE_API_TOKEN /
+  CLOUDFLARE_ACCOUNT_ID in the job env). The caller must have checked out the app at the run SHA and then this
+  repository's `actions/` at `.cf-tools`.
 inputs:
   target:
     description: prod | preview | dev. Bound once by the engine; application env can never change it.
     required: true
+  stage:
+    description: all | migrate | publish | verify | rollback (see description). dev only supports all; prod and preview never run as all.
+    default: all
   mode:
     description: auto (branch / main push, with automatic recovery) | manual (persistent Dev dispatch, no recovery)
     default: auto
@@ -24,18 +34,33 @@ inputs:
   smoke_password:
     default: ''
   sibling_result:
-    description: Result of the job this one was ordered after (Preview Deploy), for the shared-D1 guard
+    description: Result of the job this one was ordered after (Preview Migration), for the shared-D1 guard
     default: ''
   sibling_migration:
     description: Migration state reported by that job (applied | failed | none)
     default: ''
+  deploy_outputs:
+    description: toJSON(needs.deploy.outputs) - hand-off to the verify / rollback stages (validated as data)
+    default: '{}'
+  migration_outputs:
+    description: toJSON(needs.migration.outputs) - hand-off to the rollback stage (D1 compatibility decision)
+    default: '{}'
+  smoke_outputs:
+    description: toJSON(needs.smoke.outputs) - hand-off to the rollback stage
+    default: '{}'
 outputs:
   url:
     description: Published URL (kept for existing consumers; verified or not - see verified_url / published_unverified)
-    value: ${{ steps.verified.outputs.url || steps.publish.outputs.url }}
+    value: ${{ steps.verified.outputs.url || steps.publish.outputs.url || steps.hydrate.outputs.url }}
+  published:
+    description: true only when this run PUBLISHED a deployment (publish / all stage); the hand-off flag of the Smoke and Rollback jobs
+    value: ${{ steps.publish.outputs.published || steps.hydrate.outputs.published || 'false' }}
   published_url:
     description: URL this run published, whether or not its content was verified
-    value: ${{ steps.verified.outputs.published_url || steps.publish.outputs.url }}
+    value: ${{ steps.verified.outputs.published_url || steps.publish.outputs.url || steps.hydrate.outputs.url }}
+  published_sha:
+    description: Commit SHA that was published
+    value: ${{ steps.publish.outputs.published_sha || steps.hydrate.outputs.published_sha }}
   verified_url:
     description: URL only when content-level verification passed (smoke_level content | content-sha); empty otherwise
     value: ${{ steps.verified.outputs.verified_url }}
@@ -44,16 +69,40 @@ outputs:
     value: ${{ steps.verified.outputs.published_unverified || 'false' }}
   version_id:
     description: Production Worker version id (prod only)
-    value: ${{ steps.publish.outputs.version_id }}
+    value: ${{ steps.publish.outputs.version_id || steps.hydrate.outputs.version_id }}
+  previous_version_id:
+    description: Production Worker version that was live before this publish (prod only; the rollback target)
+    value: ${{ steps.publish.outputs.previous_version_id || steps.hydrate.outputs.previous_version_id }}
+  worker_name:
+    description: Audited Worker name of the Production deployment (prod only; identity of the rollback)
+    value: ${{ steps.publish.outputs.worker_name || steps.hydrate.outputs.worker_name }}
+  ledger_id:
+    description: GitHub Deployment ledger id (preview | dev)
+    value: ${{ steps.publish.outputs.ledger_id || steps.hydrate.outputs.ledger_id }}
+  preview_name:
+    description: Preview identity (preview only)
+    value: ${{ steps.publish.outputs.preview_name || steps.hydrate.outputs.preview_name }}
   deployed_and_verified:
     description: true ONLY when this run published its own SHA and a CONTENT-level smoke passed (never for Access liveness)
     value: ${{ steps.verified.outputs.deployed_and_verified || 'false' }}
   smoke_level:
     description: liveness (Access login reachable only) | content (application responded) | content-sha (content and commit SHA verified)
-    value: ${{ steps.verified.outputs.smoke_level }}
+    value: ${{ steps.verified.outputs.smoke_level || steps.smoke.outputs.smoke_level }}
   migration:
     description: applied | failed | none
     value: ${{ steps.migration_state.outputs.state }}
+  schema_changed:
+    description: true when this run applied pending D1 migrations (migrate / all stage)
+    value: ${{ steps.migrate.outputs.schema_changed }}
+  d1_scan:
+    description: none | additive | non-additive | unknown - static classification of the migrations this run applied
+    value: ${{ steps.migrate.outputs.d1_scan }}
+  rollback_result:
+    description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed | no_known_good (rollback stage)
+    value: ${{ steps.rbfinal.outputs.result }}
+  rollback_ok:
+    description: true only when the previous deployment was restored AND content-verified (rollback stage)
+    value: ${{ steps.rbfinal.outputs.ok || 'false' }}
 runs:
   using: composite
   steps:
@@ -61,16 +110,27 @@ runs:
     - name: Install tooling deps
       shell: bash
       run: cd "$GITHUB_ACTION_PATH/../cf-preview" && npm ci --ignore-scripts --no-audit --no-fund
-    - name: Initialise (bind target, validate credentials and env as data)
+    - name: Initialise (bind target and stage, validate credentials and env as data)
       id: init
       shell: bash
       env:
         ENGINE_TARGET: ${{ inputs.target }}
+        ENGINE_STAGE: ${{ inputs.stage }}
         ENGINE_MODE: ${{ inputs.mode }}
         INPUTS_JSON: ${{ inputs.inputs_json }}
         PREVIEW_SECRETS: ${{ inputs.target == 'preview' && inputs.preview_secrets || '' }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" init'
+    - name: Hand-off from the previous jobs (validated data)
+      id: hydrate
+      if: inputs.stage == 'verify' || inputs.stage == 'rollback'
+      shell: bash
+      env:
+        HANDOFF_DEPLOY: ${{ inputs.deploy_outputs }}
+        HANDOFF_MIGRATION: ${{ inputs.migration_outputs }}
+        HANDOFF_SMOKE: ${{ inputs.smoke_outputs }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" hydrate | tee -a "$GITHUB_OUTPUT"'
     - name: Stale-SHA guard (start)
+      if: inputs.stage != 'verify' && inputs.stage != 'rollback'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" guard start'
     - name: Setup dependencies
@@ -80,15 +140,17 @@ runs:
         setup-node: 'false'
         setup-pnpm: 'false'
     - name: Prepare (Wrangler version, Preview identity and ledger, ledger entry)
-      if: env.STALE != 'true'
+      if: env.STALE != 'true' && inputs.stage != 'verify' && inputs.stage != 'rollback'
       shell: bash
+      env:
+        PREPARE_LEDGER: ${{ inputs.stage != 'migrate' }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" prepare'
     - name: Build and audit the deployable (nothing remote is changed)
-      if: env.STALE != 'true'
+      if: env.STALE != 'true' && inputs.stage != 'verify' && inputs.stage != 'rollback'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" build'
     - name: Validate the exact migration target (same physical D1 as the deployed config)
-      if: env.STALE != 'true'
+      if: env.STALE != 'true' && inputs.stage != 'verify' && inputs.stage != 'rollback'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" audit-d1'
     - name: Shared-D1 guard (Dev after a failed Preview migration)
@@ -99,50 +161,50 @@ runs:
         PREVIEW_JOB_RESULT: ${{ inputs.sibling_result }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" d1-guard'
     - name: Stale-SHA guard (before migration)
-      if: env.STALE != 'true'
+      if: env.STALE != 'true' && (inputs.stage == 'all' || inputs.stage == 'migrate')
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" guard before-migration'
     - name: Apply pending D1 migrations (this target only)
       id: migrate
-      if: env.STALE != 'true'
+      if: env.STALE != 'true' && (inputs.stage == 'all' || inputs.stage == 'migrate')
       shell: bash
       env:
         ENGINE_TARGET: ${{ inputs.target }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" migrate | tee -a "$GITHUB_OUTPUT"'
     - name: Stale-SHA guard (after migration, before publish)
-      if: env.STALE != 'true'
+      if: env.STALE != 'true' && (inputs.stage == 'all' || inputs.stage == 'publish')
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" guard before-publish'
     - name: Publish the audited artifact
       id: publish
-      if: env.STALE != 'true'
+      if: env.STALE != 'true' && (inputs.stage == 'all' || inputs.stage == 'publish')
       shell: bash
       env:
         ENGINE_TARGET: ${{ inputs.target }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" publish | tee -a "$GITHUB_OUTPUT"'
     - name: Smoke the exact deployed URL (fails closed)
       id: smoke
-      if: env.STALE != 'true' && steps.publish.outcome == 'success'
+      if: env.STALE != 'true' && ((inputs.stage == 'all' && steps.publish.outcome == 'success') || inputs.stage == 'verify')
       shell: bash
       env:
-        PUBLISHED_URL: ${{ steps.publish.outputs.url }}
+        PUBLISHED_URL: ${{ steps.publish.outputs.url || steps.hydrate.outputs.url }}
         SMOKE_USERNAME: ${{ inputs.smoke_username }}
         SMOKE_PASSWORD: ${{ inputs.smoke_password }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" smoke | tee -a "$GITHUB_OUTPUT"'
     # The ONLY place deployed_and_verified becomes true: this run published its own SHA and its smoke passed at content level.
     - name: Mark deployed and verified
       id: verified
-      if: env.STALE != 'true' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'success'
+      if: env.STALE != 'true' && steps.smoke.outcome == 'success'
       shell: bash
       env:
-        PUBLISHED_URL: ${{ steps.publish.outputs.url }}
+        PUBLISHED_URL: ${{ steps.publish.outputs.url || steps.hydrate.outputs.url }}
         SMOKE_LEVEL: ${{ steps.smoke.outputs.smoke_level }}
-        VERSION_ID: ${{ steps.publish.outputs.version_id }}
-        PREVIOUS_VERSION_ID: ${{ steps.publish.outputs.previous_version_id }}
+        VERSION_ID: ${{ steps.publish.outputs.version_id || steps.hydrate.outputs.version_id }}
+        PREVIOUS_VERSION_ID: ${{ steps.publish.outputs.previous_version_id || steps.hydrate.outputs.previous_version_id }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" verified | tee -a "$GITHUB_OUTPUT"'
     - name: Report migration state
       id: migration_state
-      if: always()
+      if: always() && (inputs.stage == 'all' || inputs.stage == 'migrate')
       shell: bash
       env:
         OUTCOME: ${{ steps.migrate.outcome }}
@@ -150,33 +212,34 @@ runs:
         case "$OUTCOME" in success) S=applied;; failure|cancelled) S=failed;; *) S=none;; esac
         echo "state=$S" >> "$GITHUB_OUTPUT"
     # ---- Failure outcomes: always explicit, the job stays red. ----
+    - name: Migration failed - nothing was published
+      if: failure() && inputs.stage == 'migrate' && steps.migrate.outcome == 'failure'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" fail-migrate'
     - name: Failed before or during publish
-      if: failure() && steps.init.outcome == 'success' && steps.publish.outcome != 'success' && env.STALE != 'true'
+      if: failure() && (inputs.stage == 'all' || inputs.stage == 'publish') && steps.init.outcome == 'success' && steps.publish.outcome != 'success' && env.STALE != 'true'
       shell: bash
       env:
         PREVIEW_MUTATED: ${{ steps.publish.outputs.preview_mutated }}
         PUBLISH_STARTED: ${{ steps.publish.outputs.publish_started }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" fail-prepublish'
     - name: Published but smoke failed - mark unverified
-      if: failure() && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
+      if: failure() && steps.smoke.outcome == 'failure' && (inputs.stage == 'verify' || steps.publish.outcome == 'success')
       shell: bash
       env:
-        PUBLISHED_URL: ${{ steps.publish.outputs.url }}
+        PUBLISHED_URL: ${{ steps.publish.outputs.url || steps.hydrate.outputs.url }}
+        VERSION_ID: ${{ steps.publish.outputs.version_id || steps.hydrate.outputs.version_id }}
+        PREVIOUS_VERSION_ID: ${{ steps.publish.outputs.previous_version_id || steps.hydrate.outputs.previous_version_id }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" unverified'
-    - name: Production recovery (policy-driven; D1 is never rolled back)
-      if: failure() && inputs.target == 'prod' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
-      shell: bash
-      env:
-        PREVIOUS_VERSION_ID: ${{ steps.publish.outputs.previous_version_id }}
-        ENGINE_TARGET: ${{ inputs.target }}
-      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" prod-recover'
+    # ---- Preview / Shared Dev recovery: redeploy the last KNOWN-GOOD deployment of the SAME target (never a
+    # Production version). stage all (Shared Dev): runs inside the failed job; stage rollback (Preview): its own job.
     - name: Recovery - find the last known-good deployment of this target
       id: good
-      if: failure() && inputs.mode == 'auto' && inputs.target != 'prod' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure'
+      if: (failure() && inputs.stage == 'all' && inputs.mode == 'auto' && inputs.target != 'prod' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure') || (success() && inputs.stage == 'rollback' && inputs.target == 'preview')
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" recover-find | tee -a "$GITHUB_OUTPUT"'
     - name: Recovery - checkout last good
-      if: failure() && steps.good.outputs.sha != ''
+      if: '!cancelled() && steps.good.outputs.sha != '''''
       uses: actions/checkout@v6
       with:
         ref: ${{ steps.good.outputs.sha }}
@@ -184,7 +247,8 @@ runs:
         persist-credentials: false
     - name: Recovery - rebuild, audit and republish last good (no migration)
       id: recover
-      if: failure() && steps.good.outputs.sha != ''
+      if: '!cancelled() && steps.good.outputs.sha != '''''
+      continue-on-error: true
       shell: bash
       env:
         ENGINE_TARGET: ${{ inputs.target }}
@@ -193,7 +257,8 @@ runs:
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" recover-run | tee -a "$GITHUB_OUTPUT"'
     - name: Recovery - verify the restored deployment (full smoke, last-good SHA)
       id: rverify
-      if: failure() && steps.good.outputs.sha != '' && steps.recover.outcome == 'success'
+      if: '!cancelled() && steps.good.outputs.sha != '''' && steps.recover.outcome == ''success'''
+      continue-on-error: true
       shell: bash
       env:
         RECOVERED_URL: ${{ steps.recover.outputs.url }}
@@ -202,7 +267,7 @@ runs:
         SMOKE_PASSWORD: ${{ inputs.smoke_password }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" recover-verify | tee -a "$GITHUB_OUTPUT"'
     - name: Recovery - record the outcome accurately
-      if: failure() && steps.good.outputs.sha != ''
+      if: '!cancelled() && steps.good.outputs.sha != '''''
       shell: bash
       env:
         GOOD_SHA: ${{ steps.good.outputs.sha }}
@@ -210,6 +275,46 @@ runs:
         VERIFIED: ${{ steps.rverify.outcome }}
         SMOKE_LEVEL: ${{ steps.rverify.outputs.smoke_level }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" recover-record'
+    # ---- Production rollback (stage rollback): policy, previous version, D1 compatibility and "still our
+    # deployment" are all checked BEFORE anything is changed; the restored deployment is smoked again.
+    - name: Rollback - restore the previous Production version (fail-closed)
+      id: prodrb
+      if: success() && inputs.stage == 'rollback' && inputs.target == 'prod'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" prod-rollback | tee -a "$GITHUB_OUTPUT"'
+    - name: Rollback - re-run the smoke against the restored Production
+      id: prodverify
+      if: success() && inputs.stage == 'rollback' && inputs.target == 'prod' && steps.prodrb.outputs.rollback_result == 'rolled_back'
+      continue-on-error: true
+      shell: bash
+      env:
+        PREVIOUS_VERSION_ID: ${{ steps.hydrate.outputs.previous_version_id }}
+        SMOKE_USERNAME: ${{ inputs.smoke_username }}
+        SMOKE_PASSWORD: ${{ inputs.smoke_password }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" prod-rollback-verify | tee -a "$GITHUB_OUTPUT"'
+    - name: Rollback - verdict
+      id: rbfinal
+      if: '!cancelled() && inputs.stage == ''rollback'''
+      shell: bash
+      env:
+        RB_RESULT: ${{ steps.prodrb.outputs.rollback_result }}
+        RB_VERIFY: ${{ steps.prodverify.outcome }}
+        RB_LEVEL: ${{ steps.prodverify.outputs.smoke_level }}
+        GOOD_SHA: ${{ steps.good.outputs.sha }}
+        RECOVERED: ${{ steps.recover.outcome }}
+        VERIFIED: ${{ steps.rverify.outcome }}
+        SMOKE_LEVEL: ${{ steps.rverify.outputs.smoke_level }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" rollback-finish | tee -a "$GITHUB_OUTPUT"'
+    # A rollback never turns a failed deployment green: the job is red unless the previous deployment was restored AND
+    # content-verified (the Smoke job is red in every case).
+    - name: Rollback - fail unless the previous deployment was restored and verified
+      if: '!cancelled() && inputs.stage == ''rollback'' && steps.rbfinal.outputs.ok != ''true'''
+      shell: bash
+      env:
+        RESULT: ${{ steps.rbfinal.outputs.result }}
+      run: |
+        echo "::error::Rollback result '${RESULT:-unknown}': the previous deployment was NOT restored and verified. See the job summary for the manual recovery commands."
+        exit 1
     - name: Remove staged env files
       if: always()
       shell: bash

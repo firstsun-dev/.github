@@ -31,6 +31,7 @@ case "$a" in
     [ "${tips[$i]}" = GONE ] && exit 1; echo "${tips[$i]}";;
   *"payload.branch_ref"*) echo "${STUB_OWNER_REF:-}";;
   *"deployments"*"-X POST"*"--input -"*) cat >> "$STUB_LOG"; echo 4242;;
+  *"&sha="*"per_page=1"*) echo "${STUB_ENV_DEPLOY_ID:-5151}";;
   *"per_page=30"*" -q "*) [ -n "${STUB_LASTGOOD:-}" ] && echo "9:$STUB_LASTGOOD";;
   *"per_page=30"*) printf '%s' "${STUB_DEPLOYMENTS:-[]}";;
   *"deployments/9/statuses"*) echo success;;
@@ -45,10 +46,12 @@ case "$3 $4 $5" in
   "--version  ") echo "4.140.0";;
   "preview "*) [ "${STUB_PREVIEW_FAIL:-}" = 1 ] && exit 9
                if [ -n "${STUB_PREVIEW_RAW+x}" ]; then printf '%s' "$STUB_PREVIEW_RAW"; else echo '{"preview":{"urls":["https://stable.example.workers.dev"]}}'; fi;;
-  "deployments list"*) echo '[{"created_on":"2024-01-01","versions":[{"version_id":"prev-1","percentage":100}]}]';;
-  "versions upload"*) echo "Worker Version ID: new-2";;
+  "deployments list"*) [ "${STUB_NO_PREV:-}" = 1 ] && { echo '[]'; exit 0; }
+               echo '[{"created_on":"2024-01-01","versions":[{"version_id":"'"${STUB_ACTIVE:-prev-1}"'","percentage":100}]}]';;
+  "versions view"*) [ -n "${STUB_PREV_MESSAGE:-}" ] && echo '{"annotations":{"workers/message":"'"$STUB_PREV_MESSAGE"'"}}';;
+  "versions upload"*) [ "${STUB_UPLOAD_FAIL:-}" = 1 ] && exit 6; echo "Worker Version ID: new-2";;
   "versions deploy prev-1@100") [ "${STUB_ROLLBACK_FAIL:-}" = 1 ] && exit 8;;
-  "d1 migrations list") [ "${STUB_PENDING:-1}" = 1 ] && echo "Migrations to be applied: 0001.sql" || echo "No migrations to apply!";;
+  "d1 migrations list") [ "${STUB_PENDING:-1}" = 1 ] && echo "Migrations to be applied: ${STUB_PENDING_FILES-0001.sql}" || echo "No migrations to apply!";;
   "d1 migrations apply") [ "${STUB_APPLY_FAIL:-}" = 1 ] && exit 7;;
 esac
 exit 0
@@ -76,7 +79,7 @@ database_id = "PREV-ID"
 '''
 
 
-def make_workspace(toml=APP_TOML):
+def make_workspace(toml=APP_TOML, files=None):
     ws = pathlib.Path(tempfile.mkdtemp(prefix="jobrun-"))
     (ws / "bin").mkdir()
     for name, body in (("gh", GH_STUB), ("pnpm", PNPM_STUB), ("curl", CURL_STUB), ("npm", NPM_STUB)):
@@ -88,6 +91,8 @@ def make_workspace(toml=APP_TOML):
     (ws / "w" / ".cf-tools" / "actions").mkdir(parents=True)
     for tool in ("cf-preview", "cf-deploy", "cf-ci-check"):
         (ws / "w" / ".cf-tools" / "actions" / tool).symlink_to(ROOT / "actions" / tool)
+    for rel, body in (files or {}).items():
+        (ws / "w" / rel).write_text(body)
     (ws / "tmp").mkdir()
     (ws / "state").mkdir()
     return ws

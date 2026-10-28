@@ -9,7 +9,7 @@
 #                               sees the application's own 2xx.
 #   anything else               -> FAIL
 # Only content / content-sha count as "verified" (engine.sh); liveness is published-but-unverified.
-# Env: TARGET_URL DEPLOY_TARGET(prod|preview|dev) [SMOKE_ENV_FILE] EXPECTED_SHA TOOLS_DIR [SHA_PATH] [SMOKE_CMD] [ACCESS_TARGETS]
+# Env: TARGET_URL DEPLOY_TARGET(prod|preview|dev) [SMOKE_ENV_FILE] EXPECTED_SHA [ABSENT_SHA: post-rollback, EXPECTED_SHA empty] TOOLS_DIR [SHA_PATH] [SMOKE_CMD] [ACCESS_TARGETS]
 #      [SMOKE_CWD=.] [PREVIEW_ENV_FILE] [SHA_ATTEMPTS=6] [SHA_SLEEP=5]
 set -euo pipefail
 : "${DEPLOY_TARGET:?}" "${TOOLS_DIR:?}"
@@ -58,6 +58,15 @@ if [ "$result" = "probe=access-protected" ]; then
   level=liveness
   export PREVIEW_ACCESS_PROTECTED=true
   echo "::notice::Target is protected by Cloudflare Access (approved for $DEPLOY_TARGET): liveness only; content/SHA NOT verified (configure an authenticated probe via smoke_env PROBE_HEADERS for content verification)" >&2
+elif [ -n "${SHA_PATH:-}" ] && [ -z "${EXPECTED_SHA:-}" ] && [ -n "${ABSENT_SHA:-}" ]; then
+  # Post-rollback verification when the restored commit is unknown: the endpoint must stop serving the FAILED
+  # commit. Only content level - it cannot prove which commit is live now.
+  gone=0
+  for ((i = 0; i < ${SHA_ATTEMPTS:-6}; i++)); do
+    if body="$(curl -fsS --max-time 20 "${hdr[@]}" "$TARGET_URL$SHA_PATH")" && ! printf '%s' "$body" | EXPECTED_SHA="$ABSENT_SHA" sha_matches; then gone=1; break; fi
+    sleep "${SHA_SLEEP:-5}"
+  done
+  [ "$gone" = 1 ] || { echo "::error::$TARGET_URL still serves (or does not report) the failed commit $ABSENT_SHA at $SHA_PATH after the rollback" >&2; exit 1; }
 elif [ -n "${SHA_PATH:-}" ]; then
   : "${EXPECTED_SHA:?}"
   found=0

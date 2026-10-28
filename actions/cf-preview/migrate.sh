@@ -29,8 +29,14 @@ LIST="$(pnpm exec wrangler d1 migrations list "$BINDING" --remote --config "$CON
 printf '%s\n' "$LIST" >&2
 if printf '%s\n' "$LIST" | grep -qi 'No migrations to apply'; then
   echo "::notice::No pending migrations for $NAME; nothing applied." >&2
-  echo "pending=false"; echo "d1_name=$NAME"
+  echo "pending=false"; echo "d1_name=$NAME"; echo "d1_scan=none"
   exit 0
 fi
+# Worker rollback never reverts D1. Classify the migrations about to be applied (names read from the list output;
+# only the CONSERVATIVE direction depends on that parse: no names found -> d1_scan=unknown) so a later automatic
+# rollback can refuse a schema the previous Worker version may not understand.
+FILES="$(printf '%s\n' "$LIST" | grep -oE '[A-Za-z0-9_.-]+\.sql' | sort -u | tr '\n' ' ' || true)"
+MDIR="$(jq -r '.d1_databases[0].migrations_dir' "$CONF")"
+SCAN="$(node "$TOOLS_DIR/cli.mjs" migration-scan --dir "$MDIR" --files "$FILES" 2>/dev/null)" || SCAN=$'d1_scan=unknown\nd1_scan_reason=scan failed'
 pnpm exec wrangler d1 migrations apply "$BINDING" --remote --config "$CONF" >&2
-echo "pending=true"; echo "d1_name=$NAME"
+echo "pending=true"; echo "d1_name=$NAME"; printf '%s\n' "$SCAN"

@@ -8,6 +8,7 @@ cat > "$T/bin/gh" <<'STUB'
 echo "gh $*" >> "$STUB_LOG"
 a="$*"
 case "$a" in
+  *"&sha="*"per_page=1"*) [ "${NO_ENV_DEPLOY:-}" = 1 ] || echo 55;;
   *"deployments?environment"*"per_page=30"*" -q "*) printf '3:cccc\n2:bbbb\n1:aaaa\n';;
   *"deployments?environment"*"per_page=30"*) printf '%s' "$LP_JSON";;
   *"/statuses?per_page=1"*"environment_url"*) id="${a#*deployments/}"; id="${id%%/*}"; eval "echo \"\${LP_ST_$id:-failure }\"";;
@@ -69,4 +70,8 @@ grep -q -- '-X DELETE' "$T/log" && bad "retire must not delete deployments" || o
 
 [ "$(OWNER_REF=refs/heads/feat/a "$G" owner app/preview/feat-a)" = refs/heads/feat/a ] && ok "owner returns the owning full ref" || bad "owner"
 [ -z "$("$G" owner app/preview/new)" ] && ok "owner is empty for a new name" || bad "owner empty"
+# ---- mark-env-deployment: annotate the Environment deployment GitHub created for the Deploy job
+: > "$T/log"; "$G" mark-env-deployment app/prod abc1234 failure "Smoke failed — UNVERIFIED" >/dev/null
+grep -q 'deployments?environment=app%2Fprod&sha=abc1234' "$T/log" && grep -q 'deployments/55/statuses -f state=failure' "$T/log" && ok "mark-env-deployment appends the status to the deployment of that environment AND sha" || bad "mark-env-deployment"
+NO_ENV_DEPLOY=1 "$G" mark-env-deployment app/prod abc1234 failure x >/dev/null 2>&1 && bad "mark-env-deployment succeeded without a deployment" || ok "mark-env-deployment fails when there is no such deployment (never marks another one)"
 exit $fail

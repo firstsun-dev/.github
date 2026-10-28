@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   assertWranglerSupported, auditPreviewConfig, PREVIEW_NAME_RE, classifyEvent, extractPreviewUrl, isStale, previewIdentity,
+  classifyMigrationSql, workerName,
 } from '../../actions/cf-preview/lib.mjs';
 
 const id = (ref, worker = 'www', repo = 'o/r') => previewIdentity({ repo, worker, ref });
@@ -499,4 +500,35 @@ test('artifactDigest: stable for an unchanged deployable; changes when the confi
   writeFileSync(join(d, 'dist', 'index.js'), 'export default {}');
   writeFileSync(join(d, 'dist', 'assets', 'b.css'), 'b{}');
   assert.notEqual(artifactDigest(cfg), base, 'asset added');
+});
+
+// ---- Production rollback: D1 compatibility of the previous Worker version (Expand / Contract), fail closed
+test('migration scan: additive statements only -> additive', () => {
+  const sql = `-- add notes
+    CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT);
+    CREATE INDEX idx_notes_body ON notes(body);
+    ALTER TABLE notes ADD COLUMN tag TEXT;
+    ALTER TABLE notes ADD COLUMN flag INTEGER NOT NULL DEFAULT 0;
+    INSERT INTO notes (id, body) VALUES (1, 'x; y'); /* a ; in a comment */`;
+  assert.equal(classifyMigrationSql([sql]).level, 'additive');
+});
+test('migration scan: destructive, rewriting or unknown statements are never additive', () => {
+  for (const bad of [
+    'ALTER TABLE t DROP COLUMN c;', 'DROP TABLE t;', 'ALTER TABLE t RENAME TO u;', 'ALTER TABLE t RENAME COLUMN a TO b;',
+    "UPDATE t SET a = 1;", 'DELETE FROM t;', 'ALTER TABLE t ADD COLUMN c TEXT NOT NULL;', 'CREATE UNIQUE INDEX i ON t(a);',
+    'ALTER TABLE t ADD COLUMN c INTEGER REFERENCES u(id);', 'PRAGMA foreign_keys = off;', 'select 1;',
+  ]) {
+    const r = classifyMigrationSql([bad]);
+    assert.equal(r.level, 'non-additive', bad);
+    assert.ok(r.reasons.length > 0);
+  }
+});
+test('migration scan: one bad file among additive ones taints the whole run', () => {
+  assert.equal(classifyMigrationSql(['CREATE TABLE a (id INTEGER);', 'DROP TABLE a;']).level, 'non-additive');
+});
+test('worker name: only a plain Workers script name is accepted as rollback identity', () => {
+  assert.equal(workerName({ name: 'heaven-id' }), 'heaven-id');
+  for (const bad of [undefined, {}, { name: '' }, { name: 'Has Space' }, { name: 'a;b' }, { name: '-lead' }, { name: 'x'.repeat(64) }, { name: 5 }]) {
+    assert.throws(() => workerName(bad), /safe Worker name/);
+  }
 });

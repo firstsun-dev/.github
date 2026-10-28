@@ -10,7 +10,7 @@ Spec: `openspec/changes/redesign-cloudflare-worker-cicd-v2`; tracking issue #43.
 ## What it does
 
 * Every push to a non-`main` branch publishes (or updates) **that branch's own Native Preview** with a stable URL — no PR needed.
-* `main` pushes go through the Production path (migrate → upload/deploy → verify → recovery policy).
+* `main` pushes go through the Production path (Migration → Deploy → Smoke Tests → Revert on Verify Failure, see docs/cf-worker-v2-refactor.md).
 * A Preview is **never** deployed to a shared Dev Worker, and Production credentials never reach Preview jobs.
 * Strategies: `production-preview` (default), `hybrid` (adds a protected persistent Dev for Cron/Queue), `production-only` (CI only, no Preview — e.g. `anas-mcp`).
 
@@ -156,7 +156,7 @@ summary and exported as `PREVIEW_ACCESS_PROTECTED=true` to `preview_smoke_cmd`, 
   No Native Preview rollback command is assumed. Shared-database schema changes are not rolled back.
 * No earlier good deployment → explicit manual-recovery summary (push a fix, or delete the Preview).
 * Name collision → fails in Plan (see *Preview identity*).
-* Production: `production_rollback_policy`; a Worker rollback never reverts D1 migrations or external side effects.
+* Production: `production_rollback_policy` (`automatic` runs the fail-closed *Revert on Verify Failure* job after a failed *Smoke Tests* job; `d1_rollback_compat` gates it when D1 migrations were applied; see docs/cf-worker-v2-refactor.md). The failed run stays red and Release stays blocked. A Worker rollback never reverts D1 migrations or external side effects.
 
 ## Branch deletion keeps the Preview (owner decision)
 
