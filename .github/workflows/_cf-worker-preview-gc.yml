@@ -1,0 +1,110 @@
+# Cloudflare Worker v2 — Native Preview garbage collection (opt-in, dry-run by default).
+# Separate from _cf-worker-v2.yml: it does not touch the Deploy / Smoke / Rollback / Release DAG.
+# Retention starts at the branch-deletion tombstone written by the v2 `lifecycle` job. See docs/cf-worker-preview-gc.md.
+#
+# Caller (in the consumer repo):
+#   on: { schedule: [{cron: '0 19 * * *'}], workflow_dispatch: { ... } }   # 19:00 UTC = 03:00 Asia/Taipei
+#   jobs: gc: { uses: firstsun-dev/.github/.github/workflows/_cf-worker-preview-gc.yml@<immutable ref>, with: {...}, secrets: {...} }
+name: CF Worker Preview GC
+
+on:
+  workflow_call:
+    inputs:
+      enabled:
+        description: 'Master switch. false => the job only prints a notice.'
+        type: boolean
+        default: false
+      dry_run:
+        description: 'true => report only, zero remote mutation. Deletion needs enabled: true AND dry_run: false.'
+        type: boolean
+        default: true
+      retention_days:
+        description: 'Days after the branch deletion tombstone before a Preview becomes eligible.'
+        type: number
+        default: 7
+      max_deletions_per_run:
+        description: 'Upper bound on Cloudflare Preview deletions in one run.'
+        type: number
+        default: 5
+      targets:
+        description: 'JSON array: [{"app_name":"blog","preview_worker_name":"blog-preview","account_id":"<cf account id>"}]. preview_worker_name defaults to app_name.'
+        type: string
+        required: true
+      protected_previews:
+        description: 'JSON array of {"account_id","host_worker","preview_name"} that GC must never delete (e.g. fixed Dev Native Previews).'
+        type: string
+        default: '[]'
+      only_previews:
+        description: 'Optional JSON array of Preview names: restrict the run to exactly these (controlled cleanup).'
+        type: string
+        default: ''
+      tools_ref:
+        description: 'Ref of firstsun-dev/.github providing actions/cf-preview-gc. MUST equal the ref the caller pins this workflow at.'
+        type: string
+        required: true
+      runner:
+        type: string
+        default: ubuntu-latest
+    secrets:
+      CLOUDFLARE_PREVIEW_API_TOKEN:
+        required: true
+      CLOUDFLARE_PREVIEW_ACCOUNT_ID:
+        required: true
+
+jobs:
+  gc:
+    name: Preview GC
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    concurrency:
+      group: cfv2-preview-gc-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      deployments: write # only used to record "Preview garbage-collected" on the ledger when deleting
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PREVIEW_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID }}
+      GC_ENABLED: ${{ inputs.enabled }}
+      GC_DRY_RUN: ${{ inputs.dry_run }}
+      GC_RETENTION_DAYS: ${{ inputs.retention_days }}
+      GC_MAX_DELETIONS: ${{ inputs.max_deletions_per_run }}
+      GC_TARGETS: ${{ inputs.targets }}
+      GC_PROTECTED_PREVIEWS: ${{ inputs.protected_previews }}
+      GC_ONLY_PREVIEWS: ${{ inputs.only_previews }}
+      GC_REPORT_PATH: ${{ github.workspace }}/preview-gc-report.json
+    steps:
+      - name: Fetch GC tooling
+        if: inputs.enabled
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: |
+            actions/cf-preview
+            actions/cf-preview-gc
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        if: inputs.enabled
+        with:
+          node-version: 24
+      - name: Install tooling deps
+        if: inputs.enabled
+        run: cd .cf-tools/actions/cf-preview && npm ci --ignore-scripts --no-audit --no-fund
+      - name: Preview GC (${{ inputs.dry_run && 'dry run' || 'DELETE mode' }})
+        run: |
+          if [ "$GC_ENABLED" != true ]; then
+            echo "Preview GC is disabled (enabled: false)."; echo "### Preview GC disabled" >> "$GITHUB_STEP_SUMMARY"; exit 0
+          fi
+          node .cf-tools/actions/cf-preview-gc/cli.mjs
+      - name: Upload GC report
+        if: always() && inputs.enabled
+        uses: actions/upload-artifact@v7
+        with:
+          name: preview-gc-report
+          path: preview-gc-report.json
+          if-no-files-found: ignore
+          retention-days: 30

@@ -7,6 +7,8 @@ on:
       - '.github/workflows/cf-worker-v2-ci.yml'
       - '.github/actionlint.yaml'
       - 'actions/cf-preview/**'
+      - 'actions/cf-preview-gc/**'
+      - '.github/workflows/_cf-worker-preview-gc.yml'
       - 'actions/cf-deploy/**'
       - 'actions/cf-ci-check/**'
       - 'scripts/cf-preview/**'
@@ -16,6 +18,8 @@ on:
       - '.github/workflows/_cf-worker-v2.yml'
       - '.github/actionlint.yaml'
       - 'actions/cf-preview/**'
+      - 'actions/cf-preview-gc/**'
+      - '.github/workflows/_cf-worker-preview-gc.yml'
       - 'actions/cf-deploy/**'
       - 'actions/cf-ci-check/**'
       - 'scripts/cf-preview/**'
@@ -54,6 +58,8 @@ jobs:
         run: scripts/cf-preview/test-probe.sh
       - name: GitHub ledger / PR comment idempotency (stub gh)
         run: scripts/cf-preview/test-gh.sh
+      - name: Preview GC unit tests (mocked GitHub + Cloudflare; no remote calls)
+        run: node --test scripts/cf-preview-gc/gc.test.mjs
       - name: shellcheck (warnings and above)
         run: |
           shellcheck -x -S warning -P SCRIPTDIR actions/cf-preview/*.sh scripts/cf-preview/*.sh
@@ -61,4 +67,4 @@ jobs:
       - name: actionlint
         run: |
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
-          ./actionlint -color .github/workflows/_cf-worker-v2.yml .github/workflows/cf-worker-v2-ci.yml
+          ./actionlint -color .github/workflows/_cf-worker-v2.yml .github/workflows/_cf-worker-preview-gc.yml .github/workflows/cf-worker-v2-ci.yml

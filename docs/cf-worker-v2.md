@@ -40,7 +40,7 @@ Spec: `openspec/changes/redesign-cloudflare-worker-cicd-v2`; tracking issue #43.
 | push, non-main | tests → **branch Native Preview** | same; never touches persistent Dev | tests only |
 | pull_request | attach the existing Preview URL (never deploys) | same | tests |
 | fork PR | no secrets, no deploy | same | same |
-| delete (branch) | **Preview is kept**; GitHub ledger retired | same | – |
+| delete (branch) | **Preview is kept**; GitHub ledger retired (optional [Preview GC](cf-worker-preview-gc.md) removes it after 7 days) | same | – |
 | PR closed / merged | Preview kept | same | – |
 | `workflow_dispatch` `target=persistent-dev` on `persistent_dev_ref` | – | protected Dev deploy | – |
 | push main | Production | Production | Production |
