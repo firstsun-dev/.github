@@ -26,6 +26,10 @@ B="$ROOT/actions/cf-preview/build.sh"; P="$ROOT/actions/cf-preview/publish.sh"
 export B P
 D() { rm -rf "$STATE_DIR"; "$B" >/dev/null || return $?; "$P"; }
 
+# ---- nested app_path: TOOLS_DIR given RELATIVE to the workspace root (as the workflow does), stages cd into the app ----
+RELTOOLS="$(realpath --relative-to="$ROOT" "$ROOT/actions/cf-preview")"
+(cd "$ROOT" && TOOLS_DIR="$RELTOOLS" TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true D 2>/dev/null) | grep -qx 'url=https://stable.example.workers.dev' && ok "relative TOOLS_DIR works with a nested app dir" || bad "relative TOOLS_DIR works with a nested app dir"
+
 # ---- preview ----
 TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true D 2>/dev/null | grep -qx 'url=https://stable.example.workers.dev' && ok "preview: extracts stable URL" || bad "preview: extracts stable URL"
 grep -Eq 'preview --name feat-a --config [^ ]+wrangler.toml --json' "$T/log" && ok "preview: uses wrangler preview --name --config <audited config> --json" || bad "preview: wrangler args"
