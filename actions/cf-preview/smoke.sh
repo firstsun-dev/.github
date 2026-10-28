@@ -10,7 +10,7 @@
 #   anything else               -> FAIL
 # Only content / content-sha count as "verified" (engine.sh); liveness is published-but-unverified.
 # Env: TARGET_URL DEPLOY_TARGET(prod|preview|dev) [SMOKE_ENV_FILE] EXPECTED_SHA TOOLS_DIR [SHA_PATH] [SMOKE_CMD] [ACCESS_TARGETS]
-#      [PREVIEW_ENV_FILE] [SHA_ATTEMPTS=6] [SHA_SLEEP=5]
+#      [SMOKE_CWD=.] [PREVIEW_ENV_FILE] [SHA_ATTEMPTS=6] [SHA_SLEEP=5]
 set -euo pipefail
 : "${DEPLOY_TARGET:?}" "${TOOLS_DIR:?}"
 [ -n "${TARGET_URL:-}" ] || { echo "::error::no URL to smoke-test ($DEPLOY_TARGET): set app_url_prod / a deploy URL; a deployment without a probe is not verified" >&2; exit 1; }
@@ -68,5 +68,6 @@ elif [ -n "${SHA_PATH:-}" ]; then
   [ "$found" = 1 ] || { echo "::error::$TARGET_URL does not serve $EXPECTED_SHA at $SHA_PATH" >&2; exit 1; }
   level=content-sha
 fi
-[ -z "${SMOKE_CMD:-}" ] || bash -c "$SMOKE_CMD" >&2
+# smoke_cmd runs from the application directory (SMOKE_CWD = app_path), as the input documents.
+[ -z "${SMOKE_CMD:-}" ] || (cd "${SMOKE_CWD:-.}" && bash -c "$SMOKE_CMD") >&2
 echo "smoke_level=$level"
