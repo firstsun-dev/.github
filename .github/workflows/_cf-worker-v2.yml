@@ -305,14 +305,9 @@ on:
       CLOUDFLARE_PREVIEW_ACCOUNT_ID:
         required: false
       CLOUDFLARE_API_TOKEN:
-        description: Production token; only reachable by trusted main Migration/Deploy jobs
+        description: Account token for Production and Dev; Preview has separate credentials
         required: false
       CLOUDFLARE_ACCOUNT_ID:
-        required: false
-      CLOUDFLARE_DEV_API_TOKEN:
-        description: Dev token (Hybrid persistent-dev dispatch and Shared Dev); never the Production or Preview token
-        required: false
-      CLOUDFLARE_DEV_ACCOUNT_ID:
         required: false
       PREVIEW_SECRETS:
         description: Optional KEY=VALUE lines of Preview-only secrets exported to the Preview build and smoke
@@ -631,7 +626,7 @@ jobs:
           smoke_password: ${{ secrets.SMOKE_PASSWORD }}
 
   # -------------------------------------------------------------------------
-  # Shared Dev — optional, independent of Native Preview (own switch, own Dev credentials, own Environment). The
+  # Shared Dev — optional, independent of Native Preview (own switch, Dev resources and Environment). The
   # SAME engine with target = dev: every non-main branch push updates the ONE Dev Worker; the last verified
   # deployment wins. `needs: deploy` is ORDERING ONLY (Preview and Dev may share one physical D1, so their
   # migrations must never overlap); Deploy's result is ignored except by the engine's shared-D1 guard. Branch
@@ -663,9 +658,9 @@ jobs:
       published_unverified: ${{ steps.engine.outputs.published_unverified || 'false' }}
     env:
       GH_TOKEN: ${{ github.token }}
-      # Dev credentials ONLY; there is no fallback to the Preview or Production token.
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEV_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_DEV_ACCOUNT_ID }}
+      # Dev reuses the account token while keeping Dev target and binding checks.
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -829,8 +824,8 @@ jobs:
       deployments: write # engine mode only: Dev ledger entry, recorded verified ONLY after the smoke passes
     env:
       GH_TOKEN: ${{ github.token }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEV_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_DEV_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v6
         with:
