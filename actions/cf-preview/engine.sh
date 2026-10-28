@@ -12,7 +12,9 @@
 # composite input, not from the environment) and re-read from state by every phase.
 set -euo pipefail
 PHASE="${1:?phase}"
-TOOLS_DIR="${TOOLS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# Absolute on purpose: the workflow passes it relative to the workspace root, but every stage `cd "$APP_DIR"` (a
+# nested app_path such as apps/api) before using it.
+TOOLS_DIR="$(cd "${TOOLS_DIR:-$(dirname "${BASH_SOURCE[0]}")}" && pwd)"
 export TOOLS_DIR
 S="${STATE_DIR:-${RUNNER_TEMP:?RUNNER_TEMP or STATE_DIR required}/cfv2}"
 IN="$S/inputs.json"
@@ -178,7 +180,8 @@ case "$PHASE" in
   smoke)
     ctx
     URL="$(target_url)"; [ "$TARGET" != preview ] || URL="${PUBLISHED_URL:-}"
-    TARGET_URL="$URL" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="$RUN_SHA" SMOKE_CMD="$(target_smoke_cmd)" SHA_PATH="$(inp sha_path)" \
+    TARGET_URL="$URL" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="$RUN_SHA" SMOKE_CMD="$(target_smoke_cmd)" SMOKE_CWD="$APP_DIR" SHA_PATH="$(inp sha_path)" \
+      PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" \
       ACCESS_TARGETS="$(inp access_protected_targets)" SMOKE_ENV_FILE="$S/smoke.env" PREVIEW_ENV_FILE="$S/preview.env" NO_PROXY='*' \
       "$TOOLS_DIR/smoke.sh";;
 
@@ -290,7 +293,8 @@ case "$PHASE" in
 
   recover-verify)
     ctx
-    TARGET_URL="${RECOVERED_URL:?}" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="${GOOD_SHA:?}" SMOKE_CMD="$(target_smoke_cmd)" SHA_PATH="$(inp sha_path)" \
+    TARGET_URL="${RECOVERED_URL:?}" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="${GOOD_SHA:?}" SMOKE_CMD="$(target_smoke_cmd)" SMOKE_CWD="$APP_DIR" SHA_PATH="$(inp sha_path)" \
+      PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" \
       ACCESS_TARGETS="$(inp access_protected_targets)" SMOKE_ENV_FILE="$S/smoke.env" PREVIEW_ENV_FILE="$S/preview.env" NO_PROXY='*' "$TOOLS_DIR/smoke.sh";;
 
   recover-record)

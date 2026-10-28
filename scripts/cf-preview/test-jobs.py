@@ -295,7 +295,6 @@ m = deploy(FEAT, inputs=dict(D1, build_cmd='echo TARGET=prod >> "$GITHUB_ENV"; e
 check(m["result"] == "success" and "PREV-ID" in mig_file(m, "preview") and not (m["ws"] / "w" / ".wrangler" / "migrate.prod.json").exists(), "a build writing TARGET=prod into GITHUB_ENV cannot move the Preview migration to Production")
 
 # ======================================================================= Shared Dev (dev-deploy) executed with stubs
-DEV_SECRETS = {"CLOUDFLARE_DEV_API_TOKEN": "DT", "CLOUDFLARE_DEV_ACCOUNT_ID": "DA"}
 DEV_TOML = '''name = "app"
 [[d1_databases]]
 binding = "DB"
@@ -343,7 +342,7 @@ DEV_INPUTS = {
 def dev(inputs=None, env=None, toml=DEV_TOML, needs=None, secrets=None, ref=FEAT):
     ws = make_workspace(toml)
     n = needs if needs is not None else {"deploy": {"result": "skipped", "outputs": {}}}
-    r = run_job(doc, "dev-deploy", ctx(ref, dict(DEV_INPUTS, **(inputs or {})), DEV_SECRETS if secrets is None else secrets, n),
+    r = run_job(doc, "dev-deploy", ctx(ref, dict(DEV_INPUTS, **(inputs or {})), PROD_SECRETS if secrets is None else secrets, n),
                 ws, dict({"STUB_TIPS": SHA}, **(env or {})))
     r["ws"] = ws
     return r
@@ -427,9 +426,9 @@ r = dev(inputs=dict(D1, dev_build_cmd='echo TARGET=prod >> "$GITHUB_ENV"; echo D
 check(r["result"] == "success" and "SHARED-ID" in mig_file(r, "dev") and not (r["ws"] / "w" / ".wrangler" / "migrate.prod.json").exists(), "a Dev build writing TARGET=prod / DEV_ENV=prod into GITHUB_ENV cannot redirect the Dev migration to Production")
 
 r = dev(secrets={})
-check(r["result"] == "failure" and not ran(r, "BUILD"), "missing Dev credentials fail closed before the build")
-r = dev(secrets={"CLOUDFLARE_API_TOKEN": "PT", "CLOUDFLARE_ACCOUNT_ID": "PA", "CLOUDFLARE_PREVIEW_API_TOKEN": "VT"})
-check(r["result"] == "failure" and not ran(r, "BUILD"), "Production/Preview credentials are never a fallback for Dev")
+check(r["result"] == "failure" and not ran(r, "BUILD"), "missing account credentials fail closed before Dev build")
+r = dev(secrets={"CLOUDFLARE_PREVIEW_API_TOKEN": "VT", "CLOUDFLARE_PREVIEW_ACCOUNT_ID": "VA"})
+check(r["result"] == "failure" and not ran(r, "BUILD"), "Preview-only credentials are never a fallback for Dev")
 r = dev(env={"STUB_TIPS": OTHER})
 check(r["result"] == "success" and not ran(r, "BUILD") and not ran(r, "PUBLISH") and r["outputs"]["deployed_and_verified"] == "false", "stale run: nothing built, migrated or published")
 r = dev(env={"STUB_TIPS": f"{SHA},{OTHER}"}, inputs=D1)
@@ -532,7 +531,7 @@ PD = dict(DEV_INPUTS, deployment_strategy="hybrid", persistent_dev_ref="refs/hea
 
 def manual(inputs=None, env=None, toml=DEV_TOML):
     ws = make_workspace(toml)
-    r = run_job(doc, "persistent-dev", ctx("refs/heads/dev", dict(PD, **(inputs or {})), DEV_SECRETS, event="workflow_dispatch"), ws, dict({"STUB_TIPS": SHA}, **(env or {})))
+    r = run_job(doc, "persistent-dev", ctx("refs/heads/dev", dict(PD, **(inputs or {})), PROD_SECRETS, event="workflow_dispatch"), ws, dict({"STUB_TIPS": SHA}, **(env or {})))
     r["ws"] = ws
     return r
 

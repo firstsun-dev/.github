@@ -140,7 +140,7 @@ try {
       break;
     }
     case 'audit-prod': {
-      const { errors, warnings } = auditProdConfig(readConfig(opt('effective')), readConfig(opt('source')));
+      const { errors, warnings } = auditProdConfig(readConfig(opt('effective')), readConfig(opt('source')), { allow: list(opt('allow')) });
       for (const w of warnings) console.log(`::warning::${w}`);
       for (const e of errors) console.log(`::error::${e}`);
       if (errors.length) process.exit(1);

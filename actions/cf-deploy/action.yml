@@ -57,8 +57,7 @@ outputs:
 runs:
   using: composite
   steps:
-    # FIRST: `init` and every later phase run cli.mjs, which imports smol-toml. The mocked tests pre-install it, so this
-    # ordering is asserted statically (test-workflow-contract.py) - the first real run failed with ERR_MODULE_NOT_FOUND.
+    # Must run before `init`: engine.sh init calls cli.mjs, which imports `smol-toml` from this directory.
     - name: Install tooling deps
       shell: bash
       run: cd "$GITHUB_ACTION_PATH/../cf-preview" && npm ci --ignore-scripts --no-audit --no-fund

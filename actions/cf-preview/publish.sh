@@ -17,6 +17,7 @@ MODE="$(cat "$STATE_DIR/config.mode")"
 # The audited config must be byte-identical at publish time.
 [ "$(sha256sum "$CONFIG_PATH" | cut -d' ' -f1)" = "$(cat "$STATE_DIR/config.sha")" ] || { echo "::error::the audited Wrangler config changed between audit and publish; refusing to publish" >&2; exit 1; }
 
+TOOLS_DIR="$(cd "$TOOLS_DIR" && pwd)"  # absolute before `cd "$APP_DIR"` (a relative path breaks for nested app_path)
 cd "$APP_DIR"
 export CLOUDFLARE_ENV=""   # the audited config is already flattened; a named env must never be applied on top
 CFG_ARGS=(--config "$CONFIG_PATH")

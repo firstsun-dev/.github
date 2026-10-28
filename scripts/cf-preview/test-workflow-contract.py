@@ -234,7 +234,7 @@ check("exit 1" in jobs["config-guard"]["steps"][0]["run"] and "secrets." not in 
 # ---------------------------------------------------------------- 5. credentials, Environments, permissions
 SECRETS = {"CLOUDFLARE_API_TOKEN": "PROD-TOKEN", "CLOUDFLARE_ACCOUNT_ID": "PROD-ACCT",
            "CLOUDFLARE_PREVIEW_API_TOKEN": "PREVIEW-TOKEN", "CLOUDFLARE_PREVIEW_ACCOUNT_ID": "PREVIEW-ACCT",
-           "CLOUDFLARE_DEV_API_TOKEN": "DEV-TOKEN", "CLOUDFLARE_DEV_ACCOUNT_ID": "DEV-ACCT", "PREVIEW_SECRETS": "K=v"}
+           "PREVIEW_SECRETS": "K=v"}
 env = jobs["deploy"]["env"]
 c = scenario("push", MAIN, secrets=SECRETS)
 check(render(env["CLOUDFLARE_API_TOKEN"], c) == "PROD-TOKEN" and render(env["CLOUDFLARE_ACCOUNT_ID"], c) == "PROD-ACCT" and not {"CLOUDFLARE_PREVIEW_API_TOKEN", "CLOUDFLARE_PREVIEW_ACCOUNT_ID"} & set(c.secret_reads),
@@ -252,14 +252,14 @@ check(render(eng["deploy"]["with"]["preview_secrets"], c) == "" and "PREVIEW_SEC
 check(render(eng["deploy"]["with"]["preview_secrets"], scenario("push", FEAT, secrets=SECRETS)) == "K=v", "Deploy: a feature branch passes the Preview-only secrets")
 dj = jobs[DEVJOB]
 c = scenario("push", FEAT, secrets=SECRETS)
-check(render(dj["env"]["CLOUDFLARE_API_TOKEN"], c) == "DEV-TOKEN" and render(dj["env"]["CLOUDFLARE_ACCOUNT_ID"], c) == "DEV-ACCT"
-      and not {"CLOUDFLARE_PREVIEW_API_TOKEN", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"} & set(c.secret_reads), "Shared Dev gets ONLY Dev credentials (Preview and Production secrets never read)")
-c = scenario("push", FEAT, secrets={k: v for k, v in SECRETS.items() if k != "CLOUDFLARE_DEV_API_TOKEN"})
-check(render(dj["env"]["CLOUDFLARE_API_TOKEN"], c) == "", "Shared Dev: a missing Dev token stays EMPTY (no fallback)")
+check(render(dj["env"]["CLOUDFLARE_API_TOKEN"], c) == "PROD-TOKEN" and render(dj["env"]["CLOUDFLARE_ACCOUNT_ID"], c) == "PROD-ACCT"
+      and not {"CLOUDFLARE_PREVIEW_API_TOKEN", "CLOUDFLARE_PREVIEW_ACCOUNT_ID"} & set(c.secret_reads), "Shared Dev reuses account credentials and never Preview credentials")
+c = scenario("push", FEAT, secrets={k: v for k, v in SECRETS.items() if k != "CLOUDFLARE_API_TOKEN"})
+check(render(dj["env"]["CLOUDFLARE_API_TOKEN"], c) == "", "Shared Dev: missing account token stays EMPTY (no Preview fallback)")
 dtxt = yaml.dump(dj)
-check("CLOUDFLARE_PREVIEW" not in dtxt and "secrets.CLOUDFLARE_API_TOKEN" not in dtxt and "secrets.CLOUDFLARE_ACCOUNT_ID" not in dtxt and "PREVIEW_SECRETS" not in dtxt, "Shared Dev never references Production/Preview credentials or Preview-only secrets")
+check("CLOUDFLARE_PREVIEW" not in dtxt and "PREVIEW_SECRETS" not in dtxt and "secrets.CLOUDFLARE_API_TOKEN" in dtxt and "secrets.CLOUDFLARE_ACCOUNT_ID" in dtxt, "Shared Dev reuses account credentials, not Preview secrets")
 ptxt = yaml.dump(jobs["persistent-dev"])
-check("secrets.CLOUDFLARE_API_TOKEN" not in ptxt and "CLOUDFLARE_PREVIEW" not in ptxt and "CLOUDFLARE_DEV_API_TOKEN" in ptxt and "PREVIEW_SECRETS" not in ptxt, "persistent-dev uses only the Dev credentials")
+check("secrets.CLOUDFLARE_API_TOKEN" in ptxt and "secrets.CLOUDFLARE_ACCOUNT_ID" in ptxt and "CLOUDFLARE_PREVIEW" not in ptxt and "PREVIEW_SECRETS" not in ptxt, "persistent-dev reuses account credentials, not Preview secrets")
 check(not any(k in jobs[n].get("env", {}) for n in jobs for k in ("TARGET", "BUILD_ENV", "SMOKE_ENV", "DEV_ENV", "EXPECTED_SHA", "RUN_SHA")),
       "no job exports TARGET / BUILD_ENV / DEV_ENV / EXPECTED_SHA ...: the delivery target is bound by the engine action input, not by environment")
 c = scenario("push", MAIN)
@@ -413,7 +413,7 @@ check("CANNOT lock a D1 shared with ANOTHER repository" in inputs_def["d1_lock_s
 
 # ---------------------------------------------------------------- 11. interface preserved / Hybrid / lifecycle / retention
 check(all(k in inputs_def for k in ("app_url_dev", "dev_deploy_cmd", "dev_smoke_cmd", "build_env_dev", "dev_build_cmd", "dev_wrangler_env", "dev_worker_name", "dev_binding_allow", "dev_deny_resources")), "interface: Dev URL, deploy/smoke commands, build env, Wrangler env, identity and resource-policy inputs exist")
-check("CLOUDFLARE_DEV_API_TOKEN" in doc[True]["workflow_call"]["secrets"] and "CLOUDFLARE_DEV_ACCOUNT_ID" in doc[True]["workflow_call"]["secrets"], "interface: Dev credentials are the existing CLOUDFLARE_DEV_* secrets")
+check(not {"CLOUDFLARE_DEV_API_TOKEN", "CLOUDFLARE_DEV_ACCOUNT_ID"} & set(doc[True]["workflow_call"]["secrets"]), "interface: dedicated Dev secrets removed")
 check({"deploy_url", "deploy_target", "version_id", "dev_url"} <= set(doc[True]["workflow_call"]["outputs"]), "outputs: deploy_url, deploy_target, version_id, dev_url are preserved (existing consumers)")
 check(set(doc[True]["workflow_call"]["outputs"]) == {"deploy_url", "deploy_target", "version_id", "dev_url", "deploy_verified_url", "deploy_published_unverified", "dev_verified_url", "dev_published_unverified"}, "outputs: verified URLs and published-but-unverified flags are additive")
 check("verified" in doc[True]["workflow_call"]["outputs"]["deploy_verified_url"]["value"] or "verified_url" in doc[True]["workflow_call"]["outputs"]["deploy_verified_url"]["value"], "outputs: deploy_verified_url comes from the engine's verified_url")

@@ -26,9 +26,9 @@ All eligible branches SHALL target the same configured Dev Worker and `app_url_d
 #### Scenario: Branch deleted or switch disabled
 - **THEN** the Dev Worker, its URL and data SHALL be retained.
 
-### Requirement: Shared Dev SHALL isolate credentials, environment and data
+### Requirement: Shared Dev SHALL isolate environment and data (credentials intentionally shared)
 
-Shared Dev SHALL use only `CLOUDFLARE_DEV_API_TOKEN`/`CLOUDFLARE_DEV_ACCOUNT_ID` in the `<app>/dev` Environment, the Dev build environment, the named Wrangler environment, and `env.<name>.d1_databases` for migrations (no fallback to top-level/Production D1). Its effective Wrangler config SHALL name the expected Dev Worker and bind no Production resource. Dev and Native Preview MAY share one non-Production D1; Production SHALL NOT.
+Shared Dev SHALL use the existing `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID` pair in the `<app>/dev` Environment by the 2026-10-28 owner decision; no dedicated Dev token is required. It SHALL keep the Dev build environment, named Wrangler environment, and `env.<name>.d1_databases` for migrations (no fallback to top-level/Production D1). Its effective Wrangler config SHALL name the expected Dev Worker and bind no Production resource. Dev and Native Preview MAY share one non-Production D1; Production SHALL NOT.
 
 ### Requirement: Manual Persistent Dev dispatch SHALL remain available and distinct
 

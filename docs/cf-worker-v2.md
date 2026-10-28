@@ -127,6 +127,7 @@ Production Version, bound to Production resources), set `preview_worker_name` to
 * **Every Preview binding needs an explicit resource id.** Native Previews do not auto-provision; Cloudflare rejects an id-less binding with API error 10021.
   Adapters can add bindings at build time (the Astro Cloudflare adapter adds a `SESSION` KV), so preflight audits both the source config and the build-generated (redirected) config.
 * `services`, `hyperdrive`, `secrets_store_secrets` in `previews` need an explicit `preview_binding_allow` entry (e.g. `services:ID`): Preview service bindings reach the target's **Production** deployment.
+* To deliberately share one Production storage resource (R2, KV, Vectorize, Analytics Engine) with Previews, add an exact `preview_binding_allow` entry `kind:BINDING=identity` (e.g. `r2_buckets:CACHE=my-bucket`), the same grammar as `dev_binding_allow`. It waives the Production-collision and `preview_deny_resources` checks for that binding and resource only; a different resource or binding still fails, and a Production D1 can never be shared. Isolation inside the shared resource (e.g. a key prefix) is the caller's responsibility.
 * No `routes`, `triggers` or queue consumers in `previews`; `assets` and `compatibility_*` stay top-level.
 * Preview secrets are **not** inherited from Production: `wrangler preview base-config secret put <NAME>`.
 
@@ -172,7 +173,7 @@ There is no automatic reclaim; Previews accumulate until removed manually. A rep
 
 ## Security
 
-* Preview jobs receive only `CLOUDFLARE_PREVIEW_*`; Production credentials exist only in the production job; Dev credentials only in `persistent-dev` (protected `<app>/dev` environment).
+* Production and Dev jobs use the same `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` pair by owner decision. Preview keeps its `CLOUDFLARE_PREVIEW_*` credentials. Dev still uses its own `<app>/dev` Environment, Worker identity and binding guardrails.
 * Fork PRs get no deployment job and no secrets.
 * `production-only` never creates a Preview (use for `anas-mcp`: its authentication depends on Cloudflare Access at the custom domain).
 * Native Preview hostnames may sit behind Cloudflare Access (Blog's do): anonymous requests see only the Access login.

@@ -26,6 +26,10 @@ B="$ROOT/actions/cf-preview/build.sh"; P="$ROOT/actions/cf-preview/publish.sh"
 export B P
 D() { rm -rf "$STATE_DIR"; "$B" >/dev/null || return $?; "$P"; }
 
+# ---- nested app_path: TOOLS_DIR given RELATIVE to the workspace root (as the workflow does), stages cd into the app ----
+RELTOOLS="$(realpath --relative-to="$ROOT" "$ROOT/actions/cf-preview")"
+(cd "$ROOT" && TOOLS_DIR="$RELTOOLS" TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true D 2>/dev/null) | grep -qx 'url=https://stable.example.workers.dev' && ok "relative TOOLS_DIR works with a nested app dir" || bad "relative TOOLS_DIR works with a nested app dir"
+
 # ---- preview ----
 TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true D 2>/dev/null | grep -qx 'url=https://stable.example.workers.dev' && ok "preview: extracts stable URL" || bad "preview: extracts stable URL"
 grep -Eq 'preview --name feat-a --config [^ ]+wrangler.toml --json' "$T/log" && ok "preview: uses wrangler preview --name --config <audited config> --json" || bad "preview: wrangler args"
@@ -147,6 +151,24 @@ BAD_PROD='mkdir -p .wrangler/deploy dist && echo "{\"configPath\":\"../../dist/w
 : > "$T/log"
 TARGET=prod BUILD_CMD="$BAD_PROD" D >/dev/null 2>&1 && bad "prod bound Preview D1 accepted" || ok "prod: effective config binding a Preview resource is rejected"
 grep -q 'versions' "$T/log" && bad "prod published despite audit failure" || ok "prod: nothing published when effective audit fails"
+
+# A Preview that deliberately shares a Production R2 bucket (approved by an exact preview_binding_allow entry).
+cp "$T/app/wrangler.toml" "$T/app/wrangler.toml.bak"
+cat >> "$T/app/wrangler.toml" <<'TOML'
+[[r2_buckets]]
+binding = "CACHE"
+bucket_name = "shared-bucket"
+[[previews.r2_buckets]]
+binding = "CACHE"
+bucket_name = "shared-bucket"
+TOML
+SHARED_PROD='mkdir -p .wrangler/deploy dist && echo "{\"configPath\":\"../../dist/wrangler.json\"}" > .wrangler/deploy/config.json && echo "{\"name\":\"x\",\"d1_databases\":[{\"binding\":\"DB\",\"database_name\":\"prod-db\",\"database_id\":\"PROD-ID\"}],\"r2_buckets\":[{\"binding\":\"CACHE\",\"bucket_name\":\"shared-bucket\"}]}" > dist/wrangler.json'
+: > "$T/log"
+TARGET=prod BUILD_CMD="$SHARED_PROD" D >/dev/null 2>&1 && bad "prod: unapproved shared Preview R2 accepted" || ok "prod: a Preview-shared R2 bucket without an allow entry is rejected"
+: > "$T/log"
+TARGET=prod BUILD_CMD="$SHARED_PROD" PREVIEW_ALLOW='r2_buckets:CACHE=shared-bucket' D >/dev/null 2>&1 && ok "prod: an exact preview_binding_allow entry approves the shared R2 bucket" || bad "prod: approved shared R2 bucket rejected"
+grep -q 'versions deploy' "$T/log" && ok "prod: approved shared R2 bucket is published" || bad "prod: approved shared R2 bucket not published"
+mv "$T/app/wrangler.toml.bak" "$T/app/wrangler.toml"
 TARGET=other BUILD_CMD=true D >/dev/null 2>&1 && bad "bad TARGET accepted" || ok "unknown TARGET rejected"
 
 # ---- the same-artifact contract: publish.sh publishes ONLY what build.sh audited ----

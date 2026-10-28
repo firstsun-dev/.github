@@ -109,6 +109,23 @@ test('preflight: denylist', () => {
   g.previews.r2_buckets[0].bucket_name = 'general-bucket';
   assert.equal(auditPreviewConfig(g, { denyResources: ['general-bucket'] }).errors.length, 1);
 });
+test('preflight: exact kind:BINDING=identity allow shares one Production R2 bucket, nothing else', () => {
+  const g = good();
+  g.previews.r2_buckets[0].bucket_name = 'prod-bucket';
+  const entry = 'r2_buckets:ASSETS_R2=prod-bucket';
+  assert.equal(auditPreviewConfig(g).errors.length, 1);
+  assert.deepEqual(auditPreviewConfig(g, { allow: [entry] }).errors, []);
+  // the allow entry also waives the denylist for that exact binding/identity
+  assert.deepEqual(auditPreviewConfig(g, { allow: [entry], denyResources: ['prod-bucket'] }).errors, []);
+  // a different bucket under the same binding, or the same bucket under another binding, is not approved
+  assert.equal(auditPreviewConfig(g, { allow: ['r2_buckets:ASSETS_R2=other-bucket'] }).errors.length, 1);
+  assert.equal(auditPreviewConfig(g, { allow: ['r2_buckets:OTHER=prod-bucket'] }).errors.length, 1);
+});
+test('preflight: a Production D1 can never be approved for sharing', () => {
+  const g = good();
+  g.previews.d1_databases[0].database_id = 'prod-id';
+  assert.equal(auditPreviewConfig(g, { allow: ['d1_databases:DB=prod-id'] }).errors.length, 1);
+});
 test('preflight: service/hyperdrive/secrets-store need explicit allow', () => {
   const g = good();
   g.services = [{ binding: 'ID', service: 'heaven-id' }];
@@ -205,6 +222,27 @@ test('auditProdConfig: generated Production config must not bind Preview resourc
   assert.match(bad.errors[0], /Preview resource PREV/);
   // an adapter adding a Preview R2 bucket to the Production config is caught too
   assert.equal(auditProdConfig({ r2_buckets: [{ binding: 'X', bucket_name: 'prev-b' }] }, src).errors.length, 1);
+});
+
+test('auditProdConfig: an exact preview_binding_allow entry approves a shared storage resource', () => {
+  const src = { r2_buckets: [{ binding: 'CACHE', bucket_name: 'shared' }],
+    previews: { r2_buckets: [{ binding: 'CACHE', bucket_name: 'shared' }] } };
+  const prod = { r2_buckets: [{ binding: 'CACHE', bucket_name: 'shared' }] };
+  assert.equal(auditProdConfig(prod, src).errors.length, 1);
+  assert.deepEqual(auditProdConfig(prod, src, { allow: ['r2_buckets:CACHE=shared'] }).errors, []);
+  // the approval is per binding and per resource
+  assert.equal(auditProdConfig(prod, src, { allow: ['r2_buckets:OTHER=shared'] }).errors.length, 1);
+  assert.equal(auditProdConfig(prod, src, { allow: ['r2_buckets:CACHE=elsewhere'] }).errors.length, 1);
+  // other Preview resources are still caught while one is approved
+  const src2 = { ...src, previews: { r2_buckets: [...src.previews.r2_buckets, { binding: 'B', bucket_name: 'prev-b' }] } };
+  const bad = { r2_buckets: [...prod.r2_buckets, { binding: 'X', bucket_name: 'prev-b' }] };
+  assert.match(auditProdConfig(bad, src2, { allow: ['r2_buckets:CACHE=shared'] }).errors[0], /Preview resource prev-b/);
+});
+
+test('auditProdConfig: D1 can never be approved as shared with Production', () => {
+  const src = { d1_databases: [{ binding: 'DB', database_id: 'ID' }], previews: { d1_databases: [{ binding: 'DB', database_id: 'ID' }] } };
+  const prod = { d1_databases: [{ binding: 'DB', database_id: 'ID' }] };
+  assert.equal(auditProdConfig(prod, src, { allow: ['d1_databases:DB=ID'] }).errors.length, 1);
 });
 
 test('parseEnvLines: KEY=VALUE only, comments/blank skipped, unsafe input rejected', () => {
