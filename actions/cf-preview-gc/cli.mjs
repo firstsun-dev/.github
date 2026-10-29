@@ -11,14 +11,17 @@ const int = (k, d) => { const v = process.env[k]; if (!v) return d; if (!/^\d+$/
 
 export function loadConfig(env = process.env) {
   const repo = need('GITHUB_REPOSITORY');
+  // An omitted account_id means "the account of the supplied CLOUDFLARE_PREVIEW_* credentials" (the v2 contract's
+  // identity; the secret cannot be passed as a plain workflow input). An explicit id must still match it.
+  const credAccount = need('CLOUDFLARE_ACCOUNT_ID');
   const targets = json('GC_TARGETS', []).map((t) => {
-    if (!t.app_name || !t.account_id) throw new Error('every target needs app_name and account_id');
-    return { appName: t.app_name, hostWorker: t.preview_worker_name || t.app_name, accountId: String(t.account_id) };
+    if (!t.app_name) throw new Error('every target needs app_name');
+    return { appName: t.app_name, hostWorker: t.preview_worker_name || t.app_name, accountId: String(t.account_id || credAccount) };
   });
   if (!targets.length) throw new Error('GC_TARGETS is empty');
   const prot = json('GC_PROTECTED_PREVIEWS', []).map((p) => {
-    if (!p.account_id || !p.host_worker || !p.preview_name) throw new Error('protected_previews entries need account_id, host_worker and preview_name');
-    return { accountId: String(p.account_id), hostWorker: p.host_worker, previewName: p.preview_name };
+    if (!p.host_worker || !p.preview_name) throw new Error('protected_previews entries need host_worker and preview_name (account_id defaults to the credentials account)');
+    return { accountId: String(p.account_id || credAccount), hostWorker: p.host_worker, previewName: p.preview_name };
   });
   const retentionDays = int('GC_RETENTION_DAYS', 7);
   if (retentionDays < 1) throw new Error('retention_days must be >= 1');
@@ -31,7 +34,7 @@ export function loadConfig(env = process.env) {
     only: json('GC_ONLY_PREVIEWS', null),
     targets,
     protected: prot,
-    credentialAccountId: need('CLOUDFLARE_ACCOUNT_ID'),
+    credentialAccountId: credAccount,
     tombstoneCreators: ['github-actions[bot]'],
   };
 }

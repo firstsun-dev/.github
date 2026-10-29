@@ -39,8 +39,8 @@ Only Preview names derived from `<app>/preview/<name>` ledger environments are e
 | `dry_run` | `true` | report only |
 | `retention_days` | `7` | |
 | `max_deletions_per_run` | `5` | |
-| `targets` | required | JSON `[{"app_name","preview_worker_name?","account_id"}]`, one entry per Worker (monorepo) |
-| `protected_previews` | `[]` | JSON `[{"account_id","host_worker","preview_name"}]` — explicit allowlist, no name guessing |
+| `targets` | required | JSON `[{"app_name","preview_worker_name?","account_id?"}]`, one entry per Worker (monorepo). Omitted `account_id` = the account of the supplied credentials; an explicit one must match it |
+| `protected_previews` | `[]` | JSON `[{"account_id?","host_worker","preview_name"}]` — explicit allowlist, no name guessing |
 | `only_previews` | – | JSON `["name"]`, restrict a controlled cleanup to exactly these |
 | `tools_ref` | required | must equal the ref the caller pins |
 

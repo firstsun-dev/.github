@@ -292,6 +292,14 @@ test('loadConfig: safe defaults and validation', () => {
     assert.equal(c.retentionDays, 7);
     assert.equal(c.maxDeletions, 5);
     assert.equal(c.targets[0].hostWorker, 'blog');
+    process.env.GC_TARGETS = JSON.stringify([{ app_name: 'blog' }]);
+    process.env.GC_PROTECTED_PREVIEWS = JSON.stringify([{ host_worker: 'blog', preview_name: 'dev' }]);
+    const d = loadConfig();
+    assert.equal(d.targets[0].accountId, 'acc1'); // omitted => credentials account
+    assert.equal(d.protected[0].accountId, 'acc1');
+    delete process.env.GC_PROTECTED_PREVIEWS;
+    process.env.GC_TARGETS = JSON.stringify([{ app_name: 'blog', account_id: 'accX' }]);
+    assert.equal(loadConfig().targets[0].accountId, 'accX'); // explicit stays explicit; mismatch is rejected at run time
     process.env.GC_RETENTION_DAYS = '0';
     assert.throws(loadConfig, /retention_days/);
     process.env.GC_RETENTION_DAYS = '7';
