@@ -105,6 +105,7 @@ jobs:
           name: coverage-report
           path: coverage/
           overwrite: true
+          retention-days: 3
 
   artifact:
     name: Package Artifact
