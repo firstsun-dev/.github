@@ -102,6 +102,8 @@ jobs:
           node .cf-tools/actions/cf-preview-gc/cli.mjs
       - name: Upload GC report
         if: always() && inputs.enabled
+        # Best effort: the full report is already in the Job Summary; an artifact quota error must not fail the GC job.
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: preview-gc-report
