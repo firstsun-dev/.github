@@ -25,13 +25,16 @@ class Ctx(dict):
         return cur
 
 
-TOKEN = re.compile(r"\s*(?:('(?:[^']|'')*')|(&&|\|\||==|!=)|(!)|([(),])|([A-Za-z_][\w.\-]*)(\()?|(\.[A-Za-z_][\w\-]*))")
+TOKEN = re.compile(r"\s*(?:('(?:[^']|'')*')|(&&|\|\||==|!=)|(!)|([(),\[\]])|([A-Za-z_][\w.\-]*)(\()?|(\.[A-Za-z_][\w\-]*))")
 
 
 class J(dict):
     """fromJSON() result: dotted property access, a missing property is '' (GitHub null)."""
 
     def __getattr__(self, k):
+        return _wrap(self.get(k, ""))
+
+    def __getitem__(self, k):
         return _wrap(self.get(k, ""))
 
 
@@ -86,7 +89,7 @@ def ev(expr, ctx, failed=False):
         "F_success": lambda: not failed,
         "F_failure": lambda: failed,
         "F_cancelled": lambda: False,
-        "F_format": lambda f, *a: re.sub(r"\{(\d+)\}", lambda m: str(a[int(m.group(1))]), f),
+        "F_format": lambda f, *a: re.sub(r"\{\{|\}\}|\{(\d+)\}", lambda m: {"{{": "{", "}}": "}"}.get(m.group(0)) or str(a[int(m.group(1))]), f),
         "F_contains": lambda a, b: str(b) in (a if isinstance(a, (list, tuple)) else str(a)),
         "F_fromjson": lambda s: _wrap(json.loads(s)),
         "F_tojson": lambda v: json.dumps(v),
@@ -102,8 +105,23 @@ def strip_expr(s):
 
 
 def render(value, ctx, failed=False):
-    """Render a string containing ${{ }} segments."""
-    return re.sub(r"\$\{\{(.*?)\}\}", lambda m: _s(ev(m.group(1).strip(), ctx, failed)), str(value))
+    """Render a string containing ${{ }} segments (a `}}` inside a quoted string literal does not end the expression)."""
+    text, out, i = str(value), [], 0
+    while True:
+        j = text.find("${{", i)
+        if j < 0:
+            out.append(text[i:])
+            return "".join(out)
+        out.append(text[i:j])
+        k, q = j + 3, False
+        while k < len(text):
+            if text[k] == "'":
+                q = not q
+            elif not q and text.startswith("}}", k):
+                break
+            k += 1
+        out.append(_s(ev(text[j + 3:k].strip(), ctx, failed)))
+        i = k + 2
 
 
 def _s(v):

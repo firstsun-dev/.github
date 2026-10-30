@@ -1,0 +1,262 @@
+# CF Worker v2 — unified target-driven delivery (shared-engine contract)
+
+Spec: `openspec/changes/unify-cf-worker-v2-delivery-targets`. This document is the **frozen Phase 1 contract** consumers build against.
+It supersedes the job topology in `cf-worker-v2-refactor.md` ("Job DAG", "Shared Dev job order"); the engine, security rules, ledger
+and recovery rules described there still apply. `_cf-worker-v2.yml` remains the only public entrypoint; `_cf-worker-delivery.yml` is an
+**internal** reusable workflow called only by it. v1 / v1.5 and the floating `@v2` tag are untouched by this change.
+
+## Topology (final DAG)
+
+```
+Lint ‖ Typecheck ‖ Unit ‖ Integration ‖ Build Validation ‖ E2E        (unchanged, independent)
+                         │
+                 Validation Gate        every CONFIGURED job succeeded, every unconfigured one skipped, else fail closed
+                         │
+                  Delivery plan         enabled kinds of this event + smoke-mode validation + D1 plan (pure data, no credentials)
+                         │                outputs per kind: on_<kind>, d1_<kind>, owns_<kind>, owner_of_<kind>
+        ┌────────────────┼───────────────────┐
+ preflight_production  preflight_native_branch  preflight_native_dev  preflight_persistent_dev     one CALL per enabled kind (only with d1_migrations)
+        └────────────────┼───────────────────┘      non-publishing: canonical URL, target build, effective-config audit, exact D1 binding
+                         │   (every migration waits for the preflight of EVERY enabled kind: nothing mutates while a target is unvalidated)
+ migration_<owner kind>  one CALL per OWNER of a distinct physical D1 (Native Branch + Native Dev on one D1 -> one migration)
+                         │
+ delivery_production | delivery_native_branch | delivery_native_dev | delivery_persistent_dev      one CALL per enabled kind, mutually independent
+      └─ deploy ──► smoke ──► (conditional) rollback          jobs of the SAME internal workflow, scoped to that one target
+                         │
+                  Release (Production, main only; reads ONLY delivery_production)
+```
+
+Kinds: `production`, `native-branch` (per-branch Native Preview), `native-dev` (the stable Native Preview named `dev`),
+`persistent-dev` (the separate `[env.dev]` Dev Worker; Notification Hub). Only enabled kinds exist as calls (a disabled call is skipped by the
+plan flag `on_<kind>`), so no phantom delivery paths exist. **A delivery call waits only for the Validation Gate, the plan, and the
+migration call(s) of ITS OWN D1; it never waits for, and is never affected by, another kind's Deploy / Smoke / Rollback.** There is no
+matrix anywhere in the delivery graph: every `needs.<call>.outputs.*` belongs to exactly one target.
+
+| Event | Kinds |
+| --- | --- |
+| trusted push to `main` | `production` |
+| trusted push to another branch | `native-branch` if `preview_on_branch_push`; `native-dev` if `shared_dev_native_preview_on_branch_push`; `persistent-dev` if `shared_dev_on_branch_push` |
+| protected `workflow_dispatch` persistent-dev | the existing manual `persistent-dev` job (unchanged) |
+| PR / delete / tag | none (lifecycle handler only) |
+
+Rejected (plan fails closed, `config-guard` also reports): `production-only` with any Dev channel; `shared_dev_on_branch_push` together with
+`shared_dev_native_preview_on_branch_push`; unknown `smoke_mode` / `smoke_mode_overrides`; an unknown kind in a `phase_state` hand-off;
+a Preview/Dev kind whose D1 is the Production D1.
+
+### Reusable-workflow limits honoured
+
+| Constraint | How |
+| --- | --- |
+| Nesting depth | caller → `_cf-worker-v2.yml` → `_cf-worker-delivery.yml` = 3 levels (limit 10); the delivery workflow calls nothing further |
+| Permission ceiling | each `uses:` job declares the permissions the called jobs need (`contents: read`; `deployments: read` for Preflight / Migration, `deployments: write` + `pull-requests: write` for Delivery); the caller of the public workflow already had to grant these |
+| Static `uses:` | `./.github/workflows/_cf-worker-delivery.yml` per call (no expression); actions are fetched by `tools_ref` as before |
+| `tools_ref` | forwarded unchanged to every call; the engine always comes from the same pinned ref |
+| Secrets | passed explicitly per call (smoke credentials only to Delivery); never `secrets: inherit` |
+| Environments | job property inside the called workflow (`<app>/prod`, `/preview`, `/native-dev`, `/dev`); Smoke and Preflight have none |
+| Concurrency | the run-level group stays on the public workflow; the delivery workflow has **only job-level** groups (`cfv2-leg-<run>-<kind>[-rollback]`, persistent Dev keeps `cfv2-dev-<repo>-<scope>`) so nothing deadlocks |
+
+## Inputs
+
+All pre-existing inputs are unchanged (names, types, defaults). New, all optional and default-off:
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `shared_dev_native_preview_on_branch_push` | `false` | Native Dev: every eligible branch push updates Native Preview `dev` (host = `preview_worker_name` or `app_name`, `[previews]` bindings, **not** `[env.dev]`). |
+| `build_env_shared_dev_native_preview` | `""` | Build-time `KEY=VALUE` env of the Native Dev build. Never falls back to another kind's env. |
+| `app_url_shared_dev_native_preview` | `""` | Optional declared Native Dev URL. Must equal the URL derived from Cloudflare (below) or the run fails **before** the build. |
+| `preview_url_suffix` | `""` | Optional host suffix of Preview URLs (`-<worker>.<subdomain>.workers.dev` or `.<custom domain>`). Normally empty: Cloudflare reports it. Required for custom-domain Preview hosting (`preview_host_check: false`). |
+| `smoke_mode` | `full` | `full` = built-in probe + `smoke_cmd` (current behaviour); `basic` = content-level HTTP/health only (no `smoke_cmd`); `skip` = no request. |
+| `smoke_mode_overrides` | `{}` | JSON keyed by kind, e.g. `{"native-dev":"basic"}`. |
+
+Engine-owned build variables (reserved, cannot be set from caller env): `CFV2_DELIVERY_KIND`, `CFV2_TARGET_URL`; `VITE_APP_ENV` is
+`prod` / `preview` / `dev` (`dev` for **both** `native-dev` and `persistent-dev`).
+
+## Outputs (public contract)
+
+Pre-existing outputs keep their meaning: `deploy_*`, `version_id`, `previous_version_id`, `migration_status`, `rollback_result`
+describe the Production / per-branch Preview delivery; `dev_*` describe `persistent-dev`; `deploy_gate_blocked`; `phase_state`.
+Added: `native_dev_url`, `native_dev_verified_url`, `native_dev_published_unverified`, `native_dev_verified`, `native_dev_smoke_level`.
+`deploy_smoke_level` / `native_dev_smoke_level` may now be `skipped`. `phase_state` is opaque: pass it unchanged to the verify call.
+
+**Output determinism.** Every per-kind output SELECTS its source call from the plan (`jobs.plan.outputs.on_<kind> == 'true'`, or `owns_<kind>`
+for `migration_status`) and then reads that call's own result — never "whichever string is non-empty". `deploy_*` read Production, else
+Native Branch (mutually exclusive by event: `main` vs. other branches); `dev_*` read `persistent-dev`; `native_dev_*` read `native-dev`;
+`rollback_result` is the first rolled-back kind in the order production, native-branch, native-dev, persistent-dev.
+
+## Behaviour
+
+* **Per-target builds and URL pre-resolution (P1-B).** Every Deploy / Preflight checks out the validated SHA, imports its own build env, resolves
+  **its canonical URL before building**, builds, audits its generated Wrangler config and publishes that artifact.
+  * Native Preview URL (Cloudflare Workers "Previews" documentation): `workers.dev` → `<preview-name>-<worker-name>.<subdomain>.workers.dev`;
+    custom domain → `<preview-name>.<domain>`. The Workers subdomain API (`GET /accounts/{id}/workers/scripts/{worker}/subdomain`, the same
+    read-only call as `preview-host-check`) reports `previews_enabled` and `preview_url_suffix`; the URL is `https://<preview-name><suffix>`.
+    The identity is the real one: `<branch slug>` (Native Branch, via the collision-guarded identity) or the reserved name `dev`.
+  * Nothing is guessed: if neither Cloudflare nor `preview_url_suffix` provides a suffix and no URL is declared the run fails before the build;
+    a declared URL (`app_url_shared_dev_native_preview`) that contradicts the derived one fails before the build; two suffix sources must agree.
+  * The URL is exported to the build as `CFV2_TARGET_URL`; the published URL must equal it (also in recovery rebuilds), else the publish is rejected.
+  * Build-env checks before the build: another target's public URL is rejected; this application's own callback / redirect / app-origin / site
+    variables (`*CALLBACK*`, `*REDIRECT_URI/URL*`, `*APP_ORIGIN*`, `*APP_URL*`, `*SITE_URL*`) must be **same-origin with the target URL**.
+    An IdP issuer / `IDP_URL` names another service and is not verifiable, so it is only checked against this app's other targets.
+* **Preflight → Migration (P2-B).** The plan groups kinds by `account_id/database_id` of the source config. Each Preflight (one per enabled kind) builds
+  non-publishingly, audits the *effective* (adapter-generated) config and requires that the built config binds **exactly** the plan's D1 id.
+  Every Migration call waits for the Preflight of **all** enabled kinds, so no schema changes while a target sharing or using a D1 is unvalidated.
+  Branch + Native Dev on one preview D1 are migrated **once** (owner: Native Branch); distinct D1s migrate independently; D1-less targets skip
+  the stage. A Preview/Dev kind mapped to the Production D1 fails the plan. The publish stage re-audits the built config against the migrated D1 id,
+  and the Delivery call validates that the migration result it received has the planned owner kind and D1 id. A failed migration blocks only the
+  deliveries on that D1. Stale-SHA checks run before migration and again before publish; D1 is never rolled back. Same-repository serialization is
+  the workflow-level concurrency group (`cfv2-nonprod-d1-<scope>` / `cfv2-shared-dev-<app>` also cover Native Dev); a D1 shared with **another
+  repository** is not locked (GitHub limitation, see limits).
+* **Result routing (P1-A).** Each Delivery call receives only its own hand-off and its own migration result (its own call, or the shared-D1
+  owner's — validated by kind and D1 id inside the call). The Smoke and Rollback jobs refuse a hand-off whose `kind`, `published_sha` or URL belong
+  to anything else (fail closed on missing / ambiguous / stale / mismatched data).
+* **Native Dev.** Fixed name `dev`, own ledger environment `<app>/native-dev/dev`, own GitHub Environment `<app>/native-dev`, never
+  advertised on PRs. The name `dev` is reserved: with Native Dev on, a branch named `dev` gets Preview `b-dev`; Preview GC never collects `dev`.
+* **Smoke / recovery.** `skip`: no request, `deployed_and_verified=false`, `verified_url` empty, `smoke_level=skipped`, ledger `inactive`
+  (never known-good), no rollback, no Release. `basic`: Access-redirect = liveness only = Published/Unverified. Recovery is target-owned and runs
+  only in the failing kind's call: `native-dev` / `persistent-dev` redeploy the last known-good deployment of the same ledger unless a newer one
+  exists; Production keeps its fail-closed policy; a blocked cross-service gate never rolls back.
+* **Release** requires the Production Smoke to be content-verified and no Rollback to have run; it reads only `delivery_production`.
+* **`pipeline_phase`.** `deploy` runs Preflight, Migration and each call's Deploy only; the `phase_state` output carries each kind's own Deploy
+  result, its migration result and D1 id, the kinds, the inputs and the concurrency group. `verify` (second call) runs only each kind's Smoke and
+  Rollback from that data (`handoff_json`, `migration_json_in`, `d1_expected_id` are that kind's own entries) and `upstream_gate`; Heaven's
+  ID ↔ Test Client ↔ Check-in dependencies are expressed by the caller's `needs` between the deploy and verify calls, unchanged.
+
+## Verification evidence
+
+Local (mocked Cloudflare/GitHub) — suites: `test-workflow-contract.py` (job graph, no matrix / no cross-kind `needs`, gating, credential isolation,
+permission ceiling, concurrency, interface compatibility, `pipeline_phase`), `test-jobs.py` (executes the real jobs and composite engine per call
+against stubs: all four kinds, simultaneous Branch + Native Dev, reversed completion order, one-target failure isolation, shared-D1 dedupe, URL
+pre-resolution, smoke full/basic/skip, rollback isolation and stale-deployment protection, Release gate, deferred `pipeline_phase`),
+`delivery.test.mjs`, `lib.test.mjs`, `test-*.sh`, `gc.test.mjs`, shellcheck, actionlint 1.7.12. Local gate at `e72ae91`+: contract 623, test-jobs 379, node (lib+delivery+gc) 114, test-deploy 84, migrate 26, smoke 49, parse-env 27, probe 20, gh 24 — all
+passing; actionlint 1.7.12 and shellcheck clean.
+
+**Real-runner evidence** — disposable private caller `firstsun-dev/cf-v2-scratch-caller`, `runner: ubuntu-latest`, **no Cloudflare secrets**, calling
+`firstsun-dev/.github/.github/workflows/_cf-worker-v2.yml` at the pinned SHA `88d9777` (`tools_ref` = same SHA):
+
+| Run | What it proves | Observed |
+| --- | --- | --- |
+| [41035153116](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41035153116) / [41035205869](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41035205869) | **Defect found by the real runner**: `startup_failure` at `c6423d0`. | GitHub validates the permission ceiling for **every** job of a called workflow, including jobs skipped by `if:`. The Preflight / Migration calls granted only `deployments: read` while the same workflow's Deploy/Smoke/Rollback jobs request `deployments: write` + `pull-requests: write`. Fixed in `88d9777` (all per-kind calls grant the full ceiling; each called job still requests only what it needs); the contract test now checks the ceiling against every called job. Bisected by copying the workflow into the scratch repo (`pf1`/`mg1` startup_failure, `dl1`/`nocalls` start). |
+| [41035901102](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41035901102) | Cross-repo call of the public workflow at `88d9777` **starts**; the nested `uses: ./.github/workflows/_cf-worker-delivery.yml` resolves; all 20 public outputs are readable by a read-back job. | `call` = failure by design at *Build Validation*: `pnpm: command not found` (see limitations). `readback` = success: `CALL_RESULT=failure`, `DEPLOY_GATE_BLOCKED=false`, every other output empty, `phase_state` rendered as JSON. 22 downstream jobs skipped (fail closed behind the red Gate). |
+| [41036120312](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41036120312) | `pipeline_phase: verify` with a hand-built `phase_state` (kinds native-branch + native-dev): plan from the hand-off, **one independent delivery call per kind**. | success: `Delivery plan`, `Delivery (native-branch) / Smoke Tests`, `Delivery (native-dev) / Smoke Tests` ran (nothing was published, so nothing is verified); 29 other jobs skipped; read-back: `DEPLOY_TARGET=preview` (selected by the plan flag), `DEPLOY_URL`, `DEPLOY_VERIFIED`, `NATIVE_DEV_URL`, `NATIVE_DEV_VERIFIED`, `MIGRATION_STATUS`, `ROLLBACK_RESULT` empty, `DEPLOY_GATE_BLOCKED=false`. |
+| [41036125410](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41036125410) (ref `main`) | Engine event/kind guard on a real runner. | Preflight(native-dev) failed closed: `target mismatch (enabled kinds 'production', engine 'native-dev'); refusing to deploy`; Deploy / Migration / Smoke / Rollback skipped. |
+| [41036258062](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41036258062) (ref `feat/x`) | Preflight engine stage on a real runner, branch event. | Passed init and the kind guard, then failed closed: `preview credentials not provided (set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID)`; the other four jobs skipped. |
+
+Not demonstrable on GitHub-hosted runners without Cloudflare credentials (and so **not** proven by a real run): URL resolution against the Workers
+subdomain API, the build, effective-config audit and D1 binding checks, migration, publish, smoke against a live Worker, rollback. Those are proven
+only by the local suites above.
+
+## Test profiles and measured performance (PR #89 refactor)
+
+`scripts/cf-preview/test.sh fast|chain|full` is the single entrypoint for CI and agents (logs go to `$LOGDIR`, only summaries print).
+`fast` = static workflow contract, unit tests (`lib.test.mjs`, `delivery.test.mjs`), stub shell tests, GC unit tests (~10 s).
+`chain` = the real-shell Migration → Deploy → Smoke → Rollback scenarios of `test-jobs.py`, which is now shared fixtures plus **eight explicit
+`group_*` functions** (`test-jobs.py --list | --group ID`). `run-job-groups.py` is a thin launcher (bounded parallelism: `CF_V2_TEST_JOBS` or
+min(4, CPUs)) that checks a manifest of expected groups with minimum check counts: a missing, unexpected, empty, shrunken or skipped group, or a
+missing perf report, fails the run. `full` = both; it is the only profile behind the required `contract` check. `JOBRUNNER_PERF=<file>` writes a JSON
+report (subprocesses by command/engine phase, workspaces, jobs).
+
+| Metric (404 chain checks; 379 before + 25 added in this work, none removed) | Before (3842a45 / a9fd174) | After (8ad9f5f) |
+| --- | --- | --- |
+| Chain wall time, local (bounded parallelism 4) | ~6 min serial equivalent | ~101 s (`run-job-groups.py`) |
+| Fast profile, local | not separated | ~11.5 s |
+| Full (Fast then Chain, local) | not separated | 1m53s |
+| Whole CI job (GitHub-hosted: setup, tests, shellcheck, actionlint) | 2m29s – 4m13s | 2m19s – 3m17s |
+| Engine `init` average cost | 213 ms (697 calls, 36 % of subprocess CPU) | 58 ms (702 calls, 40.9 s CPU) |
+| Recorded step-subprocess CPU | ~398 s | ~306 s |
+| Node processes in one Production chain (system-wide `execve`) | 17 | 9 |
+| All `execve` in one Production chain | 567 | 549 (-3 %; the rest is the harness's own bash stubs) |
+| Step-shell subprocesses counted by the harness | 7180 | 7640 (+6 %: new `migration-gate`/`init-checks` steps; not a reduction) |
+| Workspaces created | 1408 | 1437 (new tests) |
+
+Honest reading: wall time improved through parallel groups, a lighter `init` and the Fast/Full split. The harness's step-shell count did **not** fall; the
+work removed is *inside* the steps (Node/`jq` processes per engine call). Replacing repeated full-chain scenarios with focused tests was **not** done in
+this round: every end-to-end scenario is still run, new focused unit tests were added alongside them. Remaining top costs: `engine:build` 14 %,
+`prepare` 7 %, `hydrate` 5 %.
+
+### Structure (static, before → after)
+
+| | 3842a45 | a9fd174 | 8ad9f5f |
+| --- | --- | --- | --- |
+| `_cf-worker-v2.yml` lines | 1318 | 1259 | 1249 (+2: the scheduling-lock expression now covers verify) |
+| `_cf-worker-delivery.yml` lines | 494 | 450 | 446 |
+| `engine.sh` lines | 593 | 606 | 524 |
+| `with:` field lines across the 12 per-kind calls | 196 | 144 | 132 |
+| Inline `jq` policy steps in the delivery workflow | 10 | 3 | 3 |
+| Node spawn sites inside `engine.sh init` | 24 | 17 | 3 |
+| Build / publish implementation paths in the engine | 2 / 2 | 1 / 1 | 1 / 1 |
+| Independent implementations of "which kinds / D1 / owner / smoke mode" | plan YAML + engine shell + workflow expressions | descriptor (JS) | descriptor (JS), engine re-validates it |
+
+Per call, `target`, `environment`, `d1_expected_id`, `d1_owner_kind`, `deploy_group`, `rollback_group` and `kind` are one `descriptor`. Unavoidable
+GitHub Actions duplication: the 12 static `uses:` calls (one job per kind keeps outputs unambiguous), each call's `permissions` ceiling and `secrets`
+block, and the two-step tooling checkout in every delivery job — `uses:` cannot take an expression, so a composite that fetches the tools at
+`tools_ref` cannot itself be referenced from `tools_ref`; each job runs on its own runner anyway.
+
+Pure decisions now unit-tested in `delivery.mjs` instead of inline shell/jq: target descriptor (incl. deferred-verification restore), migration peer gate,
+migration-used resolution, engine initialisation (`validateInit`), verification outcome, Production rollback guard, rollback verdict.
+
+### Deferred verification keeps the deploy call's decisions
+
+`phase_state` carries the deploy call's validated descriptor map (`descriptors`). The verify call's plan restores it (`restoreDescriptors`), checks it
+against the rest of the hand-off (kinds, application, repository, D1 ids, migration owner; phase must be `deploy`) and only moves `phase` to `verify`.
+A legacy hand-off without `descriptors` is rebuilt from the deploy call's own `phase_state.inputs`, never from the verify call's inputs; missing identity
+fails closed. For leg kinds the legacy rebuild uses the verify run's id in the (uncontended) rollback group name — the only documented difference.
+
+### Lock identity across Deploy → Verify → Rollback
+
+* **Job-level locks.** Persistent Dev's Deploy and Rollback groups are `cfv2-dev-<repo>-<d1_lock_scope or app>`. `restoreDescriptors` requires the handed-over
+  descriptor to carry exactly that, rebuilt from the current repository, the deploy call's application and the deploy call's `d1_lock_scope` — a modified
+  deploy/rollback group, another repository, another application or a changed scope is rejected. A verify call has no input that can pick another Dev lock.
+* **Run-level (top-level `concurrency`) lock.** GitHub evaluates it *before any job*, so no Plan check can repair it. For a verify call the expression is therefore the
+  deploy expression applied to `phase_state.inputs` (never `phase_state.group`); `delivery.mjs runLockGroup` is its tested twin (512 scenarios, deploy and verify
+  mode, rendered from the real YAML). The Plan job then requires `phase_state.group` to equal that value (a `cfv2-run-<id>` fallback group only has to be numeric).
+* **Trust boundary (explicit).** `phase_state.inputs` is caller-supplied data. It is the *source* of the scheduling-time lock, so a caller that edits it chooses a lock
+  exactly as it could by calling the workflow with a different `d1_lock_scope` directly; GitHub concurrency is cooperative serialisation, not authorisation. What is
+  guaranteed: a stale, malformed or inconsistent hand-off (group, descriptor, D1, owner, repository, application) cannot silently join or create a different lock and
+  fails the Plan closed, and verifying from another ref/event than the deploy ran on is refused (its derived lock would differ from `phase_state.group`).
+  A group string that merely *claims* another lock is ignored for scheduling (see the queue evidence below).
+
+### CLI contract
+
+`cli.mjs` writes workflow annotations (`::error::`, `::warning::`, `::notice::`, `::add-mask::`) to **stderr**; **stdout carries only `key=value` records** and is what the
+workflow pipes into `$GITHUB_OUTPUT`. A rejected input therefore exits non-zero with the original message and writes nothing to the output file (previously GitHub added
+`Unable to process file command 'output'`). The job harness now enforces GitHub's output-file format, so any regression fails the chain tests. `parse-env.mjs` keeps its
+documented stdout contract (its stdout never feeds an output file). Legacy `phase_state` (no `descriptors`): migration ownership is reconstructed per physical D1 only
+when every member kind's migration result proves the same owner on the same D1; missing, conflicting or foreign evidence fails closed; hand-offs without D1 migrations
+stay valid. `test.sh full` does not start Chain when Fast failed.
+
+### Real-runner evidence pinned to `8ad9f5f7b2ab83ea40200c7a4ccf625bbcb03d9b` (final implementation SHA; later commits are docs only)
+
+Disposable `firstsun-dev/cf-v2-scratch-caller`; public workflow and `tools_ref` both the SHA above; jobs on the org's provisioned `linux` runners (`heavenweb-runner-*`, pnpm
+baked in). No Cloudflare credentials existed, so nothing remote was touched.
+
+| Run | What it proves | Observed |
+| --- | --- | --- |
+| [41062254408](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41062254408) | Valid deferred verify handoff; nested reusable workflows; public outputs; deploy `smoke_mode=skip` kept although the verify call defaults to `full` | success; `deploy_smoke_level=skipped`, `deploy_verified=false`, `deploy_published_unverified=true`, `deploy_url` present |
+| [41062261540](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41062261540) | Forged `phase_state.group` | Plan fails with `phase_state.group 'attacker-group' is not the lock identity the deploy inputs imply ('cfv2-prod-scratch')`; no `Unable to process file command`; delivery skipped |
+| [41062268866](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41062268866) | Tampered D1 metadata | Plan fails with `descriptor for production binds D1 'FOREIGN' but the hand-off recorded 'REAL-DB'`; no output-file error; delivery skipped |
+| the three runs above, dispatched back-to-back | Scheduling-time lock | They ran strictly one after another (valid run first; the forged-group run stayed `pending`/`queued` until it finished, then failed; then the tampered run): the forged group string did **not** create a separate lock — all three shared the lock derived from `phase_state.inputs` (`cfv2-prod-scratch`) |
+| [41062278092](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41062278092) | Real `deploy` → `verify` chain, persistent Dev, `d1_lock_scope: shared-db` | Build Validation, Gate, Plan succeed; Deploy fails closed (`dev credentials not provided`); the real `phase_state` has `group: cfv2-shared-dev-scratch` and persistent Dev `deploy_group = rollback_group = cfv2-dev-firstsun-dev/cf-v2-scratch-caller-shared-db`; the verify call (no scope input) restores it; its Plan and Smoke succeed |
+
+Local suites on the same code: 404 chain checks, 131 Node tests, 626 workflow-contract checks (`test.sh full` = 1m53s). CI on the SHA: [run 41061646039](https://github.com/firstsun-dev/.github/actions/runs/41061646039)
+(3m17s; actionlint and shellcheck green).
+
+**Not demonstrable here and therefore NOT claimed:** live D1 migration, URL resolution against the Workers subdomain API, publish, smoke against a live Worker, rollback and
+recovery — they need approved non-production Cloudflare credentials and are covered only by the local suites. The queue timeline shows GitHub's behaviour for the scheduling
+lock on `workflow_dispatch` callers; it was not exercised for every event type.
+
+## Known limitations
+
+* **Hosted `ubuntu-latest` runners lack `pnpm`** (resolved for validation by using the org's provisioned `linux` runners; see the evidence above). `actions/setup` with `setup-pnpm: 'false'` (used by every validation job and the engine) assumes a runner image with pnpm
+  baked in (the org's `linux` runners). On `ubuntu-latest` the Validation jobs fail with `pnpm: command not found`, so a full real chain
+  (Gate → Plan → Preflight → …) cannot be exercised on a hosted runner. This is pre-existing behaviour and unchanged by this fix.
+* A caller of the public workflow must grant at least `contents: write` (Release job), `deployments: write` and `pull-requests: write`
+  (ceiling of the called jobs), as before.
+
+* Locks are repository-scoped; a D1 shared across repositories must be serialized by the owner (documented on `d1_lock_scope`).
+* The compiled-asset scan ("an artifact embeds another target's callback/issuer/origin") is **not** implemented; the build-env checks above and the
+  post-publish URL assertion are. Consumers must keep `PUBLIC_*` / `VITE_*` / `IDP_URL` in `build_env_*`.
+* `wrangler preview --name dev` custom-domain attachment is unverified and not assumed; custom-domain Preview hosting needs `preview_url_suffix`.
+* Preview URL derivation depends on the Workers subdomain API reporting `preview_url_suffix`. If the API is unreadable and no suffix / declared URL
+  is supplied, Native Branch / Native Dev fail before the build (by design) rather than build for a guessed URL.
+* Migration calls of different D1s are not ordered against each other's *Deploy*, but Native Dev / persistent Dev deliveries statically `need` the
+  Native Branch migration call (to read the shared-D1 result); that is a wait for a migration call, never for a Branch Deploy / Smoke / Rollback.

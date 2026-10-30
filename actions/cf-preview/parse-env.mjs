@@ -16,7 +16,7 @@ export const RESERVED = new Set([
   'LEDGER_ENV', 'PREVIEW_NAME', 'ENV_NAME', 'OUT_FILE', 'PREVIEW_ENV_FILE', 'SMOKE_ENV_FILE', 'BUILD_ENV_FILE',
   'D1_BINDING', 'WRANGLER_CONFIG', 'TARGET_URL', 'DEPLOY_TARGET', 'TEST_ENV', 'ACCESS_TARGETS', 'SHA_PATH', 'SMOKE_CMD',
   'BUILD_CMD', 'PUBLISH_CMD', 'ROLLBACK_TO', 'INPUTS_JSON', 'BUILD_ENV', 'SMOKE_ENV', 'CI_ENV', 'TARGET_BUILD_ENV',
-  'PREVIEW_SECRETS', 'VITE_APP_ENV', 'VITE_APP_VERSION', 'CF_AUDITED_CONFIG', 'PREVIEW_HOST_CHECK',
+  'PREVIEW_SECRETS', 'KIND', 'DELIVERY_KIND', 'CFV2_DELIVERY_KIND', 'CFV2_TARGET_URL', 'EXPECTED_URL', 'RESERVE_NATIVE_DEV', 'VITE_APP_ENV', 'VITE_APP_VERSION', 'CF_AUDITED_CONFIG', 'PREVIEW_HOST_CHECK',
 ]);
 
 /** `reserved: true` (the delivery engine: build_env_*, smoke_env, Preview secrets) also rejects RESERVED control names. */
@@ -42,7 +42,10 @@ export function parseEnvLines(text, { reserved = false } = {}) {
  *  `--emit0 <file> [--reserved]` re-validate a file written by the first form and print NUL-separated NAME=VALUE pairs.
  *  `--reserved` is what the delivery engine always passes: application env may not set deployment-control names. */
 // Compare real paths: a symlinked checkout must not turn the importer into a silent no-op.
-if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
+const isMain = () => {
+  try { return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); } catch { return false; } // e.g. `node -e`: argv[1] is not a file
+};
+if (isMain()) {
   const args = process.argv.slice(2);
   const mask = args.includes('--mask');
   const reserved = args.includes('--reserved');

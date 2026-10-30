@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/_cf-worker-v2.yml'
+      - '.github/workflows/_cf-worker-delivery.yml'
       - '.github/workflows/cf-worker-v2-ci.yml'
       - '.github/actionlint.yaml'
       - 'actions/cf-preview/**'
@@ -16,6 +17,8 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/_cf-worker-v2.yml'
+      - '.github/workflows/_cf-worker-delivery.yml'
+      - '.github/workflows/_cf-worker-delivery.yml'
       - '.github/actionlint.yaml'
       - 'actions/cf-preview/**'
       - 'actions/cf-preview-gc/**'
@@ -26,6 +29,12 @@ on:
 
 permissions:
   contents: read
+
+# Validation only (read-only, no deployment or migration is ever started from here): a newer PR commit supersedes the
+# older run. main pushes are never cancelled. Deployment/migration concurrency lives in the called workflows.
+concurrency:
+  group: cf-v2-contract-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   contract:
@@ -38,28 +47,12 @@ jobs:
           node-version: 24
       - name: Install tooling deps
         run: cd actions/cf-preview && npm ci --ignore-scripts --no-audit --no-fund
-      - name: Workflow + composite action contract (DAG, gating matrix, credential isolation, concurrency, engine order, cross-repo references)
-        run: |
-          pip install --quiet pyyaml==6.0.1
-          python3 scripts/cf-preview/test-workflow-contract.py
-      - name: Unit tests (identity, event/target matrix, preflight, Dev resource policy, migration target, D1 consistency, artifact digest, protected env)
-        run: node --test scripts/cf-preview/lib.test.mjs
-      - name: build.sh / publish.sh behaviour, all targets, same-artifact contract (stub wrangler)
-        run: scripts/cf-preview/test-deploy.sh
-      - name: migrate.sh behaviour (stub wrangler)
-        run: scripts/cf-preview/test-migrate.sh
-      - name: Smoke verification, fail-closed (stub curl)
-        run: scripts/cf-preview/test-smoke.sh
-      - name: Execute the real Migration -> Deploy -> Smoke -> Rollback chain (each job in a fresh workspace) plus Shared Dev / persistent-Dev with the composite engine and stubs (stale runs, fail-closed rollback, D1 compatibility, recovery, env-override protection, Release gate)
-        run: python3 scripts/cf-preview/test-jobs.py
-      - name: Env import is data, not code
-        run: scripts/cf-preview/test-parse-env.sh
-      - name: Preview probe classification (stub curl)
-        run: scripts/cf-preview/test-probe.sh
-      - name: GitHub ledger / PR comment idempotency (stub gh)
-        run: scripts/cf-preview/test-gh.sh
-      - name: Preview GC unit tests (mocked GitHub + Cloudflare; no remote calls)
-        run: node --test scripts/cf-preview-gc/gc.test.mjs
+      - name: Python deps
+        run: pip install --quiet pyyaml==6.0.1
+      - name: FAST profile (contract, unit, stub shell tests) - fails early, before the expensive chain
+        run: LOGDIR="$RUNNER_TEMP/cf-v2-tests" scripts/cf-preview/test.sh fast
+      - name: FULL profile remainder - real Migration -> Deploy -> Smoke -> Rollback chains, Shared/persistent Dev, deferred verify (groups run in parallel)
+        run: LOGDIR="$RUNNER_TEMP/cf-v2-tests" scripts/cf-preview/test.sh chain
       - name: shellcheck (warnings and above)
         run: |
           shellcheck -x -S warning -P SCRIPTDIR actions/cf-preview/*.sh scripts/cf-preview/*.sh
@@ -67,4 +60,4 @@ jobs:
       - name: actionlint
         run: |
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
-          ./actionlint -color .github/workflows/_cf-worker-v2.yml .github/workflows/_cf-worker-preview-gc.yml .github/workflows/cf-worker-v2-ci.yml
+          ./actionlint -color .github/workflows/_cf-worker-v2.yml .github/workflows/_cf-worker-delivery.yml .github/workflows/_cf-worker-delivery.yml .github/workflows/_cf-worker-preview-gc.yml .github/workflows/cf-worker-v2-ci.yml

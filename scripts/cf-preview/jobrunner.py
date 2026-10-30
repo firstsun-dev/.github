@@ -13,13 +13,42 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
+import time
 import yaml
 
 from ghexpr import Ctx, ev, render
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+# Opt-in performance instrumentation (JOBRUNNER_PERF=<report.json>): every step subprocess is recorded by category.
+PERF = {"subprocess": {}, "workspaces": 0, "jobs": {}, "scenario": ""}
+
+
+def _category(script):
+    """Coarse command category of a step script: the first engine/CLI entry point it calls, else 'inline'."""
+    m = re.search(r'engine\.sh"? +([a-z][\w-]*)', script)
+    if m:
+        return f"engine:{m.group(1)}"
+    for key in ("engine.sh", "cli.mjs", "build.sh", "publish.sh", "migrate.sh", "smoke.sh", "probe.sh", "gh.sh", "pnpm", "node"):
+        if key in script:
+            return key
+    return "inline"
+
+
+def _record(kind, name, dt):
+    d = PERF[kind].setdefault(name, {"n": 0, "s": 0.0})
+    d["n"] += 1
+    d["s"] = round(d["s"] + dt, 3)
+
+
+def write_perf_report():
+    path = os.environ.get("JOBRUNNER_PERF")
+    if path:
+        total = sum(v["n"] for v in PERF["subprocess"].values())
+        pathlib.Path(path).write_text(json.dumps({**PERF, "subprocess_total": total}, indent=1, sort_keys=True))
 
 GH_STUB = r'''#!/usr/bin/env bash
 echo "gh $*" >> "$STUB_LOG"
@@ -36,7 +65,7 @@ case "$a" in
   *"per_page=30"*" -q "*) [ -n "${STUB_LASTGOOD:-}" ] && echo "9:$STUB_LASTGOOD";;
   *"per_page=30"*) printf '%s' "${STUB_DEPLOYMENTS:-[]}";;
   *"deployments/9/statuses"*) echo success;;
-  *"/statuses?per_page=1"*"environment_url"*) echo "${STUB_STATUS:-success https://stable.example.workers.dev Serving good (content)}";;
+  *"/statuses?per_page=1"*"environment_url"*) echo "${STUB_STATUS:-success https://feat-x-app.example.workers.dev Serving good (content)}";;
 esac
 exit 0
 '''
@@ -46,14 +75,15 @@ echo "pnpm $*" >> "$STUB_LOG"
 case "$3 $4 $5" in
   "--version  ") echo "4.140.0";;
   "preview "*) [ "${STUB_PREVIEW_FAIL:-}" = 1 ] && exit 9
-               if [ -n "${STUB_PREVIEW_RAW+x}" ]; then printf '%s' "$STUB_PREVIEW_RAW"; else echo '{"preview":{"urls":["https://stable.example.workers.dev"]}}'; fi;;
+               if [ -n "${STUB_PREVIEW_RAW+x}" ]; then printf '%s' "$STUB_PREVIEW_RAW"; else echo '{"preview":{"urls":["https://'"$5"'-app.example.workers.dev"]}}'; fi;;
   "deployments list"*) [ "${STUB_NO_PREV:-}" = 1 ] && { echo '[]'; exit 0; }
                echo '[{"created_on":"2024-01-01","versions":[{"version_id":"'"${STUB_ACTIVE:-prev-1}"'","percentage":100}]}]';;
   "versions view"*) [ -n "${STUB_PREV_MESSAGE:-}" ] && echo '{"annotations":{"workers/message":"'"$STUB_PREV_MESSAGE"'"}}';;
   "versions upload"*) [ "${STUB_UPLOAD_FAIL:-}" = 1 ] && exit 6; echo "Worker Version ID: new-2";;
   "versions deploy prev-1@100") [ "${STUB_ROLLBACK_FAIL:-}" = 1 ] && exit 8;;
   "d1 migrations list") [ "${STUB_PENDING:-1}" = 1 ] && echo "Migrations to be applied: ${STUB_PENDING_FILES-0001.sql}" || echo "No migrations to apply!";;
-  "d1 migrations apply") [ "${STUB_APPLY_FAIL:-}" = 1 ] && exit 7;;
+  "d1 migrations apply") [ "${STUB_APPLY_FAIL:-}" = 1 ] && exit 7
+               [ -n "${STUB_APPLY_FAIL_CFG:-}" ] && [[ "$*" == *"$STUB_APPLY_FAIL_CFG"* ]] && exit 7;;
 esac
 exit 0
 '''
@@ -81,6 +111,7 @@ database_id = "PREV-ID"
 
 
 def make_workspace(toml=APP_TOML, files=None):
+    PERF["workspaces"] += 1
     ws = pathlib.Path(tempfile.mkdtemp(prefix="jobrun-"))
     (ws / "bin").mkdir()
     for name, body in (("gh", GH_STUB), ("pnpm", PNPM_STUB), ("curl", CURL_STUB), ("npm", NPM_STUB)):
@@ -97,6 +128,28 @@ def make_workspace(toml=APP_TOML, files=None):
     (ws / "tmp").mkdir()
     (ws / "state").mkdir()
     return ws
+
+
+_NAME = r"[A-Za-z_][\w.-]*"
+
+
+def output_file_violations(text):
+    """Lines GitHub's runner would reject in a $GITHUB_OUTPUT / $GITHUB_ENV file ("Unable to process file command 'output'"):
+    everything must be `name=value` or a `name<<DELIM ... DELIM` block."""
+    bad, delim = [], None
+    for line in text.splitlines():
+        if delim is not None:
+            if line == delim:
+                delim = None
+            continue
+        if not line.strip():
+            continue
+        m = re.match(rf"^({_NAME})<<(\S+)$", line)
+        if m:
+            delim = m.group(2)
+        elif not re.match(rf"^{_NAME}=", line):
+            bad.append(line[:120])
+    return bad
 
 
 def _parse_kv(path):
@@ -129,6 +182,7 @@ class _Run:
         for step in steps:
             self.counter += 1
             sid = step.get("id")
+            ctx["job"] = {"status": "failure" if failed else "success"}
             ctx["env"].update(_parse_kv(self.jobenv_file))
             cond = step.get("if")
             if cond is None:
@@ -174,11 +228,17 @@ class _Run:
             script = render(step["run"], ctx, failed)
             wd = pathlib.Path(render(step.get("working-directory", "."), ctx, failed))
             wd = wd if wd.is_absolute() else self.w / wd
+            t0 = time.perf_counter()
             p = subprocess.run(["bash", "-eo", "pipefail", "-c", script], cwd=wd, env=env, capture_output=True, text=True)
+            _record("subprocess", _category(script), time.perf_counter() - t0)
             if verbose:
                 print(f"--- {label} rc={p.returncode}\n{p.stdout[-1500:]}\n{p.stderr[-1500:]}")
             outputs = _parse_kv(out_file)
             outcome = "success" if p.returncode == 0 else "failure"
+            malformed = output_file_violations(out_file.read_text())
+            if malformed:  # the real runner fails the step ("Invalid format"), so the harness does too
+                print(f"::error::Unable to process file command 'output' successfully. Invalid format '{malformed[0]}'", file=sys.stderr)
+                outcome = "failure"
             if sid:
                 ctx["steps"][sid] = {"outcome": outcome, "conclusion": outcome, "outputs": outputs}
             ctx["env"].update(_parse_kv(self.jobenv_file))
@@ -229,7 +289,9 @@ def run_job(doc, name, ctx, ws, stub_env=None, verbose=False):
     for k, v in job.get("env", {}).items():
         ctx["env"][k] = render(v, ctx)
     runner = _Run(ws, base, jobenv_file)
+    t0 = time.perf_counter()
     failed, results = runner.steps(job["steps"], ctx, verbose=verbose)
+    _record("jobs", name, time.perf_counter() - t0)
     outs = {k: render(v, ctx, failed) for k, v in job.get("outputs", {}).items()}
     summary = (ws / "summary.md").read_text() if (ws / "summary.md").exists() else ""
     return {"result": "failure" if failed else "success", "outputs": outs, "steps": results, "log": log.read_text(), "summary": summary}
