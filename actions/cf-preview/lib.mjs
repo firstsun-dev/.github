@@ -187,6 +187,9 @@ const RESOURCE_KINDS = {
 };
 // Kinds that can reach Production state and are never allowed without an explicit allowlist entry.
 const HIGH_RISK = ['services', 'hyperdrive', 'secrets_store_secrets'];
+// Kinds a caller may share with Production through an exact `kind:BINDING=identity` preview_binding_allow entry.
+// Wider than Shared Dev's list on purpose: a Secrets Store secret can be approved for Preview only (never D1).
+const PREVIEW_SHAREABLE_KINDS = [...DEV_SHAREABLE_KINDS, 'secrets_store_secrets'];
 
 function bindingKey(kind, b) {
   return b.binding ?? b.name ?? JSON.stringify(b);
@@ -201,7 +204,9 @@ function queueProducers(cfg) {
  * `allow` is a list of "kind:binding" strings the caller has explicitly approved
  * (e.g. "services:ID_SERVICE"), `denyResources` extra Production identities to reject. An entry
  * "kind:BINDING=identity" (e.g. "r2_buckets:CACHE=prod-bucket") additionally lets that exact binding share that
- * exact Production resource; only storage kinds in DEV_SHAREABLE_KINDS qualify, never D1.
+ * exact Production resource; only storage kinds in DEV_SHAREABLE_KINDS plus secrets_store_secrets (identity
+ * `store_id/secret_name`) qualify, never D1. For a high-risk kind that exact entry also satisfies the explicit-allow
+ * requirement of the binding it names; a bare `kind:BINDING` entry never waives the Production collision.
  */
 export function auditPreviewConfig(cfg, { allow = [], denyResources = [] } = {}) {
   const errors = [];
@@ -231,15 +236,17 @@ export function auditPreviewConfig(cfg, { allow = [], denyResources = [] } = {})
     for (const b of prev) {
       const key = `${kind}:${bindingKey(kind, b)}`;
       const mine = ids(b).filter(Boolean);
+      let sharedExact = mine.length > 0;
       if (!mine.length) errors.push(`${key}: Preview binding needs an explicit resource id (Native Previews do not auto-provision; Cloudflare rejects it with 10021)`);
       for (const id of mine) {
         // An exact "kind:BINDING=identity" entry for a shareable storage kind approves sharing that one
         // resource under that one binding; it waives the Production-collision and denylist checks only.
-        if (DEV_SHAREABLE_KINDS.includes(kind) && allowed.has(`${key}=${id}`)) continue;
+        if (PREVIEW_SHAREABLE_KINDS.includes(kind) && allowed.has(`${key}=${id}`)) continue;
+        sharedExact = false;
         if (prodIds.has(id)) errors.push(`${key}: Preview binds the same resource as Production (${id})`);
         if (deny.has(id)) errors.push(`${key}: Preview binds denylisted Production resource (${id})`);
       }
-      if (HIGH_RISK.includes(kind) && !allowed.has(key)) {
+      if (HIGH_RISK.includes(kind) && !allowed.has(key) && !(sharedExact && PREVIEW_SHAREABLE_KINDS.includes(kind))) {
         errors.push(`${key}: high-risk binding needs explicit allow entry "${key}"`);
       }
     }
@@ -399,7 +406,7 @@ export function auditProdConfig(effective, source, { allow = [] } = {}) {
     for (const b of source.previews?.[kind] ?? []) {
       const key = `${kind}:${bindingKey(kind, b)}`;
       ident(b).filter(Boolean).forEach((id) => {
-        if (DEV_SHAREABLE_KINDS.includes(kind) && allowed.has(`${key}=${id}`)) return;
+        if (PREVIEW_SHAREABLE_KINDS.includes(kind) && allowed.has(`${key}=${id}`)) return;
         previewIds.add(id);
       });
     }
