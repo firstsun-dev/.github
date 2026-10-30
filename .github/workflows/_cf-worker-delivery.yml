@@ -1,0 +1,494 @@
+name: CF Worker delivery (one target)
+
+# ---------------------------------------------------------------------------
+# INTERNAL — called ONLY by _cf-worker-v2.yml (one `uses:` per delivery kind and stage). Not a public entrypoint.
+# OpenSpec: openspec/changes/unify-cf-worker-v2-delivery-targets. Contract: docs/cf-worker-v2-unified-delivery.md
+#
+# ONE implementation of target delivery, parameterised by `kind` (production | native-branch | native-dev | persistent-dev) and
+# `stage`, reusing the audited engine (actions/cf-deploy -> actions/cf-preview/engine.sh). A call handles exactly ONE target, so
+# every `needs.<job>.outputs.*` below is unambiguous: there is no matrix, no shared output key, no completion-order merge.
+#
+#   stage: preflight   non-publishing validation: URL resolution + build + effective-config audit + exact D1 binding
+#          migrate     apply the pending migrations of the physical D1 this kind OWNS (one call per distinct D1)
+#          deliver     deploy -> smoke -> conditional rollback of THIS kind, independent of every other kind
+#                      (pipeline_phase deploy = deploy only; verify = smoke + rollback from the handed-over deploy result)
+#
+# Reusable-workflow constraints honoured here: static `uses:` in the caller; tools are fetched by `tools_ref` (a local
+# `uses: ./...` would resolve against the CALLER's workspace); permissions never exceed the calling job's; secrets are passed
+# explicitly; the GitHub Environment is a job property of the called workflow; job-level concurrency only (the workflow-level
+# group belongs to the public workflow, reusing it here would deadlock).
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        description: preflight | migrate | deliver
+        type: string
+        required: true
+      kind:
+        description: production | native-branch | native-dev | persistent-dev
+        type: string
+        required: true
+      target:
+        description: prod | preview | dev (engine target class of the kind)
+        type: string
+        required: true
+      tools_ref:
+        type: string
+        required: true
+      runner:
+        type: string
+        default: linux
+      environment:
+        description: GitHub Environment of the kind (<app>/prod | /preview | /native-dev | /dev)
+        type: string
+        required: true
+      inputs_json:
+        description: toJSON of the effective public inputs (the deploy call's inputs for a deferred verify). Data only.
+        type: string
+        required: true
+      call_inputs_json:
+        description: Deferred verify only - toJSON of the verify call's inputs (identity cross-check)
+        type: string
+        default: ''
+      phase:
+        description: pipeline_phase - all | deploy | verify
+        type: string
+        default: all
+      d1_migrations:
+        type: boolean
+        default: false
+      d1_expected_id:
+        description: Physical D1 database id the plan resolved for this kind ('' = no D1)
+        type: string
+        default: ''
+      d1_owner_kind:
+        description: Kind that OWNS the migration of this kind's D1 (itself, or native-branch when they share one D1)
+        type: string
+        default: ''
+      kinds:
+        description: migrate only - JSON array of the enabled kinds of the run
+        type: string
+        default: '[]'
+      peers:
+        description: migrate only - JSON object keyed by kind, value = result of that kind's preflight
+        type: string
+        default: '{}'
+      own_migration_result:
+        description: deliver only - result of this kind's own migration call
+        type: string
+        default: ''
+      own_migration_json:
+        type: string
+        default: ''
+      owner_migration_result:
+        description: deliver only - result of the shared-D1 owner's (native-branch) migration call
+        type: string
+        default: ''
+      owner_migration_json:
+        type: string
+        default: ''
+      handoff_json:
+        description: verify only - the deploy result of THIS kind from phase_state
+        type: string
+        default: ''
+      migration_json_in:
+        description: verify only - the migration result of THIS kind from phase_state
+        type: string
+        default: ''
+      upstream_gate:
+        description: verify only - needs.<job>.result of the job the cross-service smoke depends on
+        type: string
+        default: ''
+      deploy_group:
+        description: Job-level concurrency group of the deploy job
+        type: string
+        required: true
+      rollback_group:
+        description: Job-level concurrency group of the rollback job
+        type: string
+        required: true
+    outputs:
+      d1_id:
+        description: preflight - audited physical D1 database id of the built config
+        value: ${{ jobs.preflight.outputs.d1_id }}
+      target_url:
+        description: preflight - canonical URL the target is built for
+        value: ${{ jobs.preflight.outputs.target_url }}
+      migration_json:
+        description: migrate - engine outputs of the migration of the D1 this call owns
+        value: ${{ jobs.migrate.outputs.migration_json }}
+      handoff:
+        description: deliver - the validated deploy result of THIS kind (own publish in the deploy phase, the handed-over one in the verify phase)
+        value: ${{ jobs.deploy.outputs.handoff || jobs.smoke.outputs.handoff }}
+      migration_used:
+        description: deliver - the migration result this kind's deployment depended on (shared-D1 mapping resolved)
+        value: ${{ jobs.deploy.outputs.migration_used || jobs.smoke.outputs.migration_used }}
+      smoke_json:
+        description: deliver - engine outputs of this kind's Smoke
+        value: ${{ jobs.smoke.outputs.smoke_json }}
+      smoke_status:
+        description: deliver - success | failure | none (nothing published, so nothing was smoked)
+        value: ${{ jobs.smoke.outputs.smoke_status }}
+      rollback_result:
+        description: deliver - restored_verified | restored_unverified | restored_unhealthy | blocked | failed | no_known_good; empty when no rollback ran
+        value: ${{ jobs.rollback.outputs.rollback_result }}
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: false
+      CLOUDFLARE_ACCOUNT_ID:
+        required: false
+      PREVIEW_SECRETS:
+        required: false
+      SMOKE_USERNAME:
+        required: false
+      SMOKE_PASSWORD:
+        required: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Preflight — validates THIS target before ANY target mutates a shared D1: canonical URL resolved from the real Preview
+  # identity, target build (nothing published), effective Wrangler config audit, exact D1 binding == the plan's D1.
+  # -------------------------------------------------------------------------
+  preflight:
+    name: Preflight
+    if: inputs.stage == 'preflight'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      deployments: read # Preview identity guard reads the ledger owner (no ledger entry is written here)
+    outputs:
+      d1_id: ${{ steps.engine.outputs.d1_id }}
+      target_url: ${{ steps.engine.outputs.target_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch delivery tooling
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: engine
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: ${{ inputs.target }}
+          kind: ${{ inputs.kind }}
+          stage: preflight
+          inputs_json: ${{ inputs.inputs_json }}
+          d1_expected_id: ${{ inputs.d1_expected_id }}
+          preview_secrets: ${{ inputs.target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
+
+  # -------------------------------------------------------------------------
+  # Migration — applies the pending migrations of the physical D1 THIS call owns (a D1 shared by Native Branch and Native Dev is
+  # migrated once, by the Native Branch call). Runs only after the preflight of EVERY enabled target succeeded (peers), so no
+  # schema change happens while any target that would run against that D1 is still unvalidated. Never rolled back.
+  # -------------------------------------------------------------------------
+  migrate:
+    name: Migration
+    if: inputs.stage == 'migrate'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    environment:
+      name: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      deployments: read
+    outputs:
+      migration_json: ${{ toJSON(steps.engine.outputs) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Every enabled target passed its preflight (fail closed before any mutation)
+        env:
+          KINDS: ${{ inputs.kinds }}
+          PEERS: ${{ inputs.peers }}
+        run: |
+          bad=0
+          for k in $(printf '%s' "$KINDS" | jq -r '.[]'); do
+            r="$(printf '%s' "$PEERS" | jq -r --arg k "$k" '.[$k] // "missing"')"
+            [ "$r" = success ] || { echo "::error::preflight of $k finished '$r'; no D1 is migrated while an enabled target is unvalidated"; bad=1; }
+          done
+          [ "$bad" = 0 ] || exit 1
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch delivery tooling
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: engine
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: ${{ inputs.target }}
+          kind: ${{ inputs.kind }}
+          stage: migrate
+          inputs_json: ${{ inputs.inputs_json }}
+          d1_expected_id: ${{ inputs.d1_expected_id }}
+          preview_secrets: ${{ inputs.target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
+
+  # -------------------------------------------------------------------------
+  # Deploy — target-specific Build + Publish (stage publish) of THIS kind: its own URL (resolved before the build), its own build
+  # env, the audited artifact only. Depends on the migration of ITS OWN D1 (its own call, or the shared-D1 owner's) and on nothing
+  # of any other kind. A green Deploy means "published", not "verified".
+  # -------------------------------------------------------------------------
+  deploy:
+    name: Deploy
+    if: inputs.stage == 'deliver' && inputs.phase != 'verify'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    concurrency:
+      group: ${{ inputs.deploy_group }}
+      cancel-in-progress: false
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.engine.outputs.url }}
+    permissions:
+      contents: read
+      deployments: write
+      pull-requests: write
+    outputs:
+      handoff: ${{ toJSON(steps.engine.outputs) }}
+      migration_used: ${{ steps.dep.outputs.migration_used }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - id: dep
+        name: The migration of this kind's D1 succeeded (or none is needed)
+        env:
+          D1_MIGRATIONS: ${{ inputs.d1_migrations }}
+          KIND: ${{ inputs.kind }}
+          OWNER: ${{ inputs.d1_owner_kind }}
+          EXPECT: ${{ inputs.d1_expected_id }}
+          OWN_RESULT: ${{ inputs.own_migration_result }}
+          OWN_JSON: ${{ inputs.own_migration_json }}
+          OWNER_RESULT: ${{ inputs.owner_migration_result }}
+          OWNER_JSON: ${{ inputs.owner_migration_json }}
+        run: |
+          [ "$D1_MIGRATIONS" = true ] || { echo "migration_used={}" >> "$GITHUB_OUTPUT"; exit 0; }
+          if [ "$OWNER" = "$KIND" ]; then R="$OWN_RESULT"; J="$OWN_JSON"
+          elif [ "$OWNER" = native-branch ]; then R="$OWNER_RESULT"; J="$OWNER_JSON"
+          else echo "::error::no migration owner is planned for $KIND (owner '${OWNER:-none}'); nothing is published"; exit 1; fi
+          [ "$R" = success ] || { echo "::error::the D1 migration $KIND depends on (owner ${OWNER}) finished '${R:-missing}'; nothing is published"; exit 1; }
+          J="$(printf '%s' "$J" | jq -c 'if type == "object" then . else {} end' 2>/dev/null || echo '{}')"
+          if [ "$(printf '%s' "$J" | jq -r '.stale // "false"')" != true ]; then
+            [ "$(printf '%s' "$J" | jq -r '.migration // ""')" = applied ] || { echo "::error::the migration result for $KIND reports no applied migration; nothing is published"; exit 1; }
+            [ "$(printf '%s' "$J" | jq -r '.kind // ""')" = "$OWNER" ] || { echo "::error::the migration result belongs to another kind than the planned owner $OWNER; refusing"; exit 1; }
+            [ "$(printf '%s' "$J" | jq -r '.d1_id // ""')" = "$EXPECT" ] || { echo "::error::the migration result is for another D1 than $KIND's ($EXPECT); refusing"; exit 1; }
+          fi
+          echo "migration_used=$J" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch delivery tooling
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: engine
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: ${{ inputs.target }}
+          kind: ${{ inputs.kind }}
+          stage: publish
+          inputs_json: ${{ inputs.inputs_json }}
+          d1_expected_id: ${{ inputs.d1_expected_id }}
+          preview_secrets: ${{ inputs.target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
+
+  # -------------------------------------------------------------------------
+  # Smoke — verifies THIS kind's deployment only (stage verify, no Cloudflare credentials): smoke_mode full | basic | skip.
+  # Starts the moment THIS kind's deploy is done. A kind that published nothing (stale / superseded / failed) has nothing to
+  # verify: smoke_status=none and no verification is claimed.
+  # -------------------------------------------------------------------------
+  smoke:
+    name: Smoke Tests
+    needs: [deploy]
+    if: always() && inputs.stage == 'deliver' && inputs.phase != 'deploy'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      deployments: write
+      pull-requests: write
+    outputs:
+      smoke_json: ${{ toJSON(steps.engine.outputs) }}
+      smoke_status: ${{ steps.res.outputs.status }}
+      handoff: ${{ inputs.phase == 'verify' && inputs.handoff_json || '' }}
+      migration_used: ${{ inputs.phase == 'verify' && inputs.migration_json_in || '' }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HANDOFF: ${{ inputs.phase == 'verify' && inputs.handoff_json || needs.deploy.outputs.handoff }}
+    steps:
+      - id: go
+        name: Did this run publish ${{ inputs.kind }}?
+        run: |
+          h="${HANDOFF:-}"; [ -n "$h" ] || h='{}'
+          echo "go=$(printf '%s' "$h" | jq -r '.published == "true"')" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v6
+        if: steps.go.outputs.go == 'true'
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Fetch delivery tooling
+        if: steps.go.outputs.go == 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: engine
+        if: steps.go.outputs.go == 'true'
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: ${{ inputs.target }}
+          kind: ${{ inputs.kind }}
+          stage: verify
+          inputs_json: ${{ inputs.inputs_json }}
+          call_inputs_json: ${{ inputs.call_inputs_json }}
+          d1_expected_id: ${{ inputs.d1_expected_id }}
+          preview_secrets: ${{ inputs.target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
+          smoke_username: ${{ secrets.SMOKE_USERNAME }}
+          smoke_password: ${{ secrets.SMOKE_PASSWORD }}
+          deploy_outputs: ${{ env.HANDOFF }}
+          upstream_gate: ${{ inputs.phase == 'verify' && inputs.upstream_gate || '' }}
+      - id: res
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          GO: ${{ steps.go.outputs.go }}
+        run: echo "status=$([ "$GO" = true ] && echo "$JOB_STATUS" || echo none)" >> "$GITHUB_OUTPUT"
+      # Failure-only evidence with short retention; never a delivery dependency.
+      - name: Upload smoke report (failure only)
+        uses: actions/upload-artifact@v7
+        if: failure()
+        continue-on-error: true
+        with:
+          name: smoke-report-${{ inputs.kind }}-${{ github.run_id }}
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # Revert on Verify Failure — runs ONLY for THIS kind, ONLY when its Smoke FAILED on a deployment this run published (never
+  # after a blocked cross-service gate, never after smoke_mode=skip). Another kind's failure or success cannot reach it.
+  #   production : policy `automatic` only; fail closed (recorded previous version, additive D1 change, failed version still live)
+  #   other kinds: redeploy the last known-good deployment of THAT target, unless a newer deployment of it has started
+  # The job is green ONLY when the previous deployment was restored and content-verified. D1 is never rolled back.
+  # -------------------------------------------------------------------------
+  rollback:
+    name: Revert on Verify Failure
+    needs: [deploy, smoke]
+    if: always() && inputs.stage == 'deliver' && inputs.phase != 'deploy' && needs.smoke.outputs.smoke_status == 'failure'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    concurrency:
+      group: ${{ inputs.rollback_group }}
+      cancel-in-progress: false
+    environment:
+      name: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      deployments: write
+      pull-requests: write
+    outputs:
+      rollback_result: ${{ steps.engine.outputs.rollback_result }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      HANDOFF: ${{ inputs.phase == 'verify' && inputs.handoff_json || needs.deploy.outputs.handoff }}
+      MIGJSON: ${{ inputs.phase == 'verify' && inputs.migration_json_in || needs.deploy.outputs.migration_used }}
+      SMOKEJSON: ${{ needs.smoke.outputs.smoke_json }}
+    steps:
+      - id: go
+        name: Did the Smoke of ${{ inputs.kind }} fail on a deployment this run published?
+        env:
+          POLICY_OK: ${{ inputs.kind != 'production' || fromJSON(inputs.inputs_json).production_rollback_policy == 'automatic' }}
+        run: |
+          h="${HANDOFF:-}"; [ -n "$h" ] || h='{}'; k="${SMOKEJSON:-}"; [ -n "$k" ] || k='{}'
+          pub="$(printf '%s' "$h" | jq -r '.published == "true"')"
+          blocked="$(printf '%s' "$k" | jq -r '.gate_blocked == "true"')"
+          if [ "$pub" = true ] && [ "$blocked" != true ] && [ "$POLICY_OK" = true ]; then echo "go=true" >> "$GITHUB_OUTPUT"; else echo "go=false" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/checkout@v6
+        if: steps.go.outputs.go == 'true'
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch delivery tooling
+        if: steps.go.outputs.go == 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - id: engine
+        if: steps.go.outputs.go == 'true'
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: ${{ inputs.target }}
+          kind: ${{ inputs.kind }}
+          stage: rollback
+          inputs_json: ${{ inputs.inputs_json }}
+          call_inputs_json: ${{ inputs.call_inputs_json }}
+          d1_expected_id: ${{ inputs.d1_expected_id }}
+          preview_secrets: ${{ inputs.target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
+          smoke_username: ${{ secrets.SMOKE_USERNAME }}
+          smoke_password: ${{ secrets.SMOKE_PASSWORD }}
+          deploy_outputs: ${{ env.HANDOFF }}
+          migration_outputs: ${{ env.MIGJSON }}
+          smoke_outputs: ${{ env.SMOKEJSON }}

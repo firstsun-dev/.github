@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/_cf-worker-v2.yml'
+      - '.github/workflows/_cf-worker-delivery.yml'
       - '.github/workflows/cf-worker-v2-ci.yml'
       - '.github/actionlint.yaml'
       - 'actions/cf-preview/**'
@@ -16,6 +17,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/_cf-worker-v2.yml'
+      - '.github/workflows/_cf-worker-delivery.yml'
       - '.github/actionlint.yaml'
       - 'actions/cf-preview/**'
       - 'actions/cf-preview-gc/**'
@@ -52,7 +54,7 @@ jobs:
         run: scripts/cf-preview/test-migrate.sh
       - name: Smoke verification, fail-closed (stub curl)
         run: scripts/cf-preview/test-smoke.sh
-      - name: Execute the real Gate -> Plan -> Migration -> Deploy -> Smoke -> Rollback chain as matrix legs (each leg in a fresh workspace) for every delivery kind with the composite engine and stubs (stale runs, fail-closed rollback, D1 deduplication / isolation, smoke modes, Native Dev, recovery, env-override protection, Release gate)
+      - name: Execute the real Gate -> Plan -> Preflight -> Migration -> Delivery (Deploy -> Smoke -> Rollback) chain as per-kind reusable-workflow calls (each job in a fresh workspace) for every delivery kind with the composite engine and stubs (stale runs, fail-closed rollback, D1 deduplication / isolation, smoke modes, Native Dev, recovery, env-override protection, Release gate)
         run: python3 scripts/cf-preview/test-jobs.py
       - name: Env import is data, not code
         run: scripts/cf-preview/test-parse-env.sh
@@ -69,4 +71,4 @@ jobs:
       - name: actionlint
         run: |
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
-          ./actionlint -color .github/workflows/_cf-worker-v2.yml .github/workflows/_cf-worker-preview-gc.yml .github/workflows/cf-worker-v2-ci.yml
+          ./actionlint -color .github/workflows/_cf-worker-v2.yml .github/workflows/_cf-worker-delivery.yml .github/workflows/_cf-worker-preview-gc.yml .github/workflows/cf-worker-v2-ci.yml

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DELIVERY_KINDS, resolveDeliveryTargets, resolveSmokeMode, parseSmokeOverrides, planMigrations, branchPreviewIdentity, ENGINE_TARGET,
+  canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins,
 } from '../../actions/cf-preview/delivery.mjs';
 
 const base = { event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-preview', previewOnPush: true };
@@ -121,4 +122,78 @@ test('build env URL isolation: another target URL in this build env is reported'
 test('sameUrl ignores case and trailing slashes only', () => {
   assert.ok(sameUrl('https://A.example.com/', 'https://a.example.com'));
   assert.ok(!sameUrl('https://a.example.com/x', 'https://a.example.com'));
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// P1-B: the canonical URL is resolved BEFORE the build from the real Preview identity (Cloudflare documents
+// `<preview-name>-<worker-name>.<subdomain>.workers.dev`; the Workers subdomain API reports the host part as preview_url_suffix).
+// ---------------------------------------------------------------------------------------------------------------------
+test('previewUrlFromSuffix: https://<preview-name><suffix>, never a guessed format', () => {
+  assert.equal(previewUrlFromSuffix('feat-x', '-blog.acme.workers.dev'), 'https://feat-x-blog.acme.workers.dev');
+  assert.equal(previewUrlFromSuffix('dev', '-blog.acme.workers.dev'), 'https://dev-blog.acme.workers.dev');
+  assert.equal(previewUrlFromSuffix('dev', '.app.example.com'), 'https://dev.app.example.com');
+  assert.throws(() => previewUrlFromSuffix('Feat_X', '-w.s.workers.dev'), /unsafe Preview name/);
+  for (const bad of ['', 'blog.acme.workers.dev', '-', '-a/b', '-a b.workers.dev', 'https://x.dev']) assert.throws(() => previewUrlFromSuffix('x', bad), /suffix/);
+  assert.throws(() => previewUrlFromSuffix('a'.repeat(40), '-' + 'w'.repeat(30) + '.s.workers.dev'), /63/);
+});
+test('canonicalOrigin: only a bare https origin is a valid app URL', () => {
+  assert.equal(canonicalOrigin('https://dev-blog.acme.workers.dev/'), 'https://dev-blog.acme.workers.dev');
+  for (const bad of ['http://x.dev', 'https://x.dev/path', 'https://x.dev?a=1', 'https://u:p@x.dev', 'nope']) assert.throws(() => canonicalOrigin(bad));
+});
+test('resolveCanonicalUrl: derived from Cloudflare, cross-checked with the declared URL, fails closed when unresolvable', () => {
+  const api = '-blog.acme.workers.dev';
+  assert.deepEqual(resolveCanonicalUrl({ previewName: 'feat-x', apiSuffix: api }), { url: 'https://feat-x-blog.acme.workers.dev', source: 'cloudflare' });
+  assert.equal(resolveCanonicalUrl({ previewName: 'dev', apiSuffix: api, explicit: 'https://dev-blog.acme.workers.dev' }).source, 'declared+derived');
+  assert.equal(resolveCanonicalUrl({ previewName: 'dev', suffix: '.dev.example.com' }).url, 'https://dev.dev.example.com');
+  assert.equal(resolveCanonicalUrl({ previewName: 'dev', explicit: 'https://dev.example.com' }).url, 'https://dev.example.com');
+  // incorrect URL: the declared one contradicts what Cloudflare will serve -> the build must not start
+  assert.throws(() => resolveCanonicalUrl({ previewName: 'dev', apiSuffix: api, explicit: 'https://dev-other.acme.workers.dev' }), /differs from the URL Cloudflare will serve/);
+  assert.throws(() => resolveCanonicalUrl({ previewName: 'dev', apiSuffix: api, explicit: 'https://app.example.com' }), /differs/);
+  // two suffix sources must agree
+  assert.throws(() => resolveCanonicalUrl({ previewName: 'dev', suffix: '-a.b.workers.dev', apiSuffix: api }), /contradicts/);
+  // missing URL: nothing declared and Cloudflare reported no suffix -> unresolved (never guessed)
+  assert.throws(() => resolveCanonicalUrl({ previewName: 'feat-x' }), /cannot resolve the canonical URL/);
+  assert.throws(() => resolveCanonicalUrl({ previewName: 'feat-x', apiSuffix: '' , explicit: '' }), /before the build/);
+  assert.throws(() => resolveCanonicalUrl({ previewName: 'dev', explicit: 'http://dev.example.com' }), /https/);
+});
+test('checkBuildEnvOrigins: this application\'s own callback / redirect / origin variables must be same-origin with the target', () => {
+  const url = 'https://dev-id.acme.workers.dev';
+  const ok = 'PUBLIC_APP_URL=https://dev-id.acme.workers.dev\nOAUTH_CALLBACK_URL=https://dev-id.acme.workers.dev/auth/callback\nIDP_URL=https://idp.example.com\nPUBLIC_API=https://api.example.com';
+  assert.deepEqual(checkBuildEnvOrigins(ok, url), []);
+  const bad = checkBuildEnvOrigins('OAUTH_CALLBACK_URL=https://id.example.com/cb\nPUBLIC_APP_ORIGIN=https://feat-x-id.acme.workers.dev\nOIDC_REDIRECT_URI=https://dev-id.acme.workers.dev/cb', url);
+  assert.equal(bad.length, 2);
+  assert.match(bad[0], /OAUTH_CALLBACK_URL=https:\/\/id\.example\.com/);
+  assert.match(bad[1], /PUBLIC_APP_ORIGIN/);
+  assert.deepEqual(checkBuildEnvOrigins('A=1\n# c\n\nSITE_URL=notaurl', url), []);
+  assert.deepEqual(checkBuildEnvOrigins('OAUTH_CALLBACK_URL=https://x.example.com', ''), []);
+});
+test('Branch and Native Dev never share a build URL: each resolves its own Preview name', () => {
+  const api = '-blog.acme.workers.dev';
+  const a = resolveCanonicalUrl({ previewName: 'feat-x', apiSuffix: api }).url;
+  const b = resolveCanonicalUrl({ previewName: 'dev', apiSuffix: api }).url;
+  assert.notEqual(a, b);
+  assert.deepEqual(checkBuildEnvOrigins('PUBLIC_APP_URL=' + a, b).length, 1);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// P2-B: migration plan - one execution per physical D1; the owner is the first member; Production D1 is never shared.
+// ---------------------------------------------------------------------------------------------------------------------
+test('planMigrations: Branch + Native Dev on one preview D1 -> ONE group (owner native-branch); distinct D1s stay separate', () => {
+  const cfg = { name: 'app', d1_databases: [{ binding: 'DB', database_name: 'prod', database_id: 'PROD' }],
+    previews: { d1_databases: [{ binding: 'DB', database_name: 'prev', database_id: 'PREV' }] },
+    env: { dev: { name: 'app-dev', d1_databases: [{ binding: 'DB', database_name: 'devdb', database_id: 'DEV' }] } } };
+  const g = planMigrations(cfg, ['native-branch', 'native-dev'], { accountId: 'A' });
+  assert.equal(g.length, 1);
+  assert.deepEqual(g[0].members, ['native-branch', 'native-dev']);
+  assert.equal(g[0].owner, 'native-branch');
+  assert.equal(g[0].databaseId, 'PREV');
+  const h = planMigrations(cfg, ['native-branch', 'persistent-dev'], { accountId: 'A' });
+  assert.equal(h.length, 2);
+  assert.deepEqual(h.map((x) => x.owner).sort(), ['native-branch', 'persistent-dev']);
+  assert.deepEqual(planMigrations(cfg, ['production'], { accountId: 'A' })[0].members, ['production']);
+});
+test('planMigrations: a Production D1 exposed to Preview/Dev is refused', () => {
+  const cfg = { name: 'app', d1_databases: [{ binding: 'DB', database_name: 'prod', database_id: 'PROD' }],
+    previews: { d1_databases: [{ binding: 'DB', database_name: 'prod', database_id: 'PROD' }] } };
+  assert.throws(() => planMigrations(cfg, ['native-branch'], { accountId: 'A' }), /Production D1|production/i);
 });

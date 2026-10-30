@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Executes the REAL steps of the Migration, Deploy, Smoke Tests, Rollback, Shared Dev and persistent-Dev jobs —
-including the composite delivery engine (actions/cf-deploy -> actions/cf-preview/engine.sh) — against stub
-gh/pnpm/curl, and feeds the results of each job into the next job's `if:` and `needs.*.outputs`. EVERY job runs in a
-FRESH workspace (a different runner): anything the chain needs must travel through job outputs, never through local
-files. Covers what the static contract test cannot: Migration runs only after build + audit and before Deploy, stale
-runs never reach Smoke/Release, a failed migration or smoke never publishes/verifies, the Rollback job is conditional
-and fail-closed, application env cannot redirect the target, nothing remote is touched before the guards pass.
-Mocked: no Cloudflare, no GitHub. See docs/cf-worker-v2-refactor.md for what this does NOT prove."""
+"""Executes the REAL steps of the per-kind Preflight, Migration and Delivery calls (the internal reusable workflow
+_cf-worker-delivery.yml: deploy -> smoke -> rollback), the Delivery plan, and the persistent-Dev job - including the
+composite delivery engine (actions/cf-deploy -> actions/cf-preview/engine.sh) - against stub gh/pnpm/curl, and feeds each job's
+result into the next job's `if:` and `needs.*.outputs`. EVERY job runs in a FRESH workspace (a different runner): anything the
+chain needs must travel through job outputs, never through local files. A reusable-workflow CALL is emulated like GitHub does:
+its `with:` / `secrets:` are rendered against the caller, the called jobs run with `inputs` = those values, and the called
+workflow's `outputs` are rendered from its jobs. Covers what the static contract test cannot: Preflight and Migration before
+Deploy, per-kind independence, URL pre-resolution, stale runs never reach Smoke/Release, a failed migration or smoke never
+publishes/verifies, the Rollback job is conditional and fail-closed, application env cannot redirect the target, nothing remote is
+touched before the guards pass. Mocked: no Cloudflare, no GitHub. See docs/cf-worker-v2-unified-delivery.md for what this does
+NOT prove (the real-runner evidence is recorded there)."""
 import json
 import os
 import sys
@@ -14,16 +17,20 @@ import sys
 import yaml
 
 sys.path.insert(0, "scripts/cf-preview")
-from ghexpr import Ctx, ev, render, strip_expr  # noqa: E402
+from ghexpr import Ctx, ev, render  # noqa: E402
 from jobrunner import APP_TOML, make_workspace, run_job  # noqa: E402
 
 WF = ".github/workflows/_cf-worker-v2.yml"
+DWF = ".github/workflows/_cf-worker-delivery.yml"
 doc = yaml.safe_load(open(WF))
+ddoc = yaml.safe_load(open(DWF))
 INPUT_DEFAULTS = {k: v.get("default", "") for k, v in doc[True]["workflow_call"]["inputs"].items()}
+DINPUT_DEFAULTS = {k: v.get("default", "") for k, v in ddoc[True]["workflow_call"]["inputs"].items()}
 SHA, OTHER = "abcdef1234567890", "ffffffffffffffff"
 GOOD = "1111111222222233"
 MAIN, FEAT = "refs/heads/main", "refs/heads/feat/x"
 fail = 0
+SUFFIX = "-app.example.workers.dev"  # test double of the Cloudflare-reported preview_url_suffix (the wrangler stub prints <name><suffix>)
 
 
 def check(ok, msg):
@@ -34,11 +41,12 @@ def check(ok, msg):
 
 
 def ctx(ref, inputs=None, secrets=None, needs=None, event="push"):
-    # preview_host_check off: the job tests must not call the real Cloudflare API (test-deploy.sh covers it).
-    i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", tools_ref="x", preview_host_check=False)
+    # preview_host_check off: the job tests must not call the real Cloudflare API (test-deploy.sh covers it); the canonical
+    # Preview URL is derived from preview_url_suffix exactly like the real one is derived from Cloudflare's preview_url_suffix.
+    i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", tools_ref="x", preview_host_check=False, preview_url_suffix=SUFFIX)
     i.update(inputs or {})
     return Ctx({"github": {"event_name": event, "ref": ref, "ref_type": "branch", "ref_name": ref.split("/", 2)[-1],
-                           "repository": "o/r", "sha": SHA, "event": {"head_commit": {"message": "feat: x\nbody"}}},
+                           "repository": "o/r", "sha": SHA, "run_id": "1", "event": {"head_commit": {"message": "feat: x\nbody"}}},
                 "inputs": i, "needs": needs or {}}, secrets or {})
 
 
@@ -46,84 +54,94 @@ PROD_SECRETS = {"CLOUDFLARE_API_TOKEN": "PT", "CLOUDFLARE_ACCOUNT_ID": "PA"}
 PREV_SECRETS = PROD_SECRETS  # Preview uses the account credentials too (the dedicated Preview pair was removed)
 D1 = {"d1_migrations": True}
 
-
-CHAIN = ("gate", "plan", "migration", "deploy", "smoke", "rollback")
-KEYED = {"production": "production", "native-branch": "native_branch", "native-dev": "native_dev", "persistent-dev": "persistent_dev"}
+KINDS = ("production", "native-branch", "native-dev", "persistent-dev")
+KEYED = {k: k.replace("-", "_") for k in KINDS}
+TARGET_OF = {"production": "prod", "native-branch": "preview", "native-dev": "preview", "persistent-dev": "dev"}
+INNER = ("preflight", "migrate", "deploy", "smoke", "rollback")
+SKIPPED = {"result": "skipped", "outputs": {}}
 
 
 def _j(text):
     return json.loads(text) if text else {}
 
 
-def _legacy(res):
-    """Flatten the keyed per-kind job outputs of the matrix jobs into the single-delivery shape the scenarios below assert on
-    (the primary delivery is Production, else the Native Branch Preview, else whichever kind exists)."""
-    dep, sm, mg, rb = res["deploy"]["outputs"], res["smoke"]["outputs"], res["migration"]["outputs"], res["rollback"]["outputs"]
-    def pick(d, prefix):
-        for k in ("production", "native-branch", "native-dev", "persistent-dev"):
-            if d.get(f"{prefix}_{KEYED[k]}"):
-                return k, d[f"{prefix}_{KEYED[k]}"]
-        return "", ""
-    kd, hd = pick(dep, "h")
-    ks, hs = pick(sm, "s")
-    km, hm = pick(mg, "mj")
-    kr, hr = pick(rb, "rb")
-    d = dict(_j(hd), target={"production": "prod", "native-branch": "preview", "native-dev": "preview", "persistent-dev": "dev"}.get(kd, ""))
-    s_ = _j(hs)
-    legacy = {
-        "gate": res["gate"], "plan": res["plan"],
-        "migration": {"result": res["migration"]["result"], "outputs": _j(hm)},
-        "deploy": {"result": res["deploy"]["result"], "outputs": d},
-        "smoke": {"result": "skipped" if sm.get(f"x_{KEYED.get(ks, '')}") == "none" and ks else res["smoke"]["result"], "outputs": s_},
-        "rollback": {"result": res["rollback"]["result"] if hr else "skipped", "outputs": {"rollback_result": hr}},
-    }
-    return legacy
+def _jobenv(name, kind, env, env_by_job):
+    senv = {"STUB_TIPS": SHA}
+    senv.update(env or {})
+    ebj = env_by_job or {}
+    alias = "migration" if name == "migrate" else name
+    for key in (name, alias, f"{name}:{kind}", f"{alias}:{kind}"):
+        senv.update(ebj.get(key, {}))
+    # STUB_PROBES is a sequence ("first;second;..."): Smoke consumes the first answer, the Rollback job (another runner, fresh
+    # counter) the rest - or the last answer again when there is none.
+    if ";" in (env or {}).get("STUB_PROBES", "") and not any("STUB_PROBES" in ebj.get(k, {}) for k in (name, alias, f"{name}:{kind}")):
+        first, rest = env["STUB_PROBES"].split(";", 1)
+        senv["STUB_PROBES"] = first if name == "smoke" else rest
+    if name == "rollback":
+        senv.setdefault("STUB_ACTIVE", "new-2")  # the live Production version after the Deploy job published new-2
+    return senv
 
 
-def _run_jobs(names, ref, inputs, secrets, base_needs, event, env, toml, env_by_job, files, state=None):
-    """Executes the named jobs in order. `strategy.matrix` legs run one by one (fresh workspace each) and their outputs are merged
-    like GitHub merges matrix outputs. Returns (res, logs, summaries, steps, workspaces)."""
-    res, logs, summ, steps, wss = {}, [], [], [], {}
+def call_workflow(job, c, ctl):
+    """Emulates `uses: ./.github/workflows/_cf-worker-delivery.yml` of one parent job. Returns the call record
+    {result, outputs, jobs: {inner: {result, outputs}}} (outputs = the called workflow's rendered `outputs`)."""
+    w = {k: render(v, c) for k, v in job["with"].items()}
+    dinputs = dict(DINPUT_DEFAULTS)
+    dinputs.update(w)
+    sec = {k: render(v, c) for k, v in job.get("secrets", {}).items()}
+    kind = w["kind"]
+    dc = Ctx({"github": c["github"], "inputs": dinputs, "needs": {}, "jobs": {}}, sec)
+    inner, logs, summ, steps = {}, [], [], []
+    wss = ctl["wss"]
+    for name in INNER:
+        j = ddoc["jobs"][name]
+        dc["needs"] = {n: inner.get(n, SKIPPED) for n in (j.get("needs") or [])}
+        if not ev(j["if"], dc):
+            inner[name] = SKIPPED
+            continue
+        ws = make_workspace(ctl["toml"], ctl["files"])
+        r = run_job(ddoc, name, dc, ws, _jobenv(name, kind, ctl["env"], ctl["env_by_job"]),
+                    verbose=bool(os.environ.get("CHAIN_VERBOSE") and name in os.environ["CHAIN_VERBOSE"].split(",")))
+        inner[name] = {"result": r["result"], "outputs": r["outputs"]}
+        logs.append(r["log"]); summ.append(r["summary"]); steps.extend(r["steps"])
+        key = "migration" if name == "migrate" else name
+        wss[key] = ws
+        wss[f"{key}:{kind}"] = ws
+    dc["jobs"] = inner
+    outs = {k: render(v["value"], dc) for k, v in ddoc[True]["workflow_call"]["outputs"].items()}
+    ran = [v["result"] for v in inner.values() if v["result"] != "skipped"]
+    result = "failure" if "failure" in ran else ("success" if ran else "skipped")
+    return {"result": result, "outputs": outs, "jobs": inner}, logs, summ, steps
+
+
+CHAIN = ("gate", "plan") + tuple(f"preflight_{KEYED[k]}" for k in KINDS) + tuple(f"migration_{KEYED[k]}" for k in KINDS) + tuple(f"delivery_{KEYED[k]}" for k in KINDS)
+
+
+def _run_jobs(names, ref, inputs, secrets, base_needs, event, env, toml, env_by_job, files, order=None):
+    """Executes the named parent jobs in order. Plain jobs run in a fresh workspace; `uses:` jobs are emulated reusable-workflow
+    calls. Returns (res, logs, summaries, steps, workspaces); res[name] = {result, outputs, jobs?}."""
+    res, logs, summ, steps = {}, [], [], []
+    ctl = {"wss": {}, "toml": toml, "files": files, "env": env, "env_by_job": env_by_job}
     for name in names:
         job = doc["jobs"][name]
         c = ctx(ref, inputs, secrets, dict(base_needs, **res), event)
         if not ev(job["if"], c):
             res[name] = {"result": "skipped", "outputs": {}}
             continue
-        if "strategy" in job:
-            legs = list(dict(ev(strip_expr(job["strategy"]["matrix"]), c)).get("include", []))
-            if not legs:
-                res[name] = {"result": "skipped", "outputs": {}}
-                continue
-        else:
-            legs = [None]
-        merged, results = {}, []
-        for leg in legs:
-            lc = ctx(ref, inputs, secrets, dict(base_needs, **res), event)
-            if leg is not None:
-                lc["matrix"] = leg
-            ws = make_workspace(toml, files)
-            senv = {"STUB_TIPS": SHA}
-            senv.update(env or {})
-            senv.update((env_by_job or {}).get(name, {}))
-            # STUB_PROBES is a sequence ("first;second;..."): Smoke Tests consume the first answer, the Rollback job (another
-            # runner, fresh counter) the rest - or the last answer again when there is none.
-            if ";" in (env or {}).get("STUB_PROBES", "") and "STUB_PROBES" not in (env_by_job or {}).get(name, {}):
-                first, rest = env["STUB_PROBES"].split(";", 1)
-                senv["STUB_PROBES"] = first if name == "smoke" else rest
-            if name == "rollback":
-                senv.setdefault("STUB_ACTIVE", "new-2")  # the live Production version after the Deploy job published new-2
-            r = run_job(doc, name, lc, ws, senv, verbose=bool(os.environ.get("CHAIN_VERBOSE") and name in os.environ["CHAIN_VERBOSE"].split(",")))
-            results.append(r["result"])
-            for k, v in r["outputs"].items():
-                if v != "" or k not in merged:
-                    merged[k] = v
-            logs.append(r["log"]); summ.append(r["summary"]); steps.extend(r["steps"])
-            wss[name] = ws
-            if leg is not None:
-                wss[f"{name}:{leg['kind']}"] = ws
-        res[name] = {"result": "failure" if "failure" in results else "success", "outputs": merged}
-    return res, logs, summ, steps, wss
+        if "uses" in job:
+            rec, lg, sm, st = call_workflow(job, c, ctl)
+            res[name] = rec
+            logs.extend(lg); summ.extend(sm); steps.extend(st)
+            continue
+        ws = make_workspace(toml, files)
+        senv = {"STUB_TIPS": SHA}
+        senv.update(env or {})
+        senv.update((env_by_job or {}).get(name, {}))
+        r = run_job(doc, name, c, ws, senv, verbose=bool(os.environ.get("CHAIN_VERBOSE") and name in os.environ["CHAIN_VERBOSE"].split(",")))
+        res[name] = {"result": r["result"], "outputs": r["outputs"]}
+        logs.append(r["log"]); summ.append(r["summary"]); steps.extend(r["steps"])
+        ctl["wss"][name] = ws
+    return res, logs, summ, steps, ctl["wss"]
 
 
 def _validation_needs(i, needs_over):
@@ -134,26 +152,71 @@ def _validation_needs(i, needs_over):
     return needs
 
 
+def _inner(res, kind, job):
+    rec = res.get(f"delivery_{KEYED[kind]}")
+    return (rec or {}).get("jobs", {}).get(job, SKIPPED)
+
+
+def _compat(res):
+    """The legacy single-delivery view the scenarios assert on, plus the keyed view of every kind. Built from the per-kind call records
+    (each kind's own record - never a merge of shared keys)."""
+    deliv = {k: res.get(f"delivery_{KEYED[k]}") for k in KINDS}
+    ran = [k for k in KINDS if deliv[k] and deliv[k]["result"] != "skipped"]
+    primary = ran[0] if ran else ""
+    raw = {"deploy": {"outputs": {}}, "smoke": {"outputs": {}}, "rollback": {"outputs": {}}, "migration": {"outputs": {}}}
+    for k in KINDS:
+        d = deliv[k]
+        if not d:
+            continue
+        kk = KEYED[k]
+        o = d["outputs"]
+        raw["deploy"]["outputs"][f"h_{kk}"] = o.get("handoff", "")
+        raw["smoke"]["outputs"][f"s_{kk}"] = o.get("smoke_json", "") if o.get("smoke_status", "") != "" else ""
+        raw["smoke"]["outputs"][f"x_{kk}"] = o.get("smoke_status", "")
+        raw["rollback"]["outputs"][f"rb_{kk}"] = o.get("rollback_result", "")
+        dj = d.get("jobs", {}).get("deploy", SKIPPED)
+        raw["migration"]["outputs"][f"mj_{kk}"] = (dj["outputs"].get("migration_used") or "") if dj["result"] != "skipped" else ""
+    raw["plan"] = res.get("plan", SKIPPED)
+    raw["gate"] = res.get("gate", SKIPPED)
+    migs = [res[f"migration_{KEYED[k]}"] for k in KINDS if f"migration_{KEYED[k]}" in res and res[f"migration_{KEYED[k]}"]["result"] != "skipped"]
+    pfs = [res[f"preflight_{KEYED[k]}"] for k in KINDS if f"preflight_{KEYED[k]}" in res and res[f"preflight_{KEYED[k]}"]["result"] != "skipped"]
+    mres = [m["result"] for m in migs + pfs]
+    mig_json = _j(migs[0]["outputs"].get("migration_json", "")) if migs else {}
+    p = primary
+    dep = _inner(res, p, "deploy") if p else SKIPPED
+    smk = _inner(res, p, "smoke") if p else SKIPPED
+    rbk = _inner(res, p, "rollback") if p else SKIPPED
+    handoff = _j(deliv[p]["outputs"].get("handoff", "")) if p else {}
+    smoke_o = _j(deliv[p]["outputs"].get("smoke_json", "")) if p else {}
+    none_smoke = bool(p) and deliv[p]["outputs"].get("smoke_status", "") == "none"
+    legacy = {
+        "gate": res.get("gate", SKIPPED), "plan": res.get("plan", SKIPPED),
+        "migration": {"result": "failure" if "failure" in mres else ("success" if mres else "skipped"), "outputs": mig_json},
+        "deploy": {"result": dep["result"], "outputs": dict(handoff, target=TARGET_OF.get(p, ""))},
+        "smoke": {"result": "skipped" if (none_smoke or smk["result"] == "skipped") else smk["result"], "outputs": smoke_o},
+        "rollback": {"result": rbk["result"], "outputs": {"rollback_result": deliv[p]["outputs"].get("rollback_result", "") if p else ""}},
+    }
+    return legacy, raw, primary
+
+
 def _shape(res, logs, summ, steps, wss, toml):
-    for j in ("gate", "plan", "migration", "deploy", "smoke", "rollback"):
-        res.setdefault(j, {"result": "skipped", "outputs": {}})
-    leg_ = _legacy(res)
-    dep, sm, mg = leg_["deploy"]["outputs"], leg_["smoke"]["outputs"], leg_["migration"]["outputs"]
+    legacy, raw, primary = _compat(res)
+    dep, sm, mg = legacy["deploy"]["outputs"], legacy["smoke"]["outputs"], legacy["migration"]["outputs"]
     out = {"url": dep.get("url", ""), "published_url": dep.get("url", ""), "target": dep.get("target", ""), "version_id": dep.get("version_id", ""),
            "deployed_and_verified": sm.get("deployed_and_verified") or "false", "smoke_level": sm.get("smoke_level", ""), "verified_url": sm.get("verified_url", ""),
            "published_unverified": sm.get("published_unverified") or "false", "migration": mg.get("migration", ""),
-           "rollback_result": leg_["rollback"]["outputs"].get("rollback_result", "")}
+           "rollback_result": legacy["rollback"]["outputs"].get("rollback_result", "")}
     failed = any(v["result"] == "failure" for v in res.values())
-    last = next(w for n, w in reversed(list(wss.items())) if n.split(":")[0] in ("deploy", "migration")) if ("deploy" in wss or "migration" in wss) else make_workspace(toml)
+    anyws = next((w for n, w in wss.items() if n.split(":")[0] in ("deploy", "migration", "preflight")), None) or make_workspace(toml)
     return {"result": "failure" if failed else "success", "outputs": out, "steps": steps, "log": "".join(logs), "summary": "".join(summ),
-            "ws": wss.get("deploy", last), "wss": wss, "jobs": leg_, "needs": res, "raw": res}
+            "ws": wss.get("deploy", anyws), "wss": wss, "jobs": legacy, "needs": res, "raw": raw, "res": res, "primary": primary}
 
 
 def run_chain(ref=MAIN, inputs=None, secrets=None, env=None, toml=APP_TOML, env_by_job=None, event="push", needs_over=None, files=None, chain_only=None):
-    """Gate -> Plan -> Migration -> Deploy -> Smoke -> Rollback like the scheduler would: each job's `if:` is evaluated against the
-    real results/outputs of its `needs`; matrix jobs run one leg per entry of the plan (real `strategy.matrix`)."""
+    """Gate -> Plan -> Preflight -> Migration -> Delivery (Deploy -> Smoke -> Rollback) like the scheduler would: each job's `if:` is
+    evaluated against the real results/outputs of its `needs`; every kind is its OWN reusable-workflow call."""
     secrets = secrets if secrets is not None else (PROD_SECRETS)
-    i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", tools_ref="x", preview_host_check=False)
+    i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", tools_ref="x", preview_host_check=False, preview_url_suffix=SUFFIX)
     i.update(inputs or {})
     return _shape(*_run_jobs(CHAIN, ref, inputs, secrets, _validation_needs(i, needs_over), event, env, toml, env_by_job, files), toml)
 
@@ -184,7 +247,7 @@ def migrated(r):
 
 
 def mig_file(r, target):
-    for j in ("migration", "deploy"):
+    for j in ("migration", "deploy", "preflight"):
         f = r.get("wss", {}).get(j, r["ws"]) / "w" / ".wrangler" / f"migrate.{target}.json"
         if f.exists():
             return f.read_text()
@@ -269,7 +332,7 @@ check(r["result"] == "failure" and not published(r), "main with ONLY the depreca
 # ======================================================================= Deploy: Preview
 r = deploy(FEAT)
 check(r["result"] == "success" and r["outputs"]["deployed_and_verified"] == "true" and "preview --name feat-x" in r["log"] and "--json" in r["log"], "preview success: stable branch-slug Native Preview published and verified")
-check(r["outputs"]["url"] == "https://stable.example.workers.dev" and r["outputs"]["target"] == "preview", "preview outputs the real URL")
+check(r["outputs"]["url"] == "https://feat-x-app.example.workers.dev" and r["outputs"]["target"] == "preview", "preview outputs the real URL")
 check("-X POST" in r["log"] and "state=success" in r["log"], "preview records a ledger deployment and marks it success only after the smoke")
 r2 = deploy(FEAT, env={"STUB_OWNER_REF": "refs/heads/Feat/X"})
 check(r2["result"] == "failure" and not published(r2) and "pnpm exec wrangler preview" not in r2["log"], "branch-name collision (ledger owned by another ref): fails before the build and publish")
@@ -307,7 +370,7 @@ for label, over in (("legacy record without host_worker", {"payload": {"host_wor
         del dep[0]["payload"]["host_worker"]
     r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ", "STUB_DEPLOYMENTS": json.dumps(dep)})
     check(r["log"].count("preview --name feat-x") == 1 and "No prior verified" in r["summary"], f"recovery ineligible: {label}")
-r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ", "STUB_DEPLOYMENTS": good_dep(), "STUB_STATUS": "failure https://stable.example.workers.dev"})
+r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ", "STUB_DEPLOYMENTS": good_dep(), "STUB_STATUS": "failure https://feat-x-app.example.workers.dev"})
 check(r["log"].count("preview --name feat-x") == 1, "recovery ineligible: the candidate's latest status is not success")
 r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ", "STUB_DEPLOYMENTS": good_dep(), "STUB_STATUS": "success "})
 check(r["log"].count("preview --name feat-x") == 1, "recovery ineligible: no valid recorded Preview URL")
@@ -577,7 +640,7 @@ r = deploy(MAIN, inputs={"deployment_strategy": "production-only", "preview_on_b
 check(r["result"] == "success" and published(r) and r["outputs"]["deployed_and_verified"] == "true", "production-only + default Preview=true: accepted, Production deploys")
 
 # PR lifecycle advertises only a VERIFIED Preview bound to this host Worker, application, repo and branch
-def lifecycle(deps, status="success https://stable.example.workers.dev Serving good (content)", inputs=None):
+def lifecycle(deps, status="success https://feat-x-app.example.workers.dev Serving good (content)", inputs=None):
     ws = make_workspace(APP_TOML)
     c = ctx(FEAT, inputs, {}, event="pull_request")
     c["github"]["event"] = {"pull_request": {"head": {"ref": "feat/x", "repo": {"full_name": "o/r"}}}}
@@ -594,7 +657,7 @@ check(r["result"] == "success" and advertised(r), "lifecycle: a verified Preview
 check(not advertised(lifecycle(good_dep(payload={"host_worker": "blog-preview"}))), "lifecycle: an old-host (blog-preview) Preview record is NOT advertised for the new host")
 check(not advertised(lifecycle(good_dep(payload={"branch_ref": "refs/heads/other"}))), "lifecycle: another branch ref is not advertised")
 check(not advertised(lifecycle(good_dep(payload={"worker": "other-app"}))) and not advertised(lifecycle(good_dep(payload={"repo": "x/y"}))), "lifecycle: another application or repository is not advertised")
-check(not advertised(lifecycle(good_dep(), status="success https://stable.example.workers.dev Published s; unverified (liveness)")), "lifecycle: a liveness-only Preview is not advertised as verified")
+check(not advertised(lifecycle(good_dep(), status="success https://feat-x-app.example.workers.dev Published s; unverified (liveness)")), "lifecycle: a liveness-only Preview is not advertised as verified")
 check(not advertised(lifecycle(good_dep(), status="success http://insecure.example")), "lifecycle: a non-https or unverified record is not advertised")
 r = lifecycle("[]")
 check(r["result"] == "success" and not advertised(r), "lifecycle: no matching verified Preview leaves the PR comment unchanged (job still succeeds)")
@@ -746,25 +809,32 @@ check(res_of(r) == {"migration": "success", "deploy": "success", "smoke": "skipp
 r = deploy(MAIN, inputs=AUTO, env={"STUB_PROBES": "500 "}, env_by_job={"rollback": {"STUB_ACTIVE": "someone-elses-version"}})
 check(r["outputs"]["rollback_result"] == "blocked" and "versions deploy prev-1" not in r["log"] and "live_version_changed" in r["summary"], "the live version is no longer the one THIS run deployed -> rollback refused (never replaces another deployment)")
 # hand-off is DATA and validated
-def leg(job, kind, ref=MAIN, inputs=None, needs=None, env=None, toml=APP_TOML, secrets=None):
-    """Runs ONE matrix leg of `job` for `kind` against hand-built needs (fresh workspace)."""
-    tgt = {"production": "prod", "native-branch": "preview", "native-dev": "preview", "persistent-dev": "dev"}[kind]
+def leg(job, kind, ref=MAIN, inputs=None, needs=None, env=None, toml=APP_TOML, secrets=None, phase="all", handoff_json="", migration_json_in="", upstream_gate="", call_inputs=None):
+    """Runs ONE job of the internal delivery workflow for `kind` against hand-built `needs` (fresh workspace).
+    A job whose `if:` is false is reported skipped without running any step (like the scheduler)."""
+    c = ctx(ref, inputs, PROD_SECRETS if secrets is None else secrets, {})
     envn = {"production": "app/prod", "native-branch": "app/preview", "native-dev": "app/native-dev", "persistent-dev": "app/dev"}[kind]
-    c = ctx(ref, inputs, PROD_SECRETS if secrets is None else secrets, needs or {})
-    c["matrix"] = {"kind": kind, "target": tgt, "environment": envn, "members": kind}
+    dinputs = dict(DINPUT_DEFAULTS, stage="deliver", kind=kind, target=TARGET_OF[kind], tools_ref="x", environment=envn, inputs_json=json.dumps(dict(c["inputs"])),
+                   phase=phase, handoff_json=handoff_json, migration_json_in=migration_json_in, upstream_gate=upstream_gate, deploy_group="g", rollback_group="g",
+                   call_inputs_json=json.dumps(call_inputs) if call_inputs is not None else "")
+    dc = Ctx({"github": c["github"], "inputs": dinputs, "needs": needs or {}, "jobs": {}}, c.secrets)
+    if not ev(ddoc["jobs"][job]["if"], dc):
+        return {"result": "skipped", "outputs": {}, "steps": [], "log": "", "summary": "", "ws": None}
     ws = make_workspace(toml)
-    r = run_job(doc, job, c, ws, dict({"STUB_TIPS": SHA}, **(env or {})))
+    r = run_job(ddoc, job, dc, ws, dict({"STUB_TIPS": SHA}, **(env or {})))
     r["ws"] = ws
     return r
 
 
-def hand(kind, outs, smoke="failure", sjson=None):
-    k = KEYED[kind]
-    return {"deploy": {"result": "success", "outputs": {f"h_{k}": json.dumps(outs)}}, "smoke": {"result": smoke, "outputs": {f"s_{k}": json.dumps(sjson or {}), f"x_{k}": smoke}},
-            "migration": {"result": "skipped", "outputs": {}}, "plan": {"result": "success", "outputs": {"has_targets": "true"}}}
+def hand(kind, outs, smoke="failure", sjson=None, migration_used="{}"):
+    """The `needs` of the Smoke / Rollback jobs of ONE delivery call (its own Deploy hand-off and Smoke result)."""
+    outs = dict(outs)
+    outs.setdefault("kind", kind)
+    return {"deploy": {"result": "success", "outputs": {"handoff": json.dumps(outs), "migration_used": migration_used}},
+            "smoke": {"result": smoke, "outputs": {"smoke_json": json.dumps(sjson or {}), "smoke_status": smoke}}}
 
 
-GOODH = {"published": "true", "url": "https://app.example.com", "version_id": "new-2", "previous_version_id": "prev-1", "worker_name": "app"}
+GOODH = {"kind": "production", "published": "true", "url": "https://app.example.com", "version_id": "new-2", "previous_version_id": "prev-1", "worker_name": "app"}
 fr = leg("rollback", "production", inputs=AUTO, needs=hand("production", dict(GOODH, url="http://evil.example/x")), env={"STUB_ACTIVE": "new-2"})
 check(fr["result"] == "failure" and "versions deploy" not in fr["log"] and step(fr, "Hand-off from the previous jobs (validated data)") == "failure", "a malformed hand-off (non-https URL) is refused at hydrate, before anything is changed")
 for key, val in (("version_id", "x; rm -rf /"), ("previous_version_id", "$(touch PWNED)"), ("worker_name", "App Name"), ("published_sha", OTHER)):
@@ -790,26 +860,30 @@ check(res_of(r)["rollback"] == "success" and r["outputs"]["rollback_result"] == 
 # A Worker whose Smoke must wait for ANOTHER Worker's job runs the same workflow twice: the deploy call (CI/E2E, Plan, Migration,
 # Deploy) and the verify call (Plan from the hand-off, Smoke, Rollback, Release). Every job runs in a FRESH workspace; the only
 # thing the verify call receives is the phase_state data blob.
-SKIPPED = {"result": "skipped", "outputs": {}}
-
-
 def deferred(ref=MAIN, inputs=None, env=None, gate="success", call_over=None, deploy_env=None, toml=APP_TOML, state_over=None):
+    """Two calls of the public workflow: the deploy call (pipeline_phase deploy) and the verify call, which receives ONLY the
+    `phase_state` output of the deploy call (rendered here from the REAL output expression) - every job in a fresh workspace."""
     base = dict(inputs or {})
     d = run_chain(ref, dict(base, pipeline_phase="deploy"), env=deploy_env, toml=toml)
-    blob = dict(ctx(ref, dict(base, pipeline_phase="deploy"), PROD_SECRETS)["inputs"])
-    raw = d["raw"]
-    kinds = json.loads(raw["plan"]["outputs"].get("kinds") or "[]")
-    state = json.dumps(dict({"inputs": blob, "kinds": kinds, "deploy": raw["deploy"]["outputs"], "migration": raw["migration"]["outputs"], "group": "g"}, **(state_over or {})))
+    dci = ctx(ref, dict(base, pipeline_phase="deploy"), PROD_SECRETS)
+    jobs_ctx = {"plan": d["res"].get("plan", SKIPPED)}
+    for k in KINDS:
+        jobs_ctx[f"delivery_{KEYED[k]}"] = d["res"].get(f"delivery_{KEYED[k]}", SKIPPED)
+    for k in KINDS:
+        jobs_ctx[f"migration_{KEYED[k]}"] = d["res"].get(f"migration_{KEYED[k]}", SKIPPED)
+    pc = Ctx({"github": dci["github"], "inputs": dci["inputs"], "jobs": jobs_ctx}, {})
+    state = render(doc[True]["workflow_call"]["outputs"]["phase_state"]["value"], pc)
+    if state_over:
+        state = json.dumps(dict(json.loads(state), **state_over))
     vin = dict(base, pipeline_phase="verify", phase_state=state, upstream_gate=gate)
     vin.update(call_over or {})
-    res, logs, summ, steps, wss = _run_jobs(("plan", "smoke", "rollback"), ref, vin, PROD_SECRETS, {"gate": SKIPPED, "deploy": SKIPPED, "migration": SKIPPED}, "push", env, toml, None, None)
+    res, logs, summ, steps, wss = _run_jobs(("plan",) + tuple(f"delivery_{KEYED[k]}" for k in KINDS), ref, vin, PROD_SECRETS, {"gate": SKIPPED}, "push", env, toml, None, None)
     shaped = _shape(dict(res), logs, summ, steps, wss, toml)
-    return {"deploy": d, "jobs": shaped["jobs"], "log": "".join(logs), "summary": "".join(summ), "steps": steps, "vin": vin, "state": state, "raw": res}
+    return {"deploy": d, "jobs": shaped["jobs"], "log": "".join(logs), "summary": "".join(summ), "steps": steps, "vin": vin, "state": state, "raw": res, "res": res}
 
 
 def verify_release(v, inputs=None):
-    needs = dict(v["raw"], deploy=SKIPPED)
-    return bool(ev(doc["jobs"]["release"]["if"], ctx(MAIN, dict(v["vin"], release_cmd="pnpm release", **(inputs or {})), PROD_SECRETS, needs)))
+    return bool(ev(doc["jobs"]["release"]["if"], ctx(MAIN, dict(v["vin"], release_cmd="pnpm release", **(inputs or {})), PROD_SECRETS, v["res"])))
 
 
 AUTO_P = {"production_rollback_policy": "automatic"}
@@ -883,7 +957,7 @@ check(r["result"] == "success" and r["outputs"]["deployed_and_verified"] == "tru
 # ======================================================================= NEW: Native Dev, smoke modes, multi-target migration
 ND = {"preview_on_branch_push": False, "shared_dev_native_preview_on_branch_push": True, "build_env_shared_dev_native_preview": "SITE=nd",
       "build_cmd": 'echo "BUILD kind=$CFV2_DELIVERY_KIND site=${SITE:-none} url=$CFV2_TARGET_URL app_env=$VITE_APP_ENV" >> "$STUB_LOG"'}
-NDURL = "https://stable.example.workers.dev"
+NDURL = "https://dev-app.example.workers.dev"
 r = deploy(FEAT, inputs=ND, env={"STUB_PROBES": "200 "})
 check(r["result"] == "success" and "preview --name dev" in r["log"] and r["outputs"]["deployed_and_verified"] == "true" and r["jobs"]["plan"]["outputs"]["kinds"] == '["native-dev"]',
       "Native Dev: the plan has exactly one delivery; it publishes the named Preview `dev` and is verified")
@@ -990,5 +1064,128 @@ r = deploy(FEAT, env={"STUB_PROBES": "200 "})
 check(r["jobs"]["plan"]["outputs"]["kinds"] == '["native-branch"]' and "preview --name feat-x" in r["log"] and "preview --name dev" not in r["log"], "legacy caller on a branch push: Native Branch only (default), no Native Dev")
 r = deploy(MAIN, env={"STUB_PROBES": "200 "})
 check(r["jobs"]["plan"]["outputs"]["kinds"] == '["production"]' and r["outputs"]["deployed_and_verified"] == "true", "legacy caller on main: Production only")
+
+# ======================================================================= FIX REGRESSIONS (PR #89 review): P1-A, P1-B, P2-A, P2-B
+OUTS = doc[True]["workflow_call"]["outputs"]
+
+
+def public_outputs(r, inputs=None, ref=FEAT):
+    """The PUBLIC workflow_call outputs, rendered from the real output expressions over the per-call results."""
+    jobs_ctx = {n: v for n, v in r["res"].items()}
+    c = Ctx({"github": ctx(ref)["github"], "inputs": ctx(ref, inputs)["inputs"], "jobs": jobs_ctx}, {})
+    return {k: render(v["value"], c) for k, v in OUTS.items() if k != "phase_state"}
+
+
+BD = dict(ND, preview_on_branch_push=True)
+FWD = CHAIN
+REV = ("gate", "plan") + tuple(f"preflight_{KEYED[k]}" for k in reversed(KINDS)) + tuple(f"migration_{KEYED[k]}" for k in reversed(KINDS)) + tuple(f"delivery_{KEYED[k]}" for k in reversed(KINDS))
+
+
+def run_order(order, ref=FEAT, inputs=None, env=None, toml=APP_TOML, env_by_job=None):
+    i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", tools_ref="x", preview_host_check=False, preview_url_suffix=SUFFIX)
+    i.update(inputs or {})
+    return _shape(*_run_jobs(order, ref, inputs, PROD_SECRETS, _validation_needs(i, None), "push", env, toml, env_by_job, None), toml)
+
+
+# (2) results completing in REVERSED order: the public outputs and each kind's result are identical (nothing depends on completion order)
+for nm, inp, e in (("Branch + Native Dev", BD, {"STUB_PROBES": "200 "}), ("Branch + Native Dev, D1 shared", dict(BD, **D1), {"STUB_PROBES": "200 "})):
+    f_, b_ = run_order(FWD, inputs=inp, env=e), run_order(REV, inputs=inp, env=e)
+    check(public_outputs(f_, inp) == public_outputs(b_, inp), f"P1-A reversed completion order ({nm}): every public output is identical")
+    check({k: v["result"] for k, v in f_["res"].items()} == {k: v["result"] for k, v in b_["res"].items()}, f"P1-A reversed completion order ({nm}): every call finishes with the same result")
+pf = public_outputs(run_order(REV, inputs=BD, env={"STUB_PROBES": "200 "}), BD)
+check(pf["deploy_url"] == "https://feat-x-app.example.workers.dev" and pf["native_dev_url"] == "https://dev-app.example.workers.dev" and pf["deploy_verified"] == "true" and pf["native_dev_verified"] == "true"
+      and pf["deploy_verified_url"] == pf["deploy_url"] and pf["native_dev_verified_url"] == pf["native_dev_url"] and pf["dev_url"] == "" and pf["rollback_result"] == "",
+      "P1-A: Branch and Native Dev results are keyed per target (deploy_* = Branch, native_dev_* = Dev, dev_* empty) - no cross-target leakage")
+# (1)+(3) one target failing while the other succeeds, in both orders, and the public outputs stay per-target
+bad = dict(BD, build_cmd=BD["build_cmd"] + '; [ "$CFV2_DELIVERY_KIND" != native-dev ] || false')
+for order, nm in ((FWD, "forward"), (REV, "reversed")):
+    rr = run_order(order, inputs=bad, env={"STUB_PROBES": "200 "})
+    po = public_outputs(rr, bad)
+    check(rr["res"]["delivery_native_dev"]["result"] == "failure" and rr["res"]["delivery_native_branch"]["result"] == "success" and po["deploy_verified"] == "true" and po["native_dev_verified"] == "false" and po["native_dev_url"] == "",
+          f"one target failing ({nm}): Native Dev fails closed (no URL, not verified) while the Branch delivery succeeds and is verified")
+# (7) rollback isolation: Native Dev's smoke fails and recovers; the Branch Preview is untouched and stays verified
+GDN2 = {"STUB_DEPLOYMENTS": json.dumps([{"id": 7, "sha": GOOD, "payload": {"repo": "o/r", "kind": "native-dev", "preview_name": "dev", "host_worker": "app", "worker": "app"}}]),
+        "STUB_STATUS": f"success {NDURL} Serving good (content)"}
+rr = run_order(FWD, inputs=BD, env=dict(GDN2, STUB_PROBES="200 "), env_by_job={"smoke:native-dev": {"STUB_PROBES": "500 "}, "rollback:native-dev": {"STUB_PROBES": "200 "}})
+po = public_outputs(rr, BD)
+check(rr["res"]["delivery_native_dev"]["jobs"]["rollback"]["result"] == "success" and rr["res"]["delivery_native_branch"]["jobs"]["rollback"]["result"] == "skipped" and po["deploy_verified"] == "true"
+      and po["native_dev_verified"] == "false" and po["rollback_result"] == "restored_verified" and rr["res"]["delivery_native_branch"]["result"] == "success",
+      "P2-A rollback isolation: only the failing Native Dev call rolls back (restored_verified); the Branch call never runs a rollback and stays green and verified")
+check(rr["log"].count("preview --name dev") == 2 and rr["log"].count("preview --name feat-x") == 1, "P2-A rollback isolation: the rollback republishes `dev` only; the Branch Preview is published exactly once")
+# P2-A: Smoke of one kind does not wait for another kind's Deploy: a Deploy that never finishes (failure) elsewhere cannot change this kind's chain
+rr = run_order(FWD, inputs=BD, env={"STUB_PROBES": "200 "}, env_by_job={"deploy:native-branch": {"STUB_PREVIEW_FAIL": "1"}})
+check(rr["res"]["delivery_native_branch"]["jobs"]["deploy"]["result"] == "failure" and rr["res"]["delivery_native_branch"]["jobs"]["smoke"]["outputs"].get("smoke_status") == "none"
+      and rr["res"]["delivery_native_dev"]["jobs"]["smoke"]["result"] == "success" and json.loads(rr["res"]["delivery_native_dev"]["outputs"]["smoke_json"])["deployed_and_verified"] == "true",
+      "P2-A: the Branch Deploy fails, its Smoke has nothing to verify (smoke_status none) - Native Dev's own Deploy -> Smoke chain is unaffected")
+# stale deployment protection: a rollback whose live deployment is no longer ours is refused; a superseded run does not roll back
+rr = run_order(FWD, inputs=BD, env=dict(GDN2, STUB_PROBES="200 "), env_by_job={"smoke:native-dev": {"STUB_PROBES": "500 "}, "rollback:native-dev": {"STUB_NEWEST": "9999"}})
+check(rr["res"]["delivery_native_dev"]["jobs"]["rollback"]["result"] == "failure" and rr["res"]["delivery_native_dev"]["outputs"]["rollback_result"] == "no_known_good" and rr["log"].count("preview --name dev") == 1,
+      "stale deployment protection: a NEWER deployment of `dev` exists -> the rollback is skipped (never replaces it)")
+# (4) shared D1 dedupe: ONE migration call serves both; the dependent delivery receives the OWNER's result, validated by kind + D1 id
+rr = run_order(FWD, inputs=dict(BD, **D1), env={"STUB_PROBES": "200 "})
+check(rr["log"].count("migrations apply") == 1 and rr["res"]["migration_native_branch"]["result"] == "success" and rr["res"]["migration_native_dev"]["result"] == "skipped" and rr["res"]["delivery_native_dev"]["result"] == "success",
+      "P2-B shared D1: exactly one `d1 migrations apply`, run by the Native Branch call; Native Dev has no migration call and still deploys")
+used = json.loads(rr["res"]["delivery_native_dev"]["jobs"]["deploy"]["outputs"]["migration_used"])
+check(used["kind"] == "native-branch" and used["d1_id"] == "PREV-ID" and used["migration"] == "applied", "P2-B shared D1: the Native Dev delivery consumed the shared migration result (owner native-branch, D1 PREV-ID)")
+check(all(rr["res"][f"preflight_{KEYED[k]}"]["result"] == ("success" if k in ("native-branch", "native-dev") else "skipped") for k in KINDS), "P2-B: a Preflight ran for EVERY enabled kind (and only for them) before the migration")
+check(rr["res"]["preflight_native_dev"]["jobs"]["preflight"]["outputs"]["d1_id"] == "PREV-ID" and rr["res"]["preflight_native_dev"]["jobs"]["preflight"]["outputs"]["target_url"] == NDURL, "P2-B/P1-B: the Native Dev Preflight audited the built config's D1 id and canonical URL")
+# P2-B: nothing is migrated while ANY enabled target fails its preflight (the Native Dev build is broken, the shared D1 stays untouched)
+rr = run_order(FWD, inputs=dict(bad, **D1), env={"STUB_PROBES": "200 "})
+check(rr["res"]["preflight_native_dev"]["result"] == "failure" and not migrated(rr) and rr["res"]["migration_native_branch"]["result"] == "failure" and not published(rr)
+      and rr["res"]["delivery_native_branch"]["jobs"]["deploy"]["result"] == "failure",
+      "P2-B: one target's failed preflight blocks the migration of the D1 it shares - NO mutation at all, nothing published, fail closed")
+# effective (adapter) config binding another database than the plan's: refused before ANY mutation
+REDIR = ('mkdir -p .wrangler/deploy dist && printf \'%s\' \'{"configPath":"../../dist/wrangler.json"}\' > .wrangler/deploy/config.json && '
+         'printf \'%s\' \'{"name":"app","main":"index.js","d1_databases":[{"binding":"DB","database_name":"other","database_id":"OTHER-ID"}]}\' > dist/wrangler.json')
+rr = run_order(FWD, inputs=dict(BD, **D1, build_cmd=REDIR), env={"STUB_PROBES": "200 "})
+check(rr["res"]["preflight_native_branch"]["result"] == "failure" and not migrated(rr) and not published(rr), "P2-B: an adapter-generated effective config that binds another D1 than the plan's is refused in the Preflight: nothing is migrated or published")
+# (5) incorrect / missing URLs: fail BEFORE the build
+rr = run_order(FWD, inputs=dict(ND, app_url_shared_dev_native_preview="https://somewhere-else.example.workers.dev"), env={"STUB_PROBES": "200 "})
+check(rr["res"]["delivery_native_dev"]["result"] == "failure" and "BUILD" not in rr["log"] and not published(rr), "P1-B incorrect URL: a declared Native Dev URL that contradicts the Preview URL fails BEFORE the build (nothing built, nothing published)")
+rr = run_order(FWD, inputs=dict(ND, preview_url_suffix=""), env={"STUB_PROBES": "200 "})
+check(rr["res"]["delivery_native_dev"]["result"] == "failure" and "BUILD" not in rr["log"] and not published(rr), "P1-B missing URL: no Cloudflare suffix, no preview_url_suffix and no declared URL -> fails before the build (never a guessed hostname)")
+rr = run_order(FWD, inputs=dict(BD, preview_url_suffix=""), env={"STUB_PROBES": "200 "})
+check(rr["res"]["delivery_native_branch"]["result"] == "failure" and rr["res"]["delivery_native_dev"]["result"] == "failure" and "BUILD" not in rr["log"], "P1-B missing URL: Native Branch is resolved BEFORE its build too (it used to build without a canonical URL)")
+rr = run_order(FWD, inputs=dict(BD, build_env_preview="OAUTH_CALLBACK_URL=https://id.example.com/cb", build_env_shared_dev_native_preview="OAUTH_CALLBACK_URL=https://dev-app.example.workers.dev/cb"), env={"STUB_PROBES": "200 "})
+check(rr["res"]["delivery_native_branch"]["result"] == "failure" and rr["res"]["delivery_native_dev"]["result"] == "success" and "preview --name feat-x" not in rr["log"],
+      "P1-B: a Branch build env whose OAuth callback origin is not the Branch Preview's own origin fails before the build; the correct Native Dev callback passes")
+rr = run_order(FWD, inputs=dict(BD, build_env_preview="PUBLIC_APP_URL=https://feat-x-app.example.workers.dev", build_env_shared_dev_native_preview="PUBLIC_APP_URL=https://dev-app.example.workers.dev",
+                              build_cmd='echo "BUILD kind=$CFV2_DELIVERY_KIND url=$CFV2_TARGET_URL app=$PUBLIC_APP_URL" >> "$STUB_LOG"'), env={"STUB_PROBES": "200 "})
+check("BUILD kind=native-branch url=https://feat-x-app.example.workers.dev app=https://feat-x-app.example.workers.dev" in rr["log"] and "BUILD kind=native-dev url=https://dev-app.example.workers.dev app=https://dev-app.example.workers.dev" in rr["log"],
+      "P1-B: each target is built with ITS OWN resolved canonical URL (CFV2_TARGET_URL) - Branch and Native Dev are separate builds")
+rr = run_order(FWD, inputs=dict(ND, build_cmd='echo BUILD >> "$STUB_LOG"'), env={"STUB_PROBES": "200 ", "STUB_PREVIEW_RAW": '{"preview":{"urls":["https://dev-OTHER.example.workers.dev"]}}'})
+check(rr["res"]["delivery_native_dev"]["jobs"]["deploy"]["result"] == "failure" and rr["res"]["delivery_native_dev"]["outputs"]["smoke_status"] == "none", "P1-B: Cloudflare publishing a URL other than the one the artifact was built for -> publish rejected, nothing verified")
+# (9) hand-off isolation: a hand-off of another kind (or mismatched data) is refused by the stage that would act on it
+fr = leg("smoke", "native-dev", needs=hand("native-branch", dict(GOODH, kind="native-branch", url="https://feat-x-app.example.workers.dev", preview_name="feat-x", ledger_id="4242"), smoke="success"), env={"STUB_PROBES": "200 "})
+check(fr["result"] == "failure" and "hand-off belongs to kind" in fr["log"] + fr["summary"] + "".join(n for n, _ in fr["steps"]) or fr["result"] == "failure", "hand-off isolation: Native Dev refuses a Native Branch hand-off (kind mismatch) - fail closed")
+fr = leg("smoke", "native-dev", needs=hand("native-dev", {"published": "true", "kind": "native-dev", "url": NDURL, "preview_name": "dev", "ledger_id": "4242", "published_sha": SHA, "target_url": "https://dev-other.example.workers.dev"}, smoke="success"), env={"STUB_PROBES": "200 "})
+check(fr["result"] == "failure", "hand-off isolation: a hand-off whose published URL differs from the URL it was built for is refused")
+fr = leg("smoke", "native-dev", needs={"deploy": {"result": "success", "outputs": {"handoff": "", "migration_used": "{}"}}, "smoke": SKIPPED}, env={"STUB_PROBES": "200 "})
+check(fr["result"] == "success" and fr["outputs"]["smoke_status"] == "none" and "BUILD" not in fr["log"], "missing hand-off: nothing was published -> nothing verified (smoke_status none), no verification claimed")
+# deploy call refuses to run without the right migration result (own / owner mismatch)
+dctx_base = dict(GOODH)
+for nm, over in (("a failed migration of its D1", dict(own_migration_result="failure", own_migration_json=json.dumps({"migration": "applied", "kind": "native-branch", "d1_id": "PREV-ID"}))),
+                 ("a migration result for another D1", dict(own_migration_result="success", own_migration_json=json.dumps({"migration": "applied", "kind": "native-branch", "d1_id": "FOREIGN"}))),
+                 ("a migration result of another kind", dict(own_migration_result="success", own_migration_json=json.dumps({"migration": "applied", "kind": "persistent-dev", "d1_id": "PREV-ID"}))),
+                 ("a missing migration result", dict(own_migration_result="", own_migration_json=""))):
+    dc = Ctx({"github": ctx(FEAT)["github"], "inputs": dict(DINPUT_DEFAULTS, stage="deliver", kind="native-branch", target="preview", d1_migrations="true", d1_expected_id="PREV-ID", d1_owner_kind="native-branch", tools_ref="x", inputs_json=json.dumps(dict(ctx(FEAT)["inputs"], d1_migrations=True)), deploy_group="g", rollback_group="g", **over), "needs": {}}, PROD_SECRETS)
+    ws = make_workspace(APP_TOML)
+    rr_ = run_job(ddoc, "deploy", dc, ws, {"STUB_TIPS": SHA})
+    check(rr_["result"] == "failure" and not published({"log": rr_["log"]}), f"Deploy refuses to publish with {nm} (fail closed before checkout/build)")
+# (10) existing caller compatibility: the legacy single-kind outputs keep their shape and meaning
+rr = deploy(MAIN, env={"STUB_PROBES": "200 "})
+po = public_outputs(rr, ref=MAIN)
+check(po["deploy_url"] == "https://app.example.com" and po["deploy_verified"] == "true" and po["deploy_target"] == "prod" and po["version_id"] == "new-2" and po["previous_version_id"] == "prev-1" and po["deploy_smoke_level"] == "content"
+      and po["deploy_verified_url"] == "https://app.example.com" and po["dev_url"] == "" and po["native_dev_url"] == "" and po["rollback_result"] == "" and po["deploy_gate_blocked"] in ("false", "False", ""),
+      "(10) legacy caller on main: deploy_url / deploy_verified / deploy_target / version_id / previous_version_id / deploy_smoke_level keep their meaning; dev_* and native_dev_* stay empty")
+rr = deploy(FEAT, env={"STUB_PROBES": "200 "})
+po = public_outputs(rr)
+check(po["deploy_url"] == "https://feat-x-app.example.workers.dev" and po["deploy_target"] == "preview" and po["deploy_verified"] == "true", "(10) legacy caller on a branch: deploy_* describe the Native Branch Preview")
+rr = dev()
+po = public_outputs(rr, DEV_INPUTS)
+check(po["dev_url"] == "https://dev.example.com" and po["dev_verified_url"] == "https://dev.example.com" and po["deploy_url"] == "" and po["native_dev_url"] == "", "(10) legacy persistent Dev caller: dev_* describe the Dev Worker, deploy_* stay empty")
+# Production Release gate (8) stays tied to the Production call only, also with a simultaneous branch run elsewhere
+rr = deploy(MAIN, inputs={"smoke_mode": "skip"}, env={"STUB_PROBES": "500 "})
+check(not release_runs(rr), "(8) Release gate: smoke_mode=skip Production is never released")
 
 sys.exit(fail)

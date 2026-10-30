@@ -135,3 +135,77 @@ export function foreignUrlsInBuildEnv(kind, buildEnvText, urls) {
 
 /** Compare an asserted target URL with the published one (case/trailing-slash insensitive). */
 export const sameUrl = (a, b) => String(a).replace(/\/+$/, '').toLowerCase() === String(b).replace(/\/+$/, '').toLowerCase();
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Canonical target URL, resolved BEFORE any build (Preview kinds). Cloudflare documents the Preview URL of a named Preview
+// as `<preview-name>-<worker-name>.<subdomain>.workers.dev` (workers.dev) or `<preview-name>.<custom domain>` (custom
+// domain). The Workers subdomain API reports the host part as `preview_url_suffix` (leading "-" for workers.dev), so the URL
+// is `https://<preview-name><suffix>`. Nothing is guessed: no suffix and no explicit URL means the build must not start.
+// ---------------------------------------------------------------------------------------------------------------------
+export const PREVIEW_SUFFIX_RE = /^[-.][a-z0-9]([a-z0-9.-]*[a-z0-9])?$/;
+
+/** Normalise a canonical URL to its origin; only an https origin (no path/query/credentials) is a valid app URL. */
+export function canonicalOrigin(url, what = 'URL') {
+  let u;
+  try { u = new URL(String(url)); } catch { throw new Error(`${what} '${url}' is not a valid URL`); }
+  if (u.protocol !== 'https:') throw new Error(`${what} must be https: ${u.protocol}//${u.host}`);
+  if (u.username || u.password || u.search || u.hash || (u.pathname && u.pathname !== '/')) {
+    throw new Error(`${what} must be a bare origin (no path, query, fragment or credentials): ${url}`);
+  }
+  return u.origin;
+}
+
+export function previewUrlFromSuffix(previewName, suffix) {
+  if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(String(previewName))) throw new Error(`unsafe Preview name '${previewName}'`);
+  if (!PREVIEW_SUFFIX_RE.test(String(suffix))) throw new Error(`Preview URL suffix '${suffix}' is invalid (expected e.g. -<worker>.<subdomain>.workers.dev or .<custom domain>)`);
+  const host = `${previewName}${suffix}`;
+  const label = host.split('.')[0];
+  if (label.length > 63) throw new Error(`Preview hostname label '${label}' is ${label.length} chars (> 63): the Preview name plus the Worker name is too long`);
+  return `https://${host}`;
+}
+
+/**
+ * Resolve the canonical URL of a native-branch / native-dev target. `explicit` = caller-declared URL (may be empty),
+ * `suffix` = caller-declared preview_url_suffix, `apiSuffix` = Cloudflare-reported preview_url_suffix of the host Worker.
+ * Throws when nothing can be resolved, when the two suffix sources disagree, or when an explicit URL contradicts the derived one.
+ */
+export function resolveCanonicalUrl({ previewName, explicit = '', suffix = '', apiSuffix = '' }) {
+  if (suffix && apiSuffix && suffix !== apiSuffix) {
+    throw new Error(`preview_url_suffix '${suffix}' contradicts the suffix Cloudflare reports for the host Worker ('${apiSuffix}')`);
+  }
+  const useSuffix = suffix || apiSuffix;
+  const derived = useSuffix ? previewUrlFromSuffix(previewName, useSuffix) : '';
+  const declared = explicit ? canonicalOrigin(explicit, 'declared app URL') : '';
+  if (declared && derived && !sameUrl(declared, derived)) {
+    throw new Error(`declared app URL ${declared} differs from the URL Cloudflare will serve Preview '${previewName}' at (${derived}); the build would embed the wrong URL`);
+  }
+  const url = declared || derived;
+  if (!url) {
+    throw new Error(`cannot resolve the canonical URL of Preview '${previewName}' before the build: Cloudflare did not report a preview_url_suffix for the host Worker and neither an explicit app URL nor preview_url_suffix was given (set preview_url_suffix, or app_url_shared_dev_native_preview for Native Dev)`);
+  }
+  return { url, source: declared ? (derived ? 'declared+derived' : 'declared') : (suffix ? 'preview_url_suffix' : 'cloudflare') };
+}
+
+/**
+ * Build-env origin consistency where it is deterministic: variables that name THIS application's own callback / redirect /
+ * origin / site / app URL must be same-origin with the target URL. (An IdP issuer is another service and cannot be verified
+ * here; foreignUrlsInBuildEnv rejects it only when it is another target's URL of this application.)
+ */
+const SELF_URL_KEY = /(CALLBACK|REDIRECT_URI|REDIRECT_URL|APP_ORIGIN|APP_URL|SITE_URL|SELF_URL|PUBLIC_ORIGIN)/i;
+export function checkBuildEnvOrigins(buildEnvText, targetUrl) {
+  if (!targetUrl) return [];
+  const origin = new URL(targetUrl).origin;
+  const bad = [];
+  for (const line of String(buildEnvText ?? '').split('\n')) {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) continue;
+    const eq = t.indexOf('=');
+    const key = t.slice(0, eq);
+    const value = t.slice(eq + 1).trim();
+    if (!SELF_URL_KEY.test(key) || !/^https?:\/\//i.test(value)) continue;
+    let o = '';
+    try { o = new URL(value).origin; } catch { bad.push(`${key} is not a valid URL`); continue; }
+    if (o !== origin) bad.push(`${key}=${o} is not the origin of this target (${origin})`);
+  }
+  return bad;
+}

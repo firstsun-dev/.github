@@ -7,7 +7,7 @@ import {
   isStale, migrationPlan, workerName, classifyMigrationSql, previewIdentity, readConfig, rebindSha, artifactDigest, checkDeployedD1, resolveSharedDev, resolveTarget, sharedPreviewDevD1,
 } from './lib.mjs';
 import {
-  DELIVERY_KINDS, ENGINE_TARGET, assertKind, branchPreviewIdentity, environmentName, foreignUrlsInBuildEnv, planMigrations, resolveDeliveryTargets, resolveSmokeMode,
+  DELIVERY_KINDS, ENGINE_TARGET, assertKind, branchPreviewIdentity, canonicalOrigin, checkBuildEnvOrigins, environmentName, foreignUrlsInBuildEnv, planMigrations, resolveCanonicalUrl, resolveDeliveryTargets, resolveSmokeMode,
 } from './delivery.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -185,6 +185,36 @@ try {
       out({ url_isolation: 'ok' });
       break;
     }
+    case 'resolve-url': {
+      // Canonical URL of ONE target, resolved BEFORE its build (fails closed). Preview kinds: derived from the real Preview
+      // identity + the host Worker's Cloudflare-reported preview_url_suffix (or the caller's preview_url_suffix), cross-checked
+      // with any declared URL. Production / persistent Dev: the declared URL (required for Dev).
+      const kind = assertKind(opt('kind'));
+      let url = '';
+      let source = 'declared';
+      if (kind === 'native-branch' || kind === 'native-dev') {
+        let apiSuffix = '';
+        if (!opt('suffix') && opt('host-check', 'true') !== 'false') {
+          const r = await previewHostReadiness(fetch, {
+            accountId: process.env.CLOUDFLARE_ACCOUNT_ID, token: process.env.CLOUDFLARE_API_TOKEN, worker: opt('host-worker'),
+            base: process.env.CF_API_BASE || undefined,
+          });
+          if (r.level === 'block') throw new Error(r.message);
+          apiSuffix = r.suffix ?? '';
+        }
+        ({ url, source } = resolveCanonicalUrl({ previewName: opt('name'), explicit: opt('explicit'), suffix: opt('suffix'), apiSuffix }));
+      } else if (opt('explicit')) {
+        url = canonicalOrigin(opt('explicit'), `${kind} app URL`);
+      } else if (kind === 'persistent-dev') {
+        throw new Error('persistent-dev requires app_url_dev (the canonical Dev URL must be known before the build)');
+      }
+      const envText = opt('build-env') && existsSync(opt('build-env')) ? readFileSync(opt('build-env'), 'utf8') : '';
+      const bad = checkBuildEnvOrigins(envText, url);
+      for (const b of bad) console.log(`::error::build environment of ${kind}: ${b}`);
+      if (bad.length) process.exit(1);
+      out({ target_url: url, url_source: source });
+      break;
+    }
     case 'plan': {
       // The delivery plan of a run, from the validated workflow inputs (INPUTS_JSON) - data only, no remote effects.
       const i = JSON.parse(process.env.INPUTS_JSON ?? '{}');
@@ -211,25 +241,24 @@ try {
           migrationsDirAbs: (d) => resolve(dirname(cfgPath), d),
         });
       }
-      const app = str('app_name');
-      const entry = (k) => ({ kind: k, target: ENGINE_TARGET[k], environment: environmentName(app, k) });
-      const plan = {
-        kinds,
-        deliveries: { include: kinds.map(entry) },
-        migrations: { include: migrations.map((g) => ({ ...entry(g.owner), members: g.members.join(','), database: g.databaseName })) },
-      };
+      const kindKey = (k) => k.replace(/-/g, '_');
+      const flat = {};
+      for (const k of DELIVERY_KINDS) {
+        const g = migrations.find((m) => m.members.includes(k));
+        flat[`on_${kindKey(k)}`] = String(kinds.includes(k));
+        flat[`d1_${kindKey(k)}`] = g ? g.databaseId : '';
+        flat[`owner_of_${kindKey(k)}`] = g ? g.owner : '';
+        flat[`owns_${kindKey(k)}`] = String(Boolean(g && g.owner === k));
+      }
       for (const m of migrations) console.error(`::notice::D1 ${m.databaseName}: one migration (owner ${m.owner}) serves ${m.members.join(', ')}`);
-      out({
-        kinds: JSON.stringify(plan.kinds), has_targets: String(kinds.length > 0), deliveries: JSON.stringify(plan.deliveries),
-        has_migrations: String(migrations.length > 0), migrations: JSON.stringify(plan.migrations),
-      });
+      out({ kinds: JSON.stringify(kinds), has_targets: String(kinds.length > 0), has_migrations: String(migrations.length > 0), ...flat });
       break;
     }
     case 'stale':
       out({ stale: String(isStale({ runSha: opt('sha'), branchTipSha: opt('tip') })) });
       break;
     default:
-      console.error('usage: cli.mjs identity|wrangler-check|extract-url|preview-host-check|classify|resolve|resolve-dev|rebind-env|artifact-digest|d1-consistency|d1-shared|dev-config-check|preflight|migration-config|effective-config|audit-prod|worker-name|migration-scan|resolve-kinds|smoke-mode|url-isolation|plan|stale');
+      console.error('usage: cli.mjs identity|wrangler-check|extract-url|preview-host-check|classify|resolve|resolve-dev|rebind-env|artifact-digest|d1-consistency|d1-shared|dev-config-check|preflight|migration-config|effective-config|audit-prod|worker-name|migration-scan|resolve-kinds|smoke-mode|url-isolation|resolve-url|plan|stale');
       process.exit(2);
   }
 } catch (e) {

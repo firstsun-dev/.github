@@ -6,6 +6,8 @@ description: >
               stale check -> publish -> smoke -> mark verified | last-known-good recovery
     deploy    Shared Dev only, opt-in (pipeline_phase): the `all` job WITHOUT smoke and recovery. A later `verify` job smokes
               it and a `rollback` job recovers it, so a cross-service smoke can wait for another Worker's deployment.
+    preflight Pre-mutation validation (all targets): URL resolution + build + effective-config audit + exact D1 binding check.
+              Non-publishing, mutates nothing remote; the Migration of a shared D1 waits for the preflight of EVERY target using it.
     migrate   Migration job (prod | preview): build + audit + D1 target check + stale check + migrate. Publishes nothing.
     publish   Deploy job   (prod | preview): build + audit + stale check + publish the audited artifact. Runs no smoke.
     verify    Smoke job    (prod | preview | dev): smoke the published URL; mark verified | unverified. NO Cloudflare credentials.
@@ -23,7 +25,7 @@ inputs:
     description: production | native-branch | native-dev | persistent-dev. Empty = the kind implied by target (prod -> production, preview -> native-branch, dev -> persistent-dev). native-dev is target preview.
     default: ''
   stage:
-    description: all | deploy | migrate | publish | verify | rollback (see description). dev supports all, deploy, verify, rollback; prod and preview support migrate, publish, verify, rollback.
+    description: all | deploy | preflight | migrate | publish | verify | rollback (see description). dev supports all, deploy, preflight, migrate, publish, verify, rollback; prod and preview support preflight, migrate, publish, verify, rollback.
     default: all
   mode:
     description: auto (branch / main push, with automatic recovery) | manual (persistent Dev dispatch, no recovery)
@@ -47,6 +49,9 @@ inputs:
   smoke_outputs:
     description: toJSON(needs.smoke.outputs) - hand-off to the rollback stage
     default: '{}'
+  d1_expected_id:
+    description: Physical D1 database id the plan resolved for this kind. Every build of this kind must bind exactly it (preflight, migrate, publish); empty = no D1.
+    default: ''
   call_inputs_json:
     description: Deferred verification only - toJSON(inputs) of the VERIFY call, compared with the deploy call's identity inputs (inputs_json)
     default: ''
@@ -54,6 +59,18 @@ inputs:
     description: Verify stage only - result of the job this verification must wait for (success | skipped = satisfied; anything else blocks, fail closed). Empty = no gate.
     default: ''
 outputs:
+  d1_id:
+    description: Physical D1 database id the built config of this kind binds (audited; empty without d1_migrations)
+    value: ${{ steps.report.outputs.d1_id }}
+  target_url:
+    description: Canonical URL this target was built for (resolved BEFORE the build); empty when none is declared (Production without app_url_prod)
+    value: ${{ steps.report.outputs.target_url }}
+  stale:
+    description: true when the run was superseded by a newer push and this stage did nothing
+    value: ${{ steps.report.outputs.stale || 'false' }}
+  kind:
+    description: Delivery kind this stage ran for
+    value: ${{ steps.report.outputs.kind }}
   gate_blocked:
     description: true when the verify stage refused to run because a required upstream job did not succeed (no smoke ran; not attributable to this Worker, so no rollback)
     value: ${{ steps.gate.outputs.blocked || 'false' }}
@@ -129,6 +146,7 @@ runs:
         ENGINE_KIND: ${{ inputs.kind }}
         ENGINE_STAGE: ${{ inputs.stage }}
         ENGINE_MODE: ${{ inputs.mode }}
+        ENGINE_D1_EXPECT: ${{ inputs.d1_expected_id }}
         INPUTS_JSON: ${{ inputs.inputs_json }}
         CALL_INPUTS_JSON: ${{ inputs.call_inputs_json }}
         PREVIEW_SECRETS: ${{ inputs.target == 'preview' && inputs.preview_secrets || '' }}
@@ -173,7 +191,7 @@ runs:
       if: env.STALE != 'true' && inputs.stage != 'verify' && inputs.stage != 'rollback'
       shell: bash
       env:
-        PREPARE_LEDGER: ${{ inputs.stage != 'migrate' }}
+        PREPARE_LEDGER: ${{ inputs.stage != 'migrate' && inputs.stage != 'preflight' }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" prepare'
     - name: Build and audit the deployable (nothing remote is changed)
       if: env.STALE != 'true' && inputs.stage != 'verify' && inputs.stage != 'rollback'
@@ -338,6 +356,11 @@ runs:
       run: |
         echo "::error::Rollback result '${RESULT:-unknown}': the previous deployment was NOT restored and verified. See the job summary for the manual recovery commands."
         exit 1
+    - name: Report stage state (D1 id, canonical URL, superseded)
+      id: report
+      if: always() && steps.init.outcome == 'success'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" report | tee -a "$GITHUB_OUTPUT"'
     - name: Remove staged env files
       if: always()
       shell: bash

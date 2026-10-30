@@ -60,8 +60,23 @@ ctx() {
 # Which commands/env belong to the target. Never falls back across targets (except dev_build_cmd -> build_cmd).
 target_build_cmd() { case "$TARGET" in dev) local c; c="$(inp dev_build_cmd)"; echo "${c:-$(inp build_cmd)}";; *) inp build_cmd;; esac; }
 target_smoke_cmd() { case "$TARGET" in dev) local c; c="$(inp dev_smoke_cmd)"; echo "${c:-$(inp smoke_cmd)}";; *) inp smoke_cmd;; esac; }
-target_url() {
+# Declared (caller-supplied) canonical URL of the kind; Preview kinds additionally derive theirs from Cloudflare (resolve_target_url).
+declared_url() {
   case "$KIND" in production) inp app_url_prod;; persistent-dev) inp app_url_dev;; native-dev) inp app_url_shared_dev_native_preview;; *) echo "";; esac
+}
+# The canonical URL THIS target is built for: resolved ONCE before the build (state file), else the declared one.
+target_url() { if [ -s "$S/target_url" ]; then rd target_url; else declared_url; fi; }
+# Resolve the canonical URL BEFORE any build of this target (fails closed): Preview kinds derive it from the real Preview
+# identity and the host Worker's Cloudflare-reported preview_url_suffix (or preview_url_suffix), cross-checked with the declared
+# URL; the build env is checked for self-origin consistency (callback / redirect / app origin). Writes $S/target_url.
+resolve_target_url() { # <build env file>
+  local R
+  R="$(node "$TOOLS_DIR/cli.mjs" resolve-url --kind "$KIND" --name "$PREVIEW_NAME" --host-worker "$HOST_WORKER" --explicit "$(declared_url)" \
+    --suffix "$(inp preview_url_suffix)" --host-check "$(inp preview_host_check)" --build-env "$1")" || die "cannot resolve the canonical URL of $KIND before the build; nothing was built"
+  printf '%s\n' "$R" | grep -v '^target_url=\|^url_source=' >&2 || true
+  R_URL="$(printf '%s\n' "$R" | sed -n 's/^target_url=//p')"
+  if [ -n "$R_URL" ]; then printf '%s' "$R_URL" > "$S/target_url"; else rm -f "$S/target_url"; fi
+  echo "::notice::canonical URL of $KIND resolved before the build: ${R_URL:-<none declared>} ($(printf '%s\n' "$R" | sed -n 's/^url_source=//p'))" >&2
 }
 # GitHub Environment (deployment history, protection rules) of the kind. Production / Preview / Dev names are unchanged.
 gh_env() { case "$KIND" in production) echo "$APP_NAME/prod";; native-branch) echo "$APP_NAME/preview";; native-dev) echo "$APP_NAME/native-dev";; persistent-dev) echo "$APP_NAME/dev";; esac; }
@@ -98,15 +113,19 @@ case "$PHASE" in
     SM="$(node "$TOOLS_DIR/cli.mjs" smoke-mode --kind "$K" --mode "$(inp smoke_mode)" --overrides "$(inp smoke_mode_overrides)" | sed -n 's/^smoke_mode=//p')"
     [ -n "$SM" ] || die "cannot resolve smoke_mode for $K"
     printf '%s' "$SM" > "$S/smoke_mode"
-    case "$STAGE" in all|deploy|migrate|publish|verify|rollback) ;; *) die "bad engine stage: $STAGE";; esac
+    case "$STAGE" in all|deploy|preflight|migrate|publish|verify|rollback) ;; *) die "bad engine stage: $STAGE";; esac
     # Production / Preview are always split. Shared Dev and persistent Dev default to the single-job engine (all); Shared Dev
     # alone may split into deploy (migrate + publish, no smoke, no recovery) -> verify -> rollback (pipeline_phase).
     if [ "$T" = dev ]; then
-      case "$STAGE" in all|deploy|migrate|publish|verify|rollback) ;; *) die "persistent Dev stage must be all, deploy, migrate, publish, verify or rollback, got '$STAGE'";; esac
+      case "$STAGE" in all|deploy|preflight|migrate|publish|verify|rollback) ;; *) die "persistent Dev stage must be all, deploy, preflight, migrate, publish, verify or rollback, got '$STAGE'";; esac
     else
-      case "$STAGE" in migrate|publish|verify|rollback) ;; *) die "$K must run as split stages (migrate/publish/verify/rollback), got '$STAGE'";; esac
+      case "$STAGE" in preflight|migrate|publish|verify|rollback) ;; *) die "$K must run as split stages (preflight/migrate/publish/verify/rollback), got '$STAGE'";; esac
     fi
     printf '%s' "$STAGE" > "$S/stage"
+    # The physical D1 the plan resolved for this kind (id only). Every build re-audit must bind exactly this database.
+    D1X="${ENGINE_D1_EXPECT:-}"
+    [[ "$D1X" =~ ^[A-Za-z0-9_-]*$ ]] || die "malformed expected D1 id"
+    printf '%s' "$D1X" > "$S/d1_expect"
     case "$M" in auto|manual) ;; *) die "bad engine mode: $M";; esac
     [ "$M" = auto ] || [ "$T" = dev ] || die "manual mode is only for the persistent Dev target"
     [ "$M" = auto ] || [ "$STAGE" = all ] || die "manual Dev runs as one job (stage all)"
@@ -206,6 +225,7 @@ case "$PHASE" in
 
   build)
     ctx
+    resolve_target_url "$S/build.env"
     BUILD_CMD="$(target_build_cmd)" BUILD_ENV_FILE="$S/build.env" APP_VERSION="$(inp app_version)" PREVIEW_ENV_FILE="$S/preview.env" \
       PREVIEW_NAME="$PREVIEW_NAME" PREVIEW_HOST_CHECK="$(inp preview_host_check)" PREVIEW_ALLOW="$(inp preview_binding_allow)" PREVIEW_DENY="$(inp preview_deny_resources)" \
       DEV_WORKER="$(inp dev_worker_name)" DEV_ALLOW="$(inp dev_binding_allow)" DEV_DENY="$(inp dev_deny_resources)" PROD_URL="$(inp app_url_prod)" \
@@ -216,7 +236,15 @@ case "$PHASE" in
     [ "$(inp d1_migrations)" = true ] || exit 0
     # The D1 the DEPLOYED config binds must be the exact physical database the migration targets, and the migration
     # directory must be real: checked read-only before any remote command.
-    node "$TOOLS_DIR/cli.mjs" d1-consistency --config "$(rd config.path)" --source "$APP_DIR/$WRANGLER_CONFIG" --target "$TARGET" --binding "$D1_BINDING" --dev-env "$DEV_ENV" --mode "$(rd config.mode)"
+    D1R="$(node "$TOOLS_DIR/cli.mjs" d1-consistency --config "$(rd config.path)" --source "$APP_DIR/$WRANGLER_CONFIG" --target "$TARGET" --binding "$D1_BINDING" --dev-env "$DEV_ENV" --mode "$(rd config.mode)")" || die "the built $KIND config does not bind the audited D1"
+    printf '%s\n' "$D1R" >&2
+    D1_ID="$(printf '%s\n' "$D1R" | sed -n 's/^d1_id=//p')"
+    [ -n "$D1_ID" ] || die "the built $KIND config binds no D1 database id"
+    # Pre-mutation / pre-publish proof: the DEPLOYED binding is the physical D1 the plan migrates (never another database).
+    if [ -n "$(rd d1_expect)" ] && [ "$D1_ID" != "$(rd d1_expect)" ]; then
+      die "the built $KIND config binds D1 '$D1_ID' but the plan migrates '$(rd d1_expect)'; refusing (the artifact would run against an unmigrated or foreign database)"
+    fi
+    printf '%s' "$D1_ID" > "$S/d1_id"
     (cd "$APP_DIR" && node "$TOOLS_DIR/cli.mjs" migration-config --config "$WRANGLER_CONFIG" --target "$TARGET" --binding "$D1_BINDING" --dev-env "$DEV_ENV" --out "$S/migrate-check.json" | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}");;
 
   migrate)
@@ -229,7 +257,12 @@ case "$PHASE" in
     PENDING="$(printf '%s\n' "$OUT" | sed -n 's/^pending=//p')"
     printf '%s' "$PENDING" > "$S/migration"
     echo "schema_changed=$PENDING"
+    echo "kind=$KIND"; echo "d1_id=$(rd d1_id)"
     echo "migration=applied";;
+
+  report) # final, always-run state report of a stage (data only)
+    ctx
+    echo "d1_id=$(rd d1_id)"; echo "target_url=$(rd target_url)"; echo "stale=${STALE:-false}"; echo "kind=$KIND";;
 
   fail-migrate) # the Migration job failed: nothing was published; the remote D1 state is whatever wrangler left
     ctx
@@ -246,11 +279,11 @@ case "$PHASE" in
     COMMIT_MSG=""; [ -z "${GITHUB_EVENT_PATH:-}" ] || [ ! -f "$GITHUB_EVENT_PATH" ] || COMMIT_MSG="$(jq -r '.head_commit.message // ""' "$GITHUB_EVENT_PATH")"
     APP_URL="$(target_url)" OUT_FILE="$S/preview.json" APP_VERSION="$(inp app_version)" COMMIT_MSG="$COMMIT_MSG" \
       WORKER_NAME="$(inp preview_worker_name)" PUBLISH_CMD="$([ "$TARGET" = dev ] && inp dev_deploy_cmd || true)" \
-      PREVIEW_NAME="$PREVIEW_NAME" EXPECTED_URL="$([ "$KIND" = native-dev ] && target_url || true)" \
+      PREVIEW_NAME="$PREVIEW_NAME" EXPECTED_URL="$([ "$TARGET" = preview ] && target_url || true)" \
       "$TOOLS_DIR/publish.sh"
     # Reached only when publish.sh succeeded: the hand-off of this deployment to the Smoke / Rollback jobs.
     echo "published=true"; echo "published_sha=$RUN_SHA"; echo "ledger_id=$LEDGER_ID"; echo "preview_name=$PREVIEW_NAME"
-    echo "worker_name=$AUDITED_NAME";;
+    echo "worker_name=$AUDITED_NAME"; echo "kind=$KIND"; echo "target_url=$(target_url)"; echo "d1_id=$(rd d1_id)";;
 
   hydrate) # Smoke / Rollback jobs: validated hand-off from the Migration / Deploy / Smoke jobs (data, never runner files)
     ctx
@@ -270,11 +303,20 @@ case "$PHASE" in
     H_PNAME="$(val "$D" preview_name '^([a-z0-9]+(-[a-z0-9]+)*)?$')"
     H_PUB="$(val "$D" published '^(true|false)?$')"
     H_PUBSHA="$(val "$D" published_sha '^([0-9a-f]{7,40})?$')"
+    H_KIND="$(val "$D" kind '^(production|native-branch|native-dev|persistent-dev)?$')"
+    H_TURL="$(val "$D" target_url '^(https://[^[:space:]]+)?$')"
+    M_D1="$(val "$M" d1_id '^[A-Za-z0-9_-]*$')"
     H_PENDING="$(val "$M" schema_changed '^(true|false)?$')"
     H_SCAN="$(val "$M" d1_scan '^(none|additive|non-additive|unknown)?$')"
     H_MIG="$(val "$M" migration '^(applied|failed|none)?$')"
     H_LEVEL="$(val "$K" smoke_level '^(liveness|content|content-sha)?$')"
     [ "$H_PUB" = true ] || die "the Deploy job did not report a published deployment; nothing to verify or roll back"
+    # Each kind receives ONLY its own results: a hand-off of another kind (or without a kind) is refused, fail closed.
+    [ "$H_KIND" = "$KIND" ] || die "hand-off belongs to kind '${H_KIND:-<none>}', this stage is '$KIND'; refusing to act on another target's deployment"
+    [ -z "$H_TURL" ] || [ "$H_URL" = "$H_TURL" ] || die "hand-off published $H_URL but the build was for $H_TURL; refusing"
+    if [ -n "${HANDOFF_MIGRATION:-}" ] && [ "$HANDOFF_MIGRATION" != '{}' ]; then
+      [ -z "$M_D1" ] || [ -z "$(rd d1_expect)" ] || [ "$M_D1" = "$(rd d1_expect)" ] || die "migration hand-off is for D1 '$M_D1', this kind's D1 is '$(rd d1_expect)'; refusing"
+    fi
     [ -z "$H_PUBSHA" ] || [ "$H_PUBSHA" = "$RUN_SHA" ] || die "hand-off was published from $H_PUBSHA, this run is $RUN_SHA; refusing to act on another deployment"
     [ "$TARGET" = prod ] || [ -n "$H_URL" ] || die "$TARGET hand-off has no published URL"
     printf '%s' "$H_LEDGER" > "$S/ledger_id"; printf '%s' "$H_PNAME" > "$S/preview_name"
@@ -436,12 +478,13 @@ case "$PHASE" in
     VERSION="$(APP_VERSION_IN="$(inp app_version)" node "$TOOLS_DIR/cli.mjs" rebind-env --var APP_VERSION_IN --from "$RUN_SHA" --to "$GOOD_SHA")"
     [ -z "$(inp app_version)" ] || [ "$VERSION" != "$(inp app_version)" ] || echo "::warning::app_version is not derived from the commit SHA; recovery keeps it as configured" >&2
     (cd "$APP_DIR" && pnpm install --frozen-lockfile)
+    resolve_target_url "$R/build.env"
     STATE_DIR="$R" BUILD_CMD="$(target_build_cmd)" BUILD_ENV_FILE="$R/build.env" APP_VERSION="$VERSION" PREVIEW_ENV_FILE="$S/preview.env" PREVIEW_NAME="$PREVIEW_NAME" \
       PREVIEW_HOST_CHECK=false PREVIEW_ALLOW="$(inp preview_binding_allow)" PREVIEW_DENY="$(inp preview_deny_resources)" \
       DEV_WORKER="$(inp dev_worker_name)" DEV_ALLOW="$(inp dev_binding_allow)" DEV_DENY="$(inp dev_deny_resources)" PROD_URL="$(inp app_url_prod)" \
       DELIVERY_KIND="$KIND" TARGET_URL="$(target_url)" "$TOOLS_DIR/build.sh" >&2
     OUT="$(STATE_DIR="$R" APP_URL="$(target_url)" OUT_FILE="$R/preview.json" APP_VERSION="$VERSION" WORKER_NAME="$(inp preview_worker_name)" \
-      PUBLISH_CMD="$([ "$TARGET" = dev ] && inp dev_deploy_cmd || true)" "$TOOLS_DIR/publish.sh")"
+      PUBLISH_CMD="$([ "$TARGET" = dev ] && inp dev_deploy_cmd || true)" EXPECTED_URL="$([ "$TARGET" = preview ] && target_url || true)" PREVIEW_NAME="$PREVIEW_NAME" "$TOOLS_DIR/publish.sh")"
     URL="$(printf '%s\n' "$OUT" | sed -n 's/^url=//p')"
     [ -n "$URL" ] || die "recovery produced no URL"
     [ "$URL" = "$GOOD_URL" ] || die "recovered URL $URL differs from the recorded last-good URL $GOOD_URL; refusing to verify a different deployment"

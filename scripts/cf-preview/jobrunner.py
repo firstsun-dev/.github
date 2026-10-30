@@ -36,7 +36,7 @@ case "$a" in
   *"per_page=30"*" -q "*) [ -n "${STUB_LASTGOOD:-}" ] && echo "9:$STUB_LASTGOOD";;
   *"per_page=30"*) printf '%s' "${STUB_DEPLOYMENTS:-[]}";;
   *"deployments/9/statuses"*) echo success;;
-  *"/statuses?per_page=1"*"environment_url"*) echo "${STUB_STATUS:-success https://stable.example.workers.dev Serving good (content)}";;
+  *"/statuses?per_page=1"*"environment_url"*) echo "${STUB_STATUS:-success https://feat-x-app.example.workers.dev Serving good (content)}";;
 esac
 exit 0
 '''
@@ -46,7 +46,7 @@ echo "pnpm $*" >> "$STUB_LOG"
 case "$3 $4 $5" in
   "--version  ") echo "4.140.0";;
   "preview "*) [ "${STUB_PREVIEW_FAIL:-}" = 1 ] && exit 9
-               if [ -n "${STUB_PREVIEW_RAW+x}" ]; then printf '%s' "$STUB_PREVIEW_RAW"; else echo '{"preview":{"urls":["https://stable.example.workers.dev"]}}'; fi;;
+               if [ -n "${STUB_PREVIEW_RAW+x}" ]; then printf '%s' "$STUB_PREVIEW_RAW"; else echo '{"preview":{"urls":["https://'"$5"'-app.example.workers.dev"]}}'; fi;;
   "deployments list"*) [ "${STUB_NO_PREV:-}" = 1 ] && { echo '[]'; exit 0; }
                echo '[{"created_on":"2024-01-01","versions":[{"version_id":"'"${STUB_ACTIVE:-prev-1}"'","percentage":100}]}]';;
   "versions view"*) [ -n "${STUB_PREV_MESSAGE:-}" ] && echo '{"annotations":{"workers/message":"'"$STUB_PREV_MESSAGE"'"}}';;
