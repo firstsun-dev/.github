@@ -126,7 +126,7 @@ Production and Native Preview normal publishes SHALL share one reusable Deploy j
 
 #### Scenario: Trusted feature push
 - **WHEN** the source is an eligible non-main branch and required gates succeed
-- **THEN** Deploy SHALL use Preview Environment/credentials, the stable branch identity and Native Preview publishing
+- **THEN** Deploy SHALL use Preview Environment and the shared account credentials, the stable branch identity and Native Preview publishing
 - **AND** parse the actual Preview URL from Wrangler machine-readable output
 - **AND** smoke that exact URL, not a guessed or constant Dev endpoint.
 

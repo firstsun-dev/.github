@@ -21,7 +21,7 @@ The published `_cf-worker-template.yml` v1/v1.5.0 uploads a version and then dep
 
 ## Approved decisions and platform facts (2026-10-20)
 
-- Previews may reuse the repository's existing Cloudflare deploy credentials (no separate least-privilege token) — owner decision; a dedicated Preview token remains recommended for Workers with stateful bindings.
+- Previews use the repository's existing Cloudflare deploy credentials (`CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`, same as Production and Dev); there is no separate Preview token or account ID and no fallback — owner decision.
 - No per-branch D1/R2 for Blog (see Data and security policy).
 - Facts proven in the `heaven-www` pilot and `wrangler 4.151.1`: see design.md "Verified platform facts".
 

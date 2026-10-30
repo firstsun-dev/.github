@@ -116,10 +116,10 @@ case "$PHASE" in
       R="$(node "$TOOLS_DIR/cli.mjs" resolve --event "$EVENT" --ref "$BRANCH_REF" --strategy "$STRATEGY" --preview-on-push "$(inp preview_on_branch_push)" --dispatch-target "$(inp dispatch_target)" | sed -n 's/^target=//p')"
       [ "$R" = "$T" ] || die "target mismatch (resolved '$R', engine '$T'); refusing to deploy"
     fi
-    # Each credential belongs to exactly one target; the job passes only that one and there is no fallback.
+    # Prod, Preview and Dev all use the one account credential pair (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID).
     # The Smoke job (stage verify) never receives Cloudflare credentials: it only probes the published URL.
     if [ "$STAGE" != verify ]; then
-      [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || die "$T credentials not provided; refusing to fall back to other credentials"
+      [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || die "$T credentials not provided (set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID)"
     elif [ -n "${CLOUDFLARE_API_TOKEN:-}${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
       die "the Smoke stage must not receive Cloudflare credentials"
     fi

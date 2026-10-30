@@ -23,7 +23,7 @@ Retention starts at the **branch-deletion tombstone**, not at creation or last d
 1. **Ledger** (GitHub Deployments of the consumer repo, read with its own `github.token`, fully paginated): environments `<app>/preview/<name>`. All records of a Preview must agree on `repo`, `worker`, `host_worker`, `preview_name` and a single `branch_ref`, and `previewIdentity()` of that ref must reproduce `<name>`. Anything else (legacy records without payload/host, two refs sharing a slug) → SKIP.
 2. **Tombstone**: the latest status of the newest deployment must be `inactive` with description exactly `Branch deleted; Preview kept` (written by the v2 `lifecycle` job via `gh.sh retire`) and created by `github-actions[bot]`. Its `created_at` is `deleted_at`. A superseded/other inactive status is not a tombstone; a newer deployment (including one in progress) after it means the Preview is live.
 3. **Branch**: live `git/ref/heads/<branch>` must be 404, and no existing branch may normalise to the same Preview name.
-4. **Cloudflare**: the target `account_id` must equal `CLOUDFLARE_PREVIEW_ACCOUNT_ID`; `GET /accounts/{id}/workers/workers/{host}/previews/{name}` decides existence (404 = already gone, treated as idempotent ledger cleanup). 401/403/429 abort the run.
+4. **Cloudflare**: the target `account_id` must equal `CLOUDFLARE_ACCOUNT_ID`; `GET /accounts/{id}/workers/workers/{host}/previews/{name}` decides existence (404 = already gone, treated as idempotent ledger cleanup). 401/403/429 abort the run.
 5. **Just before each delete**: branch, newest deployment id, ownership payload, tombstone status and the Cloudflare Preview are re-read; any change skips it (protects against concurrent pushes / branch recreation).
 6. **Delete**: `wrangler@4.135.0 preview delete --name <name> --worker-name <host> --skip-confirmation` with the account passed explicitly. Never `wrangler delete`. At most `max_deletions_per_run`, oldest first. Afterwards an `inactive` status `Preview garbage-collected (<ts>)` is appended to the newest deployment so it is never retried. GitHub Deployment history is never deleted.
 
@@ -44,7 +44,7 @@ Only Preview names derived from `<app>/preview/<name>` ledger environments are e
 | `only_previews` | – | JSON `["name"]`, restrict a controlled cleanup to exactly these |
 | `tools_ref` | required | must equal the ref the caller pins |
 
-Secrets: `CLOUDFLARE_PREVIEW_API_TOKEN`, `CLOUDFLARE_PREVIEW_ACCOUNT_ID` (same contract as v2). A target whose `account_id` differs from the supplied credentials is reported as ERROR and untouched; for several Cloudflare accounts add one caller job per account with its own secrets.
+Secrets: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` (same pair as v2; there are no Preview-specific credentials). A target whose `account_id` differs from the supplied credentials is reported as ERROR and untouched; for several Cloudflare accounts add one caller job per account with its own secrets.
 
 Permissions: `contents: read`, `deployments: write` (only used when deleting). The Cloudflare token needs Workers Scripts Edit on the Preview account.
 
@@ -78,8 +78,8 @@ jobs:
       targets: '[{"app_name":"www","preview_worker_name":"www","account_id":"<cloudflare account id>"}]'
       protected_previews: '[{"account_id":"<id>","host_worker":"www","preview_name":"<fixed-dev-preview-name>"}]'
     secrets:
-      CLOUDFLARE_PREVIEW_API_TOKEN: ${{ secrets.CLOUDFLARE_PREVIEW_API_TOKEN }}
-      CLOUDFLARE_PREVIEW_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 ```
 
 The workflow file must be on the default branch for `schedule` to run.
