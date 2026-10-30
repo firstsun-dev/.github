@@ -218,7 +218,7 @@ try {
         deliveries: { include: kinds.map(entry) },
         migrations: { include: migrations.map((g) => ({ ...entry(g.owner), members: g.members.join(','), database: g.databaseName })) },
       };
-      for (const m of migrations) console.log(`::notice::D1 ${m.databaseName}: one migration (owner ${m.owner}) serves ${m.members.join(', ')}`);
+      for (const m of migrations) console.error(`::notice::D1 ${m.databaseName}: one migration (owner ${m.owner}) serves ${m.members.join(', ')}`);
       out({
         kinds: JSON.stringify(plan.kinds), has_targets: String(kinds.length > 0), deliveries: JSON.stringify(plan.deliveries),
         has_migrations: String(migrations.length > 0), migrations: JSON.stringify(plan.migrations),

@@ -2,6 +2,8 @@
 
 `.github/workflows/_cf-worker-v2.yml` was refactored **in place** (breaking, no `v3`). Spec: `openspec/changes/refactor-cloudflare-worker-cicd-v2` (PR #57). Shipped v2.x behavior stays documented by `docs/cf-worker-v2.md` / PR #56 as the historical record; **the interface below replaces it**. The floating `@v2` tag has not moved and no consumer has been changed.
 
+> **Topology superseded:** the job set below (Migration → Deploy → Smoke → Rollback + Shared Dev trio) was replaced by the matrix topology in [cf-worker-v2-unified-delivery.md](cf-worker-v2-unified-delivery.md). Engine, security and recovery rules here still apply.
+
 ## Job DAG and architecture (thin workflow, one delivery engine)
 
 ```

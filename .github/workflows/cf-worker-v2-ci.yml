@@ -44,13 +44,15 @@ jobs:
           python3 scripts/cf-preview/test-workflow-contract.py
       - name: Unit tests (identity, event/target matrix, preflight, Dev resource policy, migration target, D1 consistency, artifact digest, protected env)
         run: node --test scripts/cf-preview/lib.test.mjs
+      - name: Delivery decision library (target matrix, smoke modes, D1 deduplication, Native Dev identity, URL isolation)
+        run: node --test scripts/cf-preview/delivery.test.mjs
       - name: build.sh / publish.sh behaviour, all targets, same-artifact contract (stub wrangler)
         run: scripts/cf-preview/test-deploy.sh
       - name: migrate.sh behaviour (stub wrangler)
         run: scripts/cf-preview/test-migrate.sh
       - name: Smoke verification, fail-closed (stub curl)
         run: scripts/cf-preview/test-smoke.sh
-      - name: Execute the real Migration -> Deploy -> Smoke -> Rollback chain (each job in a fresh workspace) plus Shared Dev / persistent-Dev with the composite engine and stubs (stale runs, fail-closed rollback, D1 compatibility, recovery, env-override protection, Release gate)
+      - name: Execute the real Gate -> Plan -> Migration -> Deploy -> Smoke -> Rollback chain as matrix legs (each leg in a fresh workspace) for every delivery kind with the composite engine and stubs (stale runs, fail-closed rollback, D1 deduplication / isolation, smoke modes, Native Dev, recovery, env-override protection, Release gate)
         run: python3 scripts/cf-preview/test-jobs.py
       - name: Env import is data, not code
         run: scripts/cf-preview/test-parse-env.sh

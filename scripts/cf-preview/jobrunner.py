@@ -53,7 +53,8 @@ case "$3 $4 $5" in
   "versions upload"*) [ "${STUB_UPLOAD_FAIL:-}" = 1 ] && exit 6; echo "Worker Version ID: new-2";;
   "versions deploy prev-1@100") [ "${STUB_ROLLBACK_FAIL:-}" = 1 ] && exit 8;;
   "d1 migrations list") [ "${STUB_PENDING:-1}" = 1 ] && echo "Migrations to be applied: ${STUB_PENDING_FILES-0001.sql}" || echo "No migrations to apply!";;
-  "d1 migrations apply") [ "${STUB_APPLY_FAIL:-}" = 1 ] && exit 7;;
+  "d1 migrations apply") [ "${STUB_APPLY_FAIL:-}" = 1 ] && exit 7
+               [ -n "${STUB_APPLY_FAIL_CFG:-}" ] && [[ "$*" == *"$STUB_APPLY_FAIL_CFG"* ]] && exit 7;;
 esac
 exit 0
 '''
@@ -129,6 +130,7 @@ class _Run:
         for step in steps:
             self.counter += 1
             sid = step.get("id")
+            ctx["job"] = {"status": "failure" if failed else "success"}
             ctx["env"].update(_parse_kv(self.jobenv_file))
             cond = step.get("if")
             if cond is None:

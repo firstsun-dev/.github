@@ -2,6 +2,7 @@
 // Pure decision + orchestration logic; every remote effect goes through the injected `github` / `cloudflare`
 // clients so the whole policy is unit-testable with fakes. Fail closed: any uncertainty => SKIP, never delete.
 import { previewIdentity } from '../cf-preview/lib.mjs';
+import { RESERVED_PREVIEW_NAMES } from '../cf-preview/delivery.mjs';
 
 /** Exact description written by `gh.sh retire` when a branch is deleted. */
 export const TOMBSTONE_DESCRIPTION = 'Branch deleted; Preview kept';
@@ -44,6 +45,11 @@ export async function classify({ cfg, target, previewName, deployments, github, 
   });
   const { accountId, hostWorker, appName } = target;
 
+  // The stable Native Dev Preview owns the reserved name `dev` (OpenSpec unify-cf-worker-v2-delivery-targets): never collected,
+  // whatever an old branch ledger says (a legacy branch literally named `dev` would have used that name).
+  if (RESERVED_PREVIEW_NAMES.includes(previewName)) {
+    return mk('KEEP', 'protected', `'${previewName}' is the reserved name of the Native Dev Preview (never garbage-collected)`);
+  }
   if (cfg.protected.some((p) => sameProtected(p, accountId, hostWorker, previewName))) {
     return mk('KEEP', 'protected', 'in the protected_previews allowlist (account + host worker + preview name)');
   }
