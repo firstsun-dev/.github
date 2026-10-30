@@ -438,7 +438,8 @@ case "$PHASE" in
     (cd "$APP_DIR" && pnpm install --frozen-lockfile)
     STATE_DIR="$R" BUILD_CMD="$(target_build_cmd)" BUILD_ENV_FILE="$R/build.env" APP_VERSION="$VERSION" PREVIEW_ENV_FILE="$S/preview.env" PREVIEW_NAME="$PREVIEW_NAME" \
       PREVIEW_HOST_CHECK=false PREVIEW_ALLOW="$(inp preview_binding_allow)" PREVIEW_DENY="$(inp preview_deny_resources)" \
-      DEV_WORKER="$(inp dev_worker_name)" DEV_ALLOW="$(inp dev_binding_allow)" DEV_DENY="$(inp dev_deny_resources)" PROD_URL="$(inp app_url_prod)" "$TOOLS_DIR/build.sh" >&2
+      DEV_WORKER="$(inp dev_worker_name)" DEV_ALLOW="$(inp dev_binding_allow)" DEV_DENY="$(inp dev_deny_resources)" PROD_URL="$(inp app_url_prod)" \
+      DELIVERY_KIND="$KIND" TARGET_URL="$(target_url)" "$TOOLS_DIR/build.sh" >&2
     OUT="$(STATE_DIR="$R" APP_URL="$(target_url)" OUT_FILE="$R/preview.json" APP_VERSION="$VERSION" WORKER_NAME="$(inp preview_worker_name)" \
       PUBLISH_CMD="$([ "$TARGET" = dev ] && inp dev_deploy_cmd || true)" "$TOOLS_DIR/publish.sh")"
     URL="$(printf '%s\n' "$OUT" | sed -n 's/^url=//p')"
