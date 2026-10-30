@@ -147,31 +147,77 @@ only by the local suites above.
 
 ## Test profiles and measured performance (PR #89 refactor)
 
-`scripts/cf-preview/test.sh fast|chain|full` is the single entrypoint used by CI and by agents (logs go to `$LOGDIR`, only summaries print).
+`scripts/cf-preview/test.sh fast|chain|full` is the single entrypoint for CI and agents (logs go to `$LOGDIR`, only summaries print).
 `fast` = static workflow contract, unit tests (`lib.test.mjs`, `delivery.test.mjs`), stub shell tests, GC unit tests (~10 s).
-`chain` = the real-shell Migration → Deploy → Smoke → Rollback scenarios of `test-jobs.py`, run as 7 independent groups in parallel
-(`run-job-groups.py`; every scenario already owns fresh workspaces, so groups share no mutable state). `full` = both; it is the only profile
-that satisfies the required `contract` check (a skipped Full cannot pass the merge gate: there is one job).
-Set `JOBRUNNER_PERF=<file>` to get a JSON report of subprocesses by command category/engine phase, workspaces and jobs.
+`chain` = the real-shell Migration → Deploy → Smoke → Rollback scenarios of `test-jobs.py`, which is now shared fixtures plus **eight explicit
+`group_*` functions** (`test-jobs.py --list | --group ID`). `run-job-groups.py` is a thin launcher (bounded parallelism: `CF_V2_TEST_JOBS` or
+min(4, CPUs)) that checks a manifest of expected groups with minimum check counts: a missing, unexpected, empty, shrunken or skipped group, or a
+missing perf report, fails the run. `full` = both; it is the only profile behind the required `contract` check. `JOBRUNNER_PERF=<file>` writes a JSON
+report (subprocesses by command/engine phase, workspaces, jobs).
 
-| Metric (same 379 assertions) | Before | After |
+| Metric (393 checks; 379 before + 14 added in this work, none removed) | Before (3842a45 / a9fd174) | After (506c101) |
 | --- | --- | --- |
-| `test-jobs.py` wall time (32-core dev box) | ~6 min (398 s measured under load; ~170 s serial on a quiet box) | ~94 s (7 parallel groups) |
+| Chain wall time, local (bounded parallelism 4) | ~6 min serial equivalent | ~101 s (`run-job-groups.py`) |
 | Fast profile | not separated | ~10 s |
-| Whole CI job (GitHub-hosted, incl. setup, lint) | not measured on this branch | 2m29s – 4m13s |
-| Subprocesses in `test-jobs.py` | 7180 | 7564 (**+5 %**: the extra engine gate steps) |
-| Workspaces created | 1408 | 1412 |
+| Whole CI job (GitHub-hosted: setup, tests, lint) | 2m29s – 4m13s | 2m19s – 2m50s |
+| Engine `init` average cost | 213 ms (697 calls, 36 % of subprocess CPU) | 58 ms (702 calls, 40.9 s CPU) |
+| Recorded step-subprocess CPU | ~398 s | ~306 s |
+| Node processes in one Production chain (system-wide `execve`) | 17 | 9 |
+| All `execve` in one Production chain | 567 | 549 (-3 %; the rest is the harness's own bash stubs) |
+| Step-shell subprocesses counted by the harness | 7180 | 7640 (+6 %: new `migration-gate`/`init-checks` steps; not a reduction) |
+| Workspaces created | 1408 | 1437 (new tests) |
 
-Honest reading: the speed-up is parallelism plus the Fast/Full split; the subprocess **count was not reduced**. Measured CPU hot spots
-(share of subprocess time): `engine.sh init` 36 % (213 ms avg, 697 calls — up to six Node processes per call), `build` 14 %, `prepare` 7 %.
-Next measured lever: one Node process for all `init` checks (descriptor, classify, kinds, URL isolation, env parsing).
+Honest reading: wall time improved through parallel groups, a lighter `init` and the Fast/Full split. The harness's step-shell count did **not** fall; the
+work removed is *inside* the steps (Node/`jq` processes per engine call). Replacing repeated full-chain scenarios with focused tests was **not** done in
+this round: every end-to-end scenario is still run, new focused unit tests were added alongside them. Remaining top costs: `engine:build` 14 %,
+`prepare` 7 %, `hydrate` 5 %.
 
-Pure decisions now unit-tested in `delivery.mjs` (instead of inline shell/jq): target descriptor, migration peer gate, migration-used
-resolution, verification outcome, Production rollback guard, rollback verdict.
+### Structure (static, before → after)
+
+| | 3842a45 | a9fd174 | 506c101 |
+| --- | --- | --- | --- |
+| `_cf-worker-v2.yml` lines | 1318 | 1259 | 1247 |
+| `_cf-worker-delivery.yml` lines | 494 | 450 | 446 |
+| `engine.sh` lines | 593 | 606 | 524 |
+| `with:` field lines across the 12 per-kind calls | 196 | 144 | 132 |
+| Inline `jq` policy steps in the delivery workflow | 10 | 3 | 3 |
+| Node spawn sites inside `engine.sh init` | 24 | 17 | 3 |
+| Build / publish implementation paths in the engine | 2 / 2 | 1 / 1 | 1 / 1 |
+| Independent implementations of "which kinds / D1 / owner / smoke mode" | plan YAML + engine shell + workflow expressions | descriptor (JS) | descriptor (JS), engine re-validates it |
+
+Per call, `target`, `environment`, `d1_expected_id`, `d1_owner_kind`, `deploy_group`, `rollback_group` and `kind` are one `descriptor`. Unavoidable
+GitHub Actions duplication: the 12 static `uses:` calls (one job per kind keeps outputs unambiguous), each call's `permissions` ceiling and `secrets`
+block, and the two-step tooling checkout in every delivery job — `uses:` cannot take an expression, so a composite that fetches the tools at
+`tools_ref` cannot itself be referenced from `tools_ref`; each job runs on its own runner anyway.
+
+Pure decisions now unit-tested in `delivery.mjs` instead of inline shell/jq: target descriptor (incl. deferred-verification restore), migration peer gate,
+migration-used resolution, engine initialisation (`validateInit`), verification outcome, Production rollback guard, rollback verdict.
+
+### Deferred verification keeps the deploy call's decisions
+
+`phase_state` carries the deploy call's validated descriptor map (`descriptors`). The verify call's plan restores it (`restoreDescriptors`), checks it
+against the rest of the hand-off (kinds, application, repository, D1 ids, migration owner; phase must be `deploy`) and only moves `phase` to `verify`.
+A legacy hand-off without `descriptors` is rebuilt from the deploy call's own `phase_state.inputs`, never from the verify call's inputs; missing identity
+fails closed. For leg kinds the legacy rebuild uses the verify run's id in the (uncontended) rollback group name — the only documented difference.
+
+### Real-runner evidence pinned to `506c101` (immutable code SHA; later commits on this branch are docs only)
+
+Disposable `firstsun-dev/cf-v2-scratch-caller`, public workflow and `tools_ref` both `506c101bbb2341a84136cd2488549f177fc1876d`, jobs on the org's
+provisioned `linux` runners (`heavenweb-runner-*`, pnpm baked in — this is what unblocked Build Validation, which hosted `ubuntu-latest` cannot run).
+No Cloudflare credentials existed, so nothing remote was touched.
+
+| Run | What it proves | Observed |
+| --- | --- | --- |
+| [41056958707](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41056958707) | Cross-repo nested call resolves; verify with a real deploy-phase `phase_state` (smoke_mode=skip) while the verify call uses the default `full` | success; Plan, Smoke ran on org runners; `deploy_smoke_level=skipped`, `deploy_verified=false`, `deploy_published_unverified=true` |
+| [41056964707](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41056964707) | Tampered descriptor D1 | Plan fails: `descriptor for production binds D1 'FOREIGN' but the hand-off recorded 'REAL-DB'`; delivery skipped |
+| [41057340143](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41057340143) | Real `deploy` → `verify` chain, persistent Dev, `d1_lock_scope: shared-db` | Build Validation, Gate, Plan succeed; Deploy fails closed (`dev credentials not provided`); the real `phase_state` carries `deploy_group = rollback_group = cfv2-dev-firstsun-dev/cf-v2-scratch-caller-shared-db`, `smoke_mode: skip`, `phase: deploy`; the verify call (no scope input) restores it and its Plan and Smoke succeed |
+
+**Not demonstrable here and therefore NOT claimed:** live D1 migration, URL resolution against the Workers subdomain API, publish, smoke against a live
+Worker, rollback and recovery — they need approved non-production Cloudflare credentials and are covered only by the local suites above.
 
 ## Known limitations
 
-* **Hosted runners lack `pnpm`.** `actions/setup` with `setup-pnpm: 'false'` (used by every validation job and the engine) assumes a runner image with pnpm
+* **Hosted `ubuntu-latest` runners lack `pnpm`** (resolved for validation by using the org's provisioned `linux` runners; see the evidence above). `actions/setup` with `setup-pnpm: 'false'` (used by every validation job and the engine) assumes a runner image with pnpm
   baked in (the org's `linux` runners). On `ubuntu-latest` the Validation jobs fail with `pnpm: command not found`, so a full real chain
   (Gate → Plan → Preflight → …) cannot be exercised on a hosted runner. This is pre-existing behaviour and unchanged by this fix.
 * A caller of the public workflow must grant at least `contents: write` (Release job), `deployments: write` and `pull-requests: write`
