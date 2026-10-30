@@ -130,13 +130,28 @@ pre-resolution, smoke full/basic/skip, rollback isolation and stale-deployment p
 `delivery.test.mjs`, `lib.test.mjs`, `test-*.sh`, `gc.test.mjs`, shellcheck, actionlint 1.7.12. Local gate at `e72ae91`+: contract 623, test-jobs 379, node (lib+delivery+gc) 114, test-deploy 84, migrate 26, smoke 49, parse-env 27, probe 20, gh 24 — all
 passing; actionlint 1.7.12 and shellcheck clean.
 
-**Real-runner evidence: NOT yet recorded.** The disposable private caller repo `firstsun-dev/cf-v2-scratch-caller` (pinned-SHA call of the public workflow,
-`runner: ubuntu-latest`, no Cloudflare secrets, plus a read-back job over every public output) could not be created: the repository-creation command was
-denied by the session's permission classifier twice. Until it runs, the following remain unproven on GitHub itself: `uses: ./.github/workflows/_cf-worker-delivery.yml`
-resolution from a cross-repository call, the permission ceiling, the rendered `phase_state` / output expressions, and that a hosted runner provides `pnpm`
-for `actions/setup` with `setup-pnpm: false` (it is baked into the org's `linux` runners). G1 stays BLOCKED on this item.
+**Real-runner evidence** — disposable private caller `firstsun-dev/cf-v2-scratch-caller`, `runner: ubuntu-latest`, **no Cloudflare secrets**, calling
+`firstsun-dev/.github/.github/workflows/_cf-worker-v2.yml` at the pinned SHA `88d9777` (`tools_ref` = same SHA):
+
+| Run | What it proves | Observed |
+| --- | --- | --- |
+| [41035153116](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41035153116) / [41035205869](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41035205869) | **Defect found by the real runner**: `startup_failure` at `c6423d0`. | GitHub validates the permission ceiling for **every** job of a called workflow, including jobs skipped by `if:`. The Preflight / Migration calls granted only `deployments: read` while the same workflow's Deploy/Smoke/Rollback jobs request `deployments: write` + `pull-requests: write`. Fixed in `88d9777` (all per-kind calls grant the full ceiling; each called job still requests only what it needs); the contract test now checks the ceiling against every called job. Bisected by copying the workflow into the scratch repo (`pf1`/`mg1` startup_failure, `dl1`/`nocalls` start). |
+| [41035901102](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41035901102) | Cross-repo call of the public workflow at `88d9777` **starts**; the nested `uses: ./.github/workflows/_cf-worker-delivery.yml` resolves; all 20 public outputs are readable by a read-back job. | `call` = failure by design at *Build Validation*: `pnpm: command not found` (see limitations). `readback` = success: `CALL_RESULT=failure`, `DEPLOY_GATE_BLOCKED=false`, every other output empty, `phase_state` rendered as JSON. 22 downstream jobs skipped (fail closed behind the red Gate). |
+| [41036120312](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41036120312) | `pipeline_phase: verify` with a hand-built `phase_state` (kinds native-branch + native-dev): plan from the hand-off, **one independent delivery call per kind**. | success: `Delivery plan`, `Delivery (native-branch) / Smoke Tests`, `Delivery (native-dev) / Smoke Tests` ran (nothing was published, so nothing is verified); 29 other jobs skipped; read-back: `DEPLOY_TARGET=preview` (selected by the plan flag), `DEPLOY_URL`, `DEPLOY_VERIFIED`, `NATIVE_DEV_URL`, `NATIVE_DEV_VERIFIED`, `MIGRATION_STATUS`, `ROLLBACK_RESULT` empty, `DEPLOY_GATE_BLOCKED=false`. |
+| [41036125410](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41036125410) (ref `main`) | Engine event/kind guard on a real runner. | Preflight(native-dev) failed closed: `target mismatch (enabled kinds 'production', engine 'native-dev'); refusing to deploy`; Deploy / Migration / Smoke / Rollback skipped. |
+| [41036258062](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41036258062) (ref `feat/x`) | Preflight engine stage on a real runner, branch event. | Passed init and the kind guard, then failed closed: `preview credentials not provided (set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID)`; the other four jobs skipped. |
+
+Not demonstrable on GitHub-hosted runners without Cloudflare credentials (and so **not** proven by a real run): URL resolution against the Workers
+subdomain API, the build, effective-config audit and D1 binding checks, migration, publish, smoke against a live Worker, rollback. Those are proven
+only by the local suites above.
 
 ## Known limitations
+
+* **Hosted runners lack `pnpm`.** `actions/setup` with `setup-pnpm: 'false'` (used by every validation job and the engine) assumes a runner image with pnpm
+  baked in (the org's `linux` runners). On `ubuntu-latest` the Validation jobs fail with `pnpm: command not found`, so a full real chain
+  (Gate → Plan → Preflight → …) cannot be exercised on a hosted runner. This is pre-existing behaviour and unchanged by this fix.
+* A caller of the public workflow must grant at least `contents: write` (Release job), `deployments: write` and `pull-requests: write`
+  (ceiling of the called jobs), as before.
 
 * Locks are repository-scoped; a D1 shared across repositories must be serialized by the owner (documented on `d1_lock_scope`).
 * The compiled-asset scan ("an artifact embeds another target's callback/issuer/origin") is **not** implemented; the build-env checks above and the
