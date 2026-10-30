@@ -42,7 +42,10 @@ export function parseEnvLines(text, { reserved = false } = {}) {
  *  `--emit0 <file> [--reserved]` re-validate a file written by the first form and print NUL-separated NAME=VALUE pairs.
  *  `--reserved` is what the delivery engine always passes: application env may not set deployment-control names. */
 // Compare real paths: a symlinked checkout must not turn the importer into a silent no-op.
-if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
+const isMain = () => {
+  try { return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); } catch { return false; } // e.g. `node -e`: argv[1] is not a file
+};
+if (isMain()) {
   const args = process.argv.slice(2);
   const mask = args.includes('--mask');
   const reserved = args.includes('--reserved');

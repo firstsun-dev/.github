@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // CLI used by _cf-worker-v2.yml. Prints key=value lines (GITHUB_OUTPUT-safe) or exits non-zero.
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import {
   assertWranglerSupported, auditDevConfig, previewHostReadiness, auditPreviewConfig, auditProdConfig, classifyEvent, extractPreviewUrl,
@@ -8,7 +8,7 @@ import {
 } from './lib.mjs';
 import {
   DELIVERY_KINDS, ENGINE_TARGET, assertKind, branchPreviewIdentity, canonicalOrigin, checkBuildEnvOrigins, environmentName, foreignUrlsInBuildEnv, planMigrations, resolveCanonicalUrl, resolveDeliveryTargets, resolveSmokeMode,
-  buildDescriptors, parseDescriptor, checkPeerPreflights, resolveMigrationUsed, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors,
+  buildDescriptors, parseDescriptor, checkPeerPreflights, resolveMigrationUsed, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors, validateInit,
 } from './delivery.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -304,6 +304,22 @@ try {
         recovered: e.RECOVERED ?? '', verified: e.VERIFIED ?? '', smokeLevel: e.SMOKE_LEVEL ?? '',
       });
       out({ result: v.result, level: v.level, ok: String(v.ok) });
+      break;
+    }
+    case 'init-checks': { // --state DIR --inputs FILE; env ENGINE_* GITHUB_EVENT_NAME GITHUB_REF CALL_INPUTS_JSON PREVIEW_SECRETS. ONE process for every init check.
+      const e = process.env;
+      const r = validateInit({
+        inputs: JSON.parse(readFileSync(opt('inputs'), 'utf8')), target: e.ENGINE_TARGET, kind: e.ENGINE_KIND ?? '', stage: e.ENGINE_STAGE || 'all', mode: e.ENGINE_MODE || 'auto',
+        d1Expect: e.ENGINE_D1_EXPECT ?? '', descriptor: e.ENGINE_DESCRIPTOR ?? '', callInputs: e.CALL_INPUTS_JSON ?? '', event: e.GITHUB_EVENT_NAME, ref: e.GITHUB_REF,
+        previewSecrets: e.PREVIEW_SECRETS ?? '',
+      });
+      const dir = opt('state');
+      const put = (name, text) => writeFileSync(resolve(dir, name), text, { mode: 0o600 });
+      const env = (name, pairs) => { if (pairs?.length) appendFileSync(resolve(dir, name), pairs.map(([k, v]) => `${k}=${v}`).join('\n') + '\n', { mode: 0o600 }); };
+      put('kind', r.kind); put('smoke_mode', r.smokeMode); put('stage', r.stage); put('d1_expect', r.d1Expect); put('target', r.target); put('mode', r.mode);
+      env('build.env', r.buildEnv); env('smoke.env', r.smokeEnv); env('preview.env', r.previewEnv);
+      for (const [, v] of r.previewEnv ?? []) if (v) console.log(`::add-mask::${v}`);
+      out({ kind: r.kind, smoke_mode: r.smokeMode });
       break;
     }
     case 'stale':

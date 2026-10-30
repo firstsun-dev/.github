@@ -4,7 +4,7 @@ import {
   DELIVERY_KINDS, resolveDeliveryTargets, resolveSmokeMode, parseSmokeOverrides, planMigrations, branchPreviewIdentity, ENGINE_TARGET,
   canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins,
   targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor, checkPeerPreflights, resolveMigrationUsed,
-  isContentLevel, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors,
+  isContentLevel, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors, validateInit,
 } from '../../actions/cf-preview/delivery.mjs';
 
 const base = { event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-preview', previewOnPush: true };
@@ -463,4 +463,86 @@ test('deferred verify: a legacy hand-off (no descriptors) is rebuilt ONLY from t
   assert.equal(pd['persistent-dev'].deploy_group, 'cfv2-dev-o/r-shared-db');
   assert.throws(() => R({ ...legacy, inputs: { app_name: 'app', smoke_mode: 'maybe' } }), /smoke_mode/);
   assert.throws(() => R({ ...legacy, inputs: { smoke_mode: 'skip' } }), /app_name is missing/);
+});
+
+// ---- engine initialisation: one pure validation (was ~6 Node processes + jq in engine.sh init) --------------------------------
+const IN0 = {
+  app_name: 'app', deployment_strategy: 'production-preview', production_rollback_policy: 'automatic', build_cmd: 'pnpm build', preview_on_branch_push: true,
+  app_url_prod: 'https://app.example.com', app_url_dev: 'https://dev.example.com', dev_worker_name: 'app-dev', smoke_env: '', build_env_prod: '', build_env_preview: '',
+};
+const INIT = (o = {}, i = {}) => validateInit({ inputs: { ...IN0, ...i }, target: 'preview', stage: 'migrate', event: 'push', ref: 'refs/heads/feat/x', ...o });
+const initFails = (re, o, i) => assert.throws(() => INIT(o, i), re);
+
+test('init: a valid Native Branch push binds kind, stage, mode and the smoke policy', () => {
+  const r = INIT();
+  assert.deepEqual([r.kind, r.target, r.stage, r.mode, r.smokeMode], ['native-branch', 'preview', 'migrate', 'auto', 'full']);
+  assert.equal(INIT({ target: 'prod', stage: 'publish', ref: 'refs/heads/main' }).kind, 'production');
+});
+
+test('init: target, kind, stage and mode binding refuse everything unknown or cross-target', () => {
+  initFails(/bad engine target/, { target: 'staging' });
+  initFails(/does not belong to engine target/, { kind: 'production' });
+  initFails(/must run as split stages/, { stage: 'all' });
+  initFails(/bad engine stage/, { stage: 'nope' });
+  initFails(/malformed expected D1 id/, { d1Expect: 'a b' });
+  initFails(/bad engine mode/, { mode: 'weird' });
+  initFails(/manual mode is only for the persistent Dev target/, { mode: 'manual' });
+  assert.throws(() => INIT({ target: 'dev', kind: 'persistent-dev', mode: 'manual', stage: 'migrate' }, { dev_build_cmd: 'x' }), /manual Dev runs as one job/);
+  assert.throws(() => validateInit({ inputs: [], target: 'preview', event: 'push', ref: 'refs/heads/x' }), /inputs_json is not an object/);
+});
+
+test('init: strategy, rollback policy and Dev channel combinations fail closed before anything runs', () => {
+  initFails(/bad deployment_strategy/, {}, { deployment_strategy: 'x' });
+  initFails(/bad production_rollback_policy/, {}, { production_rollback_policy: 'maybe' });
+  initFails(/production-only cannot be combined/, { ref: 'refs/heads/main' }, { deployment_strategy: 'production-only', shared_dev_on_branch_push: true });
+  initFails(/conflicting automatic Dev channels/, {}, { shared_dev_on_branch_push: true, shared_dev_native_preview_on_branch_push: true });
+});
+
+test('init: the engine kind must be among the kinds this event enables (no phantom delivery)', () => {
+  initFails(/target mismatch/, { target: 'prod', stage: 'publish' }); // branch push never enables production
+  initFails(/target mismatch/, {}, { preview_on_branch_push: false });
+  initFails(/target mismatch/, { ref: 'refs/heads/main' }); // main push enables production only
+  assert.equal(INIT({ kind: 'native-dev' }, { shared_dev_native_preview_on_branch_push: true }).kind, 'native-dev');
+});
+
+test('init: manual persistent Dev only from the approved ref via dispatch', () => {
+  const M = (o = {}, i = {}) => validateInit({ inputs: { ...IN0, deployment_strategy: 'hybrid', dev_build_cmd: 'x', persistent_dev_ref: 'refs/heads/dev', dispatch_target: 'persistent-dev', ...i }, target: 'dev', kind: 'persistent-dev', stage: 'all', mode: 'manual', event: 'workflow_dispatch', ref: 'refs/heads/dev', ...o });
+  assert.equal(M().kind, 'persistent-dev');
+  assert.throws(() => M({ ref: 'refs/heads/other' }), /manual Dev is only allowed from the approved persistent_dev_ref/);
+  assert.throws(() => M({ event: 'push' }), /manual Dev is only allowed/);
+});
+
+test('init: per-target requirements (Native Dev flag, Dev identity/URL/build, build command)', () => {
+  initFails(/target mismatch/, { kind: 'native-dev' }); // without the flag Native Dev is not an enabled kind at all
+  const D = (i = {}) => validateInit({ inputs: { ...IN0, deployment_strategy: 'hybrid', shared_dev_on_branch_push: true, dev_build_cmd: 'x', ...i }, target: 'dev', stage: 'all', event: 'push', ref: 'refs/heads/feat/x' });
+  assert.equal(D().kind, 'persistent-dev');
+  assert.throws(() => D({ dev_worker_name: '' }), /dev_worker_name/);
+  assert.throws(() => D({ app_url_dev: '' }), /app_url_dev/);
+  assert.throws(() => D({ dev_build_cmd: '', build_cmd: '' }), /no build command for target dev/);
+  assert.throws(() => D({ dev_build_cmd: '', d1_migrations: true }), /requires dev_build_cmd/);
+  assert.equal(D({ dev_build_cmd: '' }).kind, 'persistent-dev', 'dev_build_cmd falls back to build_cmd without D1 migrations');
+  initFails(/no build command for target preview/, {}, { build_cmd: '' });
+});
+
+test('init: env data - reserved/forbidden names rejected, foreign target URLs rejected, each kind uses ONLY its own build env', () => {
+  initFails(/CFV2_BUILD_ENV: .*TARGET may not be set/, {}, { build_env_preview: 'TARGET=prod' });
+  initFails(/CFV2_SMOKE_ENV/, {}, { smoke_env: 'GITHUB_TOKEN=x' });
+  initFails(/CFV2_PS/, { previewSecrets: 'CLOUDFLARE_API_TOKEN=x' });
+  initFails(/contains the production URL/, {}, { build_env_preview: 'PUBLIC_URL=https://app.example.com' });
+  const r = INIT({ previewSecrets: 'API_KEY=s3cret' }, { build_env_preview: 'A=1\nB=2', build_env_prod: 'PROD_ONLY=1', smoke_env: 'S=1' });
+  assert.deepEqual(r.buildEnv, [['A', '1'], ['B', '2']], 'a Preview build never sees the Production build env');
+  assert.deepEqual(r.smokeEnv, [['S', '1']]);
+  assert.deepEqual(r.previewEnv, [['API_KEY', 's3cret']]);
+  assert.equal(INIT({ target: 'prod', stage: 'publish', ref: 'refs/heads/main', previewSecrets: 'API_KEY=s3cret' }).previewEnv, null, 'Preview secrets are only read for the Preview target');
+});
+
+test('init: deferred verify identity inputs must equal the deploy call\'s; a descriptor must match the stage', () => {
+  const ci = (o = {}) => JSON.stringify({ app_name: 'app', app_path: '', production_rollback_policy: 'automatic', tools_ref: '', ...o });
+  assert.doesNotThrow(() => INIT({ callInputs: ci() }));
+  for (const k of ['app_name', 'app_path', 'production_rollback_policy', 'tools_ref']) initFails(new RegExp(`'${k}' differs`), { callInputs: ci({ [k]: 'x' }) });
+  initFails(/call inputs are not an object/, { callInputs: '[1]' });
+  const d = targetDescriptor({ kind: 'native-branch', app: 'app', runId: 1, repo: 'o/r', smokeMode: 'skip' });
+  assert.equal(INIT({ descriptor: JSON.stringify(d) }).smokeMode, 'skip', 'the smoke policy comes from the descriptor');
+  initFails(/is for production, not native-branch/, { descriptor: JSON.stringify(targetDescriptor({ kind: 'production', app: 'app', runId: 1 })) });
+  initFails(/D1 id differs/, { descriptor: JSON.stringify({ ...d, d1_expected_id: 'X', d1_owner_kind: '' }) });
 });

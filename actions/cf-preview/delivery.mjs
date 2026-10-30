@@ -1,6 +1,7 @@
 // Pure decision logic of the target-driven delivery architecture (OpenSpec unify-cf-worker-v2-delivery-targets).
 // One normalised vocabulary for the four delivery kinds; no I/O. Imported by cli.mjs, unit-tested in lib.test.mjs.
 import { classifyEvent, migrationPlan, previewIdentity, STRATEGIES } from './lib.mjs';
+import { parseEnvLines } from './parse-env.mjs';
 
 export const DELIVERY_KINDS = ['production', 'native-branch', 'native-dev', 'persistent-dev'];
 export const SMOKE_MODES = ['full', 'basic', 'skip'];
@@ -441,4 +442,88 @@ export function restoreDescriptors(state, { repo, runId = '0' }) {
     out[k] = validateDescriptor({ ...d, phase: 'verify' });
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Engine initialisation (pure): every check that used to be a separate Node/jq call in `engine.sh init`, evaluated once over the
+// validated inputs. Throws (fail closed, BEFORE any mutation) with the message the operator sees. Credentials stay a shell check.
+// ---------------------------------------------------------------------------------------------------------------------
+const KIND_OF_TARGET = { prod: 'production', preview: 'native-branch', dev: 'persistent-dev' };
+const STAGES = ['all', 'deploy', 'preflight', 'migrate', 'publish', 'verify', 'rollback'];
+const BUILD_ENV_INPUT = { production: 'build_env_prod', 'native-branch': 'build_env_preview', 'native-dev': 'build_env_shared_dev_native_preview', 'persistent-dev': 'build_env_dev' };
+
+export function validateInit({ inputs, target, kind = '', stage = 'all', mode = 'auto', d1Expect = '', descriptor = '', callInputs = '', event, ref, previewSecrets = '' }) {
+  if (inputs === null || typeof inputs !== 'object' || Array.isArray(inputs)) throw new Error('inputs_json is not an object');
+  const s = (k) => (inputs[k] == null ? '' : String(inputs[k]));
+  const on = (k) => s(k) === 'true';
+  if (!['prod', 'preview', 'dev'].includes(target)) throw new Error(`bad engine target: ${target}`);
+  const K = kind || KIND_OF_TARGET[target];
+  if (ENGINE_TARGET[K] !== target) throw new Error(`delivery kind '${K}' does not belong to engine target '${target}'`);
+  let smokeMode;
+  if (descriptor) {
+    const d = parseDescriptor(descriptor, K);
+    if (d.target !== target) throw new Error(`target descriptor engine target '${d.target}' differs from the stage's '${target}'`);
+    if (d.d1_expected_id !== d1Expect) throw new Error("target descriptor D1 id differs from the stage's expected D1");
+    smokeMode = d.smoke_mode;
+  } else smokeMode = resolveSmokeMode(K, s('smoke_mode'), s('smoke_mode_overrides'));
+  if (!STAGES.includes(stage)) throw new Error(`bad engine stage: ${stage}`);
+  if (target === 'dev') { /* every stage is allowed for persistent Dev */ } else if (!['preflight', 'migrate', 'publish', 'verify', 'rollback'].includes(stage)) {
+    throw new Error(`${K} must run as split stages (preflight/migrate/publish/verify/rollback), got '${stage}'`);
+  }
+  if (!/^[A-Za-z0-9_-]*$/.test(d1Expect)) throw new Error('malformed expected D1 id');
+  if (!['auto', 'manual'].includes(mode)) throw new Error(`bad engine mode: ${mode}`);
+  if (mode !== 'auto' && target !== 'dev') throw new Error('manual mode is only for the persistent Dev target');
+  if (mode !== 'auto' && stage !== 'all') throw new Error('manual Dev runs as one job (stage all)');
+  if (callInputs) { // deferred verification: the verify call's identity inputs must equal the deploy call's
+    let c;
+    try { c = JSON.parse(callInputs); } catch { c = null; }
+    if (c === null || typeof c !== 'object' || Array.isArray(c)) throw new Error('call inputs are not an object');
+    for (const k of ['app_name', 'app_path', 'production_rollback_policy', 'tools_ref']) {
+      if ((c[k] == null ? '' : String(c[k])) !== s(k)) throw new Error(`verify call input '${k}' differs from the deploy call that produced the hand-off; refusing to verify another deployment`);
+    }
+  }
+  const strategy = s('deployment_strategy');
+  if (!STRATEGIES.includes(strategy)) throw new Error('bad deployment_strategy');
+  if (!['automatic', 'manual', 'disabled'].includes(s('production_rollback_policy'))) throw new Error('bad production_rollback_policy');
+  if (strategy === 'production-only' && (on('shared_dev_on_branch_push') || on('shared_dev_native_preview_on_branch_push'))) {
+    throw new Error('deployment_strategy: production-only cannot be combined with shared_dev_on_branch_push / shared_dev_native_preview_on_branch_push: true; refusing to publish or migrate anything');
+  }
+  if (on('shared_dev_on_branch_push') && on('shared_dev_native_preview_on_branch_push')) throw new Error('shared_dev_on_branch_push and shared_dev_native_preview_on_branch_push are conflicting automatic Dev channels; enable only one');
+  if (mode === 'manual') {
+    const action = classifyEvent({ event, ref, strategy, devRef: s('persistent_dev_ref'), dispatchTarget: s('dispatch_target') }).action;
+    if (action !== 'persistent-dev') throw new Error(`manual Dev is only allowed from the approved persistent_dev_ref via dispatch (classified '${action}')`);
+  } else {
+    const kinds = resolveDeliveryTargets({
+      event, ref, strategy, previewOnPush: on('preview_on_branch_push'), sharedDevOnPush: on('shared_dev_on_branch_push'),
+      sharedDevNativeOnPush: on('shared_dev_native_preview_on_branch_push'), dispatchTarget: s('dispatch_target'), devRef: s('persistent_dev_ref'),
+    });
+    if (!kinds.includes(K)) throw new Error(`target mismatch (enabled kinds '${kinds.join(',')}', engine '${K}'); refusing to deploy`);
+  }
+  return { kind: K, stage, mode, target, smokeMode, d1Expect, ...validateTargetConfig({ inputs, kind: K, target, previewSecrets }) };
+}
+
+/** Per-target requirements and the validated KEY=VALUE env data each kind builds/smokes with (a build env never falls back to another kind's). */
+function validateTargetConfig({ inputs, kind, target, previewSecrets }) {
+  const s = (k) => (inputs[k] == null ? '' : String(inputs[k]));
+  const on = (k) => s(k) === 'true';
+  if (kind === 'native-dev' && !on('shared_dev_native_preview_on_branch_push')) throw new Error('native-dev requires shared_dev_native_preview_on_branch_push: true');
+  if (target === 'dev') {
+    if (!s('dev_worker_name')) throw new Error('Shared Dev requires dev_worker_name (the Dev Worker identity is always verified)');
+    if (!s('app_url_dev')) throw new Error('Shared Dev requires app_url_dev (a Dev deployment without a probe is not verified)');
+  }
+  const buildCmd = target === 'dev' ? (s('dev_build_cmd') || s('build_cmd')) : s('build_cmd');
+  if (!buildCmd) throw new Error(`no build command for target ${target}`);
+  if (on('d1_migrations') && target === 'dev' && !s('dev_build_cmd')) throw new Error('Shared Dev with d1_migrations requires dev_build_cmd: the Dev build must succeed BEFORE the Dev D1 is migrated');
+  const buildEnvText = s(BUILD_ENV_INPUT[kind]);
+  const bad = foreignUrlsInBuildEnv(kind, buildEnvText, { production: s('app_url_prod'), 'persistent-dev': s('app_url_dev'), 'native-dev': s('app_url_shared_dev_native_preview') });
+  if (bad.length) throw new Error(`build environment of ${kind}: ${bad.join('; ')}; each target must be built with its own URLs`);
+  const parse = (name, text) => {
+    const r = parseEnvLines(text, { reserved: true });
+    if (r.errors.length) throw new Error(`${name}: ${r.errors.join('; ')}`);
+    return r.pairs;
+  };
+  return {
+    buildEnv: parse('CFV2_BUILD_ENV', buildEnvText), smokeEnv: parse('CFV2_SMOKE_ENV', s('smoke_env')),
+    previewEnv: target === 'preview' && previewSecrets ? parse('CFV2_PS', previewSecrets) : null,
+  };
 }

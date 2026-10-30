@@ -126,99 +126,17 @@ case "$PHASE" in
 
   init)
     mkdir -p "$S"; chmod 700 "$S"; umask 077
-    printf '%s' "${INPUTS_JSON:?}" > "$IN"; jq -e 'type == "object"' "$IN" >/dev/null || die "inputs_json is not an object"
+    printf '%s' "${INPUTS_JSON:?}" > "$IN"
+    # ONE Node process validates everything pure (target/kind/stage/mode binding, descriptor, strategy and policy enums, enabled kind of
+    # this event, per-target requirements, URL isolation, env data) and writes the validated state files. Nothing is mutated if it fails.
+    node "$TOOLS_DIR/cli.mjs" init-checks --state "$S" --inputs "$IN" | { grep -v '^kind=\|^smoke_mode=' || true; }
     load_inputs
-    T="${ENGINE_TARGET:?}"; M="${ENGINE_MODE:-auto}"; STAGE="${ENGINE_STAGE:-all}"
-    case "$T" in prod|preview|dev) ;; *) die "bad engine target: $T";; esac
-    K="${ENGINE_KIND:-}"
-    if [ -z "$K" ]; then case "$T" in prod) K=production;; preview) K=native-branch;; dev) K=persistent-dev;; esac; fi
-    case "$K:$T" in production:prod|native-branch:preview|native-dev:preview|persistent-dev:dev) ;; *) die "delivery kind '$K' does not belong to engine target '$T'";; esac
-    printf '%s' "$K" > "$S/kind"
-    # smoke_mode / smoke_mode_overrides are validated as data BEFORE anything is mutated; unknown values fail closed.
-    # With a target descriptor (the plan's validated record) ONE check binds kind, target, D1 and smoke mode; without one (legacy
-    # callers) the smoke mode is resolved from the inputs as before.
-    if [ -n "${ENGINE_DESCRIPTOR:-}" ]; then
-      SM="$(DESCRIPTOR="$ENGINE_DESCRIPTOR" node "$TOOLS_DIR/cli.mjs" descriptor-check --kind "$K" --target "$T" --d1 "${ENGINE_D1_EXPECT:-}" | sed -n 's/^smoke_mode=//p')"
-    else
-      SM="$(node "$TOOLS_DIR/cli.mjs" smoke-mode --kind "$K" --mode "$(inp smoke_mode)" --overrides "$(inp smoke_mode_overrides)" | sed -n 's/^smoke_mode=//p')"
-    fi
-    [ -n "$SM" ] || die "cannot resolve smoke_mode for $K"
-    printf '%s' "$SM" > "$S/smoke_mode"
-    case "$STAGE" in all|deploy|preflight|migrate|publish|verify|rollback) ;; *) die "bad engine stage: $STAGE";; esac
-    # Production / Preview are always split. Shared Dev and persistent Dev default to the single-job engine (all); Shared Dev
-    # alone may split into deploy (migrate + publish, no smoke, no recovery) -> verify -> rollback (pipeline_phase).
-    if [ "$T" = dev ]; then
-      case "$STAGE" in all|deploy|preflight|migrate|publish|verify|rollback) ;; *) die "persistent Dev stage must be all, deploy, preflight, migrate, publish, verify or rollback, got '$STAGE'";; esac
-    else
-      case "$STAGE" in preflight|migrate|publish|verify|rollback) ;; *) die "$K must run as split stages (preflight/migrate/publish/verify/rollback), got '$STAGE'";; esac
-    fi
-    printf '%s' "$STAGE" > "$S/stage"
-    # The physical D1 the plan resolved for this kind (id only). Every build re-audit must bind exactly this database.
-    D1X="${ENGINE_D1_EXPECT:-}"
-    [[ "$D1X" =~ ^[A-Za-z0-9_-]*$ ]] || die "malformed expected D1 id"
-    printf '%s' "$D1X" > "$S/d1_expect"
-    case "$M" in auto|manual) ;; *) die "bad engine mode: $M";; esac
-    [ "$M" = auto ] || [ "$T" = dev ] || die "manual mode is only for the persistent Dev target"
-    [ "$M" = auto ] || [ "$STAGE" = all ] || die "manual Dev runs as one job (stage all)"
-    # Deferred verification (pipeline_phase verify): the engine inputs are the DEPLOY call's inputs, handed over as data.
-    # The verify call passes its own copy of the identity inputs; they must be identical or nothing is acted on.
-    if [ -n "${CALL_INPUTS_JSON:-}" ]; then
-      printf '%s' "$CALL_INPUTS_JSON" | jq -e 'type == "object"' >/dev/null || die "call inputs are not an object"
-      for k in app_name app_path production_rollback_policy tools_ref; do
-        [ "$(printf '%s' "$CALL_INPUTS_JSON" | jq -r --arg k "$k" '.[$k] | if . == null then "" else tostring end')" = "$(inp "$k")" ] \
-          || die "verify call input '$k' differs from the deploy call that produced the hand-off; refusing to verify another deployment"
-      done
-    fi
-    printf '%s' "$T" > "$S/target"; printf '%s' "$M" > "$S/mode"
-    ctx
-    STRATEGY="$(inp deployment_strategy)"; POLICY="$(inp production_rollback_policy)"
-    case "$STRATEGY" in production-preview|hybrid|production-only) ;; *) die "bad deployment_strategy";; esac
-    case "$POLICY" in automatic|manual|disabled) ;; *) die "bad production_rollback_policy";; esac
-    if [ "$STRATEGY" = production-only ] && { [ "$(inp shared_dev_on_branch_push)" = true ] || [ "$(inp shared_dev_native_preview_on_branch_push)" = true ]; }; then
-      die "deployment_strategy: production-only cannot be combined with shared_dev_on_branch_push / shared_dev_native_preview_on_branch_push: true; refusing to publish or migrate anything"
-    fi
-    if [ "$(inp shared_dev_on_branch_push)" = true ] && [ "$(inp shared_dev_native_preview_on_branch_push)" = true ]; then
-      die "shared_dev_on_branch_push and shared_dev_native_preview_on_branch_push are conflicting automatic Dev channels; enable only one"
-    fi
-    EVENT="${GITHUB_EVENT_NAME:?}"
-    if [ "$M" = manual ]; then
-      ACTION="$(node "$TOOLS_DIR/cli.mjs" classify --event "$EVENT" --ref "$BRANCH_REF" --strategy "$STRATEGY" --dev-ref "$(inp persistent_dev_ref)" --dispatch-target "$(inp dispatch_target)" | sed -n 's/^action=//p')"
-      [ "$ACTION" = persistent-dev ] || die "manual Dev is only allowed from the approved persistent_dev_ref via dispatch (classified '$ACTION')"
-    else
-      # The enabled kinds of THIS event (one shared resolver for the plan and every engine job); ours must be among them.
-      KINDS="$(node "$TOOLS_DIR/cli.mjs" resolve-kinds --event "$EVENT" --ref "$BRANCH_REF" --strategy "$STRATEGY" --preview-on-push "$(inp preview_on_branch_push)" \
-        --shared-dev-on-push "$(inp shared_dev_on_branch_push)" --shared-dev-native-on-push "$(inp shared_dev_native_preview_on_branch_push)" \
-        --dispatch-target "$(inp dispatch_target)" --dev-ref "$(inp persistent_dev_ref)" | sed -n 's/^kinds=//p')"
-      case ",$KINDS," in *",$K,"*) ;; *) die "target mismatch (enabled kinds '$KINDS', engine '$K'); refusing to deploy";; esac
-    fi
     # Prod, Preview and Dev all use the one account credential pair (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID).
     # The Smoke job (stage verify) never receives Cloudflare credentials: it only probes the published URL.
-    if [ "$STAGE" != verify ]; then
-      [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || die "$T credentials not provided (set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID)"
+    if [ "$(rd stage)" != verify ]; then
+      [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || die "$(rd target) credentials not provided (set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID)"
     elif [ -n "${CLOUDFLARE_API_TOKEN:-}${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
       die "the Smoke stage must not receive Cloudflare credentials"
-    fi
-    if [ "$K" = native-dev ]; then
-      [ "$(inp shared_dev_native_preview_on_branch_push)" = true ] || die "native-dev requires shared_dev_native_preview_on_branch_push: true"
-    fi
-    if [ "$T" = dev ]; then
-      [ -n "$(inp dev_worker_name)" ] || die "Shared Dev requires dev_worker_name (the Dev Worker identity is always verified)"
-      [ -n "$(inp app_url_dev)" ] || die "Shared Dev requires app_url_dev (a Dev deployment without a probe is not verified)"
-    fi
-    [ -n "$(target_build_cmd)" ] || die "no build command for target $T"
-    if [ "$(inp d1_migrations)" = true ] && [ "$T" = dev ] && [ -z "$(inp dev_build_cmd)" ]; then
-      die "Shared Dev with d1_migrations requires dev_build_cmd: the Dev build must succeed BEFORE the Dev D1 is migrated"
-    fi
-    # Caller env text -> validated data files. Reserved control names are rejected (parse-env.mjs RESERVED).
-    # Each kind has its OWN build env and never falls back to another kind's (a bundle is compiled for one URL only).
-    case "$K" in production) BE="$(inp build_env_prod)";; native-branch) BE="$(inp build_env_preview)";; native-dev) BE="$(inp build_env_shared_dev_native_preview)";; persistent-dev) BE="$(inp build_env_dev)";; esac
-    # URL isolation: a build env must not carry another target's public URL (Production / Dev / Native Dev).
-    CFV2_BE="$BE" node "$TOOLS_DIR/cli.mjs" url-isolation --kind "$K" --env-var CFV2_BE \
-      --urls "$(jq -nc --arg p "$(inp app_url_prod)" --arg d "$(inp app_url_dev)" --arg n "$(inp app_url_shared_dev_native_preview)" '{production:$p,"persistent-dev":$d,"native-dev":$n}')" >/dev/null
-    CFV2_BUILD_ENV="$BE" node "$TOOLS_DIR/parse-env.mjs" CFV2_BUILD_ENV "$S/build.env" --reserved >/dev/null
-    CFV2_SMOKE_ENV="$(inp smoke_env)" node "$TOOLS_DIR/parse-env.mjs" CFV2_SMOKE_ENV "$S/smoke.env" --reserved >/dev/null
-    if [ "$T" = preview ] && [ -n "${PREVIEW_SECRETS:-}" ]; then
-      CFV2_PS="$PREVIEW_SECRETS" node "$TOOLS_DIR/parse-env.mjs" CFV2_PS "$S/preview.env" --mask --reserved >/dev/null
     fi;;
 
   migration-gate) # before anything is built or published: peers' preflights (migrate) / the migration this kind depends on (publish)
