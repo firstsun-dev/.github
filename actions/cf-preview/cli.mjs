@@ -8,7 +8,7 @@ import {
 } from './lib.mjs';
 import {
   DELIVERY_KINDS, ENGINE_TARGET, assertKind, branchPreviewIdentity, canonicalOrigin, checkBuildEnvOrigins, environmentName, foreignUrlsInBuildEnv, planMigrations, resolveCanonicalUrl, resolveDeliveryTargets, resolveSmokeMode,
-  buildDescriptors, parseDescriptor, checkPeerPreflights, resolveMigrationUsed, verificationOutcome, prodRollbackBlock, rollbackVerdict,
+  buildDescriptors, parseDescriptor, checkPeerPreflights, resolveMigrationUsed, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors,
 } from './delivery.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -222,10 +222,10 @@ try {
       const str = (k) => (i[k] == null ? '' : String(i[k]));
       const bool = (k) => i[k] === true || i[k] === 'true';
       let kinds;
+      let restored = null; // verify: the DEPLOY call's own descriptors (validated); nothing is re-derived from this call's inputs
       if (opt('phase') === 'verify') {
-        const st = JSON.parse(process.env.PHASE_STATE ?? '{}');
-        kinds = Array.isArray(st.kinds) ? st.kinds : [];
-        for (const k of kinds) assertKind(k);
+        restored = restoreDescriptors(JSON.parse(process.env.PHASE_STATE ?? '{}'), { repo: process.env.GITHUB_REPOSITORY ?? '', runId: opt('run-id', '0') });
+        kinds = Object.keys(restored);
       } else {
         kinds = resolveDeliveryTargets({
           event: opt('event'), ref: opt('ref'), strategy: str('deployment_strategy'), previewOnPush: bool('preview_on_branch_push'),
@@ -248,10 +248,9 @@ try {
         flat[`on_${kindKey(k)}`] = String(kinds.includes(k));
         flat[`owns_${kindKey(k)}`] = String(Boolean(g && g.owner === k));
       }
-      const descriptors = buildDescriptors({
-        kinds, app: str('app_name'), runId: opt('run-id', '0'), repo: process.env.GITHUB_REPOSITORY ?? '', lockScope: str('d1_lock_scope'), groups: migrations, smokeMode: str('smoke_mode') || 'full',
-        smokeOverrides: str('smoke_mode_overrides'), phase: opt('phase') || 'all',
-        d1ByKind: opt('phase') === 'verify' ? Object.fromEntries(Object.entries(JSON.parse(process.env.PHASE_STATE ?? '{}').d1 ?? {}).map(([k, v]) => [k.replace(/_/g, '-'), v])) : null,
+      const descriptors = restored ?? buildDescriptors({
+          kinds, app: str('app_name'), runId: opt('run-id', '0'), repo: process.env.GITHUB_REPOSITORY ?? '', lockScope: str('d1_lock_scope'), groups: migrations,
+          smokeMode: str('smoke_mode') || 'full', smokeOverrides: str('smoke_mode_overrides'), phase: opt('phase') || 'all',
       });
       for (const m of migrations) console.error(`::notice::D1 ${m.databaseName}: one migration (owner ${m.owner}) serves ${m.members.join(', ')}`);
       out({ kinds: JSON.stringify(kinds), descriptors: JSON.stringify(descriptors), has_targets: String(kinds.length > 0), has_migrations: String(migrations.length > 0), ...flat });

@@ -384,3 +384,61 @@ export function rollbackVerdict({ target, rbResult = '', rbVerify = '', rbLevel 
   else if (recovered === 'success' && verified === 'success') { result = isContentLevel(smokeLevel) ? 'restored_verified' : 'restored_unverified'; level = smokeLevel; } else result = 'failed';
   return { result, level, ok: result === 'restored_verified' };
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Deferred verification (pipeline_phase=verify): the descriptors of the DEPLOY call are the source of truth. The verify call
+// receives only phase_state; it must never re-derive deployment-time policy (smoke mode, lock scope, owner, D1) from its own
+// inputs. The only change allowed is the phase transition deploy -> verify.
+// ---------------------------------------------------------------------------------------------------------------------
+const keyOf = (k) => k.replace(/-/g, '_');
+const plainObject = (o) => o !== null && typeof o === 'object' && !Array.isArray(o);
+
+/**
+ * Descriptors for a verify call, from the validated phase_state of the deploy call. `repo` = this run's repository.
+ * - With `state.descriptors`: parsed, validated and cross-checked against the rest of the hand-off (kinds, app, repository,
+ *   D1 ids, migration owner); phase must be `deploy`; the result is identical except phase = `verify`.
+ * - Legacy hand-off (no `descriptors`): reconstructed ONLY from the deploy call's own `state.inputs` (never the verify call's);
+ *   anything ambiguous or missing fails closed.
+ */
+export function restoreDescriptors(state, { repo, runId = '0' }) {
+  if (!plainObject(state)) throw new Error('phase_state is not an object');
+  if (!Array.isArray(state.kinds) || !state.kinds.length) throw new Error('phase_state names no delivery kind');
+  const kinds = DELIVERY_KINDS.filter((k) => state.kinds.includes(k));
+  if (kinds.length !== state.kinds.length || new Set(state.kinds).size !== state.kinds.length) throw new Error('phase_state.kinds contains an unknown or duplicate delivery kind');
+  if (!plainObject(state.inputs) || !state.inputs.app_name) throw new Error('phase_state.inputs.app_name is missing: cannot bind the hand-off to an application');
+  const app = String(state.inputs.app_name);
+  const d1Of = (k) => (plainObject(state.d1) && state.d1[keyOf(k)] != null ? String(state.d1[keyOf(k)]) : null);
+  const ownerOf = (k) => {
+    const raw = plainObject(state.migration) ? state.migration[`mj_${keyOf(k)}`] : null;
+    if (!raw) return null;
+    const m = typeof raw === 'string' ? (() => { try { return JSON.parse(raw); } catch { return null; } })() : raw;
+    return plainObject(m) && m.kind ? String(m.kind) : null;
+  };
+
+  if (state.descriptors === undefined) {
+    const s = state.inputs;
+    return buildDescriptors({
+      kinds, app, runId, repo, lockScope: s.d1_lock_scope == null ? '' : String(s.d1_lock_scope),
+      d1ByKind: Object.fromEntries(kinds.map((k) => [k, d1Of(k) ?? ''])),
+      smokeMode: s.smoke_mode ? String(s.smoke_mode) : 'full', smokeOverrides: s.smoke_mode_overrides == null ? '' : String(s.smoke_mode_overrides), phase: 'verify',
+    });
+  }
+
+  if (!plainObject(state.descriptors)) throw new Error('phase_state.descriptors is not an object');
+  const have = Object.keys(state.descriptors).sort().join(',');
+  if (have !== [...kinds].sort().join(',')) throw new Error(`phase_state.descriptors [${have}] do not match phase_state.kinds [${kinds}]`);
+  const out = {};
+  for (const k of kinds) {
+    const d = validateDescriptor(state.descriptors[k]);
+    if (d.kind !== k) throw new Error(`descriptor filed under ${k} is for ${d.kind}`);
+    if (d.phase !== 'deploy') throw new Error(`descriptor for ${k} is in phase '${d.phase}'; only a deploy-phase descriptor can be verified`);
+    if (d.environment !== environmentName(app, k)) throw new Error(`descriptor for ${k} belongs to another application (${d.environment}, expected ${environmentName(app, k)})`);
+    if (k === 'persistent-dev' && !d.deploy_group.startsWith(`cfv2-dev-${repo}-`)) throw new Error(`descriptor for persistent-dev belongs to another repository (${d.deploy_group})`);
+    const d1 = d1Of(k);
+    if (d1 !== null && d1 !== d.d1_expected_id) throw new Error(`descriptor for ${k} binds D1 '${d.d1_expected_id}' but the hand-off recorded '${d1}'`);
+    const owner = ownerOf(k);
+    if (owner !== null && owner !== d.d1_owner_kind) throw new Error(`descriptor for ${k} names migration owner '${d.d1_owner_kind}' but the migration result belongs to '${owner}'`);
+    out[k] = validateDescriptor({ ...d, phase: 'verify' });
+  }
+  return out;
+}

@@ -4,7 +4,7 @@ import {
   DELIVERY_KINDS, resolveDeliveryTargets, resolveSmokeMode, parseSmokeOverrides, planMigrations, branchPreviewIdentity, ENGINE_TARGET,
   canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins,
   targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor, checkPeerPreflights, resolveMigrationUsed,
-  isContentLevel, verificationOutcome, prodRollbackBlock, rollbackVerdict,
+  isContentLevel, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors,
 } from '../../actions/cf-preview/delivery.mjs';
 
 const base = { event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-preview', previewOnPush: true };
@@ -391,4 +391,76 @@ test('rollback verdict (Preview / Dev): known-good recovery must be rebuilt AND 
   assert.equal(R({ verified: 'failure' }).result, 'failed');
   assert.equal(R({ recovered: '' }).result, 'failed');
   assert.equal(rollbackVerdict({ target: 'dev', goodSha: 'x', recovered: 'success', verified: 'success', smokeLevel: 'content-sha' }).ok, true);
+});
+
+// ---- deferred verification: the deploy call's descriptors are the source of truth ------------------------------------------
+const REPO = 'o/r';
+const deployState = (over = {}, kinds = ['native-branch', 'native-dev'], dOver = {}) => {
+  const descriptors = buildDescriptors({
+    kinds, app: 'app', runId: 11, repo: REPO, lockScope: 'shared-db', smokeMode: 'skip', phase: 'deploy',
+    groups: [{ databaseId: 'DB1', members: kinds, owner: kinds[0] }], ...dOver,
+  });
+  return {
+    inputs: { app_name: 'app', d1_lock_scope: 'shared-db', smoke_mode: 'skip' }, kinds, d1: Object.fromEntries(kinds.map((k) => [k.replace(/-/g, '_'), 'DB1'])),
+    migration: Object.fromEntries(kinds.map((k) => [`mj_${k.replace(/-/g, '_')}`, JSON.stringify({ kind: kinds[0], d1_id: 'DB1' })])), descriptors, ...over,
+  };
+};
+const R = (state) => restoreDescriptors(state, { repo: REPO, runId: 99 });
+
+test('deferred verify: deployment-time policy survives (smoke skip, lock scope, owner, D1, groups); only the phase changes', () => {
+  const st = deployState();
+  const r = R(st);
+  for (const k of ['native-branch', 'native-dev']) assert.deepEqual({ ...r[k], phase: 'deploy' }, st.descriptors[k]);
+  assert.equal(r['native-dev'].smoke_mode, 'skip');
+  assert.equal(r['native-dev'].phase, 'verify');
+  assert.equal(r['native-dev'].d1_owner_kind, 'native-branch');
+  const pd = R(deployState({}, ['persistent-dev']));
+  assert.equal(pd['persistent-dev'].deploy_group, 'cfv2-dev-o/r-shared-db', 'persistent Dev keeps the deploy-time lock identity, not a verify-call default');
+  assert.equal(pd['persistent-dev'].rollback_group, pd['persistent-dev'].deploy_group);
+});
+
+test('deferred verify: every kind restores (Native Branch, Native Dev, Persistent Dev, Production)', () => {
+  for (const k of DELIVERY_KINDS) assert.equal(R(deployState({}, [k]))[k].phase, 'verify');
+});
+
+test('deferred verify: tampering is rejected (kind set, cross-target injection, D1, owner, app, repo, phase, schema)', () => {
+  const bad = (st, re) => assert.throws(() => R(st), re);
+  const st = deployState();
+  bad({ ...st, descriptors: { 'native-branch': st.descriptors['native-branch'] } }, /do not match phase_state.kinds/);
+  bad({ ...st, descriptors: { ...st.descriptors, production: targetDescriptor({ kind: 'production', app: 'app', runId: 1, phase: 'deploy' }) } }, /do not match/);
+  bad({ ...st, descriptors: { 'native-branch': st.descriptors['native-dev'], 'native-dev': st.descriptors['native-branch'] } }, /filed under/);
+  bad({ ...st, d1: { native_branch: 'FOREIGN', native_dev: 'DB1' } }, /hand-off recorded 'FOREIGN'/);
+  bad({ ...st, descriptors: { ...st.descriptors, 'native-dev': { ...st.descriptors['native-dev'], d1_expected_id: 'FOREIGN' } } }, /binds D1 'FOREIGN'/);
+  bad({ ...st, descriptors: { ...st.descriptors, 'native-dev': { ...st.descriptors['native-dev'], d1_owner_kind: 'native-dev', owns_migration: true } } }, /migration owner/);
+  bad({ ...st, inputs: { ...st.inputs, app_name: 'other' } }, /another application/);
+});
+
+test('deferred verify: wrong repository, wrong phase, schema violations and missing identity fail closed', () => {
+  const st = deployState({}, ['persistent-dev']);
+  assert.throws(() => restoreDescriptors(st, { repo: 'evil/r', runId: 1 }), /another repository/);
+  const allPhase = deployState({}, ['native-branch'], { phase: 'all' });
+  assert.throws(() => R(allPhase), /only a deploy-phase descriptor/);
+  const already = deployState({}, ['native-branch'], { phase: 'verify' });
+  assert.throws(() => R(already), /only a deploy-phase descriptor/);
+  const forged = deployState({}, ['native-branch']);
+  forged.descriptors['native-branch'] = { ...forged.descriptors['native-branch'], smoke_mode: 'maybe' };
+  assert.throws(() => R(forged), /smoke mode/);
+  assert.throws(() => R({ ...deployState(), kinds: [] }), /no delivery kind/);
+  assert.throws(() => R({ ...deployState(), kinds: ['native-dev', 'native-dev'] }), /duplicate/);
+  assert.throws(() => R({ ...deployState(), kinds: ['bogus'] }), /unknown/);
+  assert.throws(() => R({ ...deployState(), inputs: {} }), /app_name is missing/);
+  assert.throws(() => R(null), /not an object/);
+  assert.throws(() => R({ ...deployState(), descriptors: [] }), /not an object/);
+});
+
+test('deferred verify: a legacy hand-off (no descriptors) is rebuilt ONLY from the deploy call\'s own inputs, else fails closed', () => {
+  const { descriptors, ...legacy } = deployState();
+  const r = R(legacy);
+  assert.equal(r['native-dev'].smoke_mode, 'skip', 'from phase_state.inputs (the deploy call), not from the verify call');
+  assert.equal(r['native-dev'].d1_expected_id, 'DB1');
+  assert.equal(r['native-dev'].phase, 'verify');
+  const pd = R({ ...deployState({}, ['persistent-dev']), descriptors: undefined });
+  assert.equal(pd['persistent-dev'].deploy_group, 'cfv2-dev-o/r-shared-db');
+  assert.throws(() => R({ ...legacy, inputs: { app_name: 'app', smoke_mode: 'maybe' } }), /smoke_mode/);
+  assert.throws(() => R({ ...legacy, inputs: { smoke_mode: 'skip' } }), /app_name is missing/);
 });

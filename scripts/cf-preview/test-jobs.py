@@ -892,11 +892,17 @@ def deferred(ref=MAIN, inputs=None, env=None, gate="success", call_over=None, de
     state = render(doc[True]["workflow_call"]["outputs"]["phase_state"]["value"], pc)
     if state_over:
         state = json.dumps(dict(json.loads(state), **state_over))
+    out = verify_call(state, base, ref=ref, gate=gate, env=env, toml=toml, call_over=call_over)
+    return dict(out, deploy=d)
+
+
+def verify_call(state, base, ref=MAIN, gate="success", env=None, toml=APP_TOML, call_over=None):
+    """The verify call alone, given the `phase_state` string it receives (no deploy chain is re-run)."""
     vin = dict(base, pipeline_phase="verify", phase_state=state, upstream_gate=gate)
     vin.update(call_over or {})
     res, logs, summ, steps, wss = _run_jobs(("plan",) + tuple(f"delivery_{KEYED[k]}" for k in KINDS), ref, vin, PROD_SECRETS, {"gate": SKIPPED}, "push", env, toml, None, None)
     shaped = _shape(dict(res), logs, summ, steps, wss, toml)
-    return {"deploy": d, "jobs": shaped["jobs"], "log": "".join(logs), "summary": "".join(summ), "steps": steps, "vin": vin, "state": state, "raw": res, "res": res}
+    return {"jobs": shaped["jobs"], "log": "".join(logs), "summary": "".join(summ), "steps": steps, "vin": vin, "state": state, "raw": res, "res": res}
 
 
 def verify_release(v, inputs=None):
@@ -937,6 +943,27 @@ for key, val in (("app_name", "other"), ("app_path", "apps/other"), ("production
     vv = deferred(inputs=AUTO_P, call_over={key: val})
     check(vv["jobs"]["smoke"]["result"] in ("failure", "skipped") and vv["jobs"]["smoke"]["outputs"].get("deployed_and_verified") != "true" and not verify_release(vv),
           f"deferred: a verify call whose {key} differs from the deploy call's verifies nothing (identity check)")
+# ---- Deferred verification keeps the DEPLOY call's descriptors (smoke policy, lock identity, D1, owner): never re-derived from the verify call
+vst = json.loads(v["state"])
+vdesc = lambda out: json.loads(out["raw"]["plan"]["outputs"]["descriptors"])
+check(set(vst["descriptors"]) == {"production"} and vst["descriptors"]["production"]["phase"] == "deploy", "deferred: phase_state carries the deploy call's validated descriptors (phase deploy)")
+check(vdesc(v)["production"] == dict(vst["descriptors"]["production"], phase="verify"), "deferred (verify call): the descriptor is the deploy call's, only the phase moved deploy -> verify")
+sk = deferred(inputs=dict(AUTO_P, smoke_mode="skip"), call_over={"smoke_mode": "full"})
+check(vdesc(sk)["production"]["smoke_mode"] == "skip" and sk["jobs"]["smoke"]["outputs"]["smoke_level"] == "skipped" and sk["jobs"]["smoke"]["outputs"]["deployed_and_verified"] != "true" and not verify_release(sk),
+      "deferred: deploy smoke_mode=skip, verify call default full -> STILL skip (Published/Unverified, no Release): deployment-time policy is not replaced by verify-call defaults")
+pdv = deferred(FEAT, inputs=dict(DEV_INPUTS, preview_on_branch_push=False, d1_lock_scope="shared-db"), toml=DEV_TOML, call_over={"d1_lock_scope": ""})
+check(vdesc(pdv)["persistent-dev"]["deploy_group"] == "cfv2-dev-o/r-shared-db" == vdesc(pdv)["persistent-dev"]["rollback_group"],
+      "deferred: deploy d1_lock_scope=shared-db, verify call without scope -> the SAME effective Dev lock identity")
+for what, mut in (("a cross-target descriptor (persistent-dev injected for production)", lambda st: dict(st, descriptors={"production": json.loads(desc("persistent-dev", phase="deploy", deploy_group="cfv2-dev-o/r-app"))})),
+                  ("a tampered D1 identity", lambda st: dict(st, descriptors={"production": dict(st["descriptors"]["production"], d1_expected_id="FOREIGN")}, d1={"production": "DB9"})),
+                  ("a tampered migration owner", lambda st: dict(st, descriptors={"production": dict(st["descriptors"]["production"], d1_owner_kind="native-branch")}, migration={"mj_production": json.dumps({"kind": "production"})})),
+                  ("another application's descriptor", lambda st: dict(st, descriptors={"production": dict(st["descriptors"]["production"], environment="other/prod")})),
+                  ("a verify-phase descriptor replayed as deploy state", lambda st: dict(st, descriptors={"production": dict(st["descriptors"]["production"], phase="verify")}))):
+    tv = verify_call(json.dumps(mut(vst)), dict(AUTO_P))
+    check(tv["jobs"]["plan"]["result"] == "failure" and tv["jobs"]["smoke"]["result"] == "skipped" and not verify_release(tv), f"deferred: {what} in phase_state fails the plan closed - nothing is smoked or released")
+legacy = {k: v_ for k, v_ in vst.items() if k != "descriptors"}
+lv = verify_call(json.dumps(legacy), dict(AUTO_P))
+check(lv["jobs"]["smoke"]["result"] == "success" and vdesc(lv)["production"]["smoke_mode"] == "full" and vdesc(lv)["production"]["phase"] == "verify", "deferred: a legacy phase_state (no descriptors) still verifies, rebuilt from the deploy call's own inputs")
 vv = deferred(inputs=AUTO_P, call_over={"phase_state": "{}"})
 check(vv["jobs"]["smoke"]["result"] == "skipped" and vv["jobs"]["rollback"]["result"] == "skipped" and not verify_release(vv), "deferred: an empty hand-off verifies nothing")
 forged = {"inputs": {"app_name": "app"}, "kinds": ["production"], "deploy": {"h_production": json.dumps({"published": "true", "url": "http://insecure.example", "published_sha": "0" * 40})}, "migration": {}}
