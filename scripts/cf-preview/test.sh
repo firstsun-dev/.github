@@ -4,7 +4,7 @@
 #   test.sh chain  real-shell delivery-chain scenarios, groups run in parallel (the expensive part)
 #   test.sh full   fast + chain  (the merge gate)
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
 LOGDIR="${LOGDIR:-$(mktemp -d)}"; mkdir -p "$LOGDIR"
 rc=0
 run() { # run <label> <cmd...>
