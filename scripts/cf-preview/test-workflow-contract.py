@@ -293,23 +293,19 @@ check("exit 1" in jobs["config-guard"]["steps"][0]["run"] and "secrets." not in 
 
 # ---------------------------------------------------------------- 5. credentials, Environments, permissions
 SECRETS = {"CLOUDFLARE_API_TOKEN": "PROD-TOKEN", "CLOUDFLARE_ACCOUNT_ID": "PROD-ACCT",
-           "CLOUDFLARE_PREVIEW_API_TOKEN": "PREVIEW-TOKEN", "CLOUDFLARE_PREVIEW_ACCOUNT_ID": "PREVIEW-ACCT",
            "PREVIEW_SECRETS": "K=v"}
 env = jobs["deploy"]["env"]
-c = scenario("push", MAIN, secrets=SECRETS)
-check(render(env["CLOUDFLARE_API_TOKEN"], c) == "PROD-TOKEN" and render(env["CLOUDFLARE_ACCOUNT_ID"], c) == "PROD-ACCT" and not {"CLOUDFLARE_PREVIEW_API_TOKEN", "CLOUDFLARE_PREVIEW_ACCOUNT_ID"} & set(c.secret_reads),
-      "Deploy: main gets ONLY Production credentials (Preview secrets never read)")
-c = scenario("push", FEAT, secrets=SECRETS)
-check(render(env["CLOUDFLARE_API_TOKEN"], c) == "PREVIEW-TOKEN" and render(env["CLOUDFLARE_ACCOUNT_ID"], c) == "PREVIEW-ACCT" and not {"CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"} & set(c.secret_reads),
-      "Deploy: a feature branch gets ONLY Preview credentials (Production secrets never read)")
-c = scenario("push", MAIN, secrets={k: v for k, v in SECRETS.items() if k != "CLOUDFLARE_API_TOKEN"})
-check(render(env["CLOUDFLARE_API_TOKEN"], c) == "", "Deploy: missing Production token stays EMPTY on main (no fallback to the Preview token)")
-c = scenario("push", FEAT, secrets={k: v for k, v in SECRETS.items() if k != "CLOUDFLARE_PREVIEW_API_TOKEN"})
-check(render(env["CLOUDFLARE_API_TOKEN"], c) == "", "Deploy: missing Preview token stays EMPTY on a branch (no fallback to Production)")
+for ref, label in ((MAIN, "main"), (FEAT, "a feature branch")):
+    c = scenario("push", ref, secrets=SECRETS)
+    check(render(env["CLOUDFLARE_API_TOKEN"], c) == "PROD-TOKEN" and render(env["CLOUDFLARE_ACCOUNT_ID"], c) == "PROD-ACCT",
+          f"Deploy: {label} uses the account credentials")
+    c = scenario("push", ref, secrets={k: v for k, v in SECRETS.items() if k != "CLOUDFLARE_API_TOKEN"})
+    check(render(env["CLOUDFLARE_API_TOKEN"], c) == "", f"Deploy: missing account token stays EMPTY on {label} ")
+check(not any("PREVIEW_API_TOKEN" in k or "PREVIEW_ACCOUNT_ID" in k for k in doc[True]["workflow_call"]["secrets"]), "workflow_call declares no Preview-specific Cloudflare credentials")
 check("CLOUDFLARE_DEV" not in yaml.dump(jobs["deploy"]), "Deploy never references the Dev credentials")
 for n in ("migration", "rollback"):
     check(jobs[n]["env"]["CLOUDFLARE_API_TOKEN"] == env["CLOUDFLARE_API_TOKEN"] and jobs[n]["env"]["CLOUDFLARE_ACCOUNT_ID"] == env["CLOUDFLARE_ACCOUNT_ID"],
-          f"{n}: the same target-bound credential selection as Deploy (Production credentials on main only, Preview credentials elsewhere, no fallback)")
+          f"{n}: the same credential selection as Deploy (the account credentials)")
 check("CLOUDFLARE" not in yaml.dump(jobs["smoke"]) and "secrets.CLOUDFLARE" not in yaml.dump(jobs["smoke"]), "Smoke Tests: NO Cloudflare credentials of any kind (it only probes the published URL)")
 check(set(jobs["smoke"]["env"]) == {"GH_TOKEN"}, "Smoke Tests: the job env holds nothing but the GitHub token")
 c = scenario("push", MAIN, secrets=SECRETS)

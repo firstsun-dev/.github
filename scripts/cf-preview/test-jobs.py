@@ -43,7 +43,7 @@ def ctx(ref, inputs=None, secrets=None, needs=None, event="push"):
 
 
 PROD_SECRETS = {"CLOUDFLARE_API_TOKEN": "PT", "CLOUDFLARE_ACCOUNT_ID": "PA"}
-PREV_SECRETS = {"CLOUDFLARE_PREVIEW_API_TOKEN": "VT", "CLOUDFLARE_PREVIEW_ACCOUNT_ID": "VA"}
+PREV_SECRETS = PROD_SECRETS  # Preview uses the account credentials too (the dedicated Preview pair was removed)
 D1 = {"d1_migrations": True}
 
 
@@ -53,7 +53,7 @@ CHAIN = ("migration", "deploy", "smoke", "rollback")
 def run_chain(ref=MAIN, inputs=None, secrets=None, env=None, toml=APP_TOML, env_by_job=None, event="push", needs_over=None, files=None):
     """Runs Migration -> Deploy -> Smoke -> Rollback like the scheduler would: each job's `if:` is evaluated against the
     real results/outputs of its `needs`, and each executed job gets a FRESH workspace (no shared runner state)."""
-    secrets = secrets if secrets is not None else (PROD_SECRETS if ref == MAIN else PREV_SECRETS)
+    secrets = secrets if secrets is not None else (PROD_SECRETS)
     i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", tools_ref="x", preview_host_check=False)
     i.update(inputs or {})
     needs = {j: {"result": ("success" if i.get(c, "") else "skipped"), "outputs": {}} for j, c in
@@ -196,8 +196,8 @@ r = deploy(inputs={"build_cmd": "false"})
 check(r["result"] == "failure" and not published(r) and r["outputs"]["deployed_and_verified"] == "false", "failed build never publishes")
 r = deploy(secrets={})
 check(r["result"] == "failure" and not published(r) and "pnpm" not in r["log"], "missing Production credentials fail closed at init (no fallback), before any work")
-r = deploy(secrets=PREV_SECRETS)
-check(r["result"] == "failure" and not published(r), "main with ONLY Preview credentials fails (never uses them for Production)")
+r = deploy(secrets={"CLOUDFLARE_PREVIEW_API_TOKEN": "VT", "CLOUDFLARE_PREVIEW_ACCOUNT_ID": "VA"})
+check(r["result"] == "failure" and not published(r), "main with ONLY the deprecated Preview credentials fails (they are ignored)")
 
 # ======================================================================= Deploy: Preview
 r = deploy(FEAT)
@@ -276,7 +276,7 @@ check(not (r["ws"] / "tmp" / "cfv2").exists(), "staged Preview secrets and engin
 r = deploy(FEAT, secrets=dict(PREV_SECRETS, PREVIEW_SECRETS="CLOUDFLARE_API_TOKEN=evil"))
 check(r["result"] == "failure" and not published(r), "Preview secrets cannot override Cloudflare credentials")
 r = deploy(FEAT, secrets=PROD_SECRETS)
-check(r["result"] == "failure" and not published(r), "a feature branch with ONLY Production credentials fails (never uses them)")
+check(r["result"] == "success" and published(r), "a feature branch publishes with the account credentials")
 r = deploy(MAIN, secrets=dict(PROD_SECRETS, PREVIEW_SECRETS="K=v"), inputs={"build_cmd": 'printf %s "${K:-unset}" > k.out'})
 check(r["result"] == "success" and (r["ws"] / "w" / "k.out").read_text() == "unset", "Production build never receives Preview-only secrets")
 
@@ -315,7 +315,7 @@ check(m["result"] == "failure" and not migrated(m), "no D1 declared for the targ
 m = deploy(FEAT, inputs=D1, secrets={})
 check(m["result"] == "failure" and not migrated(m), "missing credentials: fails before any remote command")
 m = deploy(FEAT, inputs=D1, secrets=PROD_SECRETS)
-check(m["result"] == "failure" and not migrated(m), "branch with ONLY Production credentials fails")
+check(m["result"] == "success" and migrated(m), "branch migrates with the account credentials")
 for ref, label in ((FEAT, "preview"), (MAIN, "prod")):
     m = deploy(ref, inputs=D1, env={"STUB_APPLY_FAIL": "1"})
     check(m["result"] == "failure" and migrated(m) and not published(m) and m["outputs"]["deployed_and_verified"] == "false" and m["outputs"]["migration"] == "failed", f"failed {label} migration: job fails, NOTHING is published or verified")
@@ -739,7 +739,7 @@ SKIPPED = {"result": "skipped", "outputs": {}}
 
 def deferred(ref=MAIN, inputs=None, env=None, gate="success", call_over=None, deploy_env=None):
     base = dict(inputs or {})
-    secrets = PROD_SECRETS if ref == MAIN else PREV_SECRETS
+    secrets = PROD_SECRETS
     d = run_chain(ref, dict(base, pipeline_phase="deploy"), env=deploy_env)
     blob = dict(ctx(ref, dict(base, pipeline_phase="deploy"), secrets)["inputs"])
     state = json.dumps({"inputs": blob, "deploy": d["jobs"]["deploy"]["outputs"], "migration": d["jobs"]["migration"]["outputs"], "dev": {}, "group": "g"})

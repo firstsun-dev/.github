@@ -94,7 +94,7 @@ One reusable `Deploy` job implements target-specific behavior; do not define par
 7. If smoke fails, mark deployment failed and follow a documented, tested code recovery policy; recovery never claims to revert D1.
 8. Reject stale Preview pushes and branch normalization collisions before overwriting an existing Preview.
 
-Reuse tested v2 identity ledger, smoke, production version/recovery and safety functionality; simplify orchestration, not the correctness checks. Protected Persistent Dev and branch deletion/PR URL linking may use separate event-specific handlers outside the normal core DAG, without duplicating whole pipelines. Production and Preview credentials must not coexist in an untrusted execution context: validate trust and GitHub Environment protection, not merely a caller-supplied target string.
+Reuse tested v2 identity ledger, smoke, production version/recovery and safety functionality; simplify orchestration, not the correctness checks. Protected Persistent Dev and branch deletion/PR URL linking may use separate event-specific handlers outside the normal core DAG, without duplicating whole pipelines. Preview and Production share one account credential; it must not reach an untrusted execution context: validate trust and GitHub Environment protection, not merely a caller-supplied target string.
 
 ### Preview and special worker policy
 

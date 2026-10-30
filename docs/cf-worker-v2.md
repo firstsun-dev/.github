@@ -11,7 +11,7 @@ Spec: `openspec/changes/redesign-cloudflare-worker-cicd-v2`; tracking issue #43.
 
 * Every push to a non-`main` branch publishes (or updates) **that branch's own Native Preview** with a stable URL — no PR needed.
 * `main` pushes go through the Production path (Migration → Deploy → Smoke Tests → Revert on Verify Failure, see docs/cf-worker-v2-refactor.md).
-* A Preview is **never** deployed to a shared Dev Worker, and Production credentials never reach Preview jobs.
+* A Preview is **never** deployed to a shared Dev Worker. Preview, Dev and Production share one account credential pair; isolation is by target Environment, Worker identity and binding guardrails.
 * Strategies: `production-preview` (default), `hybrid` (adds a protected persistent Dev for Cron/Queue), `production-only` (CI only, no Preview — e.g. `anas-mcp`).
 
 ## Versions and pinning
@@ -87,15 +87,13 @@ jobs:
       deployment_strategy: production-preview
       app_url_prod: https://example.com
     secrets:
-      CLOUDFLARE_PREVIEW_API_TOKEN: ${{ secrets.CLOUDFLARE_PREVIEW_API_TOKEN }}
-      CLOUDFLARE_PREVIEW_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 ```
 
 Notes
 
-* A repo may map the Preview secrets to its existing deploy credentials (owner decision; acceptable for stateless Workers). A dedicated least-privilege Preview token is recommended for Workers with stateful bindings.
+* Preview uses the same `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` as Production and Dev (owner decision). The old `CLOUDFLARE_PREVIEW_*` secrets no longer exist: callers must stop passing them (GitHub rejects undeclared secrets) and there is no fallback.
 * Monorepos: one caller job per Worker (`app_name`, `app_path`), each guarded by a changed-path filter; the `delete` event must run **all** caller jobs (retiring the ledger is idempotent).
 * Run `lint`/typecheck before the shared pipeline in the caller, as usual, and make the `pipeline` job depend on them.
 
@@ -176,7 +174,7 @@ There is no automatic reclaim; Previews accumulate until removed manually. A rep
 
 ## Security
 
-* Production and Dev jobs use the same `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` pair by owner decision. Preview keeps its `CLOUDFLARE_PREVIEW_*` credentials. Dev still uses its own `<app>/dev` Environment, Worker identity and binding guardrails.
+* Production and Dev jobs use the same `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` pair by owner decision. Preview uses the same pair too. Dev still uses its own `<app>/dev` Environment, Worker identity and binding guardrails.
 * Fork PRs get no deployment job and no secrets.
 * `production-only` never creates a Preview (use for `anas-mcp`: its authentication depends on Cloudflare Access at the custom domain).
 * Native Preview hostnames may sit behind Cloudflare Access (Blog's do): anonymous requests see only the Access login.

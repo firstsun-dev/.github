@@ -356,13 +356,8 @@ on:
         type: string
         default: linux
     secrets:
-      CLOUDFLARE_PREVIEW_API_TOKEN:
-        description: Least-privilege token (Workers Scripts edit + Preview resources + Preview D1). NEVER the Production token.
-        required: false
-      CLOUDFLARE_PREVIEW_ACCOUNT_ID:
-        required: false
       CLOUDFLARE_API_TOKEN:
-        description: Account token for Production and Dev; Preview has separate credentials
+        description: Account token for Production, Preview and Dev
         required: false
       CLOUDFLARE_ACCOUNT_ID:
         required: false
@@ -641,8 +636,8 @@ jobs:
       d1_scan: ${{ steps.engine.outputs.d1_scan }}
     env:
       GH_TOKEN: ${{ github.token }}
-      CLOUDFLARE_API_TOKEN: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_API_TOKEN) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_API_TOKEN) || '' }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_ACCOUNT_ID) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID) || '' }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -706,8 +701,8 @@ jobs:
       migration: ${{ needs.migration.outputs.migration }}
     env:
       GH_TOKEN: ${{ github.token }}
-      CLOUDFLARE_API_TOKEN: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_API_TOKEN) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_API_TOKEN) || '' }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_ACCOUNT_ID) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID) || '' }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -826,8 +821,8 @@ jobs:
       rollback_result: ${{ steps.engine.outputs.rollback_result }}
     env:
       GH_TOKEN: ${{ github.token }}
-      CLOUDFLARE_API_TOKEN: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_API_TOKEN) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_API_TOKEN) || '' }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ (github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_ACCOUNT_ID) || (github.ref != 'refs/heads/main' && secrets.CLOUDFLARE_PREVIEW_ACCOUNT_ID) || '' }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v6
         with:
