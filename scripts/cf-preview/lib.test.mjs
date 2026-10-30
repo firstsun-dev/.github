@@ -122,6 +122,41 @@ test('preflight: exact kind:BINDING=identity allow shares one Production R2 buck
   assert.equal(auditPreviewConfig(g, { allow: ['r2_buckets:ASSETS_R2=other-bucket'] }).errors.length, 1);
   assert.equal(auditPreviewConfig(g, { allow: ['r2_buckets:OTHER=prod-bucket'] }).errors.length, 1);
 });
+const withSecret = (prevName = 'FS_ID', prevStore = 'store-1', prevSecret = 'FS_ID') => {
+  const g = good();
+  g.secrets_store_secrets = [{ binding: 'FS_ID', store_id: 'store-1', secret_name: 'FS_ID' }];
+  g.previews.secrets_store_secrets = [{ binding: prevName, store_id: prevStore, secret_name: prevSecret }];
+  return g;
+};
+test('preflight: Secrets Store secret shared with Production needs the exact store_id/secret_name entry', () => {
+  const entry = 'secrets_store_secrets:FS_ID=store-1/FS_ID';
+  const g = withSecret();
+  assert.ok(auditPreviewConfig(g).errors.some((e) => /same resource as Production/.test(e)));
+  // a bare kind:BINDING entry satisfies the high-risk check but never waives the Production collision
+  const bare = auditPreviewConfig(g, { allow: ['secrets_store_secrets:FS_ID'] }).errors;
+  assert.equal(bare.length, 1);
+  assert.match(bare[0], /same resource as Production/);
+  // the exact entry waives the collision and satisfies the high-risk check for that binding
+  assert.deepEqual(auditPreviewConfig(g, { allow: [entry] }).errors, []);
+  assert.deepEqual(auditPreviewConfig(g, { allow: [entry], denyResources: ['store-1/FS_ID'] }).errors, []);
+  // another secret / store / binding is not approved
+  assert.ok(auditPreviewConfig(g, { allow: ['secrets_store_secrets:FS_ID=store-1/OTHER'] }).errors.length > 0);
+  assert.ok(auditPreviewConfig(g, { allow: ['secrets_store_secrets:FS_ID=store-2/FS_ID'] }).errors.length > 0);
+  assert.ok(auditPreviewConfig(g, { allow: ['secrets_store_secrets:OTHER=store-1/FS_ID'] }).errors.length > 0);
+});
+test('preflight: a Preview-only Secrets Store secret still needs the explicit high-risk allow', () => {
+  const g = withSecret('FS_ID', 'store-1', 'FS_ID_PREVIEW');
+  assert.match(auditPreviewConfig(g).errors[0], /high-risk binding needs explicit allow entry/);
+  assert.deepEqual(auditPreviewConfig(g, { allow: ['secrets_store_secrets:FS_ID'] }).errors, []);
+  // an exact entry for a different identity does not approve it
+  assert.ok(auditPreviewConfig(g, { allow: ['secrets_store_secrets:FS_ID=store-1/FS_ID'] }).errors.length > 0);
+});
+test('production audit: an approved shared Secrets Store secret is not a Preview-only resource', () => {
+  const g = withSecret();
+  const src = g;
+  assert.ok(auditProdConfig(g, src, {}).errors.length > 0);
+  assert.deepEqual(auditProdConfig(g, src, { allow: ['secrets_store_secrets:FS_ID=store-1/FS_ID'] }).errors, []);
+});
 test('preflight: a Production D1 can never be approved for sharing', () => {
   const g = good();
   g.previews.d1_databases[0].database_id = 'prod-id';
