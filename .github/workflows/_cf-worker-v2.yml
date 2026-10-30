@@ -762,7 +762,6 @@ jobs:
       pull-requests: write
     with:
       stage: preflight
-      kind: production
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['production']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -783,7 +782,6 @@ jobs:
       pull-requests: write
     with:
       stage: preflight
-      kind: native-branch
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-branch']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -804,7 +802,6 @@ jobs:
       pull-requests: write
     with:
       stage: preflight
-      kind: native-dev
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-dev']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -825,7 +822,6 @@ jobs:
       pull-requests: write
     with:
       stage: preflight
-      kind: persistent-dev
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -851,7 +847,6 @@ jobs:
       pull-requests: write
     with:
       stage: migrate
-      kind: production
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['production']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -875,7 +870,6 @@ jobs:
       pull-requests: write
     with:
       stage: migrate
-      kind: native-branch
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-branch']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -899,7 +893,6 @@ jobs:
       pull-requests: write
     with:
       stage: migrate
-      kind: native-dev
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-dev']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -923,7 +916,6 @@ jobs:
       pull-requests: write
     with:
       stage: migrate
-      kind: persistent-dev
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -953,7 +945,6 @@ jobs:
       pull-requests: write
     with:
       stage: deliver
-      kind: production
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['production']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -984,7 +975,6 @@ jobs:
       pull-requests: write
     with:
       stage: deliver
-      kind: native-branch
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-branch']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -1015,7 +1005,6 @@ jobs:
       pull-requests: write
     with:
       stage: deliver
-      kind: native-dev
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-dev']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -1048,7 +1037,6 @@ jobs:
       pull-requests: write
     with:
       stage: deliver
-      kind: persistent-dev
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}

@@ -137,7 +137,7 @@ LEG = {"production": {"kind": "production", "target": "prod", "environment": "ap
 for s, st in CALL_STAGE.items():
     for k in KINDS:
         w = jobs[f"{s}_{KK(k)}"]["with"]
-        check(w["stage"] == st and w["kind"] == k, f"{s}_{KK(k)}: stage={st}, kind={k} are static literals (bound once, not from application env)")
+        check(w["stage"] == st and "kind" not in w, f"{s}_{KK(k)}: stage={st} is a static literal (bound once, not from application env); the kind is only ever read from the descriptor")
         check(w["descriptor"] == "${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['" + k + "']) }}" and not set(w) & {"target", "environment", "d1_expected_id", "d1_owner_kind", "deploy_group", "rollback_group"},
               f"{s}_{KK(k)}: ONE target descriptor of the plan replaces the per-call target / environment / D1 / owner / concurrency-group copies")
 RANK = {"none": 0, "read": 1, "write": 2}
@@ -160,7 +160,7 @@ check({n for n, s in engine_jobs.items() if s} == {"d.preflight", "d.migrate", "
       "the five delivery-workflow jobs and the manual persistent Dev each call the SAME delivery engine action exactly once (no second deployment implementation)")
 eng = {n.replace("d.", ""): s[0] for n, s in engine_jobs.items() if s}
 check({n: eng[n]["with"]["stage"] for n in djobs} == {"preflight": "preflight", "migrate": "migrate", "deploy": "publish", "smoke": "verify", "rollback": "rollback"}, "each delivery job selects its engine stage (preflight / migrate / publish / verify / rollback)")
-check(all(eng[n]["with"]["target"] == "${{ fromJSON(inputs.descriptor).target }}" and eng[n]["with"]["kind"] == "${{ inputs.kind }}" and eng[n]["with"]["descriptor"] == "${{ inputs.descriptor }}" for n in djobs), "the engine target comes from the call's validated descriptor, kind from the static input; the engine re-validates the descriptor")
+check(all(eng[n]["with"]["target"] == "${{ fromJSON(inputs.descriptor).target }}" and eng[n]["with"]["kind"] == "${{ fromJSON(inputs.descriptor).kind }}" and eng[n]["with"]["descriptor"] == "${{ inputs.descriptor }}" for n in djobs), "the engine target comes from the call's validated descriptor, kind from the static input; the engine re-validates the descriptor")
 check(eng["persistent-dev"]["with"]["target"] == "dev" and eng["persistent-dev"]["with"]["mode"] == "manual", "manual persistent Dev binds target=dev, mode=manual")
 check(all(eng[n]["with"]["inputs_json"] == "${{ inputs.inputs_json }}" for n in djobs) and all(eng[n]["with"]["d1_expected_id"] == "${{ fromJSON(inputs.descriptor).d1_expected_id }}" for n in djobs),
       "engine inputs are passed as one JSON data blob; every stage binds the plan's D1 id (preflight, migrate, publish, verify, rollback)")
@@ -256,12 +256,12 @@ check(all(pub[k] == "${{ inputs." + k + " }}" for k in ("own_migration_result", 
       "Deploy: the migration of THIS kind's D1 (own, or the shared-D1 owner's) is checked by the engine gate (per-D1 gating, never a global needs; delivery.test.mjs covers every refusal)")
 sm_if = lambda inputs, deploy_res="success": bool(ev(djobs["smoke"]["if"], Ctx({"inputs": dict({"stage": "deliver", "phase": "all"}, **inputs), "needs": {"deploy": {"result": deploy_res, "outputs": {}}}}, {})))
 check(sm_if({}) and sm_if({"phase": "verify"}) and not sm_if({"phase": "deploy"}) and not sm_if({"stage": "migrate"}) and sm_if({}, "failure"), "Smoke: runs in all and verify phases (even when Deploy failed: nothing published -> smoke_status none), never in the deploy phase or another stage")
-rb_if = lambda status, inputs=None: bool(ev(djobs["rollback"]["if"], Ctx({"inputs": dict({"stage": "deliver", "phase": "all", "kind": "native-branch", "inputs_json": "{}"}, **(inputs or {})), "needs": {"smoke": {"result": "x", "outputs": {"smoke_status": status}}}}, {})))
+rb_if = lambda status, inputs=None: bool(ev(djobs["rollback"]["if"], Ctx({"inputs": dict({"stage": "deliver", "phase": "all", "descriptor": json.dumps(desc("native-branch")), "inputs_json": "{}"}, **(inputs or {})), "needs": {"smoke": {"result": "x", "outputs": {"smoke_status": status}}}}, {})))
 check(rb_if("failure") and not rb_if("success") and not rb_if("none") and not rb_if("") and not rb_if("failure", {"phase": "deploy"}), "Rollback: only after THIS call's Smoke FAILED (conditional, never on the happy path, never in the deploy phase)")
 rgo = djobs["rollback"]["steps"][0]
 check(rgo["id"] == "go" and "POLICY_OK" in rgo["run"] and "gate_blocked" in rgo["run"] and "published" in rgo["run"],
       "Rollback guard: this run published + no blocked cross-service gate + (Production only) policy automatic")
-check("inputs.kind != 'production' ||" in rgo["env"]["POLICY_OK"] and "production_rollback_policy == 'automatic'" in rgo["env"]["POLICY_OK"], "Rollback: the Production policy applies to Production only; Preview / Dev recovery is target-owned")
+check("fromJSON(inputs.descriptor).kind != 'production' ||" in rgo["env"]["POLICY_OK"] and "production_rollback_policy == 'automatic'" in rgo["env"]["POLICY_OK"], "Rollback: the Production policy applies to Production only; Preview / Dev recovery is target-owned")
 
 
 def dout(kind, **kw):
@@ -372,7 +372,7 @@ for n, i, s, j in action_uses:
     first_ck = next(i_ for i_, p in enumerate(j["steps"]) if str(p.get("uses", "")).startswith("actions/checkout"))
     check(j["steps"][first_ck].get("with", {}).get("path") is None or n == "persistent-dev", f"{n}: the app checkout (workspace root) happens before the tooling checkout")
 check(all(jobs[j]["with"]["tools_ref"] == "${{ inputs.tools_ref }}" for j in CALL_JOBS), "tools_ref: every per-kind call forwards the caller's tools_ref (the engine is fetched at the SAME pinned ref)")
-check(set(ddoc[True]["workflow_call"]["inputs"]) >= {"stage", "kind", "descriptor", "tools_ref", "inputs_json"} and not set(ddoc[True]["workflow_call"]["inputs"]) & {"target", "environment", "deploy_group", "rollback_group", "d1_expected_id", "d1_owner_kind"} and ddoc[True]["workflow_call"]["inputs"]["tools_ref"].get("required") is True, "delivery workflow: tools_ref is a required input")
+check(set(ddoc[True]["workflow_call"]["inputs"]) >= {"stage", "descriptor", "tools_ref", "inputs_json"} and not set(ddoc[True]["workflow_call"]["inputs"]) & {"kind", "target", "environment", "deploy_group", "rollback_group", "d1_expected_id", "d1_owner_kind"} and ddoc[True]["workflow_call"]["inputs"]["tools_ref"].get("required") is True, "delivery workflow: tools_ref is a required input")
 _ci = open("actions/cf-ci-check/action.yml").read()
 check("rm -rf .cf-tools" not in _ci and "'.cf-tools/actions/cf-ci-check/action.yml' -delete" in _ci,
       "cf-ci-check never deletes its own action.yml (the runner re-reads it for the post step; Blog run 39722027184 failed that way)")

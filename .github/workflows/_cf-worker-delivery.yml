@@ -26,10 +26,6 @@ on:
         description: preflight | migrate | deliver
         type: string
         required: true
-      kind:
-        description: production | native-branch | native-dev | persistent-dev
-        type: string
-        required: true
       tools_ref:
         type: string
         required: true
@@ -175,7 +171,7 @@ jobs:
         with:
           target: ${{ fromJSON(inputs.descriptor).target }}
           descriptor: ${{ inputs.descriptor }}
-          kind: ${{ inputs.kind }}
+          kind: ${{ fromJSON(inputs.descriptor).kind }}
           stage: preflight
           inputs_json: ${{ inputs.inputs_json }}
           d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
@@ -224,7 +220,7 @@ jobs:
         with:
           target: ${{ fromJSON(inputs.descriptor).target }}
           descriptor: ${{ inputs.descriptor }}
-          kind: ${{ inputs.kind }}
+          kind: ${{ fromJSON(inputs.descriptor).kind }}
           stage: migrate
           kinds: ${{ inputs.kinds }}
           peers: ${{ inputs.peers }}
@@ -281,7 +277,7 @@ jobs:
         with:
           target: ${{ fromJSON(inputs.descriptor).target }}
           descriptor: ${{ inputs.descriptor }}
-          kind: ${{ inputs.kind }}
+          kind: ${{ fromJSON(inputs.descriptor).kind }}
           stage: publish
           own_migration_result: ${{ inputs.own_migration_result }}
           own_migration_json: ${{ inputs.own_migration_json }}
@@ -316,7 +312,7 @@ jobs:
       HANDOFF: ${{ inputs.phase == 'verify' && inputs.handoff_json || needs.deploy.outputs.handoff }}
     steps:
       - id: go
-        name: Did this run publish ${{ inputs.kind }}?
+        name: Did this run publish ${{ fromJSON(inputs.descriptor).kind }}?
         run: |
           h="${HANDOFF:-}"; [ -n "$h" ] || h='{}'
           echo "go=$(printf '%s' "$h" | jq -r '.published == "true"')" >> "$GITHUB_OUTPUT"
@@ -343,7 +339,7 @@ jobs:
         with:
           target: ${{ fromJSON(inputs.descriptor).target }}
           descriptor: ${{ inputs.descriptor }}
-          kind: ${{ inputs.kind }}
+          kind: ${{ fromJSON(inputs.descriptor).kind }}
           stage: verify
           inputs_json: ${{ inputs.inputs_json }}
           call_inputs_json: ${{ inputs.call_inputs_json }}
@@ -365,7 +361,7 @@ jobs:
         if: failure()
         continue-on-error: true
         with:
-          name: smoke-report-${{ inputs.kind }}-${{ github.run_id }}
+          name: smoke-report-${{ fromJSON(inputs.descriptor).kind }}-${{ github.run_id }}
           path: |
             playwright-report/
             test-results/
@@ -382,7 +378,7 @@ jobs:
   rollback:
     name: Revert on Verify Failure
     needs: [deploy, smoke]
-    if: always() && inputs.stage == 'deliver' && inputs.phase != 'deploy' && needs.smoke.outputs.smoke_status == 'failure' && (inputs.kind != 'production' || fromJSON(inputs.inputs_json).production_rollback_policy == 'automatic') && fromJSON(needs.smoke.outputs.smoke_json || '{}').gate_blocked != 'true'
+    if: always() && inputs.stage == 'deliver' && inputs.phase != 'deploy' && needs.smoke.outputs.smoke_status == 'failure' && (fromJSON(inputs.descriptor).kind != 'production' || fromJSON(inputs.inputs_json).production_rollback_policy == 'automatic') && fromJSON(needs.smoke.outputs.smoke_json || '{}').gate_blocked != 'true'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     concurrency:
@@ -405,9 +401,9 @@ jobs:
       SMOKEJSON: ${{ needs.smoke.outputs.smoke_json }}
     steps:
       - id: go
-        name: Did the Smoke of ${{ inputs.kind }} fail on a deployment this run published?
+        name: Did the Smoke of ${{ fromJSON(inputs.descriptor).kind }} fail on a deployment this run published?
         env:
-          POLICY_OK: ${{ inputs.kind != 'production' || fromJSON(inputs.inputs_json).production_rollback_policy == 'automatic' }}
+          POLICY_OK: ${{ fromJSON(inputs.descriptor).kind != 'production' || fromJSON(inputs.inputs_json).production_rollback_policy == 'automatic' }}
         run: |
           h="${HANDOFF:-}"; [ -n "$h" ] || h='{}'; k="${SMOKEJSON:-}"; [ -n "$k" ] || k='{}'
           pub="$(printf '%s' "$h" | jq -r '.published == "true"')"
@@ -437,7 +433,7 @@ jobs:
         with:
           target: ${{ fromJSON(inputs.descriptor).target }}
           descriptor: ${{ inputs.descriptor }}
-          kind: ${{ inputs.kind }}
+          kind: ${{ fromJSON(inputs.descriptor).kind }}
           stage: rollback
           inputs_json: ${{ inputs.inputs_json }}
           call_inputs_json: ${{ inputs.call_inputs_json }}
