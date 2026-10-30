@@ -15,11 +15,36 @@ import shutil
 import subprocess
 import tempfile
 
+import time
 import yaml
 
 from ghexpr import Ctx, ev, render
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+# Opt-in performance instrumentation (JOBRUNNER_PERF=<report.json>): every step subprocess is recorded by category.
+PERF = {"subprocess": {}, "workspaces": 0, "jobs": {}, "scenario": ""}
+
+
+def _category(script):
+    """Coarse command category of a step script: the first engine/CLI entry point it calls, else 'inline'."""
+    for key in ("engine.sh", "cli.mjs", "build.sh", "publish.sh", "migrate.sh", "smoke.sh", "probe.sh", "gh.sh", "pnpm", "node"):
+        if key in script:
+            return key
+    return "inline"
+
+
+def _record(kind, name, dt):
+    d = PERF[kind].setdefault(name, {"n": 0, "s": 0.0})
+    d["n"] += 1
+    d["s"] = round(d["s"] + dt, 3)
+
+
+def write_perf_report():
+    path = os.environ.get("JOBRUNNER_PERF")
+    if path:
+        total = sum(v["n"] for v in PERF["subprocess"].values())
+        pathlib.Path(path).write_text(json.dumps({**PERF, "subprocess_total": total}, indent=1, sort_keys=True))
 
 GH_STUB = r'''#!/usr/bin/env bash
 echo "gh $*" >> "$STUB_LOG"
@@ -82,6 +107,7 @@ database_id = "PREV-ID"
 
 
 def make_workspace(toml=APP_TOML, files=None):
+    PERF["workspaces"] += 1
     ws = pathlib.Path(tempfile.mkdtemp(prefix="jobrun-"))
     (ws / "bin").mkdir()
     for name, body in (("gh", GH_STUB), ("pnpm", PNPM_STUB), ("curl", CURL_STUB), ("npm", NPM_STUB)):
@@ -176,7 +202,9 @@ class _Run:
             script = render(step["run"], ctx, failed)
             wd = pathlib.Path(render(step.get("working-directory", "."), ctx, failed))
             wd = wd if wd.is_absolute() else self.w / wd
+            t0 = time.perf_counter()
             p = subprocess.run(["bash", "-eo", "pipefail", "-c", script], cwd=wd, env=env, capture_output=True, text=True)
+            _record("subprocess", _category(script), time.perf_counter() - t0)
             if verbose:
                 print(f"--- {label} rc={p.returncode}\n{p.stdout[-1500:]}\n{p.stderr[-1500:]}")
             outputs = _parse_kv(out_file)
@@ -231,7 +259,9 @@ def run_job(doc, name, ctx, ws, stub_env=None, verbose=False):
     for k, v in job.get("env", {}).items():
         ctx["env"][k] = render(v, ctx)
     runner = _Run(ws, base, jobenv_file)
+    t0 = time.perf_counter()
     failed, results = runner.steps(job["steps"], ctx, verbose=verbose)
+    _record("jobs", name, time.perf_counter() - t0)
     outs = {k: render(v, ctx, failed) for k, v in job.get("outputs", {}).items()}
     summary = (ws / "summary.md").read_text() if (ws / "summary.md").exists() else ""
     return {"result": "failure" if failed else "success", "outputs": outs, "steps": results, "log": log.read_text(), "summary": summary}

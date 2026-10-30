@@ -31,7 +31,16 @@ export TOOLS_DIR
 S="${STATE_DIR:-${RUNNER_TEMP:?RUNNER_TEMP or STATE_DIR required}/cfv2}"
 IN="$S/inputs.json"
 die() { echo "::error::$*" >&2; exit 1; }
-inp() { jq -r --arg k "$1" '.[$k] | if . == null then "" else tostring end' "$IN"; }
+# One jq process per engine invocation: inputs.json is read into INP once (NUL-delimited, so values may hold newlines).
+# `inp` runs inside $(...) subshells, so the cache must be filled in the parent shell (load_inputs) before it is used.
+declare -A INP=()
+load_inputs() {
+  INP=(); local k v
+  [ -f "$IN" ] || return 0
+  while IFS= read -r -d '' k && IFS= read -r -d '' v; do INP[$k]="$v"; done \
+    < <(jq -j 'if type == "object" then to_entries[] | (.key, "\u0000", (.value | if . == null then "" else tostring end), "\u0000") else empty end' "$IN" 2>/dev/null || true)
+}
+inp() { printf '%s' "${INP[$1]-}"; }
 summary() { printf '%s\n' "$*" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"; }
 setenv() { printf '%s=%s\n' "$1" "$2" >> "${GITHUB_ENV:-/dev/null}"; }
 rd() { [ -f "$S/$1" ] && cat "$S/$1" || true; }
@@ -96,6 +105,7 @@ stale_check() { # sets STALE for the rest of the job when the branch moved on; F
   fi
 }
 
+load_inputs
 case "$PHASE" in
   guard)
     stale_check "${2:-guard}" || true;;
@@ -103,6 +113,7 @@ case "$PHASE" in
   init)
     mkdir -p "$S"; chmod 700 "$S"; umask 077
     printf '%s' "${INPUTS_JSON:?}" > "$IN"; jq -e 'type == "object"' "$IN" >/dev/null || die "inputs_json is not an object"
+    load_inputs
     T="${ENGINE_TARGET:?}"; M="${ENGINE_MODE:-auto}"; STAGE="${ENGINE_STAGE:-all}"
     case "$T" in prod|preview|dev) ;; *) die "bad engine target: $T";; esac
     K="${ENGINE_KIND:-}"

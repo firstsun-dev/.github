@@ -18,7 +18,7 @@ import yaml
 
 sys.path.insert(0, "scripts/cf-preview")
 from ghexpr import Ctx, ev, render  # noqa: E402
-from jobrunner import APP_TOML, make_workspace, run_job  # noqa: E402
+from jobrunner import APP_TOML, make_workspace, run_job, write_perf_report  # noqa: E402
 
 WF = ".github/workflows/_cf-worker-v2.yml"
 DWF = ".github/workflows/_cf-worker-delivery.yml"
@@ -1190,4 +1190,5 @@ check(po["dev_url"] == "https://dev.example.com" and po["dev_verified_url"] == "
 rr = deploy(MAIN, inputs={"smoke_mode": "skip"}, env={"STUB_PROBES": "500 "})
 check(not release_runs(rr), "(8) Release gate: smoke_mode=skip Production is never released")
 
+write_perf_report()
 sys.exit(fail)
