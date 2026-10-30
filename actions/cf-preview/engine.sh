@@ -391,8 +391,9 @@ case "$PHASE" in
     ctx
     URL="${PUBLISHED_URL:-$(target_url)}"
     LEVEL="${SMOKE_LEVEL:-}"
-    case "$LEVEL" in
-      content|content-sha) V=true; NOTE="verification: $LEVEL"; LEDGER_STATE=success; LEDGER_DESC="Serving $RUN_SHA ($LEVEL)";;
+    VO="$(node "$TOOLS_DIR/cli.mjs" verification-outcome --level "$LEVEL")"   # the ONE rule: only a content-level smoke verifies
+    case "$(printf '%s\n' "$VO" | sed -n 's/^verification_kind=//p')" in
+      content) V=true; NOTE="verification: $LEVEL"; LEDGER_STATE=success; LEDGER_DESC="Serving $RUN_SHA ($LEVEL)";;
       skipped) V=false; NOTE="PUBLISHED, NOT VERIFIED — smoke_mode=skip; no verification was performed"
          LEDGER_STATE=inactive; LEDGER_DESC="Published $RUN_SHA; unverified (smoke_mode=skip); not a known-good deployment";;
       *) V=false; NOTE="PUBLISHED, NOT VERIFIED — Cloudflare Access liveness only; content and commit NOT verified"
@@ -550,20 +551,20 @@ case "$PHASE" in
       summary "- Manual recovery, after confirming the previous version runs on the current D1 schema: \`$MANUAL\`"
       exit 0
     }
-    [ "$POLICY" = automatic ] || blocked policy "production_rollback_policy is '$POLICY'."
-    [ -n "$PREV" ] || blocked no_previous_version "No previous Worker version id was recorded (first deployment, or the deployment list was unreadable); there is nothing safe to roll back to."
-    [ -n "$NEW" ] && [ -n "$W" ] || blocked no_identity "The deployed version id or Worker name was not handed over."
-    [ "$PREV" != "$NEW" ] || blocked same_version "The previous and the new version id are identical."
-    if [ "${D1_PENDING:-}" = true ]; then
-      # A Worker rollback never reverts D1. This run changed the schema: the previous version must be PROVEN to cope.
-      [ "$(inp d1_rollback_compat)" = expand-contract ] || blocked d1_unattested "This run applied D1 migrations and d1_rollback_compat is not 'expand-contract': compatibility of the previous Worker version with the new schema is unproven."
-      [ "${D1_SCAN:-}" = additive ] || blocked d1_not_additive "This run applied D1 migrations that are not provably additive (scan: ${D1_SCAN:-unknown}); the previous Worker version may not work on the new schema."
-    fi
+    # The decision (policy, identity, no D1 schema rollback, never over a newer/foreign deployment) is delivery.mjs prodRollbackBlock.
+    guard() { # [VAR=value ...] -> refuses (exit 0 with rollback_result=blocked) when the guard says so
+      local G c
+      G="$(env POLICY="$POLICY" PREVIOUS="$PREV" CURRENT="$NEW" WORKER="$W" D1_PENDING="${D1_PENDING:-}" D1_COMPAT="$(inp d1_rollback_compat)" D1_SCAN="${D1_SCAN:-}" "$@" \
+        node "$TOOLS_DIR/cli.mjs" rollback-guard)"
+      c="$(printf '%s\n' "$G" | sed -n 's/^block_code=//p')"
+      [ -z "$c" ] || blocked "$c" "$(printf '%s\n' "$G" | sed -n 's/^block_why=//p')"
+    }
+    guard
     RB="$S/rollback"; mkdir -p "$RB"; node -e 'const [n,f]=process.argv.slice(1);require("fs").writeFileSync(f,JSON.stringify({name:n,compatibility_date:"2025-01-01"}))' "$W" "$RB/wrangler.json"
     LIVE="$(cd "$APP_DIR" && pnpm exec wrangler deployments list --config "$RB/wrangler.json" --json 2>/dev/null \
       | jq -r 'sort_by(.created_on) | reverse | .[0].versions | max_by(.percentage // 0) | .version_id // empty' 2>/dev/null || echo "")"
     # Never roll back a deployment that is no longer ours (someone deployed out of band): fail closed.
-    [ "$LIVE" = "$NEW" ] || blocked live_version_changed "The live version is '${LIVE:-unknown}', not the version \`$NEW\` this run deployed; refusing to replace someone else's deployment."
+    guard LIVE="$LIVE"
     if (cd "$APP_DIR" && pnpm exec wrangler versions deploy "$PREV@100" --config "$RB/wrangler.json" --message "Revert: smoke failed on $RUN_SHA" --yes) >&2; then
       echo "rollback_result=rolled_back"; echo "rollback_reason=rolled back to $PREV"
     else
@@ -584,19 +585,10 @@ case "$PHASE" in
 
   rollback-finish) # final, target-independent verdict of the Rollback job (ok=true only when restored AND content-verified)
     ctx
-    R=""; LEVEL=""
+    RV="$(env TARGET="$TARGET" RB_RESULT="${RB_RESULT:-}" RB_VERIFY="${RB_VERIFY:-}" RB_LEVEL="${RB_LEVEL:-}" GOOD_SHA="${GOOD_SHA:-}" RECOVERED="${RECOVERED:-}" VERIFIED="${VERIFIED:-}" \
+      SMOKE_LEVEL="${SMOKE_LEVEL:-}" node "$TOOLS_DIR/cli.mjs" rollback-verdict)"   # delivery.mjs rollbackVerdict
+    R="$(printf '%s\n' "$RV" | sed -n 's/^result=//p')"; LEVEL="$(printf '%s\n' "$RV" | sed -n 's/^level=//p')"
     if [ "$TARGET" = prod ]; then
-      case "${RB_RESULT:-}" in
-        rolled_back)
-          if [ "${RB_VERIFY:-}" = success ]; then
-            case "${RB_LEVEL:-}" in
-              content|content-sha) R=restored_verified; LEVEL="$RB_LEVEL";;
-              *) R=restored_unverified; LEVEL="${RB_LEVEL:-}";;
-            esac
-          else R=restored_unhealthy; fi;;
-        blocked) R=blocked;;
-        *) R=failed;;
-      esac
       case "$R" in
         restored_verified)
           summary "### ♻️ Production rolled back to \`${PREVIOUS_VERSION_ID:-?}\` and verified ($LEVEL). The run stays **FAILED** for $RUN_SHA and Release is blocked. D1 migrations (if any) were NOT reverted."
@@ -604,11 +596,6 @@ case "$PHASE" in
         restored_unverified) summary "### ⚠️ Production rolled back to \`${PREVIOUS_VERSION_ID:-?}\` but only liveness could be observed (${LEVEL:-no level}): the restored deployment is NOT content-verified. Run FAILED.";;
         restored_unhealthy) summary "### 🚨 Production was rolled back to \`${PREVIOUS_VERSION_ID:-?}\` but the post-rollback smoke FAILED — Production may be unhealthy. Investigate now. Run FAILED.";;
       esac
-    else
-      if [ -z "${GOOD_SHA:-}" ]; then R=no_known_good
-      elif [ "${RECOVERED:-}" = success ] && [ "${VERIFIED:-}" = success ]; then
-        case "${SMOKE_LEVEL:-}" in content|content-sha) R=restored_verified; LEVEL="$SMOKE_LEVEL";; *) R=restored_unverified; LEVEL="${SMOKE_LEVEL:-}";; esac
-      else R=failed; fi
     fi
     echo "result=$R"; echo "level=$LEVEL"; echo "ok=$([ "$R" = restored_verified ] && echo true || echo false)";;
 

@@ -4,6 +4,7 @@ import {
   DELIVERY_KINDS, resolveDeliveryTargets, resolveSmokeMode, parseSmokeOverrides, planMigrations, branchPreviewIdentity, ENGINE_TARGET,
   canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins,
   targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor, checkPeerPreflights, resolveMigrationUsed,
+  isContentLevel, verificationOutcome, prodRollbackBlock, rollbackVerdict,
 } from '../../actions/cf-preview/delivery.mjs';
 
 const base = { event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-preview', previewOnPush: true };
@@ -329,4 +330,65 @@ test('migration used: fails closed on a missing, failed, foreign or malformed mi
 test('migration used: a stale-skipped migration is accepted (nothing was applied, nothing will be published)', () => {
   assert.equal(U({ ownJson: JSON.stringify({ stale: 'true' }) }).stale, 'true');
   assert.equal(U({ ownJson: JSON.stringify({ stale: true }) }).stale, true);
+});
+
+// ---- verification and recovery decisions ---------------------------------------------------------------------------------
+test('verification: ONLY a content-level smoke verifies a deployment', () => {
+  for (const l of ['content', 'content-sha']) assert.deepEqual(verificationOutcome(l), { verified: true, kind: 'content' });
+  for (const l of ['liveness', 'access', '', undefined, 'CONTENT', 'content ']) assert.equal(verificationOutcome(l).verified, false);
+  assert.equal(verificationOutcome('skipped').kind, 'skipped');
+  assert.equal(verificationOutcome('liveness').kind, 'liveness');
+  assert.equal(isContentLevel('content-sha'), true);
+});
+
+const RB = { policy: 'automatic', previous: 'v1', current: 'v2', worker: 'app', d1Pending: false };
+
+test('production rollback guard: every refusal reason, in order, fail closed', () => {
+  assert.equal(prodRollbackBlock({ ...RB, live: 'v2' }), null);
+  assert.equal(prodRollbackBlock(RB), null, 'without an observed live version only the static checks run');
+  for (const p of ['manual', 'never', '']) assert.equal(prodRollbackBlock({ ...RB, policy: p }).code, 'policy');
+  assert.equal(prodRollbackBlock({ ...RB, previous: '' }).code, 'no_previous_version');
+  assert.equal(prodRollbackBlock({ ...RB, current: '' }).code, 'no_identity');
+  assert.equal(prodRollbackBlock({ ...RB, worker: '' }).code, 'no_identity');
+  assert.equal(prodRollbackBlock({ ...RB, previous: 'v2' }).code, 'same_version');
+  assert.equal(prodRollbackBlock({ ...RB, policy: 'manual', previous: '' }).code, 'policy', 'policy is checked first');
+});
+
+test('production rollback guard: no D1 schema rollback - applied migrations need attested expand-contract AND an additive scan', () => {
+  const D = { ...RB, d1Pending: true };
+  assert.equal(prodRollbackBlock({ ...D, d1Compat: '' }).code, 'd1_unattested');
+  assert.equal(prodRollbackBlock({ ...D, d1Compat: 'none', d1Scan: 'additive' }).code, 'd1_unattested');
+  for (const scan of ['unknown', 'destructive', '', 'none']) assert.equal(prodRollbackBlock({ ...D, d1Compat: 'expand-contract', d1Scan: scan }).code, 'd1_not_additive');
+  assert.match(prodRollbackBlock({ ...D, d1Compat: 'expand-contract', d1Scan: '' }).why, /scan: unknown/);
+  assert.equal(prodRollbackBlock({ ...D, d1Compat: 'expand-contract', d1Scan: 'additive', live: 'v2' }), null);
+  assert.equal(prodRollbackBlock({ ...RB, d1Pending: false, d1Compat: '', d1Scan: 'destructive' }), null, 'no applied migration: D1 is irrelevant');
+});
+
+test('production rollback guard: never replaces a deployment that is no longer ours (stale / out-of-band)', () => {
+  assert.equal(prodRollbackBlock({ ...RB, live: 'someone-elses' }).code, 'live_version_changed');
+  assert.equal(prodRollbackBlock({ ...RB, live: '' }).code, 'live_version_changed');
+  assert.match(prodRollbackBlock({ ...RB, live: '' }).why, /'unknown'/);
+});
+
+test('rollback verdict (production): restored_verified only after a content-level re-smoke of the rolled-back version', () => {
+  const P = (o) => rollbackVerdict({ target: 'prod', ...o });
+  assert.deepEqual(P({ rbResult: 'rolled_back', rbVerify: 'success', rbLevel: 'content-sha' }), { result: 'restored_verified', level: 'content-sha', ok: true });
+  assert.equal(P({ rbResult: 'rolled_back', rbVerify: 'success', rbLevel: 'liveness' }).result, 'restored_unverified');
+  assert.equal(P({ rbResult: 'rolled_back', rbVerify: 'success', rbLevel: '' }).ok, false);
+  assert.equal(P({ rbResult: 'rolled_back', rbVerify: 'failure', rbLevel: 'content' }).result, 'restored_unhealthy');
+  assert.equal(P({ rbResult: 'rolled_back', rbVerify: '' }).result, 'restored_unhealthy');
+  assert.equal(P({ rbResult: 'blocked' }).result, 'blocked');
+  for (const r of ['failed', '', 'weird']) assert.deepEqual(P({ rbResult: r, rbVerify: 'success', rbLevel: 'content' }), { result: 'failed', level: '', ok: false });
+});
+
+test('rollback verdict (Preview / Dev): known-good recovery must be rebuilt AND re-verified at content level', () => {
+  const R = (o) => rollbackVerdict({ target: 'preview', goodSha: 'abc1234', recovered: 'success', verified: 'success', smokeLevel: 'content', ...o });
+  assert.deepEqual(R({}), { result: 'restored_verified', level: 'content', ok: true });
+  assert.equal(R({ smokeLevel: 'liveness' }).result, 'restored_unverified');
+  assert.equal(R({ goodSha: '' }).result, 'no_known_good');
+  assert.equal(R({ goodSha: '', recovered: 'success' }).ok, false);
+  assert.equal(R({ recovered: 'failure' }).result, 'failed');
+  assert.equal(R({ verified: 'failure' }).result, 'failed');
+  assert.equal(R({ recovered: '' }).result, 'failed');
+  assert.equal(rollbackVerdict({ target: 'dev', goodSha: 'x', recovered: 'success', verified: 'success', smokeLevel: 'content-sha' }).ok, true);
 });

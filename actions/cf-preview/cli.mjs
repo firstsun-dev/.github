@@ -8,7 +8,7 @@ import {
 } from './lib.mjs';
 import {
   DELIVERY_KINDS, ENGINE_TARGET, assertKind, branchPreviewIdentity, canonicalOrigin, checkBuildEnvOrigins, environmentName, foreignUrlsInBuildEnv, planMigrations, resolveCanonicalUrl, resolveDeliveryTargets, resolveSmokeMode,
-  buildDescriptors, parseDescriptor, checkPeerPreflights, resolveMigrationUsed,
+  buildDescriptors, parseDescriptor, checkPeerPreflights, resolveMigrationUsed, verificationOutcome, prodRollbackBlock, rollbackVerdict,
 } from './delivery.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -282,6 +282,29 @@ try {
         });
         out({ migration_used: JSON.stringify(m) });
       }
+      break;
+    }
+    case 'verification-outcome': { // --level L
+      const o = verificationOutcome(opt('level'));
+      out({ verified: String(o.verified), verification_kind: o.kind });
+      break;
+    }
+    case 'rollback-guard': { // env: POLICY PREVIOUS CURRENT WORKER D1_PENDING D1_COMPAT D1_SCAN [LIVE set only for the live check]
+      const e = process.env;
+      const b = prodRollbackBlock({
+        policy: e.POLICY ?? '', previous: e.PREVIOUS ?? '', current: e.CURRENT ?? '', worker: e.WORKER ?? '', d1Pending: e.D1_PENDING === 'true',
+        d1Compat: e.D1_COMPAT ?? '', d1Scan: e.D1_SCAN ?? '', live: 'LIVE' in e ? e.LIVE : undefined,
+      });
+      out({ block_code: b ? b.code : '', block_why: b ? b.why : '' });
+      break;
+    }
+    case 'rollback-verdict': { // env: TARGET RB_RESULT RB_VERIFY RB_LEVEL GOOD_SHA RECOVERED VERIFIED SMOKE_LEVEL
+      const e = process.env;
+      const v = rollbackVerdict({
+        target: e.TARGET, rbResult: e.RB_RESULT ?? '', rbVerify: e.RB_VERIFY ?? '', rbLevel: e.RB_LEVEL ?? '', goodSha: e.GOOD_SHA ?? '',
+        recovered: e.RECOVERED ?? '', verified: e.VERIFIED ?? '', smokeLevel: e.SMOKE_LEVEL ?? '',
+      });
+      out({ result: v.result, level: v.level, ok: String(v.ok) });
       break;
     }
     case 'stale':

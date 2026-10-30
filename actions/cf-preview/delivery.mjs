@@ -336,3 +336,51 @@ export function resolveMigrationUsed({ d1Migrations, kind, ownerKind = '', expec
   }
   return m;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Verification and recovery decisions (pure). The engine only gathers facts (levels, versions, the live version) and
+// performs the effects; WHAT those facts mean lives here, unit-tested.
+// ---------------------------------------------------------------------------------------------------------------------
+/** Only a content-level smoke verifies a deployment; Access liveness or a skipped smoke never does. */
+export const isContentLevel = (level) => level === 'content' || level === 'content-sha';
+
+export function verificationOutcome(level) {
+  if (isContentLevel(level)) return { verified: true, kind: 'content' };
+  return { verified: false, kind: level === 'skipped' ? 'skipped' : 'liveness' };
+}
+
+/**
+ * Production automatic rollback: why it must NOT happen (null = allowed so far). Checked in this order, fail closed.
+ * `live` = the version Cloudflare reports as live; pass undefined to skip that last, observation-based check.
+ * A Worker rollback never reverts D1: after an applied migration the previous version must be PROVEN to cope.
+ */
+export function prodRollbackBlock({ policy, previous = '', current = '', worker = '', d1Pending = false, d1Compat = '', d1Scan = '', live }) {
+  if (policy !== 'automatic') return { code: 'policy', why: `production_rollback_policy is '${policy}'.` };
+  if (!previous) return { code: 'no_previous_version', why: 'No previous Worker version id was recorded (first deployment, or the deployment list was unreadable); there is nothing safe to roll back to.' };
+  if (!current || !worker) return { code: 'no_identity', why: 'The deployed version id or Worker name was not handed over.' };
+  if (previous === current) return { code: 'same_version', why: 'The previous and the new version id are identical.' };
+  if (d1Pending) {
+    if (d1Compat !== 'expand-contract') return { code: 'd1_unattested', why: "This run applied D1 migrations and d1_rollback_compat is not 'expand-contract': compatibility of the previous Worker version with the new schema is unproven." };
+    if (d1Scan !== 'additive') return { code: 'd1_not_additive', why: `This run applied D1 migrations that are not provably additive (scan: ${d1Scan || 'unknown'}); the previous Worker version may not work on the new schema.` };
+  }
+  if (live !== undefined && live !== current) {
+    return { code: 'live_version_changed', why: `The live version is '${live || 'unknown'}', not the version \`${current}\` this run deployed; refusing to replace someone else's deployment.` };
+  }
+  return null;
+}
+
+/**
+ * Final verdict of the Rollback job. restored_verified only when the restored deployment was re-smoked at CONTENT level.
+ * Production: facts = rolled back? post-rollback smoke? level. Preview/Dev: known-good found? recovered? re-verified? level.
+ */
+export function rollbackVerdict({ target, rbResult = '', rbVerify = '', rbLevel = '', goodSha = '', recovered = '', verified = '', smokeLevel = '' }) {
+  let result;
+  let level = '';
+  if (target === 'prod') {
+    if (rbResult === 'rolled_back') {
+      if (rbVerify === 'success') { result = isContentLevel(rbLevel) ? 'restored_verified' : 'restored_unverified'; level = rbLevel; } else result = 'restored_unhealthy';
+    } else result = rbResult === 'blocked' ? 'blocked' : 'failed';
+  } else if (!goodSha) result = 'no_known_good';
+  else if (recovered === 'success' && verified === 'success') { result = isContentLevel(smokeLevel) ? 'restored_verified' : 'restored_unverified'; level = smokeLevel; } else result = 'failed';
+  return { result, level, ok: result === 'restored_verified' };
+}
