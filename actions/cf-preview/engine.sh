@@ -121,7 +121,13 @@ case "$PHASE" in
     case "$K:$T" in production:prod|native-branch:preview|native-dev:preview|persistent-dev:dev) ;; *) die "delivery kind '$K' does not belong to engine target '$T'";; esac
     printf '%s' "$K" > "$S/kind"
     # smoke_mode / smoke_mode_overrides are validated as data BEFORE anything is mutated; unknown values fail closed.
-    SM="$(node "$TOOLS_DIR/cli.mjs" smoke-mode --kind "$K" --mode "$(inp smoke_mode)" --overrides "$(inp smoke_mode_overrides)" | sed -n 's/^smoke_mode=//p')"
+    # With a target descriptor (the plan's validated record) ONE check binds kind, target, D1 and smoke mode; without one (legacy
+    # callers) the smoke mode is resolved from the inputs as before.
+    if [ -n "${ENGINE_DESCRIPTOR:-}" ]; then
+      SM="$(DESCRIPTOR="$ENGINE_DESCRIPTOR" node "$TOOLS_DIR/cli.mjs" descriptor-check --kind "$K" --target "$T" --d1 "${ENGINE_D1_EXPECT:-}" | sed -n 's/^smoke_mode=//p')"
+    else
+      SM="$(node "$TOOLS_DIR/cli.mjs" smoke-mode --kind "$K" --mode "$(inp smoke_mode)" --overrides "$(inp smoke_mode_overrides)" | sed -n 's/^smoke_mode=//p')"
+    fi
     [ -n "$SM" ] || die "cannot resolve smoke_mode for $K"
     printf '%s' "$SM" > "$S/smoke_mode"
     case "$STAGE" in all|deploy|preflight|migrate|publish|verify|rollback) ;; *) die "bad engine stage: $STAGE";; esac

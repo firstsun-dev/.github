@@ -52,6 +52,9 @@ inputs:
   d1_expected_id:
     description: Physical D1 database id the plan resolved for this kind. Every build of this kind must bind exactly it (preflight, migrate, publish); empty = no D1.
     default: ''
+  descriptor:
+    description: toJSON of this kind's target descriptor (the Delivery plan's validated record). When set, the engine verifies it against target / kind / d1_expected_id and takes the smoke mode from it.
+    default: ''
   call_inputs_json:
     description: Deferred verification only - toJSON(inputs) of the VERIFY call, compared with the deploy call's identity inputs (inputs_json)
     default: ''
@@ -147,6 +150,7 @@ runs:
         ENGINE_STAGE: ${{ inputs.stage }}
         ENGINE_MODE: ${{ inputs.mode }}
         ENGINE_D1_EXPECT: ${{ inputs.d1_expected_id }}
+        ENGINE_DESCRIPTOR: ${{ inputs.descriptor }}
         INPUTS_JSON: ${{ inputs.inputs_json }}
         CALL_INPUTS_JSON: ${{ inputs.call_inputs_json }}
         PREVIEW_SECRETS: ${{ inputs.target == 'preview' && inputs.preview_secrets || '' }}

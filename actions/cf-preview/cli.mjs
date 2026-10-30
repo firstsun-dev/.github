@@ -8,6 +8,7 @@ import {
 } from './lib.mjs';
 import {
   DELIVERY_KINDS, ENGINE_TARGET, assertKind, branchPreviewIdentity, canonicalOrigin, checkBuildEnvOrigins, environmentName, foreignUrlsInBuildEnv, planMigrations, resolveCanonicalUrl, resolveDeliveryTargets, resolveSmokeMode,
+  buildDescriptors, parseDescriptor,
 } from './delivery.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -232,7 +233,6 @@ try {
           dispatchTarget: str('dispatch_target'), devRef: str('persistent_dev_ref'),
         });
       }
-      for (const k of kinds) resolveSmokeMode(k, str('smoke_mode') || 'full', str('smoke_mode_overrides')); // fail closed on a bad mode
       let migrations = [];
       if (opt('phase') !== 'verify' && bool('d1_migrations') && kinds.length) {
         const cfgPath = resolve(opt('app-dir', '.'), str('wrangler_config') || 'wrangler.toml');
@@ -246,12 +246,22 @@ try {
       for (const k of DELIVERY_KINDS) {
         const g = migrations.find((m) => m.members.includes(k));
         flat[`on_${kindKey(k)}`] = String(kinds.includes(k));
-        flat[`d1_${kindKey(k)}`] = g ? g.databaseId : '';
-        flat[`owner_of_${kindKey(k)}`] = g ? g.owner : '';
         flat[`owns_${kindKey(k)}`] = String(Boolean(g && g.owner === k));
       }
+      const descriptors = buildDescriptors({
+        kinds, app: str('app_name'), runId: opt('run-id', '0'), repo: process.env.GITHUB_REPOSITORY ?? '', lockScope: str('d1_lock_scope'), groups: migrations, smokeMode: str('smoke_mode') || 'full',
+        smokeOverrides: str('smoke_mode_overrides'), phase: opt('phase') || 'all',
+        d1ByKind: opt('phase') === 'verify' ? Object.fromEntries(Object.entries(JSON.parse(process.env.PHASE_STATE ?? '{}').d1 ?? {}).map(([k, v]) => [k.replace(/_/g, '-'), v])) : null,
+      });
       for (const m of migrations) console.error(`::notice::D1 ${m.databaseName}: one migration (owner ${m.owner}) serves ${m.members.join(', ')}`);
-      out({ kinds: JSON.stringify(kinds), has_targets: String(kinds.length > 0), has_migrations: String(migrations.length > 0), ...flat });
+      out({ kinds: JSON.stringify(kinds), descriptors: JSON.stringify(descriptors), has_targets: String(kinds.length > 0), has_migrations: String(migrations.length > 0), ...flat });
+      break;
+    }
+    case 'descriptor-check': { // --kind K --target T --d1 ID (descriptor JSON in env DESCRIPTOR): the stage's own bindings must match the record
+      const d = parseDescriptor(process.env.DESCRIPTOR ?? '', opt('kind'));
+      if (d.target !== opt('target')) throw new Error(`target descriptor engine target '${d.target}' differs from the stage's '${opt('target')}'`);
+      if (d.d1_expected_id !== opt('d1')) throw new Error('target descriptor D1 id differs from the stage\'s expected D1');
+      out({ descriptor: 'ok', smoke_mode: d.smoke_mode });
       break;
     }
     case 'stale':

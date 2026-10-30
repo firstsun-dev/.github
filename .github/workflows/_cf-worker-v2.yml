@@ -93,7 +93,7 @@ on:
         value: ${{ fromJSON(jobs.delivery_production.outputs.smoke_json || '{}').gate_blocked == 'true' || fromJSON(jobs.delivery_native_branch.outputs.smoke_json || '{}').gate_blocked == 'true' || fromJSON(jobs.delivery_native_dev.outputs.smoke_json || '{}').gate_blocked == 'true' || fromJSON(jobs.delivery_persistent_dev.outputs.smoke_json || '{}').gate_blocked == 'true' }}
       phase_state:
         description: pipeline_phase deploy - the validated hand-off (inputs, enabled kinds, per-kind Deploy / Migration results, per-kind D1 ids, concurrency group) for the verify call. Pass it unchanged as phase_state
-        value: ${{ format('{{"inputs":{0},"kinds":{1},"deploy":{2},"migration":{3},"d1":{4},"group":"{5}"}}', toJSON(inputs), toJSON(fromJSON(jobs.plan.outputs.kinds || '[]')), format('{{"h_production":{0},"h_native_branch":{1},"h_native_dev":{2},"h_persistent_dev":{3}}}', toJSON(jobs.delivery_production.outputs.handoff), toJSON(jobs.delivery_native_branch.outputs.handoff), toJSON(jobs.delivery_native_dev.outputs.handoff), toJSON(jobs.delivery_persistent_dev.outputs.handoff)), format('{{"mj_production":{0},"mj_native_branch":{1},"mj_native_dev":{2},"mj_persistent_dev":{3}}}', toJSON(jobs.delivery_production.outputs.migration_used), toJSON(jobs.delivery_native_branch.outputs.migration_used), toJSON(jobs.delivery_native_dev.outputs.migration_used), toJSON(jobs.delivery_persistent_dev.outputs.migration_used)), format('{{"production":{0},"native_branch":{1},"native_dev":{2},"persistent_dev":{3}}}', toJSON(jobs.plan.outputs.d1_production), toJSON(jobs.plan.outputs.d1_native_branch), toJSON(jobs.plan.outputs.d1_native_dev), toJSON(jobs.plan.outputs.d1_persistent_dev)), ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && (github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.preview_on_branch_push || inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id)) }}
+        value: ${{ format('{{"inputs":{0},"kinds":{1},"deploy":{2},"migration":{3},"d1":{4},"group":"{5}"}}', toJSON(inputs), toJSON(fromJSON(jobs.plan.outputs.kinds || '[]')), format('{{"h_production":{0},"h_native_branch":{1},"h_native_dev":{2},"h_persistent_dev":{3}}}', toJSON(jobs.delivery_production.outputs.handoff), toJSON(jobs.delivery_native_branch.outputs.handoff), toJSON(jobs.delivery_native_dev.outputs.handoff), toJSON(jobs.delivery_persistent_dev.outputs.handoff)), format('{{"mj_production":{0},"mj_native_branch":{1},"mj_native_dev":{2},"mj_persistent_dev":{3}}}', toJSON(jobs.delivery_production.outputs.migration_used), toJSON(jobs.delivery_native_branch.outputs.migration_used), toJSON(jobs.delivery_native_dev.outputs.migration_used), toJSON(jobs.delivery_persistent_dev.outputs.migration_used)), format('{{"production":{0},"native_branch":{1},"native_dev":{2},"persistent_dev":{3}}}', toJSON(fromJSON(jobs.plan.outputs.descriptors || '{}')['production'].d1_expected_id || ''), toJSON(fromJSON(jobs.plan.outputs.descriptors || '{}')['native-branch'].d1_expected_id || ''), toJSON(fromJSON(jobs.plan.outputs.descriptors || '{}')['native-dev'].d1_expected_id || ''), toJSON(fromJSON(jobs.plan.outputs.descriptors || '{}')['persistent-dev'].d1_expected_id || '')), ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && (github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.preview_on_branch_push || inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id)) }}
     inputs:
       tools_ref:
         description: >
@@ -696,8 +696,8 @@ jobs:
   # -------------------------------------------------------------------------
   # Delivery plan — pure data, no Cloudflare credentials. Resolves the enabled delivery kinds of THIS event (production |
   # native-branch | native-dev | persistent-dev: exactly the enabled ones, no phantom paths), validates smoke modes and the Dev
-  # channel combination, and groups the kinds by PHYSICAL D1 (account/database id): per kind `on_<kind>`, the D1 id `d1_<kind>`,
-  # the kind that OWNS that D1's migration `owner_of_<kind>` and `owns_<kind>`. pipeline_phase verify re-uses the kinds handed over
+  # channel combination, and groups the kinds by PHYSICAL D1 (account/database id): per kind `on_<kind>` / `owns_<kind>` and the versioned
+  # target `descriptors` (engine target, Environment, groups, D1 id, migration owner, smoke mode). pipeline_phase verify re-uses the kinds handed over
   # in phase_state. Everything downstream is one `uses:` call of the internal _cf-worker-delivery.yml per kind (no matrix).
   # -------------------------------------------------------------------------
   plan:
@@ -708,23 +708,16 @@ jobs:
     timeout-minutes: 10
     outputs:
       kinds: ${{ steps.plan.outputs.kinds }}
+      descriptors: ${{ steps.plan.outputs.descriptors }}
       has_targets: ${{ steps.plan.outputs.has_targets }}
       has_migrations: ${{ steps.plan.outputs.has_migrations }}
       on_production: ${{ steps.plan.outputs.on_production }}
-      d1_production: ${{ steps.plan.outputs.d1_production }}
-      owner_of_production: ${{ steps.plan.outputs.owner_of_production }}
       owns_production: ${{ steps.plan.outputs.owns_production }}
       on_native_branch: ${{ steps.plan.outputs.on_native_branch }}
-      d1_native_branch: ${{ steps.plan.outputs.d1_native_branch }}
-      owner_of_native_branch: ${{ steps.plan.outputs.owner_of_native_branch }}
       owns_native_branch: ${{ steps.plan.outputs.owns_native_branch }}
       on_native_dev: ${{ steps.plan.outputs.on_native_dev }}
-      d1_native_dev: ${{ steps.plan.outputs.d1_native_dev }}
-      owner_of_native_dev: ${{ steps.plan.outputs.owner_of_native_dev }}
       owns_native_dev: ${{ steps.plan.outputs.owns_native_dev }}
       on_persistent_dev: ${{ steps.plan.outputs.on_persistent_dev }}
-      d1_persistent_dev: ${{ steps.plan.outputs.d1_persistent_dev }}
-      owner_of_persistent_dev: ${{ steps.plan.outputs.owner_of_persistent_dev }}
       owns_persistent_dev: ${{ steps.plan.outputs.owns_persistent_dev }}
     steps:
       - uses: actions/checkout@v6
@@ -751,7 +744,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           PHASE: ${{ inputs.pipeline_phase }}
         run: |
-          node "$TOOLS_DIR/cli.mjs" plan --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" --phase "$PHASE" --app-dir "$GITHUB_WORKSPACE/${{ inputs.app_path }}" | tee -a "$GITHUB_OUTPUT"
+          node "$TOOLS_DIR/cli.mjs" plan --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" --phase "$PHASE" --run-id "$GITHUB_RUN_ID" --app-dir "$GITHUB_WORKSPACE/${{ inputs.app_path }}" | tee -a "$GITHUB_OUTPUT"
 
   # =========================================================================
   # Stage 1 — Preflight: ONE call per enabled kind (stage preflight). Non-publishing: canonical URL resolved from the real Preview
@@ -770,14 +763,10 @@ jobs:
     with:
       stage: preflight
       kind: production
-      target: prod
+      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['production']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
-      environment: ${{ format('{0}/prod', inputs.app_name) }}
       inputs_json: ${{ toJSON(inputs) }}
-      d1_expected_id: ${{ needs.plan.outputs.d1_production }}
-      deploy_group: ${{ format('cfv2-leg-{0}-production', github.run_id) }}
-      rollback_group: ${{ format('cfv2-leg-{0}-production-rollback', github.run_id) }}
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -795,14 +784,10 @@ jobs:
     with:
       stage: preflight
       kind: native-branch
-      target: preview
+      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-branch']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
-      environment: ${{ format('{0}/preview', inputs.app_name) }}
       inputs_json: ${{ toJSON(inputs) }}
-      d1_expected_id: ${{ needs.plan.outputs.d1_native_branch }}
-      deploy_group: ${{ format('cfv2-leg-{0}-native-branch', github.run_id) }}
-      rollback_group: ${{ format('cfv2-leg-{0}-native-branch-rollback', github.run_id) }}
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -820,14 +805,10 @@ jobs:
     with:
       stage: preflight
       kind: native-dev
-      target: preview
+      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-dev']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
-      environment: ${{ format('{0}/native-dev', inputs.app_name) }}
       inputs_json: ${{ toJSON(inputs) }}
-      d1_expected_id: ${{ needs.plan.outputs.d1_native_dev }}
-      deploy_group: ${{ format('cfv2-leg-{0}-native-dev', github.run_id) }}
-      rollback_group: ${{ format('cfv2-leg-{0}-native-dev-rollback', github.run_id) }}
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -845,14 +826,10 @@ jobs:
     with:
       stage: preflight
       kind: persistent-dev
-      target: dev
+      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
-      environment: ${{ format('{0}/dev', inputs.app_name) }}
       inputs_json: ${{ toJSON(inputs) }}
-      d1_expected_id: ${{ needs.plan.outputs.d1_persistent_dev }}
-      deploy_group: ${{ format('cfv2-leg-{0}-persistent-dev', github.run_id) }}
-      rollback_group: ${{ format('cfv2-leg-{0}-persistent-dev-rollback', github.run_id) }}
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -875,17 +852,13 @@ jobs:
     with:
       stage: migrate
       kind: production
-      target: prod
+      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['production']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
-      environment: ${{ format('{0}/prod', inputs.app_name) }}
       inputs_json: ${{ toJSON(inputs) }}
       d1_migrations: ${{ inputs.d1_migrations }}
-      d1_expected_id: ${{ needs.plan.outputs.d1_production }}
       kinds: ${{ needs.plan.outputs.kinds }}
       peers: ${{ format('{{"production":"{0}","native-branch":"{1}","native-dev":"{2}","persistent-dev":"{3}"}}', needs.preflight_production.result, needs.preflight_native_branch.result, needs.preflight_native_dev.result, needs.preflight_persistent_dev.result) }}
-      deploy_group: ${{ format('cfv2-leg-{0}-production', github.run_id) }}
-      rollback_group: ${{ format('cfv2-leg-{0}-production-rollback', github.run_id) }}
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -903,17 +876,13 @@ jobs:
     with:
       stage: migrate
       kind: native-branch
-      target: preview
+      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-branch']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
-      environment: ${{ format('{0}/preview', inputs.app_name) }}
       inputs_json: ${{ toJSON(inputs) }}
       d1_migrations: ${{ inputs.d1_migrations }}
-      d1_expected_id: ${{ needs.plan.outputs.d1_native_branch }}
       kinds: ${{ needs.plan.outputs.kinds }}
       peers: ${{ format('{{"production":"{0}","native-branch":"{1}","native-dev":"{2}","persistent-dev":"{3}"}}', needs.preflight_production.result, needs.preflight_native_branch.result, needs.preflight_native_dev.result, needs.preflight_persistent_dev.result) }}
-      deploy_group: ${{ format('cfv2-leg-{0}-native-branch', github.run_id) }}
-      rollback_group: ${{ format('cfv2-leg-{0}-native-branch-rollback', github.run_id) }}
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -931,17 +900,13 @@ jobs:
     with:
       stage: migrate
       kind: native-dev
-      target: preview
+      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-dev']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
-      environment: ${{ format('{0}/native-dev', inputs.app_name) }}
       inputs_json: ${{ toJSON(inputs) }}
       d1_migrations: ${{ inputs.d1_migrations }}
-      d1_expected_id: ${{ needs.plan.outputs.d1_native_dev }}
       kinds: ${{ needs.plan.outputs.kinds }}
       peers: ${{ format('{{"production":"{0}","native-branch":"{1}","native-dev":"{2}","persistent-dev":"{3}"}}', needs.preflight_production.result, needs.preflight_native_branch.result, needs.preflight_native_dev.result, needs.preflight_persistent_dev.result) }}
-      deploy_group: ${{ format('cfv2-leg-{0}-native-dev', github.run_id) }}
-      rollback_group: ${{ format('cfv2-leg-{0}-native-dev-rollback', github.run_id) }}
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -959,17 +924,13 @@ jobs:
     with:
       stage: migrate
       kind: persistent-dev
-      target: dev
+      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
-      environment: ${{ format('{0}/dev', inputs.app_name) }}
       inputs_json: ${{ toJSON(inputs) }}
       d1_migrations: ${{ inputs.d1_migrations }}
-      d1_expected_id: ${{ needs.plan.outputs.d1_persistent_dev }}
       kinds: ${{ needs.plan.outputs.kinds }}
       peers: ${{ format('{{"production":"{0}","native-branch":"{1}","native-dev":"{2}","persistent-dev":"{3}"}}', needs.preflight_production.result, needs.preflight_native_branch.result, needs.preflight_native_dev.result, needs.preflight_persistent_dev.result) }}
-      deploy_group: ${{ format('cfv2-leg-{0}-persistent-dev', github.run_id) }}
-      rollback_group: ${{ format('cfv2-leg-{0}-persistent-dev-rollback', github.run_id) }}
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -993,23 +954,18 @@ jobs:
     with:
       stage: deliver
       kind: production
-      target: prod
+      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['production']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
-      environment: ${{ format('{0}/prod', inputs.app_name) }}
       inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
       phase: ${{ inputs.pipeline_phase }}
       d1_migrations: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).inputs.d1_migrations || inputs.d1_migrations }}
-      d1_expected_id: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).d1.production || needs.plan.outputs.d1_production }}
-      d1_owner_kind: ${{ needs.plan.outputs.owner_of_production }}
       own_migration_result: ${{ needs.migration_production.result }}
       own_migration_json: ${{ needs.migration_production.outputs.migration_json }}
       handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_production || '' }}
       migration_json_in: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).migration.mj_production || '' }}
       upstream_gate: ${{ inputs.pipeline_phase == 'verify' && inputs.upstream_gate || '' }}
-      deploy_group: ${{ format('cfv2-leg-{0}-production', github.run_id) }}
-      rollback_group: ${{ format('cfv2-leg-{0}-production-rollback', github.run_id) }}
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -1029,23 +985,18 @@ jobs:
     with:
       stage: deliver
       kind: native-branch
-      target: preview
+      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-branch']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
-      environment: ${{ format('{0}/preview', inputs.app_name) }}
       inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
       phase: ${{ inputs.pipeline_phase }}
       d1_migrations: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).inputs.d1_migrations || inputs.d1_migrations }}
-      d1_expected_id: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).d1.native_branch || needs.plan.outputs.d1_native_branch }}
-      d1_owner_kind: ${{ needs.plan.outputs.owner_of_native_branch }}
       own_migration_result: ${{ needs.migration_native_branch.result }}
       own_migration_json: ${{ needs.migration_native_branch.outputs.migration_json }}
       handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_native_branch || '' }}
       migration_json_in: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).migration.mj_native_branch || '' }}
       upstream_gate: ${{ inputs.pipeline_phase == 'verify' && inputs.upstream_gate || '' }}
-      deploy_group: ${{ format('cfv2-leg-{0}-native-branch', github.run_id) }}
-      rollback_group: ${{ format('cfv2-leg-{0}-native-branch-rollback', github.run_id) }}
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -1065,16 +1016,13 @@ jobs:
     with:
       stage: deliver
       kind: native-dev
-      target: preview
+      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-dev']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
-      environment: ${{ format('{0}/native-dev', inputs.app_name) }}
       inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
       phase: ${{ inputs.pipeline_phase }}
       d1_migrations: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).inputs.d1_migrations || inputs.d1_migrations }}
-      d1_expected_id: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).d1.native_dev || needs.plan.outputs.d1_native_dev }}
-      d1_owner_kind: ${{ needs.plan.outputs.owner_of_native_dev }}
       own_migration_result: ${{ needs.migration_native_dev.result }}
       own_migration_json: ${{ needs.migration_native_dev.outputs.migration_json }}
       owner_migration_result: ${{ needs.migration_native_branch.result }}
@@ -1082,8 +1030,6 @@ jobs:
       handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_native_dev || '' }}
       migration_json_in: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).migration.mj_native_dev || '' }}
       upstream_gate: ${{ inputs.pipeline_phase == 'verify' && inputs.upstream_gate || '' }}
-      deploy_group: ${{ format('cfv2-leg-{0}-native-dev', github.run_id) }}
-      rollback_group: ${{ format('cfv2-leg-{0}-native-dev-rollback', github.run_id) }}
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -1103,16 +1049,13 @@ jobs:
     with:
       stage: deliver
       kind: persistent-dev
-      target: dev
+      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
-      environment: ${{ format('{0}/dev', inputs.app_name) }}
       inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
       phase: ${{ inputs.pipeline_phase }}
       d1_migrations: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).inputs.d1_migrations || inputs.d1_migrations }}
-      d1_expected_id: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).d1.persistent_dev || needs.plan.outputs.d1_persistent_dev }}
-      d1_owner_kind: ${{ needs.plan.outputs.owner_of_persistent_dev }}
       own_migration_result: ${{ needs.migration_persistent_dev.result }}
       own_migration_json: ${{ needs.migration_persistent_dev.outputs.migration_json }}
       owner_migration_result: ${{ needs.migration_native_branch.result }}
@@ -1120,8 +1063,6 @@ jobs:
       handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_persistent_dev || '' }}
       migration_json_in: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).migration.mj_persistent_dev || '' }}
       upstream_gate: ${{ inputs.pipeline_phase == 'verify' && inputs.upstream_gate || '' }}
-      deploy_group: ${{ format('cfv2-dev-{0}-{1}', github.repository, inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) }}
-      rollback_group: ${{ format('cfv2-dev-{0}-{1}', github.repository, inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) }}
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

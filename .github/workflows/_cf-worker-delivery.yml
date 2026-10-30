@@ -30,20 +30,12 @@ on:
         description: production | native-branch | native-dev | persistent-dev
         type: string
         required: true
-      target:
-        description: prod | preview | dev (engine target class of the kind)
-        type: string
-        required: true
       tools_ref:
         type: string
         required: true
       runner:
         type: string
         default: linux
-      environment:
-        description: GitHub Environment of the kind (<app>/prod | /preview | /native-dev | /dev)
-        type: string
-        required: true
       inputs_json:
         description: toJSON of the effective public inputs (the deploy call's inputs for a deferred verify). Data only.
         type: string
@@ -59,14 +51,6 @@ on:
       d1_migrations:
         type: boolean
         default: false
-      d1_expected_id:
-        description: Physical D1 database id the plan resolved for this kind ('' = no D1)
-        type: string
-        default: ''
-      d1_owner_kind:
-        description: Kind that OWNS the migration of this kind's D1 (itself, or native-branch when they share one D1)
-        type: string
-        default: ''
       kinds:
         description: migrate only - JSON array of the enabled kinds of the run
         type: string
@@ -101,12 +85,8 @@ on:
         description: verify only - needs.<job>.result of the job the cross-service smoke depends on
         type: string
         default: ''
-      deploy_group:
-        description: Job-level concurrency group of the deploy job
-        type: string
-        required: true
-      rollback_group:
-        description: Job-level concurrency group of the rollback job
+      descriptor:
+        description: toJSON of THIS kind's target descriptor (versioned, validated by the Delivery plan and re-validated by the engine). Carries the engine target, GitHub Environment, concurrency groups, expected physical D1, migration owner and smoke mode; never a secret.
         type: string
         required: true
     outputs:
@@ -193,12 +173,13 @@ jobs:
       - id: engine
         uses: ./.cf-tools/actions/cf-deploy
         with:
-          target: ${{ inputs.target }}
+          target: ${{ fromJSON(inputs.descriptor).target }}
+          descriptor: ${{ inputs.descriptor }}
           kind: ${{ inputs.kind }}
           stage: preflight
           inputs_json: ${{ inputs.inputs_json }}
-          d1_expected_id: ${{ inputs.d1_expected_id }}
-          preview_secrets: ${{ inputs.target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
+          d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
+          preview_secrets: ${{ fromJSON(inputs.descriptor).target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
 
   # -------------------------------------------------------------------------
   # Migration — applies the pending migrations of the physical D1 THIS call owns (a D1 shared by Native Branch and Native Dev is
@@ -211,7 +192,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     environment:
-      name: ${{ inputs.environment }}
+      name: ${{ fromJSON(inputs.descriptor).environment }}
     permissions:
       contents: read
       deployments: read
@@ -252,12 +233,13 @@ jobs:
       - id: engine
         uses: ./.cf-tools/actions/cf-deploy
         with:
-          target: ${{ inputs.target }}
+          target: ${{ fromJSON(inputs.descriptor).target }}
+          descriptor: ${{ inputs.descriptor }}
           kind: ${{ inputs.kind }}
           stage: migrate
           inputs_json: ${{ inputs.inputs_json }}
-          d1_expected_id: ${{ inputs.d1_expected_id }}
-          preview_secrets: ${{ inputs.target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
+          d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
+          preview_secrets: ${{ fromJSON(inputs.descriptor).target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
 
   # -------------------------------------------------------------------------
   # Deploy — target-specific Build + Publish (stage publish) of THIS kind: its own URL (resolved before the build), its own build
@@ -270,10 +252,10 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     concurrency:
-      group: ${{ inputs.deploy_group }}
+      group: ${{ fromJSON(inputs.descriptor).deploy_group }}
       cancel-in-progress: false
     environment:
-      name: ${{ inputs.environment }}
+      name: ${{ fromJSON(inputs.descriptor).environment }}
       url: ${{ steps.engine.outputs.url }}
     permissions:
       contents: read
@@ -292,8 +274,8 @@ jobs:
         env:
           D1_MIGRATIONS: ${{ inputs.d1_migrations }}
           KIND: ${{ inputs.kind }}
-          OWNER: ${{ inputs.d1_owner_kind }}
-          EXPECT: ${{ inputs.d1_expected_id }}
+          OWNER: ${{ fromJSON(inputs.descriptor).d1_owner_kind }}
+          EXPECT: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
           OWN_RESULT: ${{ inputs.own_migration_result }}
           OWN_JSON: ${{ inputs.own_migration_json }}
           OWNER_RESULT: ${{ inputs.owner_migration_result }}
@@ -330,12 +312,13 @@ jobs:
       - id: engine
         uses: ./.cf-tools/actions/cf-deploy
         with:
-          target: ${{ inputs.target }}
+          target: ${{ fromJSON(inputs.descriptor).target }}
+          descriptor: ${{ inputs.descriptor }}
           kind: ${{ inputs.kind }}
           stage: publish
           inputs_json: ${{ inputs.inputs_json }}
-          d1_expected_id: ${{ inputs.d1_expected_id }}
-          preview_secrets: ${{ inputs.target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
+          d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
+          preview_secrets: ${{ fromJSON(inputs.descriptor).target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
 
   # -------------------------------------------------------------------------
   # Smoke — verifies THIS kind's deployment only (stage verify, no Cloudflare credentials): smoke_mode full | basic | skip.
@@ -387,13 +370,14 @@ jobs:
         if: steps.go.outputs.go == 'true'
         uses: ./.cf-tools/actions/cf-deploy
         with:
-          target: ${{ inputs.target }}
+          target: ${{ fromJSON(inputs.descriptor).target }}
+          descriptor: ${{ inputs.descriptor }}
           kind: ${{ inputs.kind }}
           stage: verify
           inputs_json: ${{ inputs.inputs_json }}
           call_inputs_json: ${{ inputs.call_inputs_json }}
-          d1_expected_id: ${{ inputs.d1_expected_id }}
-          preview_secrets: ${{ inputs.target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
+          d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
+          preview_secrets: ${{ fromJSON(inputs.descriptor).target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
           smoke_username: ${{ secrets.SMOKE_USERNAME }}
           smoke_password: ${{ secrets.SMOKE_PASSWORD }}
           deploy_outputs: ${{ env.HANDOFF }}
@@ -431,10 +415,10 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     concurrency:
-      group: ${{ inputs.rollback_group }}
+      group: ${{ fromJSON(inputs.descriptor).rollback_group }}
       cancel-in-progress: false
     environment:
-      name: ${{ inputs.environment }}
+      name: ${{ fromJSON(inputs.descriptor).environment }}
     permissions:
       contents: read
       deployments: write
@@ -480,13 +464,14 @@ jobs:
         if: steps.go.outputs.go == 'true'
         uses: ./.cf-tools/actions/cf-deploy
         with:
-          target: ${{ inputs.target }}
+          target: ${{ fromJSON(inputs.descriptor).target }}
+          descriptor: ${{ inputs.descriptor }}
           kind: ${{ inputs.kind }}
           stage: rollback
           inputs_json: ${{ inputs.inputs_json }}
           call_inputs_json: ${{ inputs.call_inputs_json }}
-          d1_expected_id: ${{ inputs.d1_expected_id }}
-          preview_secrets: ${{ inputs.target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
+          d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
+          preview_secrets: ${{ fromJSON(inputs.descriptor).target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
           smoke_username: ${{ secrets.SMOKE_USERNAME }}
           smoke_password: ${{ secrets.SMOKE_PASSWORD }}
           deploy_outputs: ${{ env.HANDOFF }}

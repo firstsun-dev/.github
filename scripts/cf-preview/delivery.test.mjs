@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   DELIVERY_KINDS, resolveDeliveryTargets, resolveSmokeMode, parseSmokeOverrides, planMigrations, branchPreviewIdentity, ENGINE_TARGET,
   canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins,
+  targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor,
 } from '../../actions/cf-preview/delivery.mjs';
 
 const base = { event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-preview', previewOnPush: true };
@@ -196,4 +197,89 @@ test('planMigrations: a Production D1 exposed to Preview/Dev is refused', () => 
   const cfg = { name: 'app', d1_databases: [{ binding: 'DB', database_name: 'prod', database_id: 'PROD' }],
     previews: { d1_databases: [{ binding: 'DB', database_name: 'prod', database_id: 'PROD' }] } };
   assert.throws(() => planMigrations(cfg, ['native-branch'], { accountId: 'A' }), /Production D1|production/i);
+});
+
+// ---- target descriptor: the single versioned record the thin per-kind calls consume -------------------------------------
+const D = { kind: 'native-dev', app: 'app', runId: 77, d1ExpectedId: 'DB1', ownerKind: 'native-branch' };
+
+test('descriptor: derived once from the kind - engine target, environment, concurrency groups', () => {
+  const expect = { production: ['prod', 'app/prod'], 'native-branch': ['preview', 'app/preview'], 'native-dev': ['preview', 'app/native-dev'], 'persistent-dev': ['dev', 'app/dev'] };
+  for (const k of DELIVERY_KINDS) {
+    const d = targetDescriptor({ kind: k, app: 'app', runId: 5, repo: 'o/r' });
+    assert.deepEqual([d.target, d.environment], expect[k]);
+    if (k !== 'persistent-dev') {
+      assert.equal(d.deploy_group, `cfv2-leg-5-${k}`);
+      assert.equal(d.rollback_group, `cfv2-leg-5-${k}-rollback`);
+    }
+    assert.equal(d.v, 1);
+  }
+});
+
+test('descriptor: migration ownership - only the owner of the physical D1 owns the migration', () => {
+  assert.equal(targetDescriptor(D).owns_migration, false);
+  assert.equal(targetDescriptor({ ...D, kind: 'native-branch' }).owns_migration, true);
+  assert.equal(targetDescriptor({ ...D, d1ExpectedId: '', ownerKind: '' }).owns_migration, false);
+});
+
+test('descriptor: buildDescriptors maps the D1 plan (shared D1 -> one owner) and keeps enabled kinds only, in stable order', () => {
+  const groups = [{ databaseId: 'SHARED', members: ['native-branch', 'native-dev'], owner: 'native-branch' }, { databaseId: 'PROD', members: ['production'], owner: 'production' }];
+  const m = buildDescriptors({ kinds: ['native-dev', 'production', 'native-branch'], app: 'app', runId: 9, groups, smokeOverrides: '{"native-dev":"skip"}' });
+  assert.deepEqual(Object.keys(m), ['production', 'native-branch', 'native-dev']);
+  assert.equal(m['native-dev'].d1_expected_id, 'SHARED');
+  assert.equal(m['native-dev'].d1_owner_kind, 'native-branch');
+  assert.equal(m['native-dev'].owns_migration, false);
+  assert.equal(m['native-branch'].owns_migration, true);
+  assert.equal(m.production.d1_expected_id, 'PROD');
+  assert.equal(m['native-dev'].smoke_mode, 'skip');
+  assert.equal(m['native-branch'].smoke_mode, 'full');
+});
+
+test('descriptor: deferred verify takes the D1 ids from the hand-off, not from a re-plan', () => {
+  const m = buildDescriptors({ kinds: ['production'], app: 'app', runId: 9, d1ByKind: { production: 'HANDED' }, phase: 'verify' });
+  assert.equal(m.production.d1_expected_id, 'HANDED');
+  assert.equal(m.production.phase, 'verify');
+});
+
+test('descriptor: validation rejects forged, cross-kind, unknown-key and wrong-version records (trust boundary)', () => {
+  const ok = targetDescriptor(D);
+  assert.doesNotThrow(() => validateDescriptor({ ...ok }));
+  const bad = (patch, re) => assert.throws(() => validateDescriptor({ ...ok, ...patch }), re);
+  bad({ v: 2 }, /version/);
+  bad({ target: 'prod' }, /engine target/);
+  bad({ environment: 'app/prod' }, /environment/);
+  bad({ environment: 'a b/native-dev' }, /environment/);
+  bad({ deploy_group: 'cfv2-leg-77-production' }, /concurrency groups/);
+  bad({ rollback_group: 'cfv2-leg-77-native-dev' }, /concurrency groups/);
+  bad({ deploy_group: 'other' }, /concurrency groups/);
+  assert.throws(() => validateDescriptor({ ...targetDescriptor({ kind: 'persistent-dev', app: 'app', runId: 1, repo: 'o/r' }), rollback_group: 'cfv2-dev-o/r-other' }), /concurrency groups/);
+  assert.throws(() => validateDescriptor({ ...targetDescriptor({ kind: 'persistent-dev', app: 'app', runId: 1, repo: 'o/r' }), deploy_group: 'cfv2-leg-1-persistent-dev', rollback_group: 'cfv2-leg-1-persistent-dev-rollback' }), /concurrency groups/);
+  bad({ d1_expected_id: 'a b' }, /database id/);
+  bad({ d1_owner_kind: 'bogus' }, /Unknown delivery kind/);
+  bad({ owns_migration: true }, /owns_migration/);
+  bad({ smoke_mode: 'maybe' }, /smoke mode/);
+  bad({ phase: 'later' }, /phase/);
+  bad({ CLOUDFLARE_API_TOKEN: 'x' }, /unexpected/);
+  assert.throws(() => validateDescriptor({ ...ok, kind: undefined }), /./);
+  const { phase, ...noPhase } = ok;
+  assert.throws(() => validateDescriptor(noPhase), /missing \[phase\]/);
+  assert.throws(() => validateDescriptor(null), /object/);
+  assert.throws(() => parseDescriptor('{'), /not valid JSON/);
+  assert.throws(() => parseDescriptor(JSON.stringify(ok), 'production'), /not production/);
+  assert.equal(parseDescriptor(JSON.stringify(ok), 'native-dev').kind, 'native-dev');
+});
+
+test('descriptor: carries no secret and no URL (secrets stay in job env, URLs are resolved per build)', () => {
+  const s = JSON.stringify(targetDescriptor(D));
+  assert.doesNotMatch(s, /https?:|token|secret|password/i);
+});
+
+test('descriptor: persistent-dev keeps the legacy Shared Dev group (Deploy AND Rollback serialise per repo + shared-D1 scope)', () => {
+  const g = (o) => targetDescriptor({ kind: 'persistent-dev', app: 'blog', runId: 9, repo: 'o/r', ...o });
+  assert.equal(g({ lockScope: 'shared-db' }).deploy_group, 'cfv2-dev-o/r-shared-db');
+  assert.equal(g({}).deploy_group, 'cfv2-dev-o/r-blog');
+  assert.equal(g({}).rollback_group, g({}).deploy_group);
+  assert.notEqual(g({}).deploy_group, g({ app: 'wiki' }).deploy_group);
+  assert.notEqual(g({ lockScope: 'a' }).deploy_group, g({ lockScope: 'b' }).deploy_group);
+  // other kinds never share a group across runs' legs or kinds
+  assert.notEqual(targetDescriptor({ kind: 'native-dev', app: 'a', runId: 1 }).deploy_group, targetDescriptor({ kind: 'native-branch', app: 'a', runId: 1 }).deploy_group);
 });

@@ -57,6 +57,15 @@ D1 = {"d1_migrations": True}
 KINDS = ("production", "native-branch", "native-dev", "persistent-dev")
 KEYED = {k: k.replace("-", "_") for k in KINDS}
 TARGET_OF = {"production": "prod", "native-branch": "preview", "native-dev": "preview", "persistent-dev": "dev"}
+_ENV_OF = {"production": "prod", "native-branch": "preview", "native-dev": "native-dev", "persistent-dev": "dev"}
+
+
+def desc(kind, d1="", owner="", app="app", scope="", phase="all", **over):
+    """Target descriptor a stage receives. Hand-built here (fixtures); the engine re-validates it with the REAL delivery.mjs at init."""
+    g = f"cfv2-dev-o/r-{scope or app}" if kind == "persistent-dev" else f"cfv2-leg-1-{kind}"
+    return json.dumps(dict({"v": 1, "kind": kind, "target": TARGET_OF[kind], "environment": f"{app}/{_ENV_OF[kind]}", "deploy_group": g,
+                            "rollback_group": g if kind == "persistent-dev" else g + "-rollback", "d1_expected_id": d1, "d1_owner_kind": owner,
+                            "owns_migration": bool(d1 and owner == kind), "smoke_mode": "full", "phase": phase}, **over))
 INNER = ("preflight", "migrate", "deploy", "smoke", "rollback")
 SKIPPED = {"result": "skipped", "outputs": {}}
 
@@ -630,8 +639,8 @@ check(r["jobs"]["plan"]["result"] == "failure" and r["jobs"]["migration"]["resul
 for stage_job, stage in (("migrate", "migrate"), ("deploy", "deliver")):
     ws_ = make_workspace()  # defence in depth: even if a job were forced to run, the engine refuses at init
     c_ = ctx(MAIN, dict(BADCFG, d1_migrations=True), PROD_SECRETS, {})
-    dc_ = Ctx({"github": c_["github"], "inputs": dict(DINPUT_DEFAULTS, stage=stage, kind="production", target="prod", tools_ref="x", environment="app/prod", inputs_json=json.dumps(dict(c_["inputs"])),
-                                                       kinds='["production"]', peers='{"production":"success"}', deploy_group="g", rollback_group="g"), "needs": {}, "jobs": {}}, PROD_SECRETS)
+    dc_ = Ctx({"github": c_["github"], "inputs": dict(DINPUT_DEFAULTS, stage=stage, kind="production", descriptor=desc("production"), tools_ref="x", inputs_json=json.dumps(dict(c_["inputs"])),
+                                                       kinds='["production"]', peers='{"production":"success"}'), "needs": {}, "jobs": {}}, PROD_SECRETS)
     fr = run_job(ddoc, stage_job, dc_, ws_, {"STUB_TIPS": SHA})
     check(fr["result"] == "failure" and not published(fr) and "wrangler versions" not in fr["log"] and "migrations apply" not in fr["log"] and "-X POST" not in fr["log"], f"production-only + Shared Dev: the {stage_job} stage fails at init (nothing remote)")
 for both in ({"shared_dev_on_branch_push": True, "shared_dev_native_preview_on_branch_push": True},):
@@ -803,6 +812,14 @@ for ev_ref, head in (("refs/pull/1/merge", "o/r"),):
     r = deploy(ev_ref, inputs=dict(D1, **AUTO), event="pull_request")
     check(res_of(r) == NOTHING and r["log"] == "", "PR event: no Migration, Deploy, Smoke or Rollback (no Production or Preview deployment)")
 r = deploy(MAIN, inputs=dict(D1, **AUTO), event="delete")
+# a forged / mismatched target descriptor is refused by the engine at init (trust boundary), before anything remote happens
+for nm, bad in (("a cross-kind engine target", desc("production", target="preview")), ("a forged concurrency group", desc("production", deploy_group="other")),
+                ("a foreign Environment", desc("production", environment="app/preview")), ("an unknown key", desc("production", CLOUDFLARE_API_TOKEN="x"))):
+    ws_ = make_workspace()
+    c_ = ctx(MAIN, {}, PROD_SECRETS, {})
+    dc_ = Ctx({"github": c_["github"], "inputs": dict(DINPUT_DEFAULTS, stage="deliver", kind="production", descriptor=bad, tools_ref="x", inputs_json=json.dumps(dict(c_["inputs"]))), "needs": {}, "jobs": {}}, PROD_SECRETS)
+    fr = run_job(ddoc, "deploy", dc_, ws_, {"STUB_TIPS": SHA})
+    check(fr["result"] == "failure" and not published(fr) and "-X POST" not in fr["log"], f"engine refuses {nm} in the target descriptor at init (nothing built, deployed or recorded)")
 check(res_of(r) == NOTHING, "branch delete: no delivery job")
 # 11. stale SHA
 r = deploy(MAIN, inputs=dict(D1, **AUTO), env_by_job={"deploy": {"STUB_TIPS": OTHER}})
@@ -814,9 +831,8 @@ def leg(job, kind, ref=MAIN, inputs=None, needs=None, env=None, toml=APP_TOML, s
     """Runs ONE job of the internal delivery workflow for `kind` against hand-built `needs` (fresh workspace).
     A job whose `if:` is false is reported skipped without running any step (like the scheduler)."""
     c = ctx(ref, inputs, PROD_SECRETS if secrets is None else secrets, {})
-    envn = {"production": "app/prod", "native-branch": "app/preview", "native-dev": "app/native-dev", "persistent-dev": "app/dev"}[kind]
-    dinputs = dict(DINPUT_DEFAULTS, stage="deliver", kind=kind, target=TARGET_OF[kind], tools_ref="x", environment=envn, inputs_json=json.dumps(dict(c["inputs"])),
-                   phase=phase, handoff_json=handoff_json, migration_json_in=migration_json_in, upstream_gate=upstream_gate, deploy_group="g", rollback_group="g",
+    dinputs = dict(DINPUT_DEFAULTS, stage="deliver", kind=kind, descriptor=desc(kind), tools_ref="x", inputs_json=json.dumps(dict(c["inputs"])),
+                   phase=phase, handoff_json=handoff_json, migration_json_in=migration_json_in, upstream_gate=upstream_gate,
                    call_inputs_json=json.dumps(call_inputs) if call_inputs is not None else "")
     dc = Ctx({"github": c["github"], "inputs": dinputs, "needs": needs or {}, "jobs": {}}, c.secrets)
     if not ev(ddoc["jobs"][job]["if"], dc):
@@ -1038,7 +1054,8 @@ MD = dict(D1, preview_on_branch_push=True, shared_dev_native_preview_on_branch_p
 r = deploy(FEAT, inputs=MD, env={"STUB_PROBES": "200 "})
 check(r["result"] == "success" and r["log"].count("migrations apply") == 1 and r["log"].count("preview --name") == 2, "Branch + Native Dev on ONE shared preview D1: the D1 is migrated ONCE, both deliveries publish")
 pl_o = r["raw"]["plan"]["outputs"]
-check(pl_o["owns_native_branch"] == "true" and pl_o["owns_native_dev"] == "false" and pl_o["owner_of_native_dev"] == "native-branch" and pl_o["d1_native_branch"] == pl_o["d1_native_dev"] == "PREV-ID",
+pd_ = json.loads(pl_o["descriptors"])
+check(pl_o["owns_native_branch"] == "true" and pl_o["owns_native_dev"] == "false" and pd_["native-dev"]["d1_owner_kind"] == "native-branch" and pd_["native-branch"]["d1_expected_id"] == pd_["native-dev"]["d1_expected_id"] == "PREV-ID" and pd_["native-branch"]["owns_migration"] and not pd_["native-dev"]["owns_migration"],
       "the migration plan names the single owner (native-branch) and the D1 id both members share")
 check(r["raw"]["migration"]["outputs"].get("mj_native_branch") and r["raw"]["migration"]["outputs"].get("mj_native_dev") and json.loads(r["raw"]["migration"]["outputs"]["mj_native_dev"]).get("d1_id") == "PREV-ID", "both deliveries receive the shared migration result (each under its own key)")
 two_db = APP_TOML + '[env.dev]\nname = "app-dev"\n[[env.dev.d1_databases]]\nbinding = "DB"\ndatabase_name = "dev-db"\ndatabase_id = "DEV-ID"\n'
@@ -1170,7 +1187,7 @@ for nm, over in (("a failed migration of its D1", dict(own_migration_result="fai
                  ("a migration result for another D1", dict(own_migration_result="success", own_migration_json=json.dumps({"migration": "applied", "kind": "native-branch", "d1_id": "FOREIGN"}))),
                  ("a migration result of another kind", dict(own_migration_result="success", own_migration_json=json.dumps({"migration": "applied", "kind": "persistent-dev", "d1_id": "PREV-ID"}))),
                  ("a missing migration result", dict(own_migration_result="", own_migration_json=""))):
-    dc = Ctx({"github": ctx(FEAT)["github"], "inputs": dict(DINPUT_DEFAULTS, stage="deliver", kind="native-branch", target="preview", d1_migrations="true", d1_expected_id="PREV-ID", d1_owner_kind="native-branch", tools_ref="x", inputs_json=json.dumps(dict(ctx(FEAT)["inputs"], d1_migrations=True)), deploy_group="g", rollback_group="g", **over), "needs": {}}, PROD_SECRETS)
+    dc = Ctx({"github": ctx(FEAT)["github"], "inputs": dict(DINPUT_DEFAULTS, stage="deliver", kind="native-branch", descriptor=desc("native-branch", "PREV-ID", "native-branch"), d1_migrations="true", tools_ref="x", inputs_json=json.dumps(dict(ctx(FEAT)["inputs"], d1_migrations=True)), **over), "needs": {}}, PROD_SECRETS)
     ws = make_workspace(APP_TOML)
     rr_ = run_job(ddoc, "deploy", dc, ws, {"STUB_TIPS": SHA})
     check(rr_["result"] == "failure" and not published({"log": rr_["log"]}), f"Deploy refuses to publish with {nm} (fail closed before checkout/build)")

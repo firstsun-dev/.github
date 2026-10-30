@@ -25,13 +25,16 @@ class Ctx(dict):
         return cur
 
 
-TOKEN = re.compile(r"\s*(?:('(?:[^']|'')*')|(&&|\|\||==|!=)|(!)|([(),])|([A-Za-z_][\w.\-]*)(\()?|(\.[A-Za-z_][\w\-]*))")
+TOKEN = re.compile(r"\s*(?:('(?:[^']|'')*')|(&&|\|\||==|!=)|(!)|([(),\[\]])|([A-Za-z_][\w.\-]*)(\()?|(\.[A-Za-z_][\w\-]*))")
 
 
 class J(dict):
     """fromJSON() result: dotted property access, a missing property is '' (GitHub null)."""
 
     def __getattr__(self, k):
+        return _wrap(self.get(k, ""))
+
+    def __getitem__(self, k):
         return _wrap(self.get(k, ""))
 
 

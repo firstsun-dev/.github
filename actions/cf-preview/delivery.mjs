@@ -209,3 +209,86 @@ export function checkBuildEnvOrigins(buildEnvText, targetUrl) {
   }
   return bad;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Target descriptor: ONE versioned, validated record per enabled kind, produced by the Delivery plan job and consumed by the
+// thin per-kind workflow calls (and by every engine stage). It replaces the per-field `with:` copies (engine target, GitHub
+// Environment, concurrency groups, expected D1, migration owner, smoke policy). Pure data: never a secret, never a URL
+// (URLs are resolved against Cloudflare before each build), validated at generation AND at every consumer.
+// ---------------------------------------------------------------------------------------------------------------------
+export const DESCRIPTOR_VERSION = 1;
+export const PHASES = ['all', 'deploy', 'verify'];
+const DESCRIPTOR_KEYS = ['v', 'kind', 'target', 'environment', 'deploy_group', 'rollback_group', 'd1_expected_id', 'd1_owner_kind', 'owns_migration', 'smoke_mode', 'phase'];
+
+/**
+ * Concurrency identity of a kind. Production / Native Branch / Native Dev get uncontended per-run groups (no cross-target
+ * waiting). persistent-dev keeps the LEGACY Shared Dev group - keyed by repository and the shared-D1 scope (or the app) - for
+ * Deploy AND Rollback, so it serialises with the manual dispatch and with every other app using the same physical D1.
+ */
+export function concurrencyGroups(kind, { runId, repo = '', app, lockScope = '' }) {
+  if (assertKind(kind) === 'persistent-dev') {
+    const g = `cfv2-dev-${repo}-${lockScope || app}`;
+    return { deploy_group: g, rollback_group: g };
+  }
+  return { deploy_group: `cfv2-leg-${runId}-${kind}`, rollback_group: `cfv2-leg-${runId}-${kind}-rollback` };
+}
+
+export function targetDescriptor({ kind, app, runId, repo = '', lockScope = '', d1ExpectedId = '', ownerKind = '', smokeMode = 'full', phase = 'all' }) {
+  assertKind(kind);
+  return validateDescriptor({
+    v: DESCRIPTOR_VERSION, kind, target: ENGINE_TARGET[kind], environment: environmentName(app, kind),
+    ...concurrencyGroups(kind, { runId, repo, app, lockScope }),
+    d1_expected_id: d1ExpectedId, d1_owner_kind: ownerKind, owns_migration: Boolean(d1ExpectedId && ownerKind === kind),
+    smoke_mode: smokeMode, phase,
+  });
+}
+
+/** Strict schema check (throws; returns the descriptor). Unknown/missing keys, cross-kind values and forged groups all reject. */
+export function validateDescriptor(d) {
+  if (d === null || typeof d !== 'object' || Array.isArray(d)) throw new Error('target descriptor must be an object');
+  const keys = Object.keys(d);
+  const extra = keys.filter((k) => !DESCRIPTOR_KEYS.includes(k));
+  const missing = DESCRIPTOR_KEYS.filter((k) => !keys.includes(k));
+  if (extra.length || missing.length) throw new Error(`target descriptor keys: unexpected [${extra}] missing [${missing}]`);
+  if (d.v !== DESCRIPTOR_VERSION) throw new Error(`target descriptor version ${d.v} is not supported (expected ${DESCRIPTOR_VERSION})`);
+  assertKind(d.kind);
+  if (d.target !== ENGINE_TARGET[d.kind]) throw new Error(`target descriptor: kind ${d.kind} runs on engine target ${ENGINE_TARGET[d.kind]}, not ${d.target}`);
+  const app = String(d.environment).slice(0, String(d.environment).lastIndexOf('/'));
+  if (!app || /\s/.test(app) || d.environment !== environmentName(app, d.kind)) throw new Error(`target descriptor: environment '${d.environment}' does not belong to kind ${d.kind}`);
+  if (typeof d.deploy_group !== 'string' || typeof d.rollback_group !== 'string') throw new Error('target descriptor: concurrency groups must be strings');
+  const legit = d.kind === 'persistent-dev'
+    ? /^cfv2-dev-\S+-\S+$/.test(d.deploy_group) && d.rollback_group === d.deploy_group
+    : new RegExp(`^cfv2-leg-\\d+-${d.kind}$`).test(d.deploy_group) && d.rollback_group === `${d.deploy_group}-rollback`;
+  if (!legit) throw new Error(`target descriptor: concurrency groups '${d.deploy_group}' / '${d.rollback_group}' do not belong to kind ${d.kind}`);
+  if (typeof d.d1_expected_id !== 'string' || !/^[\w-]*$/.test(d.d1_expected_id)) throw new Error('target descriptor: d1_expected_id is not a database id');
+  if (d.d1_owner_kind !== '') assertKind(d.d1_owner_kind);
+  if (d.owns_migration !== Boolean(d.d1_expected_id && d.d1_owner_kind === d.kind)) throw new Error('target descriptor: owns_migration contradicts the migration owner');
+  if (!SMOKE_MODES.includes(d.smoke_mode)) throw new Error(`target descriptor: unknown smoke mode '${d.smoke_mode}'`);
+  if (!PHASES.includes(d.phase)) throw new Error(`target descriptor: unknown phase '${d.phase}'`);
+  return d;
+}
+
+/**
+ * All descriptors of a run, keyed by kind (enabled kinds only, stable order). `groups` = planMigrations() result of the run
+ * (owner/members per physical D1); `d1ByKind` = { kind: id } override for the deferred verify phase (comes from phase_state).
+ */
+export function buildDescriptors({ kinds, app, runId, repo = '', lockScope = '', groups = [], d1ByKind = null, smokeMode = 'full', smokeOverrides = '', phase = 'all' }) {
+  const out = {};
+  for (const kind of DELIVERY_KINDS.filter((k) => kinds.includes(k))) {
+    const g = groups.find((m) => m.members.includes(kind));
+    out[kind] = targetDescriptor({
+      kind, app, runId, repo, lockScope, d1ExpectedId: d1ByKind ? String(d1ByKind[kind] ?? '') : (g ? g.databaseId : ''), ownerKind: g ? g.owner : '',
+      smokeMode: resolveSmokeMode(kind, smokeMode, smokeOverrides), phase,
+    });
+  }
+  return out;
+}
+
+/** Parse + validate a descriptor (or a map of them) arriving from a workflow output / phase_state - a trust boundary. */
+export function parseDescriptor(text, expectKind = '') {
+  let d;
+  try { d = JSON.parse(String(text)); } catch (e) { throw new Error(`target descriptor is not valid JSON: ${e.message}`); }
+  validateDescriptor(d);
+  if (expectKind && d.kind !== expectKind) throw new Error(`target descriptor is for ${d.kind}, not ${expectKind}`);
+  return d;
+}
