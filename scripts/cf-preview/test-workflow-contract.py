@@ -600,4 +600,8 @@ for n in ("smoke", "rollback"):
     w = eng[n]["with"]
     check("call_inputs_json" in w and (n == "rollback" or "upstream_gate" in w), f"{n}: passes its own inputs (identity check) to the engine")
 check("CLOUDFLARE_API_TOKEN" not in yaml.dump(djobs["smoke"]) and not any("secrets.CLOUDFLARE" in str(st.get("with", {})) for st in djobs["smoke"]["steps"]), "the Smoke job (every kind) never receives Cloudflare credentials")
+ENGINE_SH = open("actions/cf-preview/engine.sh").read()
+check(ENGINE_SH.count('"$TOOLS_DIR/build.sh"') == 1 and ENGINE_SH.count('"$TOOLS_DIR/publish.sh"') == 1 and ENGINE_SH.count("run_build ") == 2 and ENGINE_SH.count("run_publish ") == 2,
+      "engine: ONE audited build primitive and ONE publish primitive, shared by the normal run and the recovery rebuild (recovery only supplies its state dir, rebound env/version, no host re-check)")
+
 sys.exit(fail)

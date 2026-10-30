@@ -93,6 +93,20 @@ gh_env() { case "$KIND" in production) echo "$APP_NAME/prod";; native-branch) ec
 smoke_mode() { rd smoke_mode; }
 kind_smoke_cmd() { if [ "$(smoke_mode)" = basic ]; then echo ""; else target_smoke_cmd; fi; }
 
+# ONE audited build and ONE publish primitive, used by the normal run AND the recovery rebuild. The caller supplies only what
+# differs: the state dir, the (validated) build env file, the app version, whether the Preview host is re-checked, the commit message.
+run_build() { # <state dir> <build env file> <app version> <preview host check>
+  STATE_DIR="$1" BUILD_CMD="$(target_build_cmd)" BUILD_ENV_FILE="$2" APP_VERSION="$3" PREVIEW_ENV_FILE="$S/preview.env" \
+    PREVIEW_NAME="$PREVIEW_NAME" PREVIEW_HOST_CHECK="$4" PREVIEW_ALLOW="$(inp preview_binding_allow)" PREVIEW_DENY="$(inp preview_deny_resources)" \
+    DEV_WORKER="$(inp dev_worker_name)" DEV_ALLOW="$(inp dev_binding_allow)" DEV_DENY="$(inp dev_deny_resources)" PROD_URL="$(inp app_url_prod)" \
+    DELIVERY_KIND="$KIND" TARGET_URL="$(target_url)" "$TOOLS_DIR/build.sh"
+}
+run_publish() { # <state dir> <out file> <app version> <commit message>
+  STATE_DIR="$1" APP_URL="$(target_url)" OUT_FILE="$2" APP_VERSION="$3" COMMIT_MSG="$4" \
+    WORKER_NAME="$(inp preview_worker_name)" PUBLISH_CMD="$([ "$TARGET" = dev ] && inp dev_deploy_cmd || true)" \
+    PREVIEW_NAME="$PREVIEW_NAME" EXPECTED_URL="$([ "$TARGET" = preview ] && target_url || true)" "$TOOLS_DIR/publish.sh"
+}
+
 stale_check() { # sets STALE for the rest of the job when the branch moved on; FAILS when the tip cannot be resolved
   ctx
   local fresh
@@ -248,10 +262,7 @@ case "$PHASE" in
   build)
     ctx
     resolve_target_url "$S/build.env"
-    BUILD_CMD="$(target_build_cmd)" BUILD_ENV_FILE="$S/build.env" APP_VERSION="$(inp app_version)" PREVIEW_ENV_FILE="$S/preview.env" \
-      PREVIEW_NAME="$PREVIEW_NAME" PREVIEW_HOST_CHECK="$(inp preview_host_check)" PREVIEW_ALLOW="$(inp preview_binding_allow)" PREVIEW_DENY="$(inp preview_deny_resources)" \
-      DEV_WORKER="$(inp dev_worker_name)" DEV_ALLOW="$(inp dev_binding_allow)" DEV_DENY="$(inp dev_deny_resources)" PROD_URL="$(inp app_url_prod)" \
-      DELIVERY_KIND="$KIND" TARGET_URL="$(target_url)" "$TOOLS_DIR/build.sh";;
+    run_build "$S" "$S/build.env" "$(inp app_version)" "$(inp preview_host_check)";;
 
   audit-d1)
     ctx
@@ -299,10 +310,7 @@ case "$PHASE" in
     AUDITED_NAME=""
     if [ "$TARGET" = prod ]; then AUDITED_NAME="$(node "$TOOLS_DIR/cli.mjs" worker-name --config "$(rd config.path)" | sed -n 's/^worker_name=//p')"; [ -n "$AUDITED_NAME" ] || die "no safe Worker name in the audited config; refusing to publish"; fi
     COMMIT_MSG=""; [ -z "${GITHUB_EVENT_PATH:-}" ] || [ ! -f "$GITHUB_EVENT_PATH" ] || COMMIT_MSG="$(jq -r '.head_commit.message // ""' "$GITHUB_EVENT_PATH")"
-    APP_URL="$(target_url)" OUT_FILE="$S/preview.json" APP_VERSION="$(inp app_version)" COMMIT_MSG="$COMMIT_MSG" \
-      WORKER_NAME="$(inp preview_worker_name)" PUBLISH_CMD="$([ "$TARGET" = dev ] && inp dev_deploy_cmd || true)" \
-      PREVIEW_NAME="$PREVIEW_NAME" EXPECTED_URL="$([ "$TARGET" = preview ] && target_url || true)" \
-      "$TOOLS_DIR/publish.sh"
+    run_publish "$S" "$S/preview.json" "$(inp app_version)" "$COMMIT_MSG"
     # Reached only when publish.sh succeeded: the hand-off of this deployment to the Smoke / Rollback jobs.
     echo "published=true"; echo "published_sha=$RUN_SHA"; echo "ledger_id=$LEDGER_ID"; echo "preview_name=$PREVIEW_NAME"
     echo "worker_name=$AUDITED_NAME"; echo "kind=$KIND"; echo "target_url=$(target_url)"; echo "d1_id=$(rd d1_id)";;
@@ -501,12 +509,8 @@ case "$PHASE" in
     [ -z "$(inp app_version)" ] || [ "$VERSION" != "$(inp app_version)" ] || echo "::warning::app_version is not derived from the commit SHA; recovery keeps it as configured" >&2
     (cd "$APP_DIR" && pnpm install --frozen-lockfile)
     resolve_target_url "$R/build.env"
-    STATE_DIR="$R" BUILD_CMD="$(target_build_cmd)" BUILD_ENV_FILE="$R/build.env" APP_VERSION="$VERSION" PREVIEW_ENV_FILE="$S/preview.env" PREVIEW_NAME="$PREVIEW_NAME" \
-      PREVIEW_HOST_CHECK=false PREVIEW_ALLOW="$(inp preview_binding_allow)" PREVIEW_DENY="$(inp preview_deny_resources)" \
-      DEV_WORKER="$(inp dev_worker_name)" DEV_ALLOW="$(inp dev_binding_allow)" DEV_DENY="$(inp dev_deny_resources)" PROD_URL="$(inp app_url_prod)" \
-      DELIVERY_KIND="$KIND" TARGET_URL="$(target_url)" "$TOOLS_DIR/build.sh" >&2
-    OUT="$(STATE_DIR="$R" APP_URL="$(target_url)" OUT_FILE="$R/preview.json" APP_VERSION="$VERSION" WORKER_NAME="$(inp preview_worker_name)" \
-      PUBLISH_CMD="$([ "$TARGET" = dev ] && inp dev_deploy_cmd || true)" EXPECTED_URL="$([ "$TARGET" = preview ] && target_url || true)" PREVIEW_NAME="$PREVIEW_NAME" "$TOOLS_DIR/publish.sh")"
+    run_build "$R" "$R/build.env" "$VERSION" false >&2
+    OUT="$(run_publish "$R" "$R/preview.json" "$VERSION" "")"
     URL="$(printf '%s\n' "$OUT" | sed -n 's/^url=//p')"
     [ -n "$URL" ] || die "recovery produced no URL"
     [ "$URL" = "$GOOD_URL" ] || die "recovered URL $URL differs from the recorded last-good URL $GOOD_URL; refusing to verify a different deployment"
