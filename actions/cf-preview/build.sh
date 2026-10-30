@@ -32,7 +32,10 @@ cd "$APP_DIR"
 # parse-env.mjs and is never written to GITHUB_ENV, so it cannot influence later stages.
 [ "$TARGET" != preview ] || load_env_file "${PREVIEW_ENV_FILE:-}"
 load_env_file "${BUILD_ENV_FILE:-}"
-export VITE_APP_ENV="$TARGET" VITE_APP_VERSION="${APP_VERSION:-}"
+# Engine-owned, informational: the kind and the canonical URL THIS build is for (never set by application env).
+export CFV2_DELIVERY_KIND="${DELIVERY_KIND:-}" CFV2_TARGET_URL="${TARGET_URL:-}"
+case "${DELIVERY_KIND:-}" in native-dev) export VITE_APP_ENV=dev;; *) export VITE_APP_ENV="$TARGET";; esac
+export VITE_APP_VERSION="${APP_VERSION:-}"
 [ "$TARGET" = dev ] && export CLOUDFLARE_ENV="$DEV_ENV" || export CLOUDFLARE_ENV=""
 
 bash -eo pipefail -c "$BUILD_CMD" >&2

@@ -100,3 +100,38 @@ export function planMigrations(cfg, kinds, { accountId = '', binding = '', devEn
   }
   return out;
 }
+
+/** GitHub Environment of each kind (protection rules / deployment history). Production and Preview names are unchanged. */
+export const ENVIRONMENT_SUFFIX = { production: 'prod', 'native-branch': 'preview', 'native-dev': 'native-dev', 'persistent-dev': 'dev' };
+export const environmentName = (app, kind) => `${app}/${ENVIRONMENT_SUFFIX[assertKind(kind)]}`;
+
+/** Ledger environment (GitHub Deployments) used for known-good lookup. Native Dev has ONE fixed ledger per app. */
+export function ledgerEnv(app, kind, previewName = '') {
+  switch (assertKind(kind)) {
+    case 'native-branch': return `${app}/preview/${previewName}`;
+    case 'native-dev': return `${app}/native-dev/${NATIVE_DEV_NAME}`;
+    case 'persistent-dev': return `${app}/dev/shared`;
+    default: return '';
+  }
+}
+
+/**
+ * Build-environment URL isolation: the build env of a target must not carry another target's public URL.
+ * `urls` = { kind: url } of every known target URL; `env` = the parsed KEY=VALUE text of THIS kind's build env.
+ * Returns the offending lines (empty = isolated).
+ */
+export function foreignUrlsInBuildEnv(kind, buildEnvText, urls) {
+  const origin = (u) => { try { return new URL(u).origin; } catch { return ''; } };
+  const foreign = Object.entries(urls).filter(([k, u]) => k !== kind && u && origin(u)).map(([k, u]) => [k, origin(u)]);
+  const bad = [];
+  for (const line of String(buildEnvText ?? '').split('\n')) {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) continue;
+    const key = t.split('=')[0];
+    for (const [k, o] of foreign) if (t.includes(o)) bad.push(`${key} contains the ${k} URL (${o})`);
+  }
+  return bad;
+}
+
+/** Compare an asserted target URL with the published one (case/trailing-slash insensitive). */
+export const sameUrl = (a, b) => String(a).replace(/\/+$/, '').toLowerCase() === String(b).replace(/\/+$/, '').toLowerCase();

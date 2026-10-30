@@ -9,7 +9,7 @@ set -euo pipefail
 case "${1:?}" in
   identity)
     : "${BRANCH_REF:?}" "${APP_NAME:?}"
-    out="$(node "${TOOLS_DIR:?}/cli.mjs" identity --repo "$GITHUB_REPOSITORY" --worker "$APP_NAME" --host-worker "${HOST_WORKER:-$APP_NAME}" --ref "$BRANCH_REF")"
+    out="$(node "${TOOLS_DIR:?}/cli.mjs" identity --repo "$GITHUB_REPOSITORY" --worker "$APP_NAME" --host-worker "${HOST_WORKER:-$APP_NAME}" --ref "$BRANCH_REF" --reserve-native-dev "${RESERVE_NATIVE_DEV:-false}")"
     name="$(printf '%s\n' "$out" | sed -n 's/^preview_name=//p')"
     [[ "$name" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "::error::unsafe Preview name: $name" >&2; exit 1; }
     env_name="$APP_NAME/preview/$name"

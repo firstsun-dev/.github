@@ -6,6 +6,9 @@ import {
   assertWranglerSupported, auditDevConfig, previewHostReadiness, auditPreviewConfig, auditProdConfig, classifyEvent, extractPreviewUrl,
   isStale, migrationPlan, workerName, classifyMigrationSql, previewIdentity, readConfig, rebindSha, artifactDigest, checkDeployedD1, resolveSharedDev, resolveTarget, sharedPreviewDevD1,
 } from './lib.mjs';
+import {
+  DELIVERY_KINDS, ENGINE_TARGET, assertKind, branchPreviewIdentity, environmentName, foreignUrlsInBuildEnv, planMigrations, resolveDeliveryTargets, resolveSmokeMode,
+} from './delivery.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
 const opt = (n, d = '') => {
@@ -18,7 +21,7 @@ const out = (o) => { for (const [k, v] of Object.entries(o)) console.log(`${k}=$
 try {
   switch (cmd) {
     case 'identity': {
-      const id = previewIdentity({ repo: opt('repo'), worker: opt('worker'), ref: opt('ref'), hostWorker: opt('host-worker') });
+      const id = branchPreviewIdentity({ repo: opt('repo'), worker: opt('worker'), ref: opt('ref'), hostWorker: opt('host-worker') }, { reserveNativeDev: opt('reserve-native-dev') === 'true' });
       out({ preview_name: id.name, preview_slug: id.slug });
       break;
     }
@@ -161,11 +164,72 @@ try {
       out({ d1_scan: r.level, d1_scan_reason: r.reasons.slice(0, 3).join(' | ') || 'only additive statements' });
       break;
     }
+    case 'resolve-kinds': {
+      // Enabled delivery kinds for the event (comma separated; empty = nothing to deliver). Throws on a forbidden combination.
+      const kinds = resolveDeliveryTargets({
+        event: opt('event'), ref: opt('ref'), strategy: opt('strategy'), previewOnPush: opt('preview-on-push', 'true') === 'true',
+        sharedDevOnPush: opt('shared-dev-on-push', 'false') === 'true', sharedDevNativeOnPush: opt('shared-dev-native-on-push', 'false') === 'true',
+        dispatchTarget: opt('dispatch-target'), devRef: opt('dev-ref'),
+      });
+      out({ kinds: kinds.join(',') });
+      break;
+    }
+    case 'smoke-mode':
+      out({ smoke_mode: resolveSmokeMode(assertKind(opt('kind')), opt('mode', 'full'), opt('overrides')) });
+      break;
+    case 'url-isolation': {
+      // --kind K --env-var VAR (this kind's build env text) --urls JSON {kind:url}
+      const bad = foreignUrlsInBuildEnv(assertKind(opt('kind')), process.env[opt('env-var')] ?? '', JSON.parse(opt('urls', '{}')));
+      for (const b of bad) console.log(`::error::build environment of ${opt('kind')}: ${b}; each target must be built with its own URLs`);
+      if (bad.length) process.exit(1);
+      out({ url_isolation: 'ok' });
+      break;
+    }
+    case 'plan': {
+      // The delivery plan of a run, from the validated workflow inputs (INPUTS_JSON) - data only, no remote effects.
+      const i = JSON.parse(process.env.INPUTS_JSON ?? '{}');
+      const str = (k) => (i[k] == null ? '' : String(i[k]));
+      const bool = (k) => i[k] === true || i[k] === 'true';
+      let kinds;
+      if (opt('phase') === 'verify') {
+        const st = JSON.parse(process.env.PHASE_STATE ?? '{}');
+        kinds = Array.isArray(st.kinds) ? st.kinds : [];
+        for (const k of kinds) assertKind(k);
+      } else {
+        kinds = resolveDeliveryTargets({
+          event: opt('event'), ref: opt('ref'), strategy: str('deployment_strategy'), previewOnPush: bool('preview_on_branch_push'),
+          sharedDevOnPush: bool('shared_dev_on_branch_push'), sharedDevNativeOnPush: bool('shared_dev_native_preview_on_branch_push'),
+          dispatchTarget: str('dispatch_target'), devRef: str('persistent_dev_ref'),
+        });
+      }
+      for (const k of kinds) resolveSmokeMode(k, str('smoke_mode') || 'full', str('smoke_mode_overrides')); // fail closed on a bad mode
+      let migrations = [];
+      if (opt('phase') !== 'verify' && bool('d1_migrations') && kinds.length) {
+        const cfgPath = resolve(opt('app-dir', '.'), str('wrangler_config') || 'wrangler.toml');
+        migrations = planMigrations(readConfig(cfgPath), kinds, {
+          accountId: process.env.CLOUDFLARE_ACCOUNT_ID ?? '', binding: str('d1_binding'), devEnv: str('dev_wrangler_env') || 'dev',
+          migrationsDirAbs: (d) => resolve(dirname(cfgPath), d),
+        });
+      }
+      const app = str('app_name');
+      const entry = (k) => ({ kind: k, target: ENGINE_TARGET[k], environment: environmentName(app, k) });
+      const plan = {
+        kinds,
+        deliveries: { include: kinds.map(entry) },
+        migrations: { include: migrations.map((g) => ({ ...entry(g.owner), members: g.members.join(','), database: g.databaseName })) },
+      };
+      for (const m of migrations) console.log(`::notice::D1 ${m.databaseName}: one migration (owner ${m.owner}) serves ${m.members.join(', ')}`);
+      out({
+        kinds: JSON.stringify(plan.kinds), has_targets: String(kinds.length > 0), deliveries: JSON.stringify(plan.deliveries),
+        has_migrations: String(migrations.length > 0), migrations: JSON.stringify(plan.migrations),
+      });
+      break;
+    }
     case 'stale':
       out({ stale: String(isStale({ runSha: opt('sha'), branchTipSha: opt('tip') })) });
       break;
     default:
-      console.error('usage: cli.mjs identity|wrangler-check|extract-url|preview-host-check|classify|resolve|resolve-dev|rebind-env|artifact-digest|d1-consistency|d1-shared|dev-config-check|preflight|migration-config|effective-config|audit-prod|worker-name|migration-scan|stale');
+      console.error('usage: cli.mjs identity|wrangler-check|extract-url|preview-host-check|classify|resolve|resolve-dev|rebind-env|artifact-digest|d1-consistency|d1-shared|dev-config-check|preflight|migration-config|effective-config|audit-prod|worker-name|migration-scan|resolve-kinds|smoke-mode|url-isolation|plan|stale');
       process.exit(2);
   }
 } catch (e) {

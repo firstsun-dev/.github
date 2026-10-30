@@ -99,3 +99,26 @@ test('same database_id under a different account is a different physical D1', ()
   const b = planMigrations(cfg('X', 'D'), ['native-dev'], { accountId: 'a2' })[0].id;
   assert.notEqual(a, b);
 });
+
+import { environmentName, ledgerEnv, foreignUrlsInBuildEnv, sameUrl } from '../../actions/cf-preview/delivery.mjs';
+test('environment and ledger names: legacy names unchanged, Native Dev gets its own', () => {
+  assert.equal(environmentName('blog', 'production'), 'blog/prod');
+  assert.equal(environmentName('blog', 'native-branch'), 'blog/preview');
+  assert.equal(environmentName('blog', 'persistent-dev'), 'blog/dev');
+  assert.equal(environmentName('blog', 'native-dev'), 'blog/native-dev');
+  assert.equal(ledgerEnv('blog', 'native-dev'), 'blog/native-dev/dev');
+  assert.equal(ledgerEnv('blog', 'persistent-dev'), 'blog/dev/shared');
+  assert.equal(ledgerEnv('blog', 'native-branch', 'feat-x'), 'blog/preview/feat-x');
+  assert.throws(() => environmentName('blog', 'prod'), /Unknown delivery kind/);
+});
+test('build env URL isolation: another target URL in this build env is reported', () => {
+  const urls = { production: 'https://app.example.com', 'native-dev': 'https://dev-app.x.workers.dev' };
+  assert.deepEqual(foreignUrlsInBuildEnv('native-dev', 'PUBLIC_URL=https://dev-app.x.workers.dev\nIDP=https://id.example.org', urls), []);
+  assert.deepEqual(foreignUrlsInBuildEnv('native-dev', 'PUBLIC_URL=https://app.example.com/', urls).length, 1);
+  assert.deepEqual(foreignUrlsInBuildEnv('production', 'X=https://dev-app.x.workers.dev', urls).length, 1);
+  assert.deepEqual(foreignUrlsInBuildEnv('production', '# c\n\nX=1', urls), []);
+});
+test('sameUrl ignores case and trailing slashes only', () => {
+  assert.ok(sameUrl('https://A.example.com/', 'https://a.example.com'));
+  assert.ok(!sameUrl('https://a.example.com/x', 'https://a.example.com'));
+});

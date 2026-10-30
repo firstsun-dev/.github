@@ -17,8 +17,11 @@ description: >
   repository's `actions/` at `.cf-tools`.
 inputs:
   target:
-    description: prod | preview | dev. Bound once by the engine; application env can never change it.
+    description: prod | preview | dev (config / credential class). Bound once by the engine; application env can never change it.
     required: true
+  kind:
+    description: production | native-branch | native-dev | persistent-dev. Empty = the kind implied by target (prod -> production, preview -> native-branch, dev -> persistent-dev). native-dev is target preview.
+    default: ''
   stage:
     description: all | deploy | migrate | publish | verify | rollback (see description). dev supports all, deploy, verify, rollback; prod and preview support migrate, publish, verify, rollback.
     default: all
@@ -34,12 +37,6 @@ inputs:
   smoke_username:
     default: ''
   smoke_password:
-    default: ''
-  sibling_result:
-    description: Result of the job this one was ordered after (Preview Migration), for the shared-D1 guard
-    default: ''
-  sibling_migration:
-    description: Migration state reported by that job (applied | failed | none)
     default: ''
   deploy_outputs:
     description: toJSON(needs.deploy.outputs) - hand-off to the verify / rollback stages (validated as data)
@@ -97,7 +94,7 @@ outputs:
     description: true ONLY when this run published its own SHA and a CONTENT-level smoke passed (never for Access liveness)
     value: ${{ steps.verified.outputs.deployed_and_verified || 'false' }}
   smoke_level:
-    description: liveness (Access login reachable only) | content (application responded) | content-sha (content and commit SHA verified)
+    description: skipped (smoke_mode=skip) | liveness (Access login reachable only) | content (application responded) | content-sha (content and commit SHA verified)
     value: ${{ steps.verified.outputs.smoke_level || steps.smoke.outputs.smoke_level }}
   migration:
     description: applied | failed | none
@@ -111,6 +108,9 @@ outputs:
   rollback_result:
     description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed | no_known_good (rollback stage)
     value: ${{ steps.rbfinal.outputs.result }}
+  smoke_mode:
+    description: full | basic | skip - the smoke mode resolved for this delivery kind
+    value: ${{ steps.mode.outputs.smoke_mode }}
   rollback_ok:
     description: true only when the previous deployment was restored AND content-verified (rollback stage)
     value: ${{ steps.rbfinal.outputs.ok || 'false' }}
@@ -126,12 +126,17 @@ runs:
       shell: bash
       env:
         ENGINE_TARGET: ${{ inputs.target }}
+        ENGINE_KIND: ${{ inputs.kind }}
         ENGINE_STAGE: ${{ inputs.stage }}
         ENGINE_MODE: ${{ inputs.mode }}
         INPUTS_JSON: ${{ inputs.inputs_json }}
         CALL_INPUTS_JSON: ${{ inputs.call_inputs_json }}
         PREVIEW_SECRETS: ${{ inputs.target == 'preview' && inputs.preview_secrets || '' }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" init'
+    - name: Resolved smoke mode
+      id: mode
+      shell: bash
+      run: 'echo "smoke_mode=$(cat "${STATE_DIR:-$RUNNER_TEMP/cfv2}/smoke_mode")" >> "$GITHUB_OUTPUT"'
     - name: Hand-off from the previous jobs (validated data)
       id: hydrate
       if: inputs.stage == 'verify' || inputs.stage == 'rollback'
@@ -178,13 +183,6 @@ runs:
       if: env.STALE != 'true' && inputs.stage != 'verify' && inputs.stage != 'rollback'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" audit-d1'
-    - name: Shared-D1 guard (Dev after a failed Preview migration)
-      if: env.STALE != 'true' && inputs.target == 'dev'
-      shell: bash
-      env:
-        PREVIEW_MIGRATION: ${{ inputs.sibling_migration }}
-        PREVIEW_JOB_RESULT: ${{ inputs.sibling_result }}
-      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" d1-guard'
     - name: Stale-SHA guard (before migration)
       if: env.STALE != 'true' && (inputs.stage == 'all' || inputs.stage == 'deploy' || inputs.stage == 'migrate')
       shell: bash
