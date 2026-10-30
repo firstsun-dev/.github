@@ -238,15 +238,22 @@ check(not mig_if("native-branch", inputs={"pipeline_phase": "verify"}) and not r
 mg = jobs["migration_native_branch"]["with"]
 check("needs.preflight_production.result" in mg["peers"] and "needs.preflight_persistent_dev.result" in mg["peers"] and mg["kinds"] == "${{ needs.plan.outputs.kinds }}", "Migration: hands the Preflight result of every kind + the enabled kinds to the call, which fails closed on anything but success")
 mstep = djobs["migrate"]["steps"][0]
-check("PEERS" in mstep["env"] and "success" in mstep["run"] and "exit 1" in mstep["run"] and "// \"missing\"" in mstep["run"], "Migration call: first step refuses to migrate unless EVERY enabled kind's preflight succeeded (a missing result is a failure)")
+ACT_STEPS = DEPLOY_ACTION["runs"]["steps"]
+gate_i = next(n for n, x in enumerate(ACT_STEPS) if x.get("id") == "migration_gate")
+first_work = next(n for n, x in enumerate(ACT_STEPS) if "Stale-SHA guard (start)" in x.get("name", ""))
+check(gate_i < first_work and ACT_STEPS[gate_i]["if"] == "inputs.stage == 'migrate' || inputs.stage == 'publish'" and "migration-gate" in ACT_STEPS[gate_i]["run"],
+      "Migration gate: runs in the engine right after init - before the stale guard, setup, build, migration and publish - for the migrate and publish stages only")
+check(eng["migrate"]["with"]["peers"] == "${{ inputs.peers }}" and eng["migrate"]["with"]["kinds"] == "${{ inputs.kinds }}" and djobs["migrate"]["steps"][0].get("uses") == "actions/checkout@v6",
+      "Migration call: hands the enabled kinds and every kind's Preflight result to the engine gate (no inline shell decision in the workflow)")
 dl_if = lambda k, kinds=None, gate="success", plan_result="success", inputs=None, **kw: runs(f"delivery_{KK(k)}", scenario("push", kw.pop("ref", FEAT), inputs or {}, {"gate": {"result": gate, "outputs": {}}, "plan": pl(kinds or (KK(k),), False, result=plan_result)}))
 check(dl_if("native-branch") and dl_if("production", ref=MAIN) and dl_if("native-dev") and dl_if("persistent-dev"), "Delivery: runs when the gate passed and ITS kind is enabled")
 check(not dl_if("native-dev", kinds=("native_branch",)) and not dl_if("production", kinds=("native_branch",), ref=FEAT), "Delivery: a disabled kind creates no delivery (no phantom paths)")
 check(not dl_if("native-branch", gate="failure") and not dl_if("native-branch", gate="skipped") and not dl_if("native-branch", plan_result="failure"), "Delivery: blocked by a failed Validation Gate or a failed plan (invalid configuration deploys nothing)")
 check(dl_if("native-branch", gate="skipped", inputs={"pipeline_phase": "verify"}), "Delivery: a verify call plans from the hand-off, not from the gate")
-dep0 = djobs["deploy"]["steps"][0]
-check(dep0["id"] == "dep" and "OWN_RESULT" in dep0["env"] and "OWNER_RESULT" in dep0["env"] and "d1_id" in dep0["run"] and ".kind" in dep0["run"] and "exit 1" in dep0["run"],
-      "Deploy: first step requires the migration result of THIS kind's D1 (own, or the shared-D1 owner's) to be success AND to name the right kind and D1 id (per-D1 gating, never a global needs)")
+pub = next(x for x in djobs["deploy"]["steps"] if x.get("id") == "engine")["with"]
+check(all(pub[k] == "${{ inputs." + k + " }}" for k in ("own_migration_result", "own_migration_json", "owner_migration_result", "owner_migration_json")) and djobs["deploy"]["outputs"]["migration_used"] == "${{ steps.engine.outputs.migration_used }}"
+      and "run" not in djobs["deploy"]["steps"][0],
+      "Deploy: the migration of THIS kind's D1 (own, or the shared-D1 owner's) is checked by the engine gate (per-D1 gating, never a global needs; delivery.test.mjs covers every refusal)")
 sm_if = lambda inputs, deploy_res="success": bool(ev(djobs["smoke"]["if"], Ctx({"inputs": dict({"stage": "deliver", "phase": "all"}, **inputs), "needs": {"deploy": {"result": deploy_res, "outputs": {}}}}, {})))
 check(sm_if({}) and sm_if({"phase": "verify"}) and not sm_if({"phase": "deploy"}) and not sm_if({"stage": "migrate"}) and sm_if({}, "failure"), "Smoke: runs in all and verify phases (even when Deploy failed: nothing published -> smoke_status none), never in the deploy phase or another stage")
 rb_if = lambda status, inputs=None: bool(ev(djobs["rollback"]["if"], Ctx({"inputs": dict({"stage": "deliver", "phase": "all", "kind": "native-branch", "inputs_json": "{}"}, **(inputs or {})), "needs": {"smoke": {"result": "x", "outputs": {"smoke_status": status}}}}, {})))

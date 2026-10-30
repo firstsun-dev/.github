@@ -1064,10 +1064,10 @@ r = deploy(FEAT, inputs=TWO_IN, toml=two_db, env={"STUB_PROBES": "200 "})
 check(r["result"] == "success" and r["log"].count("migrations apply") == 2, "Preview and persistent Dev on DISTINCT D1s: two independent migrations")
 r = deploy(FEAT, inputs=TWO_IN, toml=two_db, env={"STUB_PROBES": "200 ", "STUB_APPLY_FAIL_CFG": "migrate.dev.json"})
 dep_out = {k: (json.loads(v) if v else {}) for k, v in r["raw"]["deploy"]["outputs"].items()}
-check(r["result"] == "failure" and dep_out["h_native_branch"].get("published") == "true" and not dep_out["h_persistent_dev"].get("published"), "a failed DEV migration blocks only the Dev delivery; the Preview (other D1) is migrated, published and verified")
+check(r["result"] == "failure" and dep_out["h_native_branch"].get("published") == "true" and dep_out["h_persistent_dev"].get("published") != "true", "a failed DEV migration blocks only the Dev delivery; the Preview (other D1) is migrated, published and verified")
 r = deploy(FEAT, inputs=TWO_IN, toml=two_db, env={"STUB_PROBES": "200 ", "STUB_APPLY_FAIL_CFG": "migrate.preview.json"})
 dep_out = {k: (json.loads(v) if v else {}) for k, v in r["raw"]["deploy"]["outputs"].items()}
-check(r["result"] == "failure" and dep_out["h_persistent_dev"].get("published") == "true" and not dep_out["h_native_branch"].get("published"), "a failed PREVIEW migration blocks only the Preview delivery; Dev (other D1) proceeds")
+check(r["result"] == "failure" and dep_out["h_persistent_dev"].get("published") == "true" and dep_out["h_native_branch"].get("published") != "true", "a failed PREVIEW migration blocks only the Preview delivery; Dev (other D1) proceeds")
 prod_shared = DEV_TOML.replace('database_name = "shared-db"\ndatabase_id = "SHARED-ID"\n[env.dev]', 'database_name = "prod-db"\ndatabase_id = "PROD-ID"\n[env.dev]')
 r = deploy(FEAT, inputs=dict(ND, **D1), toml=prod_shared)
 check(r["jobs"]["plan"]["result"] == "failure" and not migrated(r) and not published(r), "a Preview/Dev target mapped to the PRODUCTION D1 fails the plan: never migrated, never published")

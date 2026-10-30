@@ -8,7 +8,7 @@ import {
 } from './lib.mjs';
 import {
   DELIVERY_KINDS, ENGINE_TARGET, assertKind, branchPreviewIdentity, canonicalOrigin, checkBuildEnvOrigins, environmentName, foreignUrlsInBuildEnv, planMigrations, resolveCanonicalUrl, resolveDeliveryTargets, resolveSmokeMode,
-  buildDescriptors, parseDescriptor,
+  buildDescriptors, parseDescriptor, checkPeerPreflights, resolveMigrationUsed,
 } from './delivery.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -262,6 +262,26 @@ try {
       if (d.target !== opt('target')) throw new Error(`target descriptor engine target '${d.target}' differs from the stage's '${opt('target')}'`);
       if (d.d1_expected_id !== opt('d1')) throw new Error('target descriptor D1 id differs from the stage\'s expected D1');
       out({ descriptor: 'ok', smoke_mode: d.smoke_mode });
+      break;
+    }
+    case 'migration-gate': { // env: GATE_STAGE migrate|publish, DESCRIPTOR, D1_MIGRATIONS, KINDS+PEERS (migrate) | OWN_* / OWNER_* results (publish)
+      const e = process.env;
+      const d = parseDescriptor(e.DESCRIPTOR ?? '', opt('kind'));
+      const parse = (t, dflt) => { try { return JSON.parse(t || dflt); } catch { return null; } };
+      if (e.GATE_STAGE === 'migrate') {
+        const kinds = parse(e.KINDS, '[]');
+        if (!Array.isArray(kinds)) throw new Error('kinds is not a JSON array');
+        const bad = checkPeerPreflights(kinds, parse(e.PEERS, '{}'));
+        for (const b of bad) console.log(`::error::${b}`);
+        if (bad.length) process.exit(1);
+        out({ migration_gate: 'ok' });
+      } else {
+        const m = resolveMigrationUsed({
+          d1Migrations: e.D1_MIGRATIONS === 'true', kind: d.kind, ownerKind: d.d1_owner_kind, expectedId: d.d1_expected_id,
+          ownResult: e.OWN_RESULT ?? '', ownJson: e.OWN_JSON ?? '', ownerResult: e.OWNER_RESULT ?? '', ownerJson: e.OWNER_JSON ?? '',
+        });
+        out({ migration_used: JSON.stringify(m) });
+      }
       break;
     }
     case 'stale':

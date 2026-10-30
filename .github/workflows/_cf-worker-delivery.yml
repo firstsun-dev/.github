@@ -203,17 +203,6 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
-      - name: Every enabled target passed its preflight (fail closed before any mutation)
-        env:
-          KINDS: ${{ inputs.kinds }}
-          PEERS: ${{ inputs.peers }}
-        run: |
-          bad=0
-          for k in $(printf '%s' "$KINDS" | jq -r '.[]'); do
-            r="$(printf '%s' "$PEERS" | jq -r --arg k "$k" '.[$k] // "missing"')"
-            [ "$r" = success ] || { echo "::error::preflight of $k finished '$r'; no D1 is migrated while an enabled target is unvalidated"; bad=1; }
-          done
-          [ "$bad" = 0 ] || exit 1
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
@@ -237,6 +226,8 @@ jobs:
           descriptor: ${{ inputs.descriptor }}
           kind: ${{ inputs.kind }}
           stage: migrate
+          kinds: ${{ inputs.kinds }}
+          peers: ${{ inputs.peers }}
           inputs_json: ${{ inputs.inputs_json }}
           d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
           preview_secrets: ${{ fromJSON(inputs.descriptor).target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
@@ -263,36 +254,12 @@ jobs:
       pull-requests: write
     outputs:
       handoff: ${{ toJSON(steps.engine.outputs) }}
-      migration_used: ${{ steps.dep.outputs.migration_used }}
+      migration_used: ${{ steps.engine.outputs.migration_used }}
     env:
       GH_TOKEN: ${{ github.token }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
-      - id: dep
-        name: The migration of this kind's D1 succeeded (or none is needed)
-        env:
-          D1_MIGRATIONS: ${{ inputs.d1_migrations }}
-          KIND: ${{ inputs.kind }}
-          OWNER: ${{ fromJSON(inputs.descriptor).d1_owner_kind }}
-          EXPECT: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
-          OWN_RESULT: ${{ inputs.own_migration_result }}
-          OWN_JSON: ${{ inputs.own_migration_json }}
-          OWNER_RESULT: ${{ inputs.owner_migration_result }}
-          OWNER_JSON: ${{ inputs.owner_migration_json }}
-        run: |
-          [ "$D1_MIGRATIONS" = true ] || { echo "migration_used={}" >> "$GITHUB_OUTPUT"; exit 0; }
-          if [ "$OWNER" = "$KIND" ]; then R="$OWN_RESULT"; J="$OWN_JSON"
-          elif [ "$OWNER" = native-branch ]; then R="$OWNER_RESULT"; J="$OWNER_JSON"
-          else echo "::error::no migration owner is planned for $KIND (owner '${OWNER:-none}'); nothing is published"; exit 1; fi
-          [ "$R" = success ] || { echo "::error::the D1 migration $KIND depends on (owner ${OWNER}) finished '${R:-missing}'; nothing is published"; exit 1; }
-          J="$(printf '%s' "$J" | jq -c 'if type == "object" then . else {} end' 2>/dev/null || echo '{}')"
-          if [ "$(printf '%s' "$J" | jq -r '.stale // "false"')" != true ]; then
-            [ "$(printf '%s' "$J" | jq -r '.migration // ""')" = applied ] || { echo "::error::the migration result for $KIND reports no applied migration; nothing is published"; exit 1; }
-            [ "$(printf '%s' "$J" | jq -r '.kind // ""')" = "$OWNER" ] || { echo "::error::the migration result belongs to another kind than the planned owner $OWNER; refusing"; exit 1; }
-            [ "$(printf '%s' "$J" | jq -r '.d1_id // ""')" = "$EXPECT" ] || { echo "::error::the migration result is for another D1 than $KIND's ($EXPECT); refusing"; exit 1; }
-          fi
-          echo "migration_used=$J" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
@@ -316,6 +283,10 @@ jobs:
           descriptor: ${{ inputs.descriptor }}
           kind: ${{ inputs.kind }}
           stage: publish
+          own_migration_result: ${{ inputs.own_migration_result }}
+          own_migration_json: ${{ inputs.own_migration_json }}
+          owner_migration_result: ${{ inputs.owner_migration_result }}
+          owner_migration_json: ${{ inputs.owner_migration_json }}
           inputs_json: ${{ inputs.inputs_json }}
           d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
           preview_secrets: ${{ fromJSON(inputs.descriptor).target == 'preview' && secrets.PREVIEW_SECRETS || '' }}

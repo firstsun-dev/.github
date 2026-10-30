@@ -52,6 +52,22 @@ inputs:
   d1_expected_id:
     description: Physical D1 database id the plan resolved for this kind. Every build of this kind must bind exactly it (preflight, migrate, publish); empty = no D1.
     default: ''
+  kinds:
+    description: migrate stage only - JSON array of the enabled kinds of the run
+    default: '[]'
+  peers:
+    description: migrate stage only - JSON object keyed by kind, value = result of that kind's preflight
+    default: '{}'
+  own_migration_result:
+    description: publish stage only - result of this kind's own migration call
+    default: ''
+  own_migration_json:
+    default: ''
+  owner_migration_result:
+    description: publish stage only - result of the shared-D1 owner's migration call
+    default: ''
+  owner_migration_json:
+    default: ''
   descriptor:
     description: toJSON of this kind's target descriptor (the Delivery plan's validated record). When set, the engine verifies it against target / kind / d1_expected_id and takes the smoke mode from it.
     default: ''
@@ -62,6 +78,9 @@ inputs:
     description: Verify stage only - result of the job this verification must wait for (success | skipped = satisfied; anything else blocks, fail closed). Empty = no gate.
     default: ''
 outputs:
+  migration_used:
+    description: publish stage only - the validated migration result this kind's deployment depends on ({} without d1_migrations)
+    value: ${{ steps.migration_gate.outputs.migration_used }}
   d1_id:
     description: Physical D1 database id the built config of this kind binds (audited; empty without d1_migrations)
     value: ${{ steps.report.outputs.d1_id }}
@@ -181,6 +200,20 @@ runs:
       run: |
         "$GITHUB_ACTION_PATH/../cf-preview/engine.sh" gate-blocked | tee -a "$GITHUB_OUTPUT"
         exit 1
+    - name: Migration gate (fail closed before any build, migration or publish)
+      id: migration_gate
+      if: inputs.stage == 'migrate' || inputs.stage == 'publish'
+      shell: bash
+      env:
+        ENGINE_STAGE: ${{ inputs.stage }}
+        ENGINE_DESCRIPTOR: ${{ inputs.descriptor }}
+        KINDS: ${{ inputs.kinds }}
+        PEERS: ${{ inputs.peers }}
+        OWN_RESULT: ${{ inputs.own_migration_result }}
+        OWN_JSON: ${{ inputs.own_migration_json }}
+        OWNER_RESULT: ${{ inputs.owner_migration_result }}
+        OWNER_JSON: ${{ inputs.owner_migration_json }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" migration-gate | tee -a "$GITHUB_OUTPUT"'
     - name: Stale-SHA guard (start)
       if: inputs.stage != 'verify' && inputs.stage != 'rollback'
       shell: bash

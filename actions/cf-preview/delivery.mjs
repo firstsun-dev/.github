@@ -292,3 +292,47 @@ export function parseDescriptor(text, expectKind = '') {
   if (expectKind && d.kind !== expectKind) throw new Error(`target descriptor is for ${d.kind}, not ${expectKind}`);
   return d;
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Migration gates (pure). Both used to be inline bash/jq in the delivery workflow; they now run in the engine, before any
+// build or publish, and are unit-tested here.
+// ---------------------------------------------------------------------------------------------------------------------
+/**
+ * Migrate stage: NO D1 may be migrated while any enabled kind is unvalidated. `peers` = { kind: result of that kind's
+ * preflight }. Anything but `success` - including a missing entry - blocks.
+ */
+export function checkPeerPreflights(kinds, peers) {
+  const failures = [];
+  for (const k of kinds) {
+    assertKind(k);
+    const r = peers && typeof peers === 'object' ? (peers[k] ?? 'missing') : 'missing';
+    if (r !== 'success') failures.push(`preflight of ${k} finished '${r}'; no D1 is migrated while an enabled target is unvalidated`);
+  }
+  return failures;
+}
+
+/**
+ * Publish stage: the migration result THIS kind's deployment depends on - its own, or the shared-D1 owner's (native-branch is
+ * the only owner a sibling can delegate to). Fails closed unless that migration succeeded and reports an applied migration of
+ * the planned owner on exactly this kind's D1 (a stale-skipped migration is accepted: nothing was applied, nothing is published).
+ * Returns the (validated, normalised) migration result object, or {} when the app has no D1 migrations.
+ */
+export function resolveMigrationUsed({ d1Migrations, kind, ownerKind = '', expectedId = '', ownResult = '', ownJson = '', ownerResult = '', ownerJson = '' }) {
+  if (!d1Migrations) return {};
+  assertKind(kind);
+  let result;
+  let json;
+  if (ownerKind === kind) { result = ownResult; json = ownJson; } else if (ownerKind === 'native-branch') { result = ownerResult; json = ownerJson; } else {
+    throw new Error(`no migration owner is planned for ${kind} (owner '${ownerKind || 'none'}'); nothing is published`);
+  }
+  if (result !== 'success') throw new Error(`the D1 migration ${kind} depends on (owner ${ownerKind}) finished '${result || 'missing'}'; nothing is published`);
+  let m;
+  try { m = JSON.parse(json); } catch { m = {}; }
+  if (m === null || typeof m !== 'object' || Array.isArray(m)) m = {};
+  if (m.stale !== true && m.stale !== 'true') {
+    if (m.migration !== 'applied') throw new Error(`the migration result for ${kind} reports no applied migration; nothing is published`);
+    if (m.kind !== ownerKind) throw new Error(`the migration result belongs to another kind than the planned owner ${ownerKind}; refusing`);
+    if (m.d1_id !== expectedId) throw new Error(`the migration result is for another D1 than ${kind}'s (${expectedId}); refusing`);
+  }
+  return m;
+}

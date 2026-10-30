@@ -207,6 +207,11 @@ case "$PHASE" in
       CFV2_PS="$PREVIEW_SECRETS" node "$TOOLS_DIR/parse-env.mjs" CFV2_PS "$S/preview.env" --mask --reserved >/dev/null
     fi;;
 
+  migration-gate) # before anything is built or published: peers' preflights (migrate) / the migration this kind depends on (publish)
+    ctx
+    GATE_STAGE="${ENGINE_STAGE:?}" D1_MIGRATIONS="$(inp d1_migrations)" DESCRIPTOR="${ENGINE_DESCRIPTOR:?a target descriptor is required}" \
+      node "$TOOLS_DIR/cli.mjs" migration-gate --kind "$KIND";;
+
   prepare)
     ctx
     if [ "$TARGET" != prod ]; then

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   DELIVERY_KINDS, resolveDeliveryTargets, resolveSmokeMode, parseSmokeOverrides, planMigrations, branchPreviewIdentity, ENGINE_TARGET,
   canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins,
-  targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor,
+  targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor, checkPeerPreflights, resolveMigrationUsed,
 } from '../../actions/cf-preview/delivery.mjs';
 
 const base = { event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-preview', previewOnPush: true };
@@ -282,4 +282,51 @@ test('descriptor: persistent-dev keeps the legacy Shared Dev group (Deploy AND R
   assert.notEqual(g({ lockScope: 'a' }).deploy_group, g({ lockScope: 'b' }).deploy_group);
   // other kinds never share a group across runs' legs or kinds
   assert.notEqual(targetDescriptor({ kind: 'native-dev', app: 'a', runId: 1 }).deploy_group, targetDescriptor({ kind: 'native-branch', app: 'a', runId: 1 }).deploy_group);
+});
+
+// ---- migration gates (were inline bash/jq in the delivery workflow) -----------------------------------------------------
+test('migrate gate: no D1 is migrated unless EVERY enabled kind passed its preflight; a missing result blocks', () => {
+  const all = { production: 'success', 'native-branch': 'success' };
+  assert.deepEqual(checkPeerPreflights(['production', 'native-branch'], all), []);
+  assert.deepEqual(checkPeerPreflights([], {}), []);
+  for (const bad of ['failure', 'cancelled', 'skipped', '']) {
+    const f = checkPeerPreflights(['production', 'native-branch'], { ...all, 'native-branch': bad });
+    assert.equal(f.length, 1);
+    assert.match(f[0], /native-branch/);
+  }
+  assert.match(checkPeerPreflights(['native-dev'], all)[0], /'missing'/);
+  assert.match(checkPeerPreflights(['native-dev'], null)[0], /'missing'/);
+  assert.throws(() => checkPeerPreflights(['bogus'], {}), /Unknown delivery kind/);
+});
+
+const MJ = (o = {}) => JSON.stringify({ migration: 'applied', kind: 'native-branch', d1_id: 'DB1', ...o });
+const U = (o) => resolveMigrationUsed({ d1Migrations: true, kind: 'native-branch', ownerKind: 'native-branch', expectedId: 'DB1', ownResult: 'success', ownJson: MJ(), ...o });
+
+test('migration used: without d1_migrations nothing is required', () => {
+  assert.deepEqual(resolveMigrationUsed({ d1Migrations: false, kind: 'production' }), {});
+});
+
+test('migration used: the owner uses its own result; a sharing kind uses the native-branch owner result', () => {
+  assert.equal(U({}).d1_id, 'DB1');
+  const shared = resolveMigrationUsed({ d1Migrations: true, kind: 'native-dev', ownerKind: 'native-branch', expectedId: 'DB1', ownResult: '', ownJson: '', ownerResult: 'success', ownerJson: MJ() });
+  assert.equal(shared.kind, 'native-branch');
+});
+
+test('migration used: fails closed on a missing, failed, foreign or malformed migration result', () => {
+  assert.throws(() => U({ ownerKind: '' }), /no migration owner is planned/);
+  assert.throws(() => U({ ownerKind: 'persistent-dev' }), /no migration owner is planned/);
+  assert.throws(() => U({ ownResult: 'failure' }), /finished 'failure'/);
+  assert.throws(() => U({ ownResult: '' }), /finished 'missing'/);
+  assert.throws(() => U({ ownResult: 'skipped' }), /finished 'skipped'/);
+  assert.throws(() => U({ ownJson: MJ({ migration: 'none' }) }), /no applied migration/);
+  assert.throws(() => U({ ownJson: '' }), /no applied migration/);
+  assert.throws(() => U({ ownJson: '[1]' }), /no applied migration/);
+  assert.throws(() => U({ ownJson: MJ({ kind: 'persistent-dev' }) }), /another kind/);
+  assert.throws(() => U({ ownJson: MJ({ d1_id: 'FOREIGN' }) }), /another D1/);
+  assert.throws(() => U({ expectedId: 'OTHER' }), /another D1/);
+});
+
+test('migration used: a stale-skipped migration is accepted (nothing was applied, nothing will be published)', () => {
+  assert.equal(U({ ownJson: JSON.stringify({ stale: 'true' }) }).stale, 'true');
+  assert.equal(U({ ownJson: JSON.stringify({ stale: true }) }).stale, true);
 });
