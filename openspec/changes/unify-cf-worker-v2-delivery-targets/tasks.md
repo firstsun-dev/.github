@@ -15,14 +15,15 @@
 - [x] Add opt-in Native Dev named Preview `dev`, protected identity, separate ledger/recovery and concurrent-branch serialization.
 - [x] Add target-specific URL pre-resolution/build-env, build/artifact audit, no shared compiled bundle, and post-publish URL assertion.
 - [x] Add `smoke_mode=full|basic|skip` and target overrides, explicit Published/Unverified semantics and conditional target-owned Recovery.
-- [x] Preserve `pipeline_phase`/`phase_state`, public caller inputs/outputs, release gates, v1/v1.5 and the currently deployed `@v2` behavior. (Contract + 393 chain checks; deferred verification now keeps the deploy call's descriptors; real-runner evidence in docs.)
+- [x] Preserve `pipeline_phase`/`phase_state`, public caller inputs/outputs, release gates, v1/v1.5 and the currently deployed `@v2` behavior. (Contract + 404 chain checks; deferred verification now keeps the deploy call's descriptors; real-runner evidence in docs.)
 - [x] Add/extend contract, shell/unit, DAG, smoke, skip, migration, DB lock, stale SHA, rollback, Access, preview cleanup and cross-service handoff tests.
-- [x] Run actionlint and relevant OpenSpec checks; prove reusable workflow calls from a separate scratch repository/runnable caller; record evidence. (actionlint+shellcheck green in CI on 506c101; scratch-caller runs 41056958707, 41056964707, 41057340143. Live Cloudflare behaviour is NOT proven — no credentials.)
+- [x] Run actionlint and relevant OpenSpec checks; prove reusable workflow calls from a separate scratch repository/runnable caller; record evidence. (actionlint+shellcheck green in CI on 8ad9f5f; scratch-caller runs 41062254408, 41062261540, 41062268866, 41062278092. Live Cloudflare behaviour is NOT proven — no credentials.)
 - [x] Review finding 1 (P1): deferred verification restores the deploy call's validated descriptors; verify-call defaults never replace deployment-time policy.
 - [x] Review finding 2 (P2): structural refactor — descriptor replaces seven per-call fields, inline migration/rollback/verification policy moved to `delivery.mjs`, one build and one publish primitive, `engine.sh init` is one validated Node process.
 - [x] Review finding 3 (P2): AST-based test grouping replaced by explicit `group_*` functions + manifest-checked launcher.
 - [x] Review finding 4 (P2): measured subprocess/CPU reduction inside the engine (init 213 ms -> 58 ms; Node processes per chain 17 -> 9); the harness step-shell count is NOT reduced (documented).
 - [x] Review finding 5 (P1): final-SHA scratch-caller validation on org runners; credential-less scope stated.
+- [x] Final review fixes: lock-identity integrity (scheduling-time lock derived from `phase_state.inputs`, group/descriptor/owner/D1 cross-checks, documented trust boundary), CLI annotations on stderr, legacy D1 ownership proof, fail-fast `test.sh full`.
 - [ ] Merge the fully tested shared implementation to **.github/main**; record frozen immutable SHA, exact interface, compatibility proof and explicit G1 pass/fail. Do not move `@v2` yet.
 
 ## G1 — MANDATORY HARD GATE (all conditions required)

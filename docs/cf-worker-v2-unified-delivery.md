@@ -155,11 +155,12 @@ min(4, CPUs)) that checks a manifest of expected groups with minimum check count
 missing perf report, fails the run. `full` = both; it is the only profile behind the required `contract` check. `JOBRUNNER_PERF=<file>` writes a JSON
 report (subprocesses by command/engine phase, workspaces, jobs).
 
-| Metric (393 checks; 379 before + 14 added in this work, none removed) | Before (3842a45 / a9fd174) | After (506c101) |
+| Metric (404 chain checks; 379 before + 25 added in this work, none removed) | Before (3842a45 / a9fd174) | After (8ad9f5f) |
 | --- | --- | --- |
 | Chain wall time, local (bounded parallelism 4) | ~6 min serial equivalent | ~101 s (`run-job-groups.py`) |
-| Fast profile | not separated | ~10 s |
-| Whole CI job (GitHub-hosted: setup, tests, lint) | 2m29s – 4m13s | 2m19s – 2m50s |
+| Fast profile, local | not separated | ~11.5 s |
+| Full (Fast then Chain, local) | not separated | 1m53s |
+| Whole CI job (GitHub-hosted: setup, tests, shellcheck, actionlint) | 2m29s – 4m13s | 2m19s – 3m17s |
 | Engine `init` average cost | 213 ms (697 calls, 36 % of subprocess CPU) | 58 ms (702 calls, 40.9 s CPU) |
 | Recorded step-subprocess CPU | ~398 s | ~306 s |
 | Node processes in one Production chain (system-wide `execve`) | 17 | 9 |
@@ -174,9 +175,9 @@ this round: every end-to-end scenario is still run, new focused unit tests were 
 
 ### Structure (static, before → after)
 
-| | 3842a45 | a9fd174 | 506c101 |
+| | 3842a45 | a9fd174 | 8ad9f5f |
 | --- | --- | --- | --- |
-| `_cf-worker-v2.yml` lines | 1318 | 1259 | 1247 |
+| `_cf-worker-v2.yml` lines | 1318 | 1259 | 1249 (+2: the scheduling-lock expression now covers verify) |
 | `_cf-worker-delivery.yml` lines | 494 | 450 | 446 |
 | `engine.sh` lines | 593 | 606 | 524 |
 | `with:` field lines across the 12 per-kind calls | 196 | 144 | 132 |
@@ -200,20 +201,48 @@ against the rest of the hand-off (kinds, application, repository, D1 ids, migrat
 A legacy hand-off without `descriptors` is rebuilt from the deploy call's own `phase_state.inputs`, never from the verify call's inputs; missing identity
 fails closed. For leg kinds the legacy rebuild uses the verify run's id in the (uncontended) rollback group name — the only documented difference.
 
-### Real-runner evidence pinned to `506c101` (immutable code SHA; later commits on this branch are docs only)
+### Lock identity across Deploy → Verify → Rollback
 
-Disposable `firstsun-dev/cf-v2-scratch-caller`, public workflow and `tools_ref` both `506c101bbb2341a84136cd2488549f177fc1876d`, jobs on the org's
-provisioned `linux` runners (`heavenweb-runner-*`, pnpm baked in — this is what unblocked Build Validation, which hosted `ubuntu-latest` cannot run).
-No Cloudflare credentials existed, so nothing remote was touched.
+* **Job-level locks.** Persistent Dev's Deploy and Rollback groups are `cfv2-dev-<repo>-<d1_lock_scope or app>`. `restoreDescriptors` requires the handed-over
+  descriptor to carry exactly that, rebuilt from the current repository, the deploy call's application and the deploy call's `d1_lock_scope` — a modified
+  deploy/rollback group, another repository, another application or a changed scope is rejected. A verify call has no input that can pick another Dev lock.
+* **Run-level (top-level `concurrency`) lock.** GitHub evaluates it *before any job*, so no Plan check can repair it. For a verify call the expression is therefore the
+  deploy expression applied to `phase_state.inputs` (never `phase_state.group`); `delivery.mjs runLockGroup` is its tested twin (512 scenarios, deploy and verify
+  mode, rendered from the real YAML). The Plan job then requires `phase_state.group` to equal that value (a `cfv2-run-<id>` fallback group only has to be numeric).
+* **Trust boundary (explicit).** `phase_state.inputs` is caller-supplied data. It is the *source* of the scheduling-time lock, so a caller that edits it chooses a lock
+  exactly as it could by calling the workflow with a different `d1_lock_scope` directly; GitHub concurrency is cooperative serialisation, not authorisation. What is
+  guaranteed: a stale, malformed or inconsistent hand-off (group, descriptor, D1, owner, repository, application) cannot silently join or create a different lock and
+  fails the Plan closed, and verifying from another ref/event than the deploy ran on is refused (its derived lock would differ from `phase_state.group`).
+  A group string that merely *claims* another lock is ignored for scheduling (see the queue evidence below).
+
+### CLI contract
+
+`cli.mjs` writes workflow annotations (`::error::`, `::warning::`, `::notice::`, `::add-mask::`) to **stderr**; **stdout carries only `key=value` records** and is what the
+workflow pipes into `$GITHUB_OUTPUT`. A rejected input therefore exits non-zero with the original message and writes nothing to the output file (previously GitHub added
+`Unable to process file command 'output'`). The job harness now enforces GitHub's output-file format, so any regression fails the chain tests. `parse-env.mjs` keeps its
+documented stdout contract (its stdout never feeds an output file). Legacy `phase_state` (no `descriptors`): migration ownership is reconstructed per physical D1 only
+when every member kind's migration result proves the same owner on the same D1; missing, conflicting or foreign evidence fails closed; hand-offs without D1 migrations
+stay valid. `test.sh full` does not start Chain when Fast failed.
+
+### Real-runner evidence pinned to `8ad9f5f7b2ab83ea40200c7a4ccf625bbcb03d9b` (final implementation SHA; later commits are docs only)
+
+Disposable `firstsun-dev/cf-v2-scratch-caller`; public workflow and `tools_ref` both the SHA above; jobs on the org's provisioned `linux` runners (`heavenweb-runner-*`, pnpm
+baked in). No Cloudflare credentials existed, so nothing remote was touched.
 
 | Run | What it proves | Observed |
 | --- | --- | --- |
-| [41056958707](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41056958707) | Cross-repo nested call resolves; verify with a real deploy-phase `phase_state` (smoke_mode=skip) while the verify call uses the default `full` | success; Plan, Smoke ran on org runners; `deploy_smoke_level=skipped`, `deploy_verified=false`, `deploy_published_unverified=true` |
-| [41056964707](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41056964707) | Tampered descriptor D1 | Plan fails: `descriptor for production binds D1 'FOREIGN' but the hand-off recorded 'REAL-DB'`; delivery skipped |
-| [41057340143](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41057340143) | Real `deploy` → `verify` chain, persistent Dev, `d1_lock_scope: shared-db` | Build Validation, Gate, Plan succeed; Deploy fails closed (`dev credentials not provided`); the real `phase_state` carries `deploy_group = rollback_group = cfv2-dev-firstsun-dev/cf-v2-scratch-caller-shared-db`, `smoke_mode: skip`, `phase: deploy`; the verify call (no scope input) restores it and its Plan and Smoke succeed |
+| [41062254408](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41062254408) | Valid deferred verify handoff; nested reusable workflows; public outputs; deploy `smoke_mode=skip` kept although the verify call defaults to `full` | success; `deploy_smoke_level=skipped`, `deploy_verified=false`, `deploy_published_unverified=true`, `deploy_url` present |
+| [41062261540](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41062261540) | Forged `phase_state.group` | Plan fails with `phase_state.group 'attacker-group' is not the lock identity the deploy inputs imply ('cfv2-prod-scratch')`; no `Unable to process file command`; delivery skipped |
+| [41062268866](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41062268866) | Tampered D1 metadata | Plan fails with `descriptor for production binds D1 'FOREIGN' but the hand-off recorded 'REAL-DB'`; no output-file error; delivery skipped |
+| the three runs above, dispatched back-to-back | Scheduling-time lock | They ran strictly one after another (valid run first; the forged-group run stayed `pending`/`queued` until it finished, then failed; then the tampered run): the forged group string did **not** create a separate lock — all three shared the lock derived from `phase_state.inputs` (`cfv2-prod-scratch`) |
+| [41062278092](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41062278092) | Real `deploy` → `verify` chain, persistent Dev, `d1_lock_scope: shared-db` | Build Validation, Gate, Plan succeed; Deploy fails closed (`dev credentials not provided`); the real `phase_state` has `group: cfv2-shared-dev-scratch` and persistent Dev `deploy_group = rollback_group = cfv2-dev-firstsun-dev/cf-v2-scratch-caller-shared-db`; the verify call (no scope input) restores it; its Plan and Smoke succeed |
 
-**Not demonstrable here and therefore NOT claimed:** live D1 migration, URL resolution against the Workers subdomain API, publish, smoke against a live
-Worker, rollback and recovery — they need approved non-production Cloudflare credentials and are covered only by the local suites above.
+Local suites on the same code: 404 chain checks, 131 Node tests, 626 workflow-contract checks (`test.sh full` = 1m53s). CI on the SHA: [run 41061646039](https://github.com/firstsun-dev/.github/actions/runs/41061646039)
+(3m17s; actionlint and shellcheck green).
+
+**Not demonstrable here and therefore NOT claimed:** live D1 migration, URL resolution against the Workers subdomain API, publish, smoke against a live Worker, rollback and
+recovery — they need approved non-production Cloudflare credentials and are covered only by the local suites. The queue timeline shows GitHub's behaviour for the scheduling
+lock on `workflow_dispatch` callers; it was not exercised for every event type.
 
 ## Known limitations
 
