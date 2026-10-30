@@ -140,12 +140,16 @@ for s, st in CALL_STAGE.items():
         check(w["stage"] == st and w["kind"] == k and w["target"] == LEG[k]["target"], f"{s}_{KK(k)}: stage={st}, kind={k}, target={LEG[k]['target']} are static literals (bound once, not from application env)")
         check(render(w["environment"], scenario()) == LEG[k]["environment"], f"{s}_{KK(k)}: GitHub Environment is {LEG[k]['environment']}")
 RANK = {"none": 0, "read": 1, "write": 2}
+need = {}
+for dj in djobs.values():
+    for p_, v in dj.get("permissions", {}).items():
+        need[p_] = max(need.get(p_, 0), RANK[v])
 for n, j in jobs.items():
     if "uses" not in j:
         continue
     cp = j.get("permissions", {})
-    ok = all(RANK[cp.get(p, "none")] >= RANK[v] for dj in djobs.values() for p, v in dj.get("permissions", {}).items() if dj.get("if", "").find(f"'{CALL_STAGE[n.split('_')[0]]}'") >= 0)
-    check(ok, f"{n}: the calling job's permissions cover what the called jobs of its stage request (permission ceiling)")
+    check(all(RANK[cp.get(p_, "none")] >= r_ for p_, r_ in need.items()),
+          f"{n}: the calling job's permissions cover EVERY job of the called workflow (GitHub validates the ceiling for all jobs, including ones skipped by `if` - a lower ceiling is a startup_failure; found by the real-runner scratch run)")
 check(len(text_all.splitlines()) <= 1500, f"the workflow stays thin ({len(text_all.splitlines())} lines)")
 
 # ---------------------------------------------------------------- 2. one deployment implementation

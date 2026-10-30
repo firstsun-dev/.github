@@ -763,9 +763,10 @@ jobs:
     needs: [gate, plan]
     if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.gate.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.on_production == 'true'
     uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions:
+    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
       contents: read
-      deployments: read
+      deployments: write
+      pull-requests: write
     with:
       stage: preflight
       kind: production
@@ -787,9 +788,10 @@ jobs:
     needs: [gate, plan]
     if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.gate.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.on_native_branch == 'true'
     uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions:
+    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
       contents: read
-      deployments: read
+      deployments: write
+      pull-requests: write
     with:
       stage: preflight
       kind: native-branch
@@ -811,9 +813,10 @@ jobs:
     needs: [gate, plan]
     if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.gate.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.on_native_dev == 'true'
     uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions:
+    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
       contents: read
-      deployments: read
+      deployments: write
+      pull-requests: write
     with:
       stage: preflight
       kind: native-dev
@@ -835,9 +838,10 @@ jobs:
     needs: [gate, plan]
     if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.gate.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.on_persistent_dev == 'true'
     uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions:
+    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
       contents: read
-      deployments: read
+      deployments: write
+      pull-requests: write
     with:
       stage: preflight
       kind: persistent-dev
@@ -864,9 +868,10 @@ jobs:
     needs: [plan, preflight_production, preflight_native_branch, preflight_native_dev, preflight_persistent_dev]
     if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.plan.result == 'success' && needs.plan.outputs.owns_production == 'true'
     uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions:
+    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
       contents: read
-      deployments: read
+      deployments: write
+      pull-requests: write
     with:
       stage: migrate
       kind: production
@@ -891,9 +896,10 @@ jobs:
     needs: [plan, preflight_production, preflight_native_branch, preflight_native_dev, preflight_persistent_dev]
     if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.plan.result == 'success' && needs.plan.outputs.owns_native_branch == 'true'
     uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions:
+    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
       contents: read
-      deployments: read
+      deployments: write
+      pull-requests: write
     with:
       stage: migrate
       kind: native-branch
@@ -918,9 +924,10 @@ jobs:
     needs: [plan, preflight_production, preflight_native_branch, preflight_native_dev, preflight_persistent_dev]
     if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.plan.result == 'success' && needs.plan.outputs.owns_native_dev == 'true'
     uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions:
+    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
       contents: read
-      deployments: read
+      deployments: write
+      pull-requests: write
     with:
       stage: migrate
       kind: native-dev
@@ -945,9 +952,10 @@ jobs:
     needs: [plan, preflight_production, preflight_native_branch, preflight_native_dev, preflight_persistent_dev]
     if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.plan.result == 'success' && needs.plan.outputs.owns_persistent_dev == 'true'
     uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions:
+    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
       contents: read
-      deployments: read
+      deployments: write
+      pull-requests: write
     with:
       stage: migrate
       kind: persistent-dev
