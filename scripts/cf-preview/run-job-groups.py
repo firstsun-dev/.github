@@ -72,7 +72,9 @@ def build(pre, secs, idx):
         for s in body:
             if _is_setup(s, defined) or n == idx:
                 keep.append(s)
-    return ast.unparse(ast.fix_missing_locations(ast.Module(body=list(pre) + keep, type_ignores=[])))
+    code = ast.unparse(ast.fix_missing_locations(ast.Module(body=list(pre) + keep, type_ignores=[])))
+    # every group process writes its own JOBRUNNER_PERF report (the file's own write_perf_report() call sits in the last section only)
+    return code + "\nimport atexit as _atexit\n_atexit.register(write_perf_report)\n"
 
 
 def main():

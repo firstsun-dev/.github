@@ -145,6 +145,30 @@ Not demonstrable on GitHub-hosted runners without Cloudflare credentials (and so
 subdomain API, the build, effective-config audit and D1 binding checks, migration, publish, smoke against a live Worker, rollback. Those are proven
 only by the local suites above.
 
+## Test profiles and measured performance (PR #89 refactor)
+
+`scripts/cf-preview/test.sh fast|chain|full` is the single entrypoint used by CI and by agents (logs go to `$LOGDIR`, only summaries print).
+`fast` = static workflow contract, unit tests (`lib.test.mjs`, `delivery.test.mjs`), stub shell tests, GC unit tests (~10 s).
+`chain` = the real-shell Migration → Deploy → Smoke → Rollback scenarios of `test-jobs.py`, run as 7 independent groups in parallel
+(`run-job-groups.py`; every scenario already owns fresh workspaces, so groups share no mutable state). `full` = both; it is the only profile
+that satisfies the required `contract` check (a skipped Full cannot pass the merge gate: there is one job).
+Set `JOBRUNNER_PERF=<file>` to get a JSON report of subprocesses by command category/engine phase, workspaces and jobs.
+
+| Metric (same 379 assertions) | Before | After |
+| --- | --- | --- |
+| `test-jobs.py` wall time (32-core dev box) | ~6 min (398 s measured under load; ~170 s serial on a quiet box) | ~94 s (7 parallel groups) |
+| Fast profile | not separated | ~10 s |
+| Whole CI job (GitHub-hosted, incl. setup, lint) | not measured on this branch | 2m29s – 4m13s |
+| Subprocesses in `test-jobs.py` | 7180 | 7564 (**+5 %**: the extra engine gate steps) |
+| Workspaces created | 1408 | 1412 |
+
+Honest reading: the speed-up is parallelism plus the Fast/Full split; the subprocess **count was not reduced**. Measured CPU hot spots
+(share of subprocess time): `engine.sh init` 36 % (213 ms avg, 697 calls — up to six Node processes per call), `build` 14 %, `prepare` 7 %.
+Next measured lever: one Node process for all `init` checks (descriptor, classify, kinds, URL isolation, env parsing).
+
+Pure decisions now unit-tested in `delivery.mjs` (instead of inline shell/jq): target descriptor, migration peer gate, migration-used
+resolution, verification outcome, Production rollback guard, rollback verdict.
+
 ## Known limitations
 
 * **Hosted runners lack `pnpm`.** `actions/setup` with `setup-pnpm: 'false'` (used by every validation job and the engine) assumes a runner image with pnpm

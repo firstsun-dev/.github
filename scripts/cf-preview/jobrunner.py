@@ -28,6 +28,9 @@ PERF = {"subprocess": {}, "workspaces": 0, "jobs": {}, "scenario": ""}
 
 def _category(script):
     """Coarse command category of a step script: the first engine/CLI entry point it calls, else 'inline'."""
+    m = re.search(r'engine\.sh"? +([a-z][\w-]*)', script)
+    if m:
+        return f"engine:{m.group(1)}"
     for key in ("engine.sh", "cli.mjs", "build.sh", "publish.sh", "migrate.sh", "smoke.sh", "probe.sh", "gh.sh", "pnpm", "node"):
         if key in script:
             return key
