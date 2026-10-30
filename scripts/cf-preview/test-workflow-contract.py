@@ -338,6 +338,7 @@ check(jobs["deploy"]["environment"]["url"] == "${{ steps.engine.outputs.url }}",
 check(dj["environment"]["name"] == "${{ inputs.app_name }}/dev" == jobs["persistent-dev"]["environment"], "Shared Dev runs in the same protected <app>/dev Environment as persistent Dev")
 check(dj["permissions"]["contents"] == "read" and "pull-requests" not in dj["permissions"], "Shared Dev is read-only on contents and writes no PR comments")
 check(all(j.get("permissions", {}).get("contents", "read") == "read" for n, j in jobs.items() if n != "release"), "no job except Release can write repository contents")
+check(jobs["migration"].get("permissions", {}).get("deployments") in ("read", "write") and jobs["migration"]["permissions"].get("deployments") != "write", "Migration can READ (not write) Deployments: the Preview identity guard reads the ledger owner on branch pushes (HTTP 403 otherwise)")
 check("contents: write" not in yaml.dump({k: jobs[k] for k in jobs if k != "release"}) and not any(w in text_all for w in ("lock.sh", "cfv2-locks", "refs/cfv2")), "no custom Git-ref lock and no content-write permission outside Release")
 for name in VALIDATION + ["lifecycle"]:
     text = yaml.dump(jobs[name])
