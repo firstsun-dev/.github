@@ -427,7 +427,7 @@ jobs:
   rollback:
     name: Revert on Verify Failure
     needs: [deploy, smoke]
-    if: always() && inputs.stage == 'deliver' && inputs.phase != 'deploy' && needs.smoke.outputs.smoke_status == 'failure'
+    if: always() && inputs.stage == 'deliver' && inputs.phase != 'deploy' && needs.smoke.outputs.smoke_status == 'failure' && (inputs.kind != 'production' || fromJSON(inputs.inputs_json).production_rollback_policy == 'automatic') && fromJSON(needs.smoke.outputs.smoke_json || '{}').gate_blocked != 'true'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     concurrency:

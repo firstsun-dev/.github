@@ -235,7 +235,7 @@ check(dep0["id"] == "dep" and "OWN_RESULT" in dep0["env"] and "OWNER_RESULT" in 
       "Deploy: first step requires the migration result of THIS kind's D1 (own, or the shared-D1 owner's) to be success AND to name the right kind and D1 id (per-D1 gating, never a global needs)")
 sm_if = lambda inputs, deploy_res="success": bool(ev(djobs["smoke"]["if"], Ctx({"inputs": dict({"stage": "deliver", "phase": "all"}, **inputs), "needs": {"deploy": {"result": deploy_res, "outputs": {}}}}, {})))
 check(sm_if({}) and sm_if({"phase": "verify"}) and not sm_if({"phase": "deploy"}) and not sm_if({"stage": "migrate"}) and sm_if({}, "failure"), "Smoke: runs in all and verify phases (even when Deploy failed: nothing published -> smoke_status none), never in the deploy phase or another stage")
-rb_if = lambda status, inputs=None: bool(ev(djobs["rollback"]["if"], Ctx({"inputs": dict({"stage": "deliver", "phase": "all"}, **(inputs or {})), "needs": {"smoke": {"result": "x", "outputs": {"smoke_status": status}}}}, {})))
+rb_if = lambda status, inputs=None: bool(ev(djobs["rollback"]["if"], Ctx({"inputs": dict({"stage": "deliver", "phase": "all", "kind": "native-branch", "inputs_json": "{}"}, **(inputs or {})), "needs": {"smoke": {"result": "x", "outputs": {"smoke_status": status}}}}, {})))
 check(rb_if("failure") and not rb_if("success") and not rb_if("none") and not rb_if("") and not rb_if("failure", {"phase": "deploy"}), "Rollback: only after THIS call's Smoke FAILED (conditional, never on the happy path, never in the deploy phase)")
 rgo = djobs["rollback"]["steps"][0]
 check(rgo["id"] == "go" and "POLICY_OK" in rgo["run"] and "gate_blocked" in rgo["run"] and "published" in rgo["run"],
