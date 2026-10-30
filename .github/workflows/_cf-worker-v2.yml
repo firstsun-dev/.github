@@ -634,6 +634,7 @@ jobs:
       name: ${{ github.ref == 'refs/heads/main' && format('{0}/prod', inputs.app_name) || format('{0}/preview', inputs.app_name) }}
     permissions:
       contents: read
+      deployments: read # Preview identity guard reads the ledger owner on branch pushes (no ledger entry is written here)
     outputs:
       migration: ${{ steps.engine.outputs.migration }}
       schema_changed: ${{ steps.engine.outputs.schema_changed }}
