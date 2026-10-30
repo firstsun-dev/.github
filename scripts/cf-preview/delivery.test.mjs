@@ -4,7 +4,7 @@ import {
   DELIVERY_KINDS, resolveDeliveryTargets, resolveSmokeMode, parseSmokeOverrides, planMigrations, branchPreviewIdentity, ENGINE_TARGET,
   canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins,
   targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor, checkPeerPreflights, resolveMigrationUsed,
-  isContentLevel, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors, validateInit,
+  isContentLevel, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
 } from '../../actions/cf-preview/delivery.mjs';
 
 const base = { event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-preview', previewOnPush: true };
@@ -400,12 +400,14 @@ const deployState = (over = {}, kinds = ['native-branch', 'native-dev'], dOver =
     kinds, app: 'app', runId: 11, repo: REPO, lockScope: 'shared-db', smokeMode: 'skip', phase: 'deploy',
     groups: [{ databaseId: 'DB1', members: kinds, owner: kinds[0] }], ...dOver,
   });
+  const inputs = { app_name: 'app', d1_lock_scope: 'shared-db', smoke_mode: 'skip', deployment_strategy: 'hybrid', preview_on_branch_push: true, d1_migrations: true };
   return {
-    inputs: { app_name: 'app', d1_lock_scope: 'shared-db', smoke_mode: 'skip' }, kinds, d1: Object.fromEntries(kinds.map((k) => [k.replace(/-/g, '_'), 'DB1'])),
+    inputs, group: runLockGroup({ ...EV, inputs, runId: 11 }), kinds, d1: Object.fromEntries(kinds.map((k) => [k.replace(/-/g, '_'), 'DB1'])),
     migration: Object.fromEntries(kinds.map((k) => [`mj_${k.replace(/-/g, '_')}`, JSON.stringify({ kind: kinds[0], d1_id: 'DB1' })])), descriptors, ...over,
   };
 };
-const R = (state) => restoreDescriptors(state, { repo: REPO, runId: 99 });
+const EV = { event: 'push', ref: 'refs/heads/feat/x' };
+const R = (state, o = {}) => restoreDescriptors(state, { repo: REPO, runId: 99, ...EV, ...o });
 
 test('deferred verify: deployment-time policy survives (smoke skip, lock scope, owner, D1, groups); only the phase changes', () => {
   const st = deployState();
@@ -437,7 +439,7 @@ test('deferred verify: tampering is rejected (kind set, cross-target injection, 
 
 test('deferred verify: wrong repository, wrong phase, schema violations and missing identity fail closed', () => {
   const st = deployState({}, ['persistent-dev']);
-  assert.throws(() => restoreDescriptors(st, { repo: 'evil/r', runId: 1 }), /another repository/);
+  assert.throws(() => R(st, { repo: 'evil/r' }), /carries lock/);
   const allPhase = deployState({}, ['native-branch'], { phase: 'all' });
   assert.throws(() => R(allPhase), /only a deploy-phase descriptor/);
   const already = deployState({}, ['native-branch'], { phase: 'verify' });
@@ -461,7 +463,8 @@ test('deferred verify: a legacy hand-off (no descriptors) is rebuilt ONLY from t
   assert.equal(r['native-dev'].phase, 'verify');
   const pd = R({ ...deployState({}, ['persistent-dev']), descriptors: undefined });
   assert.equal(pd['persistent-dev'].deploy_group, 'cfv2-dev-o/r-shared-db');
-  assert.throws(() => R({ ...legacy, inputs: { app_name: 'app', smoke_mode: 'maybe' } }), /smoke_mode/);
+  const badIn = { ...legacy.inputs, smoke_mode: 'maybe' };
+  assert.throws(() => R({ ...legacy, inputs: badIn, group: runLockGroup({ ...EV, inputs: badIn, runId: 11 }) }), /smoke_mode/);
   assert.throws(() => R({ ...legacy, inputs: { smoke_mode: 'skip' } }), /app_name is missing/);
 });
 
@@ -545,4 +548,113 @@ test('init: deferred verify identity inputs must equal the deploy call\'s; a des
   assert.equal(INIT({ descriptor: JSON.stringify(d) }).smokeMode, 'skip', 'the smoke policy comes from the descriptor');
   initFails(/is for production, not native-branch/, { descriptor: JSON.stringify(targetDescriptor({ kind: 'production', app: 'app', runId: 1 })) });
   initFails(/D1 id differs/, { descriptor: JSON.stringify({ ...d, d1_expected_id: 'X', d1_owner_kind: '' }) });
+});
+
+// ---- lock identity integrity across Deploy -> Verify -> Rollback -------------------------------------------------------------
+const PD = (o = {}, i = {}) => deployState({ inputs: { ...deployState().inputs, shared_dev_on_branch_push: true, preview_on_branch_push: false, ...i }, ...o }, ['persistent-dev']);
+
+test('lock identity: run-level group follows the same rule as the workflow (scope or app, channel, ref)', () => {
+  const I = { app_name: 'blog', deployment_strategy: 'hybrid', preview_on_branch_push: true, d1_migrations: true };
+  assert.equal(runLockGroup({ event: 'push', ref: 'refs/heads/main', inputs: I, runId: 1 }), 'cfv2-prod-blog');
+  assert.equal(runLockGroup({ event: 'push', ref: 'refs/heads/main', inputs: { ...I, d1_lock_scope: 'shared-db' }, runId: 1 }), 'cfv2-prod-shared-db');
+  assert.equal(runLockGroup({ event: 'push', ref: 'refs/heads/x', inputs: { ...I, d1_lock_scope: 'shared-db' }, runId: 1 }), 'cfv2-nonprod-d1-shared-db');
+  assert.equal(runLockGroup({ event: 'push', ref: 'refs/heads/x', inputs: { ...I, d1_migrations: false, shared_dev_on_branch_push: true }, runId: 1 }), 'cfv2-shared-dev-blog');
+  assert.equal(runLockGroup({ event: 'push', ref: 'refs/heads/x', inputs: { ...I, d1_migrations: false }, runId: 1 }), 'cfv2-blog-preview-x');
+  assert.equal(runLockGroup({ event: 'pull_request', ref: 'refs/pull/1/merge', inputs: I, runId: 7 }), 'cfv2-run-7');
+  assert.equal(runLockGroup({ event: 'push', ref: 'refs/tags/v1', inputs: I, runId: 7 }), 'cfv2-run-7');
+  assert.equal(runLockGroup({ event: 'workflow_dispatch', ref: 'refs/heads/dev', inputs: { ...I, dispatch_target: 'persistent-dev' }, runId: 7 }), 'cfv2-run-7');
+});
+
+test('lock identity: same Deploy/Verify d1_lock_scope -> same effective lock; a verify default never selects another', () => {
+  const st = PD();
+  const r = R(st)['persistent-dev'];
+  assert.equal(r.deploy_group, 'cfv2-dev-o/r-shared-db');
+  assert.equal(r.rollback_group, r.deploy_group);
+  assert.equal(st.group, 'cfv2-nonprod-d1-shared-db', 'the run-level group is also keyed by the deploy-time scope');
+  // restoring takes ONLY the hand-off: there is no verify-call input to override the scope
+  assert.equal(R(PD())['persistent-dev'].deploy_group, r.deploy_group);
+});
+
+test('lock identity: modified Persistent Dev group, rollback group, repository and application are rejected', () => {
+  const st = PD();
+  const tamper = (patch) => ({ ...st, descriptors: { 'persistent-dev': { ...st.descriptors['persistent-dev'], ...patch } } });
+  assert.throws(() => R(tamper({ deploy_group: 'cfv2-dev-o/r-other', rollback_group: 'cfv2-dev-o/r-other' })), /carries lock/);
+  assert.throws(() => R(tamper({ rollback_group: 'cfv2-dev-o/r-other' })), /rollback_group|concurrency groups|carries lock/);
+  assert.throws(() => R(tamper({ deploy_group: 'cfv2-dev-o/r-app', rollback_group: 'cfv2-dev-o/r-app' })), /carries lock/, 'the scope-less lock is a different lock');
+  assert.throws(() => R(st, { repo: 'evil/r' }), /carries lock/);
+  assert.throws(() => R({ ...st, inputs: { ...st.inputs, app_name: 'other' } }), /another application|phase_state.group|carries lock/);
+  assert.throws(() => R({ ...st, inputs: { ...st.inputs, d1_lock_scope: '' } }), /carries lock|phase_state.group/, 'a different deploy-time scope is not the original lock');
+});
+
+test('lock identity: phase_state.group must be the lock the deploy inputs imply (inconsistent / forged / missing -> rejected)', () => {
+  const st = deployState();
+  for (const g of ['cfv2-prod-app', 'attacker-group', '', undefined, 'cfv2-nonprod-d1-other']) assert.throws(() => R({ ...st, group: g }), /phase_state.group/);
+  assert.doesNotThrow(() => R(st));
+  // no branch push (e.g. a rerun on a PR event): only the numeric cfv2-run-<id> shape is acceptable
+  const pr = { event: 'pull_request', ref: 'refs/pull/1/merge' };
+  assert.doesNotThrow(() => R({ ...st, group: 'cfv2-run-123' }, pr));
+  assert.throws(() => R({ ...st, group: 'cfv2-run-abc' }, pr), /phase_state.group/);
+  assert.throws(() => R({ ...st, group: 'cfv2-nonprod-d1-shared-db' }, pr), /phase_state.group/);
+  // verifying from another ref/event than the deploy ran on cannot silently join a different lock
+  assert.throws(() => R(st, { ref: 'refs/heads/main' }), /phase_state.group/);
+});
+
+test('lock identity: Native Branch / Native Dev / Production restore exactly as before', () => {
+  for (const k of ['native-branch', 'native-dev', 'production']) {
+    const st = deployState({}, [k]);
+    const r = R(st)[k];
+    assert.equal(r.deploy_group, st.descriptors[k].deploy_group);
+    assert.equal(r.rollback_group, `${st.descriptors[k].deploy_group}-rollback`);
+    assert.equal(r.phase, 'verify');
+  }
+});
+
+// ---- legacy hand-off (no descriptors): migration ownership is reconstructed only from proof ---------------------------------------
+const legacyOf = (o = {}, kinds = ['native-branch', 'native-dev']) => { const { descriptors, ...l } = deployState(o, kinds); return l; };
+const mj = (kind, d1 = 'DB1') => JSON.stringify({ migration: 'applied', kind, d1_id: d1 });
+
+test('legacy migration ownership: no D1 -> valid, empty owner; D1 migrations disabled -> no ownership needed', () => {
+  const noD1 = legacyOf({ inputs: { ...deployState().inputs, d1_migrations: false }, d1: {}, migration: {} });
+  const r = R({ ...noD1, group: runLockGroup({ ...EV, inputs: noD1.inputs, runId: 1 }) });
+  assert.equal(r['native-dev'].d1_expected_id, '');
+  assert.equal(r['native-dev'].d1_owner_kind, '');
+  assert.equal(r['native-dev'].owns_migration, false);
+});
+
+test('legacy migration ownership: one D1 shared by Native Branch and Native Dev -> the proven owner and member relationship', () => {
+  const r = R(legacyOf());
+  assert.equal(r['native-branch'].d1_owner_kind, 'native-branch');
+  assert.equal(r['native-branch'].owns_migration, true);
+  assert.equal(r['native-dev'].d1_owner_kind, 'native-branch');
+  assert.equal(r['native-dev'].owns_migration, false);
+  assert.equal(r['native-dev'].d1_expected_id, 'DB1');
+});
+
+test('legacy migration ownership: a single kind owns its own D1; distinct D1s have independent owners', () => {
+  const one = R(legacyOf({}, ['production']));
+  assert.equal(one.production.owns_migration, true);
+  const two = legacyOf({ d1: { native_branch: 'DB1', persistent_dev: 'DB2' }, migration: { mj_native_branch: mj('native-branch', 'DB1'), mj_persistent_dev: mj('persistent-dev', 'DB2') } }, ['native-branch', 'persistent-dev']);
+  const r = R(two);
+  assert.deepEqual([r['native-branch'].owns_migration, r['persistent-dev'].owns_migration], [true, true]);
+  assert.deepEqual([r['native-branch'].d1_expected_id, r['persistent-dev'].d1_expected_id], ['DB1', 'DB2']);
+});
+
+test('legacy migration ownership: conflicting, missing, foreign or self-contradicting evidence fails closed', () => {
+  const base = legacyOf();
+  assert.throws(() => R({ ...base, migration: { mj_native_branch: mj('native-branch'), mj_native_dev: mj('native-dev') } }), /conflicting migration owners/);
+  assert.throws(() => R({ ...base, migration: {} }), /no migration-owner evidence/);
+  assert.throws(() => R({ ...base, migration: { mj_native_branch: mj('native-branch'), mj_native_dev: JSON.stringify({ stale: 'true' }) } }), /no migration-owner evidence/);
+  assert.throws(() => R({ ...base, migration: { mj_native_branch: mj('native-branch'), mj_native_dev: mj('native-branch', 'OTHER') } }), /for D1 'OTHER'/);
+  assert.throws(() => R({ ...base, migration: { mj_native_branch: mj('production'), mj_native_dev: mj('production') } }), /not among the kinds/);
+  // The owner is whatever the hand-off consistently proves; a self-consistent swap cannot be told from the truth (it only changes the informational
+  // owns_migration of a verify descriptor - verify/rollback never run a migration). It is accepted, and only the consistent owner is reported:
+  const swapped = R({ ...base, migration: { mj_native_branch: mj('native-dev'), mj_native_dev: mj('native-dev') } });
+  assert.deepEqual([swapped['native-dev'].d1_owner_kind, swapped['native-dev'].owns_migration, swapped['native-branch'].owns_migration], ['native-dev', true, false]);
+});
+
+test('legacy migration ownership: D1 identity mismatch is rejected; the descriptor-based hand-off is unchanged', () => {
+  const base = legacyOf();
+  assert.throws(() => R({ ...base, d1: { native_branch: 'DB1', native_dev: 'DB2' } }), /conflicting migration owners|for D1/);
+  const withDesc = deployState();
+  assert.deepEqual(R(withDesc)['native-dev'], { ...withDesc.descriptors['native-dev'], phase: 'verify' });
 });

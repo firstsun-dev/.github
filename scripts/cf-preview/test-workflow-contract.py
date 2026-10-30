@@ -589,9 +589,36 @@ ps_val = OUTS["phase_state"]["value"]
 check(ps_val.count("toJSON(inputs)") == 1 and '"kinds"' in ps_val and '"d1"' in ps_val and all(f"jobs.delivery_{KK(k)}.outputs.handoff" in ps_val and f"jobs.delivery_{KK(k)}.outputs.migration_used" in ps_val for k in KINDS),
       "phase_state hands over the inputs once, the enabled kinds, each kind's OWN deploy / migration result, the per-kind D1 ids and the concurrency group")
 grp_expr = re.search(r"concurrency:\n  group: \$\{\{ (.*) \}\}\n  queue: max", text_all).group(1)
-base_expr = grp_expr.split("|| (", 1)[1].rsplit(")", 1)[0]
-check(grp_expr.startswith("inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).group || (") and base_expr in ps_val,
-      "concurrency: the verify call joins the SAME group the deploy call held (handed over in phase_state, computed from the same expression)")
+PHASE_IN = "fromJSON(inputs.phase_state).inputs."
+VPFX = "inputs.pipeline_phase == 'verify' && "
+rest = grp_expr[len(VPFX):] if grp_expr.startswith(VPFX) else ""
+splits = [i for i in range(len(rest)) if rest.startswith(" || ", i) and rest[i + 4:].replace("inputs.", PHASE_IN) == rest[:i]]
+base_expr = rest[splits[0] + 4:] if splits else ""
+base_core = base_expr[1:-1] if base_expr.startswith("(") and base_expr.endswith(")") else base_expr
+check(bool(splits) and "phase_state).group" not in grp_expr and base_core in ps_val,
+      "concurrency: the verify branch is EXACTLY the deploy expression applied to phase_state.inputs (never a caller-supplied group string), and the deploy call hands over the same expression's value")
+import itertools  # noqa: E402
+
+
+def lock_cases():
+    base = {"app_name": "blog", "deployment_strategy": "hybrid", "preview_on_branch_push": True, "shared_dev_on_branch_push": False, "shared_dev_native_preview_on_branch_push": False, "d1_migrations": False, "d1_lock_scope": "", "dispatch_target": ""}
+    for event, ref in (("push", "refs/heads/main"), ("push", "refs/heads/feat/x"), ("workflow_dispatch", "refs/heads/feat/x"), ("workflow_dispatch", "refs/heads/dev"), ("pull_request", "refs/pull/1/merge"), ("push", "refs/tags/v1")):
+        for strat, pre, sd, nd, d1, scope, dt in itertools.product(("hybrid", "production-only"), (True, False), (True, False), (True, False), (True, False), ("", "shared-db"), ("", "persistent-dev")):
+            if not (event == "workflow_dispatch" or dt == ""):
+                continue
+            yield event, ref, dict(base, deployment_strategy=strat, preview_on_branch_push=pre, shared_dev_on_branch_push=sd, shared_dev_native_preview_on_branch_push=nd, d1_migrations=d1, d1_lock_scope=scope, dispatch_target=dt)
+
+
+cases = list(lock_cases())
+GRP = "${{ " + grp_expr + " }}"
+yaml_deploy = [render(GRP, scenario(e, r, dict(i, pipeline_phase="all"))) for e, r, i in cases]
+yaml_verify = [render(GRP, scenario(e, r, {"app_name": "other", "d1_lock_scope": "ignored", "pipeline_phase": "verify", "phase_state": json.dumps({"inputs": i, "group": "IGNORED"})})) for e, r, i in cases]
+js_code = ("import('./actions/cf-preview/delivery.mjs').then(async m=>{let t='';for await(const c of process.stdin)t+=c;const c=JSON.parse(t);console.log(JSON.stringify(c.map(([e,r,i])=>m.runLockGroup({event:e,ref:r,inputs:i,runId:'1'}))))})")
+js_groups = json.loads(subprocess.run(["node", "-e", js_code], input=json.dumps(cases), capture_output=True, text=True, check=True).stdout)
+norm = lambda g: re.sub(r"^cfv2-run-.*$", "cfv2-run-N", g)
+check(len(cases) > 200 and [norm(g) for g in yaml_deploy] == [norm(g) for g in js_groups], f"concurrency: the workflow expression and delivery.mjs runLockGroup agree on all {len(cases)} event/ref/input scenarios (deploy call)")
+check(yaml_verify == yaml_deploy, "concurrency: a verify call computes the SAME lock as its deploy call from phase_state.inputs alone, ignoring its own app_name / d1_lock_scope and the handed-over group string")
+check(len({g for g in yaml_deploy if g.startswith("cfv2-prod-shared-db")}) == 1 and any(g == "cfv2-nonprod-d1-shared-db" for g in yaml_verify), "concurrency: the shared-D1 scope selects the lock in verify mode too")
 gate = astep("Cross-service gate")
 check(gate["id"] == "gate" and "inputs.stage == 'verify'" in gate["if"] and "'success'" in gate["if"] and "'skipped'" in gate["if"] and "exit 1" in gate["run"] and aidx("Cross-service gate") < aidx("Stale-SHA guard (start)")
       and DEPLOY_ACTION["outputs"]["gate_blocked"]["value"].startswith("${{ steps.gate.outputs.blocked"),

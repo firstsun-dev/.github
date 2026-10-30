@@ -387,6 +387,28 @@ export function rollbackVerdict({ target, rbResult = '', rbVerify = '', rbLevel 
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Run-level lock identity (the workflow's top-level `concurrency.group`). GitHub evaluates that expression BEFORE any job, so it can
+// only use data available at scheduling time. This is its JavaScript twin (a contract test renders the YAML expression and compares
+// both over a scenario matrix). For a verify call the YAML applies the same rule to the DEPLOY call's inputs (phase_state.inputs),
+// never to an arbitrary caller-supplied group string.
+// ---------------------------------------------------------------------------------------------------------------------
+export function runLockGroup({ event, ref, inputs, runId }) {
+  const s = (k) => (inputs?.[k] == null ? '' : String(inputs[k]));
+  const on = (k) => inputs?.[k] === true || inputs?.[k] === 'true';
+  const branch = String(ref ?? '').startsWith('refs/heads/');
+  const scope = s('d1_lock_scope') || s('app_name');
+  if ((event === 'push' || (event === 'workflow_dispatch' && s('dispatch_target') !== 'persistent-dev')) && branch) {
+    if (ref === 'refs/heads/main') return `cfv2-prod-${scope}`;
+    const nonProdOnly = s('deployment_strategy') !== 'production-only';
+    const channels = on('preview_on_branch_push') || on('shared_dev_on_branch_push') || on('shared_dev_native_preview_on_branch_push');
+    if (nonProdOnly && channels && on('d1_migrations')) return `cfv2-nonprod-d1-${scope}`;
+    if (nonProdOnly && (on('shared_dev_on_branch_push') || on('shared_dev_native_preview_on_branch_push'))) return `cfv2-shared-dev-${s('app_name')}`;
+    return `cfv2-${s('app_name')}-preview-${String(ref).slice('refs/heads/'.length)}`;
+  }
+  return `cfv2-run-${runId}`;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Deferred verification (pipeline_phase=verify): the descriptors of the DEPLOY call are the source of truth. The verify call
 // receives only phase_state; it must never re-derive deployment-time policy (smoke mode, lock scope, owner, D1) from its own
 // inputs. The only change allowed is the phase transition deploy -> verify.
@@ -401,13 +423,19 @@ const plainObject = (o) => o !== null && typeof o === 'object' && !Array.isArray
  * - Legacy hand-off (no `descriptors`): reconstructed ONLY from the deploy call's own `state.inputs` (never the verify call's);
  *   anything ambiguous or missing fails closed.
  */
-export function restoreDescriptors(state, { repo, runId = '0' }) {
+export function restoreDescriptors(state, { repo, runId = '0', event = '', ref = '' }) {
   if (!plainObject(state)) throw new Error('phase_state is not an object');
   if (!Array.isArray(state.kinds) || !state.kinds.length) throw new Error('phase_state names no delivery kind');
   const kinds = DELIVERY_KINDS.filter((k) => state.kinds.includes(k));
   if (kinds.length !== state.kinds.length || new Set(state.kinds).size !== state.kinds.length) throw new Error('phase_state.kinds contains an unknown or duplicate delivery kind');
   if (!plainObject(state.inputs) || !state.inputs.app_name) throw new Error('phase_state.inputs.app_name is missing: cannot bind the hand-off to an application');
   const app = String(state.inputs.app_name);
+  // The handoff's run-level group must be exactly what the deploy call's own inputs imply here (same rule as the workflow's top-level
+  // concurrency expression). A `cfv2-run-<id>` fallback group (no branch push) carries the deploy run's id, which only has to be numeric.
+  const expectedGroup = runLockGroup({ event, ref, inputs: state.inputs, runId });
+  if (expectedGroup.startsWith('cfv2-run-') ? !/^cfv2-run-\d+$/.test(String(state.group ?? '')) : state.group !== expectedGroup) {
+    throw new Error(`phase_state.group '${state.group}' is not the lock identity the deploy inputs imply ('${expectedGroup}'); refusing to verify under another lock`);
+  }
   const d1Of = (k) => (plainObject(state.d1) && state.d1[keyOf(k)] != null ? String(state.d1[keyOf(k)]) : null);
   const ownerOf = (k) => {
     const raw = plainObject(state.migration) ? state.migration[`mj_${keyOf(k)}`] : null;
@@ -420,7 +448,7 @@ export function restoreDescriptors(state, { repo, runId = '0' }) {
     const s = state.inputs;
     return buildDescriptors({
       kinds, app, runId, repo, lockScope: s.d1_lock_scope == null ? '' : String(s.d1_lock_scope),
-      d1ByKind: Object.fromEntries(kinds.map((k) => [k, d1Of(k) ?? ''])),
+      d1ByKind: Object.fromEntries(kinds.map((k) => [k, d1Of(k) ?? ''])), groups: legacyMigrationGroups(state, kinds, d1Of, ownerOf),
       smokeMode: s.smoke_mode ? String(s.smoke_mode) : 'full', smokeOverrides: s.smoke_mode_overrides == null ? '' : String(s.smoke_mode_overrides), phase: 'verify',
     });
   }
@@ -434,7 +462,12 @@ export function restoreDescriptors(state, { repo, runId = '0' }) {
     if (d.kind !== k) throw new Error(`descriptor filed under ${k} is for ${d.kind}`);
     if (d.phase !== 'deploy') throw new Error(`descriptor for ${k} is in phase '${d.phase}'; only a deploy-phase descriptor can be verified`);
     if (d.environment !== environmentName(app, k)) throw new Error(`descriptor for ${k} belongs to another application (${d.environment}, expected ${environmentName(app, k)})`);
-    if (k === 'persistent-dev' && !d.deploy_group.startsWith(`cfv2-dev-${repo}-`)) throw new Error(`descriptor for persistent-dev belongs to another repository (${d.deploy_group})`);
+    if (k === 'persistent-dev') { // the Dev lock is the legacy shared-D1 group of THIS repository and the deploy call's own scope / app
+      const want = concurrencyGroups(k, { runId, repo, app, lockScope: state.inputs.d1_lock_scope == null ? '' : String(state.inputs.d1_lock_scope) });
+      if (d.deploy_group !== want.deploy_group || d.rollback_group !== want.rollback_group) {
+        throw new Error(`descriptor for persistent-dev carries lock '${d.deploy_group}' / '${d.rollback_group}', expected '${want.deploy_group}' for repository ${repo}, application ${app} and the deploy call's d1_lock_scope`);
+      }
+    }
     const d1 = d1Of(k);
     if (d1 !== null && d1 !== d.d1_expected_id) throw new Error(`descriptor for ${k} binds D1 '${d.d1_expected_id}' but the hand-off recorded '${d1}'`);
     const owner = ownerOf(k);
@@ -526,4 +559,44 @@ function validateTargetConfig({ inputs, kind, target, previewSecrets }) {
     buildEnv: parse('CFV2_BUILD_ENV', buildEnvText), smokeEnv: parse('CFV2_SMOKE_ENV', s('smoke_env')),
     previewEnv: target === 'preview' && previewSecrets ? parse('CFV2_PS', previewSecrets) : null,
   };
+}
+
+/**
+ * Legacy hand-offs (no `descriptors`): the physical-D1 ownership the deploy call used, proven from the hand-off itself. Per D1 id, every
+ * member kind's migration result must name the SAME owner, the owner must be one of the members, the owner's own result must name itself,
+ * and each result must carry that D1 id. D1 migrations disabled -> no ownership is needed. Anything missing or conflicting fails closed:
+ * ownership is never invented and never silently left empty for a D1-enabled deployment.
+ */
+function legacyMigrationGroups(state, kinds, d1Of, ownerOf) {
+  const enabled = state.inputs.d1_migrations === true || state.inputs.d1_migrations === 'true';
+  if (!enabled) return [];
+  const byD1 = new Map();
+  for (const k of kinds) {
+    const id = d1Of(k);
+    if (!id) continue;
+    if (!byD1.has(id)) byD1.set(id, []);
+    byD1.get(id).push(k);
+  }
+  const resultOf = (k) => {
+    const raw = plainObject(state.migration) ? state.migration[`mj_${keyOf(k)}`] : null;
+    if (!raw) return null;
+    const m = typeof raw === 'string' ? (() => { try { return JSON.parse(raw); } catch { return null; } })() : raw;
+    return plainObject(m) ? m : null;
+  };
+  const groups = [];
+  for (const [id, members] of byD1) {
+    const owners = new Set();
+    for (const k of members) {
+      const m = resultOf(k);
+      if (!m || !m.kind) throw new Error(`legacy phase_state: no migration-owner evidence for ${k} (D1 ${id}) although d1_migrations was enabled; refusing to guess the owner`);
+      if (m.d1_id !== id) throw new Error(`legacy phase_state: the migration result of ${k} is for D1 '${m.d1_id}', not '${id}'`);
+      owners.add(String(m.kind));
+    }
+    if (owners.size !== 1) throw new Error(`legacy phase_state: conflicting migration owners [${[...owners]}] for D1 ${id}`);
+    const [owner] = owners;
+    if (!members.includes(owner)) throw new Error(`legacy phase_state: migration owner '${owner}' is not among the kinds [${members}] that use D1 ${id}`);
+    if (resultOf(owner)?.kind !== owner) throw new Error(`legacy phase_state: the owner's own migration result does not name itself (${owner})`);
+    groups.push({ databaseId: id, members, owner });
+  }
+  return groups;
 }

@@ -26,7 +26,7 @@ MANIFEST = {
     "migration-d1": 55,
     "shared-dev": 74,
     "chain-smoke-rollback": 54,
-    "deferred-verification": 39,
+    "deferred-verification": 50,
     "native-dev-smoke-modes": 48,
     "review-regressions": 34,
 }

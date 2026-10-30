@@ -13,6 +13,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 import time
@@ -129,6 +130,28 @@ def make_workspace(toml=APP_TOML, files=None):
     return ws
 
 
+_NAME = r"[A-Za-z_][\w.-]*"
+
+
+def output_file_violations(text):
+    """Lines GitHub's runner would reject in a $GITHUB_OUTPUT / $GITHUB_ENV file ("Unable to process file command 'output'"):
+    everything must be `name=value` or a `name<<DELIM ... DELIM` block."""
+    bad, delim = [], None
+    for line in text.splitlines():
+        if delim is not None:
+            if line == delim:
+                delim = None
+            continue
+        if not line.strip():
+            continue
+        m = re.match(rf"^({_NAME})<<(\S+)$", line)
+        if m:
+            delim = m.group(2)
+        elif not re.match(rf"^{_NAME}=", line):
+            bad.append(line[:120])
+    return bad
+
+
 def _parse_kv(path):
     out = {}
     if path.exists():
@@ -212,6 +235,10 @@ class _Run:
                 print(f"--- {label} rc={p.returncode}\n{p.stdout[-1500:]}\n{p.stderr[-1500:]}")
             outputs = _parse_kv(out_file)
             outcome = "success" if p.returncode == 0 else "failure"
+            malformed = output_file_violations(out_file.read_text())
+            if malformed:  # the real runner fails the step ("Invalid format"), so the harness does too
+                print(f"::error::Unable to process file command 'output' successfully. Invalid format '{malformed[0]}'", file=sys.stderr)
+                outcome = "failure"
             if sid:
                 ctx["steps"][sid] = {"outcome": outcome, "conclusion": outcome, "outputs": outputs}
             ctx["env"].update(_parse_kv(self.jobenv_file))

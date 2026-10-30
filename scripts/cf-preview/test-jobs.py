@@ -454,7 +454,7 @@ def verify_release(v, inputs=None):
 
 AUTO_P = {"production_rollback_policy": "automatic"}
 vdesc = lambda out: json.loads(out["raw"]["plan"]["outputs"]["descriptors"])
-forged = {"inputs": {"app_name": "app"}, "kinds": ["production"], "deploy": {"h_production": json.dumps({"published": "true", "url": "http://insecure.example", "published_sha": "0" * 40})}, "migration": {}}
+forged = {"inputs": {"app_name": "app"}, "kinds": ["production"], "group": "cfv2-prod-app", "deploy": {"h_production": json.dumps({"published": "true", "url": "http://insecure.example", "published_sha": "0" * 40})}, "migration": {}}
 
 # persistent Dev through the SAME deferred flow (previously a separate dev-deploy / dev-verify / dev-rollback trio)
 DEVI = dict(DEV_INPUTS, preview_on_branch_push=False)
@@ -1044,6 +1044,28 @@ def group_deferred_verification():
     legacy = {k: v_ for k, v_ in vst.items() if k != "descriptors"}
     lv = verify_call(json.dumps(legacy), dict(AUTO_P))
     check(lv["jobs"]["smoke"]["result"] == "success" and vdesc(lv)["production"]["smoke_mode"] == "full" and vdesc(lv)["production"]["phase"] == "verify", "deferred: a legacy phase_state (no descriptors) still verifies, rebuilt from the deploy call's own inputs")
+    # ---- Lock identity integrity: the scheduling-time lock and the handed-over group come from the DEPLOY call's metadata
+    for what, mut in (("a forged phase_state.group", lambda st: dict(st, group="attacker-group")),
+                      ("a group of another lock family", lambda st: dict(st, group="cfv2-nonprod-d1-app")),
+                      ("a missing phase_state.group", lambda st: {k: v_ for k, v_ in st.items() if k != "group"})):
+        tv = verify_call(json.dumps(mut(vst)), dict(AUTO_P))
+        check(tv["jobs"]["plan"]["result"] == "failure" and tv["jobs"]["smoke"]["result"] == "skipped" and not verify_release(tv), f"deferred: {what} fails the plan closed - nothing is smoked or released")
+    sched = lambda inputs, state: render(doc["concurrency"]["group"], ctx(MAIN, dict(AUTO_P, pipeline_phase="verify", phase_state=json.dumps(state), **inputs), PROD_SECRETS, {}))
+    check(sched({}, vst) == sched({"app_name": "other", "d1_lock_scope": "elsewhere"}, vst) == render(doc["concurrency"]["group"], ctx(MAIN, dict(AUTO_P), PROD_SECRETS, {})),
+          "deferred: the verify call's scheduling-time lock is derived from phase_state.inputs - its own app_name / d1_lock_scope and the handed-over group string cannot select another lock")
+    check(sched({}, dict(vst, group="IGNORED-BY-THE-EXPRESSION")) == sched({}, vst), "deferred: GitHub's top-level concurrency expression never reads phase_state.group")
+    pst = json.loads(pdv["state"])
+    pdd = pst["descriptors"]["persistent-dev"]
+    for what, mut in (("a modified Persistent Dev deploy group", lambda st: dict(st, descriptors={"persistent-dev": dict(pdd, deploy_group="cfv2-dev-o/r-other", rollback_group="cfv2-dev-o/r-other")})),
+                      ("a modified Persistent Dev rollback group", lambda st: dict(st, descriptors={"persistent-dev": dict(pdd, rollback_group="cfv2-dev-o/r-other")})),
+                      ("the scope-less Dev lock instead of the deploy-time scope", lambda st: dict(st, descriptors={"persistent-dev": dict(pdd, deploy_group="cfv2-dev-o/r-app", rollback_group="cfv2-dev-o/r-app")})),
+                      ("another repository's Dev lock", lambda st: dict(st, descriptors={"persistent-dev": dict(pdd, deploy_group="cfv2-dev-evil/r-shared-db", rollback_group="cfv2-dev-evil/r-shared-db")})),
+                      ("a deploy-time scope removed from the inputs", lambda st: dict(st, inputs=dict(st["inputs"], d1_lock_scope="")))):
+        tv = verify_call(json.dumps(mut(pst)), dict(DEVI, d1_lock_scope=""), ref=FEAT, toml=DEV_TOML)
+        check(tv["jobs"]["plan"]["result"] == "failure" and tv["jobs"]["smoke"]["result"] == "skipped", f"deferred: {what} in phase_state fails the plan closed")
+    ok_v = verify_call(json.dumps(pst), dict(DEVI, d1_lock_scope=""), ref=FEAT, toml=DEV_TOML)
+    check(ok_v["jobs"]["plan"]["result"] == "success" and json.loads(ok_v["raw"]["plan"]["outputs"]["descriptors"])["persistent-dev"]["deploy_group"] == "cfv2-dev-o/r-shared-db",
+          "deferred: the valid Persistent Dev hand-off verifies with the ORIGINAL shared-db lock although the verify call passes no scope")
     vv = deferred(inputs=AUTO_P, call_over={"phase_state": "{}"})
     check(vv["jobs"]["smoke"]["result"] == "skipped" and vv["jobs"]["rollback"]["result"] == "skipped" and not verify_release(vv), "deferred: an empty hand-off verifies nothing")
     vv = deferred(inputs=AUTO_P, call_over={"phase_state": json.dumps(forged)})

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// CLI used by _cf-worker-v2.yml. Prints key=value lines (GITHUB_OUTPUT-safe) or exits non-zero.
+// CLI used by _cf-worker-v2.yml. stdout carries ONLY key=value records (it is piped into $GITHUB_OUTPUT / captured by the shell); every
+// diagnostic and workflow annotation (::error:: / ::warning:: / ::notice:: / ::add-mask::) goes to stderr. Failure = non-zero exit.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import {
@@ -38,7 +39,7 @@ try {
         accountId: process.env.CLOUDFLARE_ACCOUNT_ID, token: process.env.CLOUDFLARE_API_TOKEN, worker: opt('worker'),
         base: process.env.CF_API_BASE || undefined,
       });
-      if (r.level === 'block') { console.log(`::error::${r.message}`); process.exit(1); }
+      if (r.level === 'block') { console.error(`::error::${r.message}`); process.exit(1); }
       console.log(r.level === 'ok' ? `::notice::${r.message}` : `::warning::${r.message}`);
       out({ preview_host: r.level });
       break;
@@ -56,8 +57,8 @@ try {
       const { errors, warnings } = auditPreviewConfig(readConfig(opt('config')), {
         allow: list(opt('allow')), denyResources: list(opt('deny')),
       });
-      for (const w of warnings) console.log(`::warning::${w}`);
-      for (const e of errors) console.log(`::error::${e}`);
+      for (const w of warnings) console.error(`::warning::${w}`);
+      for (const e of errors) console.error(`::error::${e}`);
       if (errors.length) process.exit(1);
       out({ preflight: 'ok' });
       break;
@@ -110,10 +111,10 @@ try {
       else {
         effective = source.env?.[opt('dev-env', 'dev')];
         if (!effective) throw new Error(`No effective config was generated and the source config has no env.${opt('dev-env', 'dev')}`);
-        console.log(`::notice::No adapter-generated config; auditing source env.${opt('dev-env', 'dev')}`);
+        console.error(`::notice::No adapter-generated config; auditing source env.${opt('dev-env', 'dev')}`);
       }
       const { errors } = auditDevConfig(effective, source, { worker: opt('worker'), denyResources: list(opt('deny')), allow: list(opt('allow')), prodUrl: opt('prod-url') });
-      for (const e of errors) console.log(`::error::${e}`);
+      for (const e of errors) console.error(`::error::${e}`);
       if (errors.length) process.exit(1);
       out({ dev_config: 'ok' });
       break;
@@ -145,8 +146,8 @@ try {
     }
     case 'audit-prod': {
       const { errors, warnings } = auditProdConfig(readConfig(opt('effective')), readConfig(opt('source')), { allow: list(opt('allow')) });
-      for (const w of warnings) console.log(`::warning::${w}`);
-      for (const e of errors) console.log(`::error::${e}`);
+      for (const w of warnings) console.error(`::warning::${w}`);
+      for (const e of errors) console.error(`::error::${e}`);
       if (errors.length) process.exit(1);
       out({ audit_prod: 'ok' });
       break;
@@ -181,7 +182,7 @@ try {
     case 'url-isolation': {
       // --kind K --env-var VAR (this kind's build env text) --urls JSON {kind:url}
       const bad = foreignUrlsInBuildEnv(assertKind(opt('kind')), process.env[opt('env-var')] ?? '', JSON.parse(opt('urls', '{}')));
-      for (const b of bad) console.log(`::error::build environment of ${opt('kind')}: ${b}; each target must be built with its own URLs`);
+      for (const b of bad) console.error(`::error::build environment of ${opt('kind')}: ${b}; each target must be built with its own URLs`);
       if (bad.length) process.exit(1);
       out({ url_isolation: 'ok' });
       break;
@@ -211,7 +212,7 @@ try {
       }
       const envText = opt('build-env') && existsSync(opt('build-env')) ? readFileSync(opt('build-env'), 'utf8') : '';
       const bad = checkBuildEnvOrigins(envText, url);
-      for (const b of bad) console.log(`::error::build environment of ${kind}: ${b}`);
+      for (const b of bad) console.error(`::error::build environment of ${kind}: ${b}`);
       if (bad.length) process.exit(1);
       out({ target_url: url, url_source: source });
       break;
@@ -224,7 +225,7 @@ try {
       let kinds;
       let restored = null; // verify: the DEPLOY call's own descriptors (validated); nothing is re-derived from this call's inputs
       if (opt('phase') === 'verify') {
-        restored = restoreDescriptors(JSON.parse(process.env.PHASE_STATE ?? '{}'), { repo: process.env.GITHUB_REPOSITORY ?? '', runId: opt('run-id', '0') });
+        restored = restoreDescriptors(JSON.parse(process.env.PHASE_STATE ?? '{}'), { repo: process.env.GITHUB_REPOSITORY ?? '', runId: opt('run-id', '0'), event: opt('event'), ref: opt('ref') });
         kinds = Object.keys(restored);
       } else {
         kinds = resolveDeliveryTargets({
@@ -271,7 +272,7 @@ try {
         const kinds = parse(e.KINDS, '[]');
         if (!Array.isArray(kinds)) throw new Error('kinds is not a JSON array');
         const bad = checkPeerPreflights(kinds, parse(e.PEERS, '{}'));
-        for (const b of bad) console.log(`::error::${b}`);
+        for (const b of bad) console.error(`::error::${b}`);
         if (bad.length) process.exit(1);
         out({ migration_gate: 'ok' });
       } else {
@@ -318,7 +319,7 @@ try {
       const env = (name, pairs) => { if (pairs?.length) appendFileSync(resolve(dir, name), pairs.map(([k, v]) => `${k}=${v}`).join('\n') + '\n', { mode: 0o600 }); };
       put('kind', r.kind); put('smoke_mode', r.smokeMode); put('stage', r.stage); put('d1_expect', r.d1Expect); put('target', r.target); put('mode', r.mode);
       env('build.env', r.buildEnv); env('smoke.env', r.smokeEnv); env('preview.env', r.previewEnv);
-      for (const [, v] of r.previewEnv ?? []) if (v) console.log(`::add-mask::${v}`);
+      for (const [, v] of r.previewEnv ?? []) if (v) console.error(`::add-mask::${v}`);
       out({ kind: r.kind, smoke_mode: r.smokeMode });
       break;
     }
@@ -330,6 +331,6 @@ try {
       process.exit(2);
   }
 } catch (e) {
-  console.log(`::error::${e.message}`);
+  console.error(`::error::${e.message}`);
   process.exit(1);
 }
