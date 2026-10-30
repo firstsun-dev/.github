@@ -127,8 +127,14 @@ Local (mocked Cloudflare/GitHub) — suites: `test-workflow-contract.py` (job gr
 permission ceiling, concurrency, interface compatibility, `pipeline_phase`), `test-jobs.py` (executes the real jobs and composite engine per call
 against stubs: all four kinds, simultaneous Branch + Native Dev, reversed completion order, one-target failure isolation, shared-D1 dedupe, URL
 pre-resolution, smoke full/basic/skip, rollback isolation and stale-deployment protection, Release gate, deferred `pipeline_phase`),
-`delivery.test.mjs`, `lib.test.mjs`, `test-*.sh`, `gc.test.mjs`, shellcheck, actionlint 1.7.12. Final counts and the real-runner runs are
-recorded in the PR (#89) description.
+`delivery.test.mjs`, `lib.test.mjs`, `test-*.sh`, `gc.test.mjs`, shellcheck, actionlint 1.7.12. Local gate at `e72ae91`+: contract 623, test-jobs 379, node (lib+delivery+gc) 114, test-deploy 84, migrate 26, smoke 49, parse-env 27, probe 20, gh 24 — all
+passing; actionlint 1.7.12 and shellcheck clean.
+
+**Real-runner evidence: NOT yet recorded.** The disposable private caller repo `firstsun-dev/cf-v2-scratch-caller` (pinned-SHA call of the public workflow,
+`runner: ubuntu-latest`, no Cloudflare secrets, plus a read-back job over every public output) could not be created: the repository-creation command was
+denied by the session's permission classifier twice. Until it runs, the following remain unproven on GitHub itself: `uses: ./.github/workflows/_cf-worker-delivery.yml`
+resolution from a cross-repository call, the permission ceiling, the rendered `phase_state` / output expressions, and that a hosted runner provides `pnpm`
+for `actions/setup` with `setup-pnpm: false` (it is baked into the org's `linux` runners). G1 stays BLOCKED on this item.
 
 ## Known limitations
 
