@@ -9,7 +9,7 @@ import {
 } from './lib.mjs';
 import {
   DELIVERY_KINDS, ENGINE_TARGET, assertKind, branchPreviewIdentity, canonicalOrigin, checkBuildEnvOrigins, environmentName, foreignUrlsInBuildEnv, planMigrations, resolveCanonicalUrl, resolveDeliveryTargets, resolveSmokeMode,
-  buildDescriptors, parseDescriptor, checkPeerPreflights, resolveMigrationUsed, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors, validateInit,
+  buildDescriptors, parseDescriptor, resolveMigrationUsed, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors, validateInit,
 } from './delivery.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -242,19 +242,17 @@ try {
           migrationsDirAbs: (d) => resolve(dirname(cfgPath), d),
         });
       }
-      const kindKey = (k) => k.replace(/-/g, '_');
       const flat = {};
-      for (const k of DELIVERY_KINDS) {
-        const g = migrations.find((m) => m.members.includes(k));
-        flat[`on_${kindKey(k)}`] = String(kinds.includes(k));
-        flat[`owns_${kindKey(k)}`] = String(Boolean(g && g.owner === k));
-      }
+      for (const k of DELIVERY_KINDS) flat[`on_${k.replace(/-/g, '_')}`] = String(kinds.includes(k));
       const descriptors = restored ?? buildDescriptors({
           kinds, app: str('app_name'), runId: opt('run-id', '0'), repo: process.env.GITHUB_REPOSITORY ?? '', lockScope: str('d1_lock_scope'), groups: migrations,
           smokeMode: str('smoke_mode') || 'full', smokeOverrides: str('smoke_mode_overrides'), phase: opt('phase') || 'all',
       });
-      for (const m of migrations) console.error(`::notice::D1 ${m.databaseName}: one migration (owner ${m.owner}) serves ${m.members.join(', ')}`);
-      out({ kinds: JSON.stringify(kinds), descriptors: JSON.stringify(descriptors), has_targets: String(kinds.length > 0), has_migrations: String(migrations.length > 0), ...flat });
+      // THE migration of the run (at most one physical D1): the owner kind selects the Environment and the build the single Migration job uses.
+      const [mig] = migrations;
+      const migration = mig ? { kind: mig.owner, environment: descriptors[mig.owner].environment, d1_id: mig.databaseId, kinds: mig.members } : null;
+      if (mig) console.error(`::notice::D1 ${mig.databaseName}: ONE migration (owner ${mig.owner}) serves ${mig.members.join(', ')}`);
+      out({ kinds: JSON.stringify(kinds), descriptors: JSON.stringify(descriptors), has_targets: String(kinds.length > 0), has_migrations: String(Boolean(mig)), migration: migration ? JSON.stringify(migration) : '', ...flat });
       break;
     }
     case 'descriptor-check': { // --kind K --target T --d1 ID (descriptor JSON in env DESCRIPTOR): the stage's own bindings must match the record
@@ -264,24 +262,14 @@ try {
       out({ descriptor: 'ok', smoke_mode: d.smoke_mode });
       break;
     }
-    case 'migration-gate': { // env: GATE_STAGE migrate|publish, DESCRIPTOR, D1_MIGRATIONS, KINDS+PEERS (migrate) | OWN_* / OWNER_* results (publish)
+    case 'migration-gate': { // publish stage; env: DESCRIPTOR, D1_MIGRATIONS, MIGRATION_RESULT / MIGRATION_JSON (needs.migration.result / outputs.migration_json)
       const e = process.env;
       const d = parseDescriptor(e.DESCRIPTOR ?? '', opt('kind'));
-      const parse = (t, dflt) => { try { return JSON.parse(t || dflt); } catch { return null; } };
-      if (e.GATE_STAGE === 'migrate') {
-        const kinds = parse(e.KINDS, '[]');
-        if (!Array.isArray(kinds)) throw new Error('kinds is not a JSON array');
-        const bad = checkPeerPreflights(kinds, parse(e.PEERS, '{}'));
-        for (const b of bad) console.error(`::error::${b}`);
-        if (bad.length) process.exit(1);
-        out({ migration_gate: 'ok' });
-      } else {
-        const m = resolveMigrationUsed({
-          d1Migrations: e.D1_MIGRATIONS === 'true', kind: d.kind, ownerKind: d.d1_owner_kind, expectedId: d.d1_expected_id,
-          ownResult: e.OWN_RESULT ?? '', ownJson: e.OWN_JSON ?? '', ownerResult: e.OWNER_RESULT ?? '', ownerJson: e.OWNER_JSON ?? '',
-        });
-        out({ migration_used: JSON.stringify(m) });
-      }
+      const m = resolveMigrationUsed({
+        d1Migrations: e.D1_MIGRATIONS === 'true', kind: d.kind, ownerKind: d.d1_owner_kind, expectedId: d.d1_expected_id,
+        result: e.MIGRATION_RESULT ?? '', json: e.MIGRATION_JSON ?? '',
+      });
+      out({ migration_used: JSON.stringify(m) });
       break;
     }
     case 'verification-outcome': { // --level L

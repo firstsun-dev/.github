@@ -7,18 +7,17 @@ name: CF Worker Pipeline v2
 #
 #   Lint  Typecheck  Unit  Integration  Build Validation  E2E        six independent, parallel jobs (no `needs` between them)
 #                         |
-#                  Validation Gate -> Delivery plan (enabled kinds, D1 owners; pure data)
+#                  Validation Gate -> Delivery plan (enabled targets, ONE physical D1, the migration owner; pure data)
 #                         |
-#      Preflight (one call per kind)   non-publishing: canonical URL, target build, effective-config audit, exact D1 binding
-#                         |  (every Migration waits for EVERY enabled kind's Preflight: nothing mutates while a target is unvalidated)
-#      Migration (one call per distinct physical D1; Native Branch + Native Dev on one D1 -> one migration)
-#                         |
-#      Delivery  (one call per kind of _cf-worker-delivery.yml):  Deploy -> Smoke -> conditional Rollback,
-#                         |                                       independent of every other kind
+#      Database Migration   ONE job. Its first steps are the read-only safety checks (target build, effective-config audit, exact D1 binding
+#                         |  of every enabled target), the last one applies the migration ONCE. No separate Preflight stage.
+#      Delivery  (one call per enabled target of _cf-worker-delivery.yml):  Deploy -> Smoke -> conditional Rollback,
+#                         |                                       independent of every other target
 #                      Release  optional, main only, only after a VERIFIED Production delivery with no rollback
 #
 # ONE delivery implementation (_cf-worker-delivery.yml -> actions/cf-deploy -> engine.sh) serves every kind; a call handles exactly one
 # target, so job outputs are unambiguous (no matrix output merging). The run-level concurrency group below spans the whole run.
+# One pipeline migrates at most one physical D1: distinct databases among the enabled targets are rejected by the plan, before any mutation.
 # Event handlers outside the DAG: `lifecycle` (PR comment / branch delete), `config-guard` and `persistent-dev` (Hybrid, protected
 # manual dispatch; the same engine in one job, manual mode).
 #
@@ -59,8 +58,8 @@ on:
         description: Production Worker version that was live before this run's publish (prod only; the rollback target)
         value: ${{ fromJSON((jobs.plan.outputs.on_production == 'true' && jobs.delivery_production.outputs.handoff) || (jobs.plan.outputs.on_native_branch == 'true' && jobs.delivery_native_branch.outputs.handoff) || '{}').previous_version_id }}
       migration_status:
-        description: applied | failed | none (Migration stage; none when d1_migrations is false). First migrated D1 of the plan (Production, else Native Branch, Native Dev, persistent Dev)
-        value: ${{ (jobs.plan.outputs.owns_production == 'true' && fromJSON(jobs.migration_production.outputs.migration_json || '{}').migration) || (jobs.plan.outputs.owns_native_branch == 'true' && fromJSON(jobs.migration_native_branch.outputs.migration_json || '{}').migration) || (jobs.plan.outputs.owns_native_dev == 'true' && fromJSON(jobs.migration_native_dev.outputs.migration_json || '{}').migration) || (jobs.plan.outputs.owns_persistent_dev == 'true' && fromJSON(jobs.migration_persistent_dev.outputs.migration_json || '{}').migration) || '' }}
+        description: applied | failed | none - the result of the single Migration job (none when d1_migrations is false, nothing needed migrating, or on a pipeline_phase verify call)
+        value: ${{ jobs.migration.outputs.migration_status || 'none' }}
       rollback_result:
         description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed | no_known_good; empty when no rollback ran. Anything but empty is a FAILED run (first kind of the run that rolled back)
         value: ${{ (jobs.plan.outputs.on_production == 'true' && jobs.delivery_production.outputs.rollback_result) || (jobs.plan.outputs.on_native_branch == 'true' && jobs.delivery_native_branch.outputs.rollback_result) || (jobs.plan.outputs.on_native_dev == 'true' && jobs.delivery_native_dev.outputs.rollback_result) || (jobs.plan.outputs.on_persistent_dev == 'true' && jobs.delivery_persistent_dev.outputs.rollback_result) || '' }}
@@ -698,7 +697,7 @@ jobs:
   # -------------------------------------------------------------------------
   # Delivery plan — pure data, no Cloudflare credentials. Resolves the enabled delivery kinds of THIS event (production |
   # native-branch | native-dev | persistent-dev: exactly the enabled ones, no phantom paths), validates smoke modes and the Dev
-  # channel combination, and groups the kinds by PHYSICAL D1 (account/database id): per kind `on_<kind>` / `owns_<kind>` and the versioned
+  # channel combination, and resolves the ONE PHYSICAL D1 (account/database id) all enabled kinds share (distinct databases fail the plan): the migration owner and, per kind, `on_<kind>` and the versioned
   # target `descriptors` (engine target, Environment, groups, D1 id, migration owner, smoke mode). pipeline_phase verify re-uses the kinds handed over
   # in phase_state. Everything downstream is one `uses:` call of the internal _cf-worker-delivery.yml per kind (no matrix).
   # -------------------------------------------------------------------------
@@ -713,14 +712,11 @@ jobs:
       descriptors: ${{ steps.plan.outputs.descriptors }}
       has_targets: ${{ steps.plan.outputs.has_targets }}
       has_migrations: ${{ steps.plan.outputs.has_migrations }}
+      migration: ${{ steps.plan.outputs.migration }}
       on_production: ${{ steps.plan.outputs.on_production }}
-      owns_production: ${{ steps.plan.outputs.owns_production }}
       on_native_branch: ${{ steps.plan.outputs.on_native_branch }}
-      owns_native_branch: ${{ steps.plan.outputs.owns_native_branch }}
       on_native_dev: ${{ steps.plan.outputs.on_native_dev }}
-      owns_native_dev: ${{ steps.plan.outputs.owns_native_dev }}
       on_persistent_dev: ${{ steps.plan.outputs.on_persistent_dev }}
-      owns_persistent_dev: ${{ steps.plan.outputs.owns_persistent_dev }}
     steps:
       - uses: actions/checkout@v6
         if: inputs.pipeline_phase != 'verify'
@@ -749,204 +745,110 @@ jobs:
           node "$TOOLS_DIR/cli.mjs" plan --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" --phase "$PHASE" --run-id "$GITHUB_RUN_ID" --app-dir "$GITHUB_WORKSPACE/${{ inputs.app_path }}" | tee -a "$GITHUB_OUTPUT"
 
   # =========================================================================
-  # Stage 1 — Preflight: ONE call per enabled kind (stage preflight). Non-publishing: canonical URL resolved from the real Preview
-  # identity, target build, effective-config audit, exact D1 binding == the plan's D1. Runs only with d1_migrations (the D1-less
-  # path has nothing to pre-validate before a mutation).
+  # Migration — the ONE job that mutates a database. There is no separate Preflight stage: the read-only safety checks run as the
+  # first steps of this job, in order, and every one of them precedes the single remote mutation (a failing step stops the job).
+  #   1. Delivery plan: ONE physical D1 for all enabled targets (identical D1s deduplicated, distinct D1s rejected before any
+  #      mutation, Production D1 never reachable from Preview/Dev). The plan names the owner kind and its GitHub Environment.
+  #   2. every enabled target that is not the owner: target build, effective-config audit, exact D1 binding == the plan's D1
+  #      (stage preflight, nothing remote is changed). At most Native Dev / persistent Dev: Native Branch, when enabled, is the owner.
+  #   3. the owner: target build, effective-config audit, exact D1 binding, stale-SHA guard, then the migration (stage migrate).
+  # Main push -> Production D1 (Environment <app>/prod, approvals apply); other branch push -> the shared Preview/Dev D1.
+  # Skipped (Delivery proceeds) when d1_migrations is false; never on pull_request, delete or pipeline_phase verify.
+  # The D1 schema is never rolled back automatically.
   # =========================================================================
-  preflight_production:
-    name: Preflight (production)
+  migration:
+    name: Database Migration
     needs: [gate, plan]
-    if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.gate.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.on_production == 'true'
-    uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
+    if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.gate.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.has_migrations == 'true'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    environment:
+      name: ${{ fromJSON(needs.plan.outputs.migration || '{}').environment }}
+    permissions:
       contents: read
-      deployments: write
-      pull-requests: write
-    with:
-      stage: preflight
-      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['production']) }}
-      tools_ref: ${{ inputs.tools_ref }}
-      runner: ${{ inputs.runner }}
-      inputs_json: ${{ toJSON(inputs) }}
-    secrets:
+      deployments: read # Preview identity guard reads the ledger owner (no ledger entry is written here)
+    outputs:
+      migration_json: ${{ toJSON(steps.migrate.outputs) }}
+      migration_status: ${{ steps.result.outputs.status }}
+    env:
+      GH_TOKEN: ${{ github.token }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      PREVIEW_SECRETS: ${{ secrets.PREVIEW_SECRETS }}
-
-  preflight_native_branch:
-    name: Preflight (native-branch)
-    needs: [gate, plan]
-    if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.gate.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.on_native_branch == 'true'
-    uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
-      contents: read
-      deployments: write
-      pull-requests: write
-    with:
-      stage: preflight
-      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-branch']) }}
-      tools_ref: ${{ inputs.tools_ref }}
-      runner: ${{ inputs.runner }}
-      inputs_json: ${{ toJSON(inputs) }}
-    secrets:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      PREVIEW_SECRETS: ${{ secrets.PREVIEW_SECRETS }}
-
-  preflight_native_dev:
-    name: Preflight (native-dev)
-    needs: [gate, plan]
-    if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.gate.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.on_native_dev == 'true'
-    uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
-      contents: read
-      deployments: write
-      pull-requests: write
-    with:
-      stage: preflight
-      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-dev']) }}
-      tools_ref: ${{ inputs.tools_ref }}
-      runner: ${{ inputs.runner }}
-      inputs_json: ${{ toJSON(inputs) }}
-    secrets:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      PREVIEW_SECRETS: ${{ secrets.PREVIEW_SECRETS }}
-
-  preflight_persistent_dev:
-    name: Preflight (persistent-dev)
-    needs: [gate, plan]
-    if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.gate.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.on_persistent_dev == 'true'
-    uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
-      contents: read
-      deployments: write
-      pull-requests: write
-    with:
-      stage: preflight
-      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
-      tools_ref: ${{ inputs.tools_ref }}
-      runner: ${{ inputs.runner }}
-      inputs_json: ${{ toJSON(inputs) }}
-    secrets:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      PREVIEW_SECRETS: ${{ secrets.PREVIEW_SECRETS }}
-
-  # =========================================================================
-  # Stage 2 — Migration: one call per OWNER of a distinct physical D1 (`owns_<kind>` from the plan). A D1 shared by Native Branch and
-  # Native Dev is migrated once, by the Native Branch call. Every migration waits for the preflight of EVERY enabled target
-  # (`peers`), so no schema change happens while any target is unvalidated. Independent of every Deploy / Smoke / Rollback.
-  # =========================================================================
-  migration_production:
-    name: Migration (production)
-    needs: [plan, preflight_production, preflight_native_branch, preflight_native_dev, preflight_persistent_dev]
-    if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.plan.result == 'success' && needs.plan.outputs.owns_production == 'true'
-    uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
-      contents: read
-      deployments: write
-      pull-requests: write
-    with:
-      stage: migrate
-      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['production']) }}
-      tools_ref: ${{ inputs.tools_ref }}
-      runner: ${{ inputs.runner }}
-      inputs_json: ${{ toJSON(inputs) }}
-      d1_migrations: ${{ inputs.d1_migrations }}
-      kinds: ${{ needs.plan.outputs.kinds }}
-      peers: ${{ format('{{"production":"{0}","native-branch":"{1}","native-dev":"{2}","persistent-dev":"{3}"}}', needs.preflight_production.result, needs.preflight_native_branch.result, needs.preflight_native_dev.result, needs.preflight_persistent_dev.result) }}
-    secrets:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      PREVIEW_SECRETS: ${{ secrets.PREVIEW_SECRETS }}
-
-  migration_native_branch:
-    name: Migration (native-branch)
-    needs: [plan, preflight_production, preflight_native_branch, preflight_native_dev, preflight_persistent_dev]
-    if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.plan.result == 'success' && needs.plan.outputs.owns_native_branch == 'true'
-    uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
-      contents: read
-      deployments: write
-      pull-requests: write
-    with:
-      stage: migrate
-      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-branch']) }}
-      tools_ref: ${{ inputs.tools_ref }}
-      runner: ${{ inputs.runner }}
-      inputs_json: ${{ toJSON(inputs) }}
-      d1_migrations: ${{ inputs.d1_migrations }}
-      kinds: ${{ needs.plan.outputs.kinds }}
-      peers: ${{ format('{{"production":"{0}","native-branch":"{1}","native-dev":"{2}","persistent-dev":"{3}"}}', needs.preflight_production.result, needs.preflight_native_branch.result, needs.preflight_native_dev.result, needs.preflight_persistent_dev.result) }}
-    secrets:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      PREVIEW_SECRETS: ${{ secrets.PREVIEW_SECRETS }}
-
-  migration_native_dev:
-    name: Migration (native-dev)
-    needs: [plan, preflight_production, preflight_native_branch, preflight_native_dev, preflight_persistent_dev]
-    if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.plan.result == 'success' && needs.plan.outputs.owns_native_dev == 'true'
-    uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
-      contents: read
-      deployments: write
-      pull-requests: write
-    with:
-      stage: migrate
-      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-dev']) }}
-      tools_ref: ${{ inputs.tools_ref }}
-      runner: ${{ inputs.runner }}
-      inputs_json: ${{ toJSON(inputs) }}
-      d1_migrations: ${{ inputs.d1_migrations }}
-      kinds: ${{ needs.plan.outputs.kinds }}
-      peers: ${{ format('{{"production":"{0}","native-branch":"{1}","native-dev":"{2}","persistent-dev":"{3}"}}', needs.preflight_production.result, needs.preflight_native_branch.result, needs.preflight_native_dev.result, needs.preflight_persistent_dev.result) }}
-    secrets:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      PREVIEW_SECRETS: ${{ secrets.PREVIEW_SECRETS }}
-
-  migration_persistent_dev:
-    name: Migration (persistent-dev)
-    needs: [plan, preflight_production, preflight_native_branch, preflight_native_dev, preflight_persistent_dev]
-    if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.plan.result == 'success' && needs.plan.outputs.owns_persistent_dev == 'true'
-    uses: ./.github/workflows/_cf-worker-delivery.yml
-    permissions: # ceiling for EVERY job of the called workflow (incl. skipped ones): the stage's own jobs still request read-only
-      contents: read
-      deployments: write
-      pull-requests: write
-    with:
-      stage: migrate
-      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
-      tools_ref: ${{ inputs.tools_ref }}
-      runner: ${{ inputs.runner }}
-      inputs_json: ${{ toJSON(inputs) }}
-      d1_migrations: ${{ inputs.d1_migrations }}
-      kinds: ${{ needs.plan.outputs.kinds }}
-      peers: ${{ format('{{"production":"{0}","native-branch":"{1}","native-dev":"{2}","persistent-dev":"{3}"}}', needs.preflight_production.result, needs.preflight_native_branch.result, needs.preflight_native_dev.result, needs.preflight_persistent_dev.result) }}
-    secrets:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      PREVIEW_SECRETS: ${{ secrets.PREVIEW_SECRETS }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch delivery tooling
+        uses: actions/checkout@v6
+        with:
+          repository: firstsun-dev/.github
+          ref: ${{ inputs.tools_ref }}
+          path: .cf-tools
+          sparse-checkout: |
+            actions/cf-deploy
+            actions/cf-preview
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Verify native-dev build and D1 binding
+        if: needs.plan.outputs.on_native_dev == 'true' && fromJSON(needs.plan.outputs.migration).kind != 'native-dev'
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: ${{ fromJSON(needs.plan.outputs.descriptors)['native-dev'].target }}
+          descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-dev']) }}
+          kind: native-dev
+          stage: preflight
+          inputs_json: ${{ toJSON(inputs) }}
+          d1_expected_id: ${{ fromJSON(needs.plan.outputs.descriptors)['native-dev'].d1_expected_id }}
+          preview_secrets: ${{ fromJSON(needs.plan.outputs.descriptors)['native-dev'].target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
+      - name: Verify persistent-dev build and D1 binding
+        if: needs.plan.outputs.on_persistent_dev == 'true' && fromJSON(needs.plan.outputs.migration).kind != 'persistent-dev'
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: ${{ fromJSON(needs.plan.outputs.descriptors)['persistent-dev'].target }}
+          descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
+          kind: persistent-dev
+          stage: preflight
+          inputs_json: ${{ toJSON(inputs) }}
+          d1_expected_id: ${{ fromJSON(needs.plan.outputs.descriptors)['persistent-dev'].d1_expected_id }}
+          preview_secrets: ${{ fromJSON(needs.plan.outputs.descriptors)['persistent-dev'].target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
+      - id: migrate
+        name: Apply pending D1 migrations (once)
+        uses: ./.cf-tools/actions/cf-deploy
+        with:
+          target: ${{ fromJSON(needs.plan.outputs.descriptors)[fromJSON(needs.plan.outputs.migration).kind].target }}
+          descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)[fromJSON(needs.plan.outputs.migration).kind]) }}
+          kind: ${{ fromJSON(needs.plan.outputs.migration).kind }}
+          stage: migrate
+          inputs_json: ${{ toJSON(inputs) }}
+          d1_expected_id: ${{ fromJSON(needs.plan.outputs.migration).d1_id }}
+          preview_secrets: ${{ fromJSON(needs.plan.outputs.descriptors)[fromJSON(needs.plan.outputs.migration).kind].target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
+      # The one deterministic public status: applied | none (nothing was pending / superseded) when the job succeeded, failed otherwise
+      # (also when a validation step stopped the job before the migrate step ran).
+      - id: result
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          STATE: ${{ steps.migrate.outputs.migration }}
+        run: echo "status=$([ "$JOB_STATUS" = success ] && echo "${STATE:-none}" || echo failed)" >> "$GITHUB_OUTPUT"
 
   # =========================================================================
-  # Stage 3 — Delivery: ONE call per enabled kind of the SAME internal workflow (deploy -> smoke -> conditional rollback). A kind
-  # needs only the Validation Gate, the plan and the migration call(s) of ITS OWN D1; it never waits for, and is never touched by,
-  # another kind's Deploy / Smoke / Rollback. Each call receives ONLY its own migration result (own, or the shared-D1 owner's,
-  # validated inside the call by kind + D1 id) and only its own hand-off.
+  # Delivery — ONE call per enabled kind of the SAME internal workflow (deploy -> smoke -> conditional rollback). A kind needs only
+  # the Validation Gate, the plan and the single Migration job (success, or skipped when there is nothing to migrate); it never waits
+  # for, and is never touched by, another kind's Deploy / Smoke / Rollback. Each call receives the one migration result, validated
+  # inside the call by kind + D1 id, and only its own hand-off.
   # =========================================================================
   delivery_production:
     name: Delivery (production)
-    needs: [gate, plan, migration_production]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_production == 'true' && (inputs.pipeline_phase == 'verify' || needs.gate.result == 'success')
+    needs: [gate, plan, migration]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_production == 'true' && (inputs.pipeline_phase == 'verify' || needs.gate.result == 'success') && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
     uses: ./.github/workflows/_cf-worker-delivery.yml
     permissions:
       contents: read
       deployments: write
       pull-requests: write
     with:
-      stage: deliver
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['production']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -954,8 +856,8 @@ jobs:
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
       phase: ${{ inputs.pipeline_phase }}
       d1_migrations: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).inputs.d1_migrations || inputs.d1_migrations }}
-      own_migration_result: ${{ needs.migration_production.result }}
-      own_migration_json: ${{ needs.migration_production.outputs.migration_json }}
+      migration_result: ${{ needs.migration.result }}
+      migration_json: ${{ needs.migration.outputs.migration_json }}
       handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_production || '' }}
       migration_json_in: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).migration.mj_production || '' }}
       upstream_gate: ${{ inputs.pipeline_phase == 'verify' && inputs.upstream_gate || '' }}
@@ -968,15 +870,14 @@ jobs:
 
   delivery_native_branch:
     name: Delivery (native-branch)
-    needs: [gate, plan, migration_native_branch]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_native_branch == 'true' && (inputs.pipeline_phase == 'verify' || needs.gate.result == 'success')
+    needs: [gate, plan, migration]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_native_branch == 'true' && (inputs.pipeline_phase == 'verify' || needs.gate.result == 'success') && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
     uses: ./.github/workflows/_cf-worker-delivery.yml
     permissions:
       contents: read
       deployments: write
       pull-requests: write
     with:
-      stage: deliver
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-branch']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -984,8 +885,8 @@ jobs:
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
       phase: ${{ inputs.pipeline_phase }}
       d1_migrations: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).inputs.d1_migrations || inputs.d1_migrations }}
-      own_migration_result: ${{ needs.migration_native_branch.result }}
-      own_migration_json: ${{ needs.migration_native_branch.outputs.migration_json }}
+      migration_result: ${{ needs.migration.result }}
+      migration_json: ${{ needs.migration.outputs.migration_json }}
       handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_native_branch || '' }}
       migration_json_in: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).migration.mj_native_branch || '' }}
       upstream_gate: ${{ inputs.pipeline_phase == 'verify' && inputs.upstream_gate || '' }}
@@ -998,15 +899,14 @@ jobs:
 
   delivery_native_dev:
     name: Delivery (native-dev)
-    needs: [gate, plan, migration_native_dev, migration_native_branch]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_native_dev == 'true' && (inputs.pipeline_phase == 'verify' || needs.gate.result == 'success')
+    needs: [gate, plan, migration]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_native_dev == 'true' && (inputs.pipeline_phase == 'verify' || needs.gate.result == 'success') && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
     uses: ./.github/workflows/_cf-worker-delivery.yml
     permissions:
       contents: read
       deployments: write
       pull-requests: write
     with:
-      stage: deliver
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-dev']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -1014,10 +914,8 @@ jobs:
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
       phase: ${{ inputs.pipeline_phase }}
       d1_migrations: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).inputs.d1_migrations || inputs.d1_migrations }}
-      own_migration_result: ${{ needs.migration_native_dev.result }}
-      own_migration_json: ${{ needs.migration_native_dev.outputs.migration_json }}
-      owner_migration_result: ${{ needs.migration_native_branch.result }}
-      owner_migration_json: ${{ needs.migration_native_branch.outputs.migration_json }}
+      migration_result: ${{ needs.migration.result }}
+      migration_json: ${{ needs.migration.outputs.migration_json }}
       handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_native_dev || '' }}
       migration_json_in: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).migration.mj_native_dev || '' }}
       upstream_gate: ${{ inputs.pipeline_phase == 'verify' && inputs.upstream_gate || '' }}
@@ -1030,15 +928,14 @@ jobs:
 
   delivery_persistent_dev:
     name: Delivery (persistent-dev)
-    needs: [gate, plan, migration_persistent_dev, migration_native_branch]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_persistent_dev == 'true' && (inputs.pipeline_phase == 'verify' || needs.gate.result == 'success')
+    needs: [gate, plan, migration]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_persistent_dev == 'true' && (inputs.pipeline_phase == 'verify' || needs.gate.result == 'success') && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
     uses: ./.github/workflows/_cf-worker-delivery.yml
     permissions:
       contents: read
       deployments: write
       pull-requests: write
     with:
-      stage: deliver
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
       tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
@@ -1046,10 +943,8 @@ jobs:
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
       phase: ${{ inputs.pipeline_phase }}
       d1_migrations: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).inputs.d1_migrations || inputs.d1_migrations }}
-      own_migration_result: ${{ needs.migration_persistent_dev.result }}
-      own_migration_json: ${{ needs.migration_persistent_dev.outputs.migration_json }}
-      owner_migration_result: ${{ needs.migration_native_branch.result }}
-      owner_migration_json: ${{ needs.migration_native_branch.outputs.migration_json }}
+      migration_result: ${{ needs.migration.result }}
+      migration_json: ${{ needs.migration.outputs.migration_json }}
       handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_persistent_dev || '' }}
       migration_json_in: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).migration.mj_persistent_dev || '' }}
       upstream_gate: ${{ inputs.pipeline_phase == 'verify' && inputs.upstream_gate || '' }}

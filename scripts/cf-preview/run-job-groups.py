@@ -23,12 +23,12 @@ ROOT = HERE.parents[1]
 MANIFEST = {
     "production-release": 43,
     "preview-deploy": 46,
-    "migration-d1": 55,
+    "migration-d1": 62,
     "shared-dev": 74,
     "chain-smoke-rollback": 54,
     "deferred-verification": 50,
     "native-dev-smoke-modes": 48,
-    "review-regressions": 34,
+    "review-regressions": 36,
 }
 
 

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   DELIVERY_KINDS, resolveDeliveryTargets, resolveSmokeMode, parseSmokeOverrides, planMigrations, branchPreviewIdentity, ENGINE_TARGET,
   canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins,
-  targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor, checkPeerPreflights, resolveMigrationUsed,
+  targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor, resolveMigrationUsed,
   isContentLevel, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
 } from '../../actions/cf-preview/delivery.mjs';
 
@@ -79,9 +79,9 @@ test('migration plan: Branch and Native Dev sharing one preview D1 migrate ONCE'
   assert.deepEqual(g[0].members, ['native-branch', 'native-dev']);
   assert.equal(g[0].owner, 'native-branch');
 });
-test('migration plan: distinct physical D1s each get their own execution', () => {
-  const g = planMigrations(cfg('PREV', 'DEV'), ['native-branch', 'persistent-dev'], { accountId: 'acc' });
-  assert.deepEqual(g.map((x) => x.id).sort(), ['acc/DEV', 'acc/PREV']);
+test('migration plan: single-DB rule - distinct physical D1s fail closed before any mutation', () => {
+  assert.throws(() => planMigrations(cfg('PREV', 'DEV'), ['native-branch', 'persistent-dev'], { accountId: 'acc' }), /2 distinct physical D1 databases: prev-db \(native-branch\) vs dev-db \(persistent-dev\).*nothing was changed/);
+  assert.throws(() => planMigrations(cfg('PREV', 'DEV'), ['native-branch', 'native-dev', 'persistent-dev'], { accountId: 'acc' }), /distinct physical D1/);
 });
 test('migration plan: Preview and persistent Dev on the SAME physical D1 dedupe (owner = first in order)', () => {
   const g = planMigrations(cfg('SHARED', 'SHARED'), ['persistent-dev', 'native-dev'], { accountId: 'acc' });
@@ -180,7 +180,7 @@ test('Branch and Native Dev never share a build URL: each resolves its own Previ
 // ---------------------------------------------------------------------------------------------------------------------
 // P2-B: migration plan - one execution per physical D1; the owner is the first member; Production D1 is never shared.
 // ---------------------------------------------------------------------------------------------------------------------
-test('planMigrations: Branch + Native Dev on one preview D1 -> ONE group (owner native-branch); distinct D1s stay separate', () => {
+test('planMigrations: Branch + Native Dev on one preview D1 -> ONE group (owner native-branch); distinct D1s are refused', () => {
   const cfg = { name: 'app', d1_databases: [{ binding: 'DB', database_name: 'prod', database_id: 'PROD' }],
     previews: { d1_databases: [{ binding: 'DB', database_name: 'prev', database_id: 'PREV' }] },
     env: { dev: { name: 'app-dev', d1_databases: [{ binding: 'DB', database_name: 'devdb', database_id: 'DEV' }] } } };
@@ -189,9 +189,7 @@ test('planMigrations: Branch + Native Dev on one preview D1 -> ONE group (owner 
   assert.deepEqual(g[0].members, ['native-branch', 'native-dev']);
   assert.equal(g[0].owner, 'native-branch');
   assert.equal(g[0].databaseId, 'PREV');
-  const h = planMigrations(cfg, ['native-branch', 'persistent-dev'], { accountId: 'A' });
-  assert.equal(h.length, 2);
-  assert.deepEqual(h.map((x) => x.owner).sort(), ['native-branch', 'persistent-dev']);
+  assert.throws(() => planMigrations(cfg, ['native-branch', 'persistent-dev'], { accountId: 'A' }), /distinct physical D1/);
   assert.deepEqual(planMigrations(cfg, ['production'], { accountId: 'A' })[0].members, ['production']);
 });
 test('planMigrations: a Production D1 exposed to Preview/Dev is refused', () => {
@@ -286,50 +284,39 @@ test('descriptor: persistent-dev keeps the legacy Shared Dev group (Deploy AND R
 });
 
 // ---- migration gates (were inline bash/jq in the delivery workflow) -----------------------------------------------------
-test('migrate gate: no D1 is migrated unless EVERY enabled kind passed its preflight; a missing result blocks', () => {
-  const all = { production: 'success', 'native-branch': 'success' };
-  assert.deepEqual(checkPeerPreflights(['production', 'native-branch'], all), []);
-  assert.deepEqual(checkPeerPreflights([], {}), []);
-  for (const bad of ['failure', 'cancelled', 'skipped', '']) {
-    const f = checkPeerPreflights(['production', 'native-branch'], { ...all, 'native-branch': bad });
-    assert.equal(f.length, 1);
-    assert.match(f[0], /native-branch/);
-  }
-  assert.match(checkPeerPreflights(['native-dev'], all)[0], /'missing'/);
-  assert.match(checkPeerPreflights(['native-dev'], null)[0], /'missing'/);
-  assert.throws(() => checkPeerPreflights(['bogus'], {}), /Unknown delivery kind/);
-});
-
 const MJ = (o = {}) => JSON.stringify({ migration: 'applied', kind: 'native-branch', d1_id: 'DB1', ...o });
-const U = (o) => resolveMigrationUsed({ d1Migrations: true, kind: 'native-branch', ownerKind: 'native-branch', expectedId: 'DB1', ownResult: 'success', ownJson: MJ(), ...o });
+const U = (o) => resolveMigrationUsed({ d1Migrations: true, kind: 'native-branch', ownerKind: 'native-branch', expectedId: 'DB1', result: 'success', json: MJ(), ...o });
 
 test('migration used: without d1_migrations nothing is required', () => {
   assert.deepEqual(resolveMigrationUsed({ d1Migrations: false, kind: 'production' }), {});
 });
 
-test('migration used: the owner uses its own result; a sharing kind uses the native-branch owner result', () => {
+test('migration used: every kind (owner or sharing sibling) validates the ONE migration result against the planned owner and its own D1', () => {
   assert.equal(U({}).d1_id, 'DB1');
-  const shared = resolveMigrationUsed({ d1Migrations: true, kind: 'native-dev', ownerKind: 'native-branch', expectedId: 'DB1', ownResult: '', ownJson: '', ownerResult: 'success', ownerJson: MJ() });
+  const shared = resolveMigrationUsed({ d1Migrations: true, kind: 'native-dev', ownerKind: 'native-branch', expectedId: 'DB1', result: 'success', json: MJ() });
   assert.equal(shared.kind, 'native-branch');
+  const dev = resolveMigrationUsed({ d1Migrations: true, kind: 'persistent-dev', ownerKind: 'persistent-dev', expectedId: 'DB1', result: 'success', json: MJ({ kind: 'persistent-dev' }) });
+  assert.equal(dev.kind, 'persistent-dev');
 });
 
 test('migration used: fails closed on a missing, failed, foreign or malformed migration result', () => {
   assert.throws(() => U({ ownerKind: '' }), /no migration owner is planned/);
-  assert.throws(() => U({ ownerKind: 'persistent-dev' }), /no migration owner is planned/);
-  assert.throws(() => U({ ownResult: 'failure' }), /finished 'failure'/);
-  assert.throws(() => U({ ownResult: '' }), /finished 'missing'/);
-  assert.throws(() => U({ ownResult: 'skipped' }), /finished 'skipped'/);
-  assert.throws(() => U({ ownJson: MJ({ migration: 'none' }) }), /no applied migration/);
-  assert.throws(() => U({ ownJson: '' }), /no applied migration/);
-  assert.throws(() => U({ ownJson: '[1]' }), /no applied migration/);
-  assert.throws(() => U({ ownJson: MJ({ kind: 'persistent-dev' }) }), /another kind/);
-  assert.throws(() => U({ ownJson: MJ({ d1_id: 'FOREIGN' }) }), /another D1/);
+  assert.throws(() => U({ ownerKind: 'persistent-dev' }), /another kind/);
+  assert.throws(() => U({ result: 'failure' }), /finished 'failure'/);
+  assert.throws(() => U({ result: 'cancelled' }), /finished 'cancelled'/);
+  assert.throws(() => U({ result: '' }), /finished 'missing'/);
+  assert.throws(() => U({ result: 'skipped' }), /finished 'skipped'/);
+  assert.throws(() => U({ json: MJ({ migration: 'none' }) }), /no applied migration/);
+  assert.throws(() => U({ json: '' }), /no applied migration/);
+  assert.throws(() => U({ json: '[1]' }), /no applied migration/);
+  assert.throws(() => U({ json: MJ({ kind: 'persistent-dev' }) }), /another kind/);
+  assert.throws(() => U({ json: MJ({ d1_id: 'FOREIGN' }) }), /another D1/);
   assert.throws(() => U({ expectedId: 'OTHER' }), /another D1/);
 });
 
 test('migration used: a stale-skipped migration is accepted (nothing was applied, nothing will be published)', () => {
-  assert.equal(U({ ownJson: JSON.stringify({ stale: 'true' }) }).stale, 'true');
-  assert.equal(U({ ownJson: JSON.stringify({ stale: true }) }).stale, true);
+  assert.equal(U({ json: JSON.stringify({ stale: 'true' }) }).stale, 'true');
+  assert.equal(U({ json: JSON.stringify({ stale: true }) }).stale, true);
 });
 
 // ---- verification and recovery decisions ---------------------------------------------------------------------------------

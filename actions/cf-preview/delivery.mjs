@@ -76,10 +76,12 @@ export function branchPreviewIdentity(args, { reserveNativeDev = false } = {}) {
 }
 
 /**
- * Migration plan across the enabled targets: ONE execution per distinct physical D1 (`account/database_id`).
- * `cfg` is the SOURCE Wrangler config; `kinds` the enabled kinds. Production D1 must never be reachable from a
- * non-production kind (migrationPlan already refuses a D1 declared on both sides; this re-checks the final identities).
- * Owner = the first member in OWNER_ORDER; the others wait for the owner's result.
+ * Migration plan across the enabled targets: at most ONE physical D1 (`account/database_id`) per pipeline. Kinds that name the same
+ * D1 (e.g. Native Branch + Native Dev) are deduplicated into one group; two DISTINCT databases fail closed before any mutation
+ * (documented compatibility restriction: docs/cf-worker-v2-unified-delivery.md). Returns [] without kinds, else [group].
+ * `cfg` is the SOURCE Wrangler config; `kinds` the enabled kinds. Production D1 must never be reachable from a non-production
+ * kind (migrationPlan already refuses a D1 declared on both sides; this re-checks the final identities).
+ * Owner = the first member in OWNER_ORDER: the kind whose build + audit + Environment the single Migration job uses.
  */
 const OWNER_ORDER = ['native-branch', 'native-dev', 'persistent-dev', 'production'];
 export function planMigrations(cfg, kinds, { accountId = '', binding = '', devEnv = 'dev', migrationsDirAbs = (d) => d } = {}) {
@@ -90,6 +92,10 @@ export function planMigrations(cfg, kinds, { accountId = '', binding = '', devEn
     const id = `${accountId}/${p.databaseId}`;
     if (!groups.has(id)) groups.set(id, { id, databaseId: p.databaseId, databaseName: p.databaseName, binding: p.binding, members: [] });
     groups.get(id).members.push(kind);
+  }
+  if (groups.size > 1) {
+    const list = [...groups.values()].map((g) => `${g.databaseName} (${g.members.join(', ')})`).join(' vs ');
+    throw new Error(`d1_migrations: the enabled targets name ${groups.size} distinct physical D1 databases: ${list}. One pipeline migrates at most one database; point the targets at the same D1 or disable one channel (nothing was changed)`);
   }
   const out = [...groups.values()].map((g) => {
     g.members.sort((a, b) => OWNER_ORDER.indexOf(a) - OWNER_ORDER.indexOf(b));
@@ -295,37 +301,20 @@ export function parseDescriptor(text, expectKind = '') {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Migration gates (pure). Both used to be inline bash/jq in the delivery workflow; they now run in the engine, before any
-// build or publish, and are unit-tested here.
+// Migration gate (pure). Runs in the engine before any build or publish of a Delivery call and is unit-tested here. (The
+// pre-mutation validation of every target lives in the single Migration job: its steps run in order, so a failed target
+// check stops the job before the migrate step - no peer-result bookkeeping.)
 // ---------------------------------------------------------------------------------------------------------------------
 /**
- * Migrate stage: NO D1 may be migrated while any enabled kind is unvalidated. `peers` = { kind: result of that kind's
- * preflight }. Anything but `success` - including a missing entry - blocks.
+ * Publish stage: the result of THE Migration job this kind's deployment depends on. Fails closed unless that job succeeded and
+ * reports an applied migration of the planned owner on exactly this kind's D1 (a stale-skipped migration is accepted: nothing was
+ * applied, nothing is published). Returns the (validated, normalised) migration result object, or {} when the app has no D1
+ * migrations.
  */
-export function checkPeerPreflights(kinds, peers) {
-  const failures = [];
-  for (const k of kinds) {
-    assertKind(k);
-    const r = peers && typeof peers === 'object' ? (peers[k] ?? 'missing') : 'missing';
-    if (r !== 'success') failures.push(`preflight of ${k} finished '${r}'; no D1 is migrated while an enabled target is unvalidated`);
-  }
-  return failures;
-}
-
-/**
- * Publish stage: the migration result THIS kind's deployment depends on - its own, or the shared-D1 owner's (native-branch is
- * the only owner a sibling can delegate to). Fails closed unless that migration succeeded and reports an applied migration of
- * the planned owner on exactly this kind's D1 (a stale-skipped migration is accepted: nothing was applied, nothing is published).
- * Returns the (validated, normalised) migration result object, or {} when the app has no D1 migrations.
- */
-export function resolveMigrationUsed({ d1Migrations, kind, ownerKind = '', expectedId = '', ownResult = '', ownJson = '', ownerResult = '', ownerJson = '' }) {
+export function resolveMigrationUsed({ d1Migrations, kind, ownerKind = '', expectedId = '', result = '', json = '' }) {
   if (!d1Migrations) return {};
   assertKind(kind);
-  let result;
-  let json;
-  if (ownerKind === kind) { result = ownResult; json = ownJson; } else if (ownerKind === 'native-branch') { result = ownerResult; json = ownerJson; } else {
-    throw new Error(`no migration owner is planned for ${kind} (owner '${ownerKind || 'none'}'); nothing is published`);
-  }
+  if (!ownerKind) throw new Error(`no migration owner is planned for ${kind}; nothing is published`);
   if (result !== 'success') throw new Error(`the D1 migration ${kind} depends on (owner ${ownerKind}) finished '${result || 'missing'}'; nothing is published`);
   let m;
   try { m = JSON.parse(json); } catch { m = {}; }

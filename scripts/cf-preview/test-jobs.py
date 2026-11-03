@@ -2,14 +2,15 @@
 """Scenario groups (explicit `group_*` functions registered in GROUPS): `test-jobs.py [--list] [--group ID]...`; no flag runs all.
 run-job-groups.py runs each group in its own process, in parallel, against the manifest of expected groups.
 
-Executes the REAL steps of the per-kind Preflight, Migration and Delivery calls (the internal reusable workflow
-_cf-worker-delivery.yml: deploy -> smoke -> rollback), the Delivery plan, and the persistent-Dev job - including the
+Executes the REAL steps of the ONE Database Migration job (pre-mutation validation of every enabled target, then the single
+migration), the per-kind Delivery calls (the internal reusable workflow _cf-worker-delivery.yml: deploy -> smoke -> rollback), the
+Delivery plan, and the persistent-Dev job - including the
 composite delivery engine (actions/cf-deploy -> actions/cf-preview/engine.sh) - against stub gh/pnpm/curl, and feeds each job's
 result into the next job's `if:` and `needs.*.outputs`. EVERY job runs in a FRESH workspace (a different runner): anything the
 chain needs must travel through job outputs, never through local files. A reusable-workflow CALL is emulated like GitHub does:
 its `with:` / `secrets:` are rendered against the caller, the called jobs run with `inputs` = those values, and the called
-workflow's `outputs` are rendered from its jobs. Covers what the static contract test cannot: Preflight and Migration before
-Deploy, per-kind independence, URL pre-resolution, stale runs never reach Smoke/Release, a failed migration or smoke never
+workflow's `outputs` are rendered from its jobs. Covers what the static contract test cannot: the Migration job (validation, then ONE
+migration) before Deploy, per-kind independence, URL pre-resolution, stale runs never reach Smoke/Release, a failed migration or smoke never
 publishes/verifies, the Rollback job is conditional and fail-closed, application env cannot redirect the target, nothing remote is
 touched before the guards pass. Mocked: no Cloudflare, no GitHub. See docs/cf-worker-v2-unified-delivery.md for what this does
 NOT prove (the real-runner evidence is recorded there)."""
@@ -73,7 +74,7 @@ def desc(kind, d1="", owner="", app="app", scope="", phase="all", **over):
     return json.dumps(dict({"v": 1, "kind": kind, "target": TARGET_OF[kind], "environment": f"{app}/{_ENV_OF[kind]}", "deploy_group": g,
                             "rollback_group": g if kind == "persistent-dev" else g + "-rollback", "d1_expected_id": d1, "d1_owner_kind": owner,
                             "owns_migration": bool(d1 and owner == kind), "smoke_mode": "full", "phase": phase}, **over))
-INNER = ("preflight", "migrate", "deploy", "smoke", "rollback")
+INNER = ("deploy", "smoke", "rollback")
 SKIPPED = {"result": "skipped", "outputs": {}}
 
 
@@ -85,12 +86,11 @@ def _jobenv(name, kind, env, env_by_job):
     senv = {"STUB_TIPS": SHA}
     senv.update(env or {})
     ebj = env_by_job or {}
-    alias = "migration" if name == "migrate" else name
-    for key in (name, alias, f"{name}:{kind}", f"{alias}:{kind}"):
+    for key in (name, f"{name}:{kind}"):
         senv.update(ebj.get(key, {}))
     # STUB_PROBES is a sequence ("first;second;..."): Smoke consumes the first answer, the Rollback job (another runner, fresh
     # counter) the rest - or the last answer again when there is none.
-    if ";" in (env or {}).get("STUB_PROBES", "") and not any("STUB_PROBES" in ebj.get(k, {}) for k in (name, alias, f"{name}:{kind}")):
+    if ";" in (env or {}).get("STUB_PROBES", "") and not any("STUB_PROBES" in ebj.get(k, {}) for k in (name, f"{name}:{kind}")):
         first, rest = env["STUB_PROBES"].split(";", 1)
         senv["STUB_PROBES"] = first if name == "smoke" else rest
     if name == "rollback":
@@ -120,9 +120,8 @@ def call_workflow(job, c, ctl):
                     verbose=bool(os.environ.get("CHAIN_VERBOSE") and name in os.environ["CHAIN_VERBOSE"].split(",")))
         inner[name] = {"result": r["result"], "outputs": r["outputs"]}
         logs.append(r["log"]); summ.append(r["summary"]); steps.extend(r["steps"])
-        key = "migration" if name == "migrate" else name
-        wss[key] = ws
-        wss[f"{key}:{kind}"] = ws
+        wss[name] = ws
+        wss[f"{name}:{kind}"] = ws
     dc["jobs"] = inner
     outs = {k: render(v["value"], dc) for k, v in ddoc[True]["workflow_call"]["outputs"].items()}
     ran = [v["result"] for v in inner.values() if v["result"] != "skipped"]
@@ -130,7 +129,7 @@ def call_workflow(job, c, ctl):
     return {"result": result, "outputs": outs, "jobs": inner}, logs, summ, steps
 
 
-CHAIN = ("gate", "plan") + tuple(f"preflight_{KEYED[k]}" for k in KINDS) + tuple(f"migration_{KEYED[k]}" for k in KINDS) + tuple(f"delivery_{KEYED[k]}" for k in KINDS)
+CHAIN = ("gate", "plan", "migration") + tuple(f"delivery_{KEYED[k]}" for k in KINDS)
 
 
 def _run_jobs(names, ref, inputs, secrets, base_needs, event, env, toml, env_by_job, files, order=None):
@@ -194,10 +193,9 @@ def _compat(res):
         raw["migration"]["outputs"][f"mj_{kk}"] = (dj["outputs"].get("migration_used") or "") if dj["result"] != "skipped" else ""
     raw["plan"] = res.get("plan", SKIPPED)
     raw["gate"] = res.get("gate", SKIPPED)
-    migs = [res[f"migration_{KEYED[k]}"] for k in KINDS if f"migration_{KEYED[k]}" in res and res[f"migration_{KEYED[k]}"]["result"] != "skipped"]
-    pfs = [res[f"preflight_{KEYED[k]}"] for k in KINDS if f"preflight_{KEYED[k]}" in res and res[f"preflight_{KEYED[k]}"]["result"] != "skipped"]
-    mres = [m["result"] for m in migs + pfs]
-    mig_json = _j(migs[0]["outputs"].get("migration_json", "")) if migs else {}
+    mig = res.get("migration", SKIPPED)
+    mres = [] if mig["result"] == "skipped" else [mig["result"]]
+    mig_json = _j(mig["outputs"].get("migration_json", ""))
     p = primary
     dep = _inner(res, p, "deploy") if p else SKIPPED
     smk = _inner(res, p, "smoke") if p else SKIPPED
@@ -223,13 +221,13 @@ def _shape(res, logs, summ, steps, wss, toml):
            "published_unverified": sm.get("published_unverified") or "false", "migration": mg.get("migration", ""),
            "rollback_result": legacy["rollback"]["outputs"].get("rollback_result", "")}
     failed = any(v["result"] == "failure" for v in res.values())
-    anyws = next((w for n, w in wss.items() if n.split(":")[0] in ("deploy", "migration", "preflight")), None) or make_workspace(toml)
+    anyws = next((w for n, w in wss.items() if n.split(":")[0] in ("deploy", "migration")), None) or make_workspace(toml)
     return {"result": "failure" if failed else "success", "outputs": out, "steps": steps, "log": "".join(logs), "summary": "".join(summ),
             "ws": wss.get("deploy", anyws), "wss": wss, "jobs": legacy, "needs": res, "raw": raw, "res": res, "primary": primary}
 
 
 def run_chain(ref=MAIN, inputs=None, secrets=None, env=None, toml=APP_TOML, env_by_job=None, event="push", needs_over=None, files=None, chain_only=None):
-    """Gate -> Plan -> Preflight -> Migration -> Delivery (Deploy -> Smoke -> Rollback) like the scheduler would: each job's `if:` is
+    """Gate -> Plan -> Migration (validate every target, migrate once) -> Delivery (Deploy -> Smoke -> Rollback) like the scheduler would: each job's `if:` is
     evaluated against the real results/outputs of its `needs`; every kind is its OWN reusable-workflow call."""
     secrets = secrets if secrets is not None else (PROD_SECRETS)
     i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", tools_ref="x", preview_host_check=False, preview_url_suffix=SUFFIX)
@@ -251,7 +249,7 @@ def published(r):
 
 def step(r, name):
     """Outcome of an engine step across the whole chain: the job where it actually ran wins over 'skipped' elsewhere."""
-    seen = [o for n, o in r["steps"] if n == f"engine / {name}"]
+    seen = [o for n, o in r["steps"] if n == f"engine / {name}" or n.endswith(f") / {name}") or n.endswith(f"binding / {name}") or n.endswith(f"(once) / {name}")]
     for pref in ("failure", "success"):
         if pref in seen:
             return pref
@@ -263,7 +261,7 @@ def migrated(r):
 
 
 def mig_file(r, target):
-    for j in ("migration", "deploy", "preflight"):
+    for j in ("migration", "deploy"):
         f = r.get("wss", {}).get(j, r["ws"]) / "w" / ".wrangler" / f"migrate.{target}.json"
         if f.exists():
             return f.read_text()
@@ -394,7 +392,7 @@ def leg(job, kind, ref=MAIN, inputs=None, needs=None, env=None, toml=APP_TOML, s
     """Runs ONE job of the internal delivery workflow for `kind` against hand-built `needs` (fresh workspace).
     A job whose `if:` is false is reported skipped without running any step (like the scheduler)."""
     c = ctx(ref, inputs, PROD_SECRETS if secrets is None else secrets, {})
-    dinputs = dict(DINPUT_DEFAULTS, stage="deliver", descriptor=desc(kind), tools_ref="x", inputs_json=json.dumps(dict(c["inputs"])),
+    dinputs = dict(DINPUT_DEFAULTS, descriptor=desc(kind), tools_ref="x", inputs_json=json.dumps(dict(c["inputs"])),
                    phase=phase, handoff_json=handoff_json, migration_json_in=migration_json_in, upstream_gate=upstream_gate,
                    call_inputs_json=json.dumps(call_inputs) if call_inputs is not None else "")
     dc = Ctx({"github": c["github"], "inputs": dinputs, "needs": needs or {}, "jobs": {}}, c.secrets)
@@ -429,8 +427,7 @@ def deferred(ref=MAIN, inputs=None, env=None, gate="success", call_over=None, de
     jobs_ctx = {"plan": d["res"].get("plan", SKIPPED)}
     for k in KINDS:
         jobs_ctx[f"delivery_{KEYED[k]}"] = d["res"].get(f"delivery_{KEYED[k]}", SKIPPED)
-    for k in KINDS:
-        jobs_ctx[f"migration_{KEYED[k]}"] = d["res"].get(f"migration_{KEYED[k]}", SKIPPED)
+    jobs_ctx["migration"] = d["res"].get("migration", SKIPPED)
     pc = Ctx({"github": dci["github"], "inputs": dci["inputs"], "jobs": jobs_ctx}, {})
     state = render(doc[True]["workflow_call"]["outputs"]["phase_state"]["value"], pc)
     if state_over:
@@ -443,7 +440,7 @@ def verify_call(state, base, ref=MAIN, gate="success", env=None, toml=APP_TOML, 
     """The verify call alone, given the `phase_state` string it receives (no deploy chain is re-run)."""
     vin = dict(base, pipeline_phase="verify", phase_state=state, upstream_gate=gate)
     vin.update(call_over or {})
-    res, logs, summ, steps, wss = _run_jobs(("plan",) + tuple(f"delivery_{KEYED[k]}" for k in KINDS), ref, vin, PROD_SECRETS, {"gate": SKIPPED}, "push", env, toml, None, None)
+    res, logs, summ, steps, wss = _run_jobs(("plan",) + tuple(f"delivery_{KEYED[k]}" for k in KINDS), ref, vin, PROD_SECRETS, {"gate": SKIPPED, "migration": SKIPPED}, "push", env, toml, None, None)
     shaped = _shape(dict(res), logs, summ, steps, wss, toml)
     return {"jobs": shaped["jobs"], "log": "".join(logs), "summary": "".join(summ), "steps": steps, "vin": vin, "state": state, "raw": res, "res": res}
 
@@ -717,6 +714,29 @@ def group_migration_d1():
     # a build COMMAND that writes TARGET/DEV_ENV into GITHUB_ENV still cannot redirect the migration: the engine binds the target
     m = deploy(FEAT, inputs=dict(D1, build_cmd='echo TARGET=prod >> "$GITHUB_ENV"; echo DEV_ENV=prod >> "$GITHUB_ENV"; echo D1_BINDING=NOPE >> "$GITHUB_ENV"'))
     check(m["result"] == "success" and "PREV-ID" in mig_file(m, "preview") and not (m["ws"] / "w" / ".wrangler" / "migrate.prod.json").exists(), "a build writing TARGET=prod into GITHUB_ENV cannot move the Preview migration to Production")
+    # ---- ONE Database Migration job: the required scenarios (PR #89 simplification), each as an explicit check
+    e200 = {"STUB_PROBES": "200 "}
+    m = deploy(MAIN, inputs=D1, env=e200)
+    mo = public_outputs(m, D1, MAIN)
+    check(m["result"] == "success" and m["log"].count("migrations apply") == 1 and "PROD-ID" in mig_file(m, "prod") and m["res"]["migration"]["result"] == "success" and mo["migration_status"] == "applied",
+          "main push: the Production D1 is migrated exactly ONCE, by the single Migration job (migration_status=applied)")
+    m = deploy(FEAT, inputs=D1, env=e200)
+    mo = public_outputs(m, D1)
+    check(m["result"] == "success" and m["log"].count("migrations apply") == 1 and "PREV-ID" in mig_file(m, "preview") and "PROD-ID" not in mig_file(m, "preview") and mo["migration_status"] == "applied",
+          "feature-branch push: the Preview D1 is migrated exactly ONCE and never the Production D1")
+    m = deploy(FEAT, env=e200)
+    mo = public_outputs(m)
+    check(m["result"] == "success" and m["res"]["migration"]["result"] == "skipped" and not migrated(m) and "preview --name feat-x" in m["log"] and mo["migration_status"] == "none",
+          "d1_migrations=false (D1-less app or migration disabled): the Migration job is skipped, Delivery is NOT blocked, migration_status=none")
+    m = deploy(MAIN, env=e200)
+    check(m["res"]["migration"]["result"] == "skipped" and m["res"]["delivery_production"]["result"] == "success" and not migrated(m), "same on main: a skipped Migration never blocks the Production delivery")
+    m = deploy(FEAT, inputs=D1, env={"STUB_APPLY_FAIL": "1"})
+    check(m["res"]["migration"]["result"] == "failure" and public_outputs(m, D1)["migration_status"] == "failed" and m["res"]["delivery_native_branch"]["result"] == "skipped" and not published(m),
+          "failed Migration: migration_status=failed and the dependent Delivery never starts (nothing published, no automatic schema rollback)")
+    m = deploy(MAIN, inputs=D1, toml=bad)
+    check(m["result"] == "failure" and not migrated(m) and not published(m), "a Production D1 mapped into the Preview/Dev side fails inside the Migration job before any mutation")
+    md = deferred(MAIN, inputs=dict(D1), env=e200)
+    check(md["deploy"]["log"].count("migrations apply") == 1 and "migrations apply" not in md["log"], "pipeline_phase deferred verification never repeats the Migration (it ran once in the deploy call)")
 
 
 def group_shared_dev():
@@ -812,13 +832,18 @@ def group_shared_dev():
     check(r["result"] == "success" and "wrangler deploy --config " in r["log"] and "wrangler.toml --env dev" in r["log"] and r["log"].index("BUILD") < r["log"].index("wrangler deploy"), "Shared Dev built-in publish (no dev_deploy_cmd): wrangler deploy gets the audited --config (and the named env for a source config), after the build")
     r = deploy(MAIN, inputs=BADCFG)
     check(r["jobs"]["plan"]["result"] == "failure" and r["jobs"]["migration"]["result"] == r["jobs"]["deploy"]["result"] == "skipped" and "BUILD" not in r["log"] and not published(r), "production-only + Shared Dev: the plan fails; no delivery job is scheduled (no build, migration, publish)")
-    for stage_job, stage in (("migrate", "migrate"), ("deploy", "deliver")):
-        ws_ = make_workspace()  # defence in depth: even if a job were forced to run, the engine refuses at init
+    for stage_job in ("migration", "deploy"):  # defence in depth: even if a job were forced to run, the engine refuses at init
+        ws_ = make_workspace()
         c_ = ctx(MAIN, dict(BADCFG, d1_migrations=True), PROD_SECRETS, {})
-        dc_ = Ctx({"github": c_["github"], "inputs": dict(DINPUT_DEFAULTS, stage=stage, descriptor=desc("production"), tools_ref="x", inputs_json=json.dumps(dict(c_["inputs"])),
-                                                           kinds='["production"]', peers='{"production":"success"}'), "needs": {}, "jobs": {}}, PROD_SECRETS)
-        fr = run_job(ddoc, stage_job, dc_, ws_, {"STUB_TIPS": SHA})
-        check(fr["result"] == "failure" and not published(fr) and "wrangler versions" not in fr["log"] and "migrations apply" not in fr["log"] and "-X POST" not in fr["log"], f"production-only + Shared Dev: the {stage_job} stage fails at init (nothing remote)")
+        if stage_job == "migration":
+            pj = {"descriptors": json.dumps({"production": json.loads(desc("production", "PROD-ID", "production"))}), "migration": json.dumps({"kind": "production", "environment": "app/prod", "d1_id": "PROD-ID", "kinds": ["production"]}),
+                  "on_production": "true", "on_native_branch": "false", "on_native_dev": "false", "on_persistent_dev": "false"}
+            c_ = ctx(MAIN, dict(BADCFG, d1_migrations=True), PROD_SECRETS, {"gate": {"result": "success", "outputs": {}}, "plan": {"result": "success", "outputs": pj}})
+            fr = run_job(doc, "migration", c_, ws_, {"STUB_TIPS": SHA})
+        else:
+            dc_ = Ctx({"github": c_["github"], "inputs": dict(DINPUT_DEFAULTS, descriptor=desc("production"), tools_ref="x", inputs_json=json.dumps(dict(c_["inputs"]))), "needs": {}, "jobs": {}}, PROD_SECRETS)
+            fr = run_job(ddoc, stage_job, dc_, ws_, {"STUB_TIPS": SHA})
+        check(fr["result"] == "failure" and not published(fr) and "wrangler versions" not in fr["log"] and "migrations apply" not in fr["log"] and "-X POST" not in fr["log"], f"production-only + Shared Dev: the {stage_job} job fails at init (nothing remote)")
     for both in ({"shared_dev_on_branch_push": True, "shared_dev_native_preview_on_branch_push": True},):
         r = deploy(FEAT, inputs=both)
         check(r["jobs"]["plan"]["result"] == "failure" and not published(r), "persistent Dev + Native Dev both enabled: conflicting automatic Dev channels, the plan fails closed")
@@ -892,7 +917,7 @@ def group_chain_smoke_rollback():
         check(res_of(r) == NOTHING and r["log"] == "" and not release_runs(r), f"CI: failed {failing} -> Migration, Deploy, Smoke and Rollback are all skipped; nothing remote is touched; no Release")
     # 3. migration failure
     r = deploy(MAIN, inputs=dict(D1, **AUTO), env={"STUB_APPLY_FAIL": "1"})
-    check(res_of(r) == {"migration": "failure", "deploy": "failure", "smoke": "skipped", "rollback": "skipped"} and not published(r) and not release_runs(r), "Migration failure -> its Deploy leg stops (fails closed), Smoke and Rollback have nothing to do, nothing published, Release blocked")
+    check(res_of(r) == {"migration": "failure", "deploy": "skipped", "smoke": "skipped", "rollback": "skipped"} and not published(r) and not release_runs(r), "Migration failure -> the dependent Delivery never starts (job-level), Smoke and Rollback have nothing to do, nothing published, Release blocked")
     check("D1 migration failed" in r["summary"] and r["outputs"]["migration"] == "failed", "a failed migration is reported explicitly (migration_status=failed, summary)")
     # 4. deploy failure
     r = deploy(MAIN, inputs=AUTO, env={"STUB_UPLOAD_FAIL": "1"})
@@ -1170,17 +1195,17 @@ def group_native_dev_smoke_modes():
     check(r["result"] == "success" and r["log"].count("migrations apply") == 1 and r["log"].count("preview --name") == 2, "Branch + Native Dev on ONE shared preview D1: the D1 is migrated ONCE, both deliveries publish")
     pl_o = r["raw"]["plan"]["outputs"]
     pd_ = json.loads(pl_o["descriptors"])
-    check(pl_o["owns_native_branch"] == "true" and pl_o["owns_native_dev"] == "false" and pd_["native-dev"]["d1_owner_kind"] == "native-branch" and pd_["native-branch"]["d1_expected_id"] == pd_["native-dev"]["d1_expected_id"] == "PREV-ID" and pd_["native-branch"]["owns_migration"] and not pd_["native-dev"]["owns_migration"],
-          "the migration plan names the single owner (native-branch) and the D1 id both members share")
+    mig_plan = json.loads(pl_o["migration"])
+    check(mig_plan == {"kind": "native-branch", "environment": "app/preview", "d1_id": "PREV-ID", "kinds": ["native-branch", "native-dev"]} and pd_["native-dev"]["d1_owner_kind"] == "native-branch" and pd_["native-branch"]["d1_expected_id"] == pd_["native-dev"]["d1_expected_id"] == "PREV-ID" and pd_["native-branch"]["owns_migration"] and not pd_["native-dev"]["owns_migration"],
+          "the migration plan names the single owner (native-branch), its Environment and the D1 id both members share")
     check(r["raw"]["migration"]["outputs"].get("mj_native_branch") and r["raw"]["migration"]["outputs"].get("mj_native_dev") and json.loads(r["raw"]["migration"]["outputs"]["mj_native_dev"]).get("d1_id") == "PREV-ID", "both deliveries receive the shared migration result (each under its own key)")
     r = deploy(FEAT, inputs=TWO_IN, toml=two_db, env={"STUB_PROBES": "200 "})
-    check(r["result"] == "success" and r["log"].count("migrations apply") == 2, "Preview and persistent Dev on DISTINCT D1s: two independent migrations")
+    check(r["jobs"]["plan"]["result"] == "failure" and r["jobs"]["migration"]["result"] == "skipped" and not migrated(r) and not published(r) and "BUILD" not in r["log"],
+          "single-DB rule: Preview and persistent Dev on DISTINCT D1s fail the plan before any build, migration or publish (documented compatibility restriction)")
     r = deploy(FEAT, inputs=TWO_IN, toml=two_db, env={"STUB_PROBES": "200 ", "STUB_APPLY_FAIL_CFG": "migrate.dev.json"})
-    dep_out = {k: (json.loads(v) if v else {}) for k, v in r["raw"]["deploy"]["outputs"].items()}
-    check(r["result"] == "failure" and dep_out["h_native_branch"].get("published") == "true" and dep_out["h_persistent_dev"].get("published") != "true", "a failed DEV migration blocks only the Dev delivery; the Preview (other D1) is migrated, published and verified")
+    check(r["result"] == "failure" and not migrated(r) and not published(r), "single-DB rule: no partial migration either (a failing Dev D1 can never leave the Preview D1 migrated)")
     r = deploy(FEAT, inputs=TWO_IN, toml=two_db, env={"STUB_PROBES": "200 ", "STUB_APPLY_FAIL_CFG": "migrate.preview.json"})
-    dep_out = {k: (json.loads(v) if v else {}) for k, v in r["raw"]["deploy"]["outputs"].items()}
-    check(r["result"] == "failure" and dep_out["h_persistent_dev"].get("published") == "true" and dep_out["h_native_branch"].get("published") != "true", "a failed PREVIEW migration blocks only the Preview delivery; Dev (other D1) proceeds")
+    check(r["result"] == "failure" and not migrated(r) and not published(r) and r["jobs"]["plan"]["result"] == "failure", "single-DB rule: the same holds when the Preview D1 is the failing one - the plan, not a migration, is what fails")
     prod_shared = DEV_TOML.replace('database_name = "shared-db"\ndatabase_id = "SHARED-ID"\n[env.dev]', 'database_name = "prod-db"\ndatabase_id = "PROD-ID"\n[env.dev]')
     r = deploy(FEAT, inputs=dict(ND, **D1), toml=prod_shared)
     check(r["jobs"]["plan"]["result"] == "failure" and not migrated(r) and not published(r), "a Preview/Dev target mapped to the PRODUCTION D1 fails the plan: never migrated, never published")
@@ -1202,7 +1227,7 @@ def group_review_regressions():
     """FIX REGRESSIONS (PR #89 review): P1-A, P1-B, P2-A, P2-B"""
     global FWD, REV, nm, inp, e, pf, order, rr, po, used, fr, over
     FWD = CHAIN
-    REV = ("gate", "plan") + tuple(f"preflight_{KEYED[k]}" for k in reversed(KINDS)) + tuple(f"migration_{KEYED[k]}" for k in reversed(KINDS)) + tuple(f"delivery_{KEYED[k]}" for k in reversed(KINDS))
+    REV = ("gate", "plan", "migration") + tuple(f"delivery_{KEYED[k]}" for k in reversed(KINDS))
 
 
     # (2) results completing in REVERSED order: the public outputs and each kind's result are identical (nothing depends on completion order)
@@ -1234,21 +1259,25 @@ def group_review_regressions():
     rr = run_order(FWD, inputs=BD, env=dict(GDN2, STUB_PROBES="200 "), env_by_job={"smoke:native-dev": {"STUB_PROBES": "500 "}, "rollback:native-dev": {"STUB_NEWEST": "9999"}})
     check(rr["res"]["delivery_native_dev"]["jobs"]["rollback"]["result"] == "failure" and rr["res"]["delivery_native_dev"]["outputs"]["rollback_result"] == "no_known_good" and rr["log"].count("preview --name dev") == 1,
           "stale deployment protection: a NEWER deployment of `dev` exists -> the rollback is skipped (never replaces it)")
-    # (4) shared D1 dedupe: ONE migration call serves both; the dependent delivery receives the OWNER's result, validated by kind + D1 id
+    # (4) shared D1 dedupe: ONE migration serves both; each dependent delivery receives THE result, validated by kind + D1 id
     rr = run_order(FWD, inputs=dict(BD, **D1), env={"STUB_PROBES": "200 "})
-    check(rr["log"].count("migrations apply") == 1 and rr["res"]["migration_native_branch"]["result"] == "success" and rr["res"]["migration_native_dev"]["result"] == "skipped" and rr["res"]["delivery_native_dev"]["result"] == "success",
-          "P2-B shared D1: exactly one `d1 migrations apply`, run by the Native Branch call; Native Dev has no migration call and still deploys")
+    check(rr["log"].count("migrations apply") == 1 and rr["res"]["migration"]["result"] == "success" and rr["res"]["delivery_native_dev"]["result"] == "success" and rr["res"]["delivery_native_branch"]["result"] == "success",
+          "P2-B shared D1: exactly one `d1 migrations apply` in the ONE Migration job; Native Dev has no migration of its own and still deploys")
     used = json.loads(rr["res"]["delivery_native_dev"]["jobs"]["deploy"]["outputs"]["migration_used"])
     check(used["kind"] == "native-branch" and used["d1_id"] == "PREV-ID" and used["migration"] == "applied", "P2-B shared D1: the Native Dev delivery consumed the shared migration result (owner native-branch, D1 PREV-ID)")
-    check(all(rr["res"][f"preflight_{KEYED[k]}"]["result"] == ("success" if k in ("native-branch", "native-dev") else "skipped") for k in KINDS), "P2-B: a Preflight ran for EVERY enabled kind (and only for them) before the migration")
-    check(rr["res"]["preflight_native_dev"]["jobs"]["preflight"]["outputs"]["d1_id"] == "PREV-ID" and rr["res"]["preflight_native_dev"]["jobs"]["preflight"]["outputs"]["target_url"] == NDURL, "P2-B/P1-B: the Native Dev Preflight audited the built config's D1 id and canonical URL")
-    # P2-B: nothing is migrated while ANY enabled target fails its preflight (the Native Dev build is broken, the shared D1 stays untouched)
+    msteps = dict(rr["steps"])
+    check(msteps.get("Verify native-dev build and D1 binding / Validate the exact migration target (same physical D1 as the deployed config)") == "success" and msteps.get("Verify native-dev build and D1 binding / Apply pending D1 migrations (this target only)") == "skipped"
+          and msteps.get("Apply pending D1 migrations (once) / Apply pending D1 migrations (this target only)") == "success" and msteps.get("Verify persistent-dev build and D1 binding") == "skipped",
+          "P2-B: the Migration job validated the non-owner Native Dev (build, effective-config audit, exact D1) WITHOUT migrating, then the owner migrated once; persistent Dev (not enabled) was not touched")
+    check(rr["res"]["migration"]["outputs"]["migration_json"] and json.loads(rr["res"]["migration"]["outputs"]["migration_json"])["d1_id"] == "PREV-ID", "P2-B/P1-B: the Migration job reports the audited D1 id of the migration it applied")
+    # P2-B: nothing is migrated while ANY enabled target fails its validation (the Native Dev build is broken, the shared D1 stays untouched)
     rr = run_order(FWD, inputs=dict(bad, **D1), env={"STUB_PROBES": "200 "})
-    check(rr["res"]["preflight_native_dev"]["result"] == "failure" and not migrated(rr) and rr["res"]["migration_native_branch"]["result"] == "failure" and not published(rr)
-          and rr["res"]["delivery_native_branch"]["jobs"]["deploy"]["result"] == "failure",
-          "P2-B: one target's failed preflight blocks the migration of the D1 it shares - NO mutation at all, nothing published, fail closed")
+    check(rr["res"]["migration"]["result"] == "failure" and not migrated(rr) and not published(rr) and rr["res"]["delivery_native_branch"]["result"] == "skipped" and rr["res"]["delivery_native_dev"]["result"] == "skipped",
+          "P2-B: one target's failed validation blocks the migration of the D1 it shares - NO mutation at all, nothing published, no Delivery starts, fail closed")
     rr = run_order(FWD, inputs=dict(BD, **D1, build_cmd=REDIR), env={"STUB_PROBES": "200 "})
-    check(rr["res"]["preflight_native_branch"]["result"] == "failure" and not migrated(rr) and not published(rr), "P2-B: an adapter-generated effective config that binds another D1 than the plan's is refused in the Preflight: nothing is migrated or published")
+    check(rr["res"]["migration"]["result"] == "failure" and not migrated(rr) and not published(rr), "P2-B: an adapter-generated effective config that binds another D1 than the plan's is refused for a non-owner target: nothing is migrated or published")
+    rr = run_order(FWD, inputs=dict(D1, build_cmd=REDIR), env={"STUB_PROBES": "200 "})
+    check(rr["res"]["migration"]["result"] == "failure" and not migrated(rr) and not published(rr), "P2-B: the same refusal for the OWNER (checked in its migrate step, before the migration)")
     # (5) incorrect / missing URLs: fail BEFORE the build
     rr = run_order(FWD, inputs=dict(ND, app_url_shared_dev_native_preview="https://somewhere-else.example.workers.dev"), env={"STUB_PROBES": "200 "})
     check(rr["res"]["delivery_native_dev"]["result"] == "failure" and "BUILD" not in rr["log"] and not published(rr), "P1-B incorrect URL: a declared Native Dev URL that contradicts the Preview URL fails BEFORE the build (nothing built, nothing published)")
@@ -1272,11 +1301,13 @@ def group_review_regressions():
     check(fr["result"] == "failure", "hand-off isolation: a hand-off whose published URL differs from the URL it was built for is refused")
     fr = leg("smoke", "native-dev", needs={"deploy": {"result": "success", "outputs": {"handoff": "", "migration_used": "{}"}}, "smoke": SKIPPED}, env={"STUB_PROBES": "200 "})
     check(fr["result"] == "success" and fr["outputs"]["smoke_status"] == "none" and "BUILD" not in fr["log"], "missing hand-off: nothing was published -> nothing verified (smoke_status none), no verification claimed")
-    for nm, over in (("a failed migration of its D1", dict(own_migration_result="failure", own_migration_json=json.dumps({"migration": "applied", "kind": "native-branch", "d1_id": "PREV-ID"}))),
-                     ("a migration result for another D1", dict(own_migration_result="success", own_migration_json=json.dumps({"migration": "applied", "kind": "native-branch", "d1_id": "FOREIGN"}))),
-                     ("a migration result of another kind", dict(own_migration_result="success", own_migration_json=json.dumps({"migration": "applied", "kind": "persistent-dev", "d1_id": "PREV-ID"}))),
-                     ("a missing migration result", dict(own_migration_result="", own_migration_json=""))):
-        dc = Ctx({"github": ctx(FEAT)["github"], "inputs": dict(DINPUT_DEFAULTS, stage="deliver", descriptor=desc("native-branch", "PREV-ID", "native-branch"), d1_migrations="true", tools_ref="x", inputs_json=json.dumps(dict(ctx(FEAT)["inputs"], d1_migrations=True)), **over), "needs": {}}, PROD_SECRETS)
+    gj = lambda **o: dict({"migration_result": "success", "migration_json": json.dumps({"migration": "applied", "kind": "native-branch", "d1_id": "PREV-ID"})}, **o)
+    for nm, over in (("a failed migration", gj(migration_result="failure")),
+                     ("a cancelled migration", gj(migration_result="cancelled")),
+                     ("a migration result for another D1", gj(migration_json=json.dumps({"migration": "applied", "kind": "native-branch", "d1_id": "FOREIGN"}))),
+                     ("a migration result of another kind", gj(migration_json=json.dumps({"migration": "applied", "kind": "persistent-dev", "d1_id": "PREV-ID"}))),
+                     ("a missing migration result", gj(migration_result="", migration_json=""))):
+        dc = Ctx({"github": ctx(FEAT)["github"], "inputs": dict(DINPUT_DEFAULTS, descriptor=desc("native-branch", "PREV-ID", "native-branch"), d1_migrations="true", tools_ref="x", inputs_json=json.dumps(dict(ctx(FEAT)["inputs"], d1_migrations=True)), **over), "needs": {}}, PROD_SECRETS)
         ws = make_workspace(APP_TOML)
         rr_ = run_job(ddoc, "deploy", dc, ws, {"STUB_TIPS": SHA})
         check(rr_["result"] == "failure" and not published({"log": rr_["log"]}), f"Deploy refuses to publish with {nm} (fail closed before checkout/build)")

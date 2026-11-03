@@ -57,7 +57,7 @@ test('every failing command keeps stdout record-clean: unknown command, bad kind
     [['nope'], {}],
     [['smoke-mode', '--kind', 'bogus', '--mode', 'full'], {}],
     [['verification-outcome'], {}],
-    [['migration-gate', '--kind', 'production'], { DESCRIPTOR: 'not json', GATE_STAGE: 'migrate' }],
+    [['migration-gate', '--kind', 'production'], { DESCRIPTOR: 'not json' }],
     [['init-checks', '--state', tmpdir(), '--inputs', '/nonexistent'], { ENGINE_TARGET: 'prod' }],
   ];
   for (const [args, env] of cases) {
@@ -69,12 +69,16 @@ test('every failing command keeps stdout record-clean: unknown command, bad kind
   assert.notEqual(run(['smoke-mode', '--kind', 'bogus', '--mode', 'full']).status, 0);
 });
 
-test('migration gate: peer failures are annotated on stderr with a non-zero exit and clean stdout', () => {
-  const d = targetDescriptor({ kind: 'production', app: 'app', runId: 1 });
-  const r = run(['migration-gate', '--kind', 'production'], { DESCRIPTOR: JSON.stringify(d), GATE_STAGE: 'migrate', KINDS: '["production"]', PEERS: '{"production":"failure"}' });
+test('migration gate: a failed Migration job is annotated on stderr with a non-zero exit and clean stdout', () => {
+  const d = targetDescriptor({ kind: 'production', app: 'app', runId: 1, d1ExpectedId: 'DB1', ownerKind: 'production' });
+  const env = { DESCRIPTOR: JSON.stringify(d), D1_MIGRATIONS: 'true' };
+  const r = run(['migration-gate', '--kind', 'production'], { ...env, MIGRATION_RESULT: 'failure', MIGRATION_JSON: '{}' });
   assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /::error::preflight of production finished 'failure'/);
+  assert.match(r.stderr, /finished 'failure'/);
   assert.equal(r.stdout, '');
+  const ok = run(['migration-gate', '--kind', 'production'], { ...env, MIGRATION_RESULT: 'success', MIGRATION_JSON: JSON.stringify({ migration: 'applied', kind: 'production', d1_id: 'DB1' }) });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(ok.stdout, /^migration_used=\{.*\}$/m);
 });
 
 test('add-mask for Preview secrets goes to stderr, not into any output file', () => {

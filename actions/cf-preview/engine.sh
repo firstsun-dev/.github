@@ -125,7 +125,8 @@ case "$PHASE" in
     stale_check "${2:-guard}" || true;;
 
   init)
-    mkdir -p "$S"; chmod 700 "$S"; umask 077
+    # One job may run several engine invocations (the Migration job validates every target, then migrates): each starts from a clean state.
+    rm -rf "$S"; mkdir -p "$S"; chmod 700 "$S"; umask 077
     printf '%s' "${INPUTS_JSON:?}" > "$IN"
     # ONE Node process validates everything pure (target/kind/stage/mode binding, descriptor, strategy and policy enums, enabled kind of
     # this event, per-target requirements, URL isolation, env data) and writes the validated state files. Nothing is mutated if it fails.
@@ -139,9 +140,9 @@ case "$PHASE" in
       die "the Smoke stage must not receive Cloudflare credentials"
     fi;;
 
-  migration-gate) # before anything is built or published: peers' preflights (migrate) / the migration this kind depends on (publish)
+  migration-gate) # publish stage, before anything is built or published: the result of THE Migration job this kind depends on
     ctx
-    GATE_STAGE="${ENGINE_STAGE:?}" D1_MIGRATIONS="$(inp d1_migrations)" DESCRIPTOR="${ENGINE_DESCRIPTOR:?a target descriptor is required}" \
+    D1_MIGRATIONS="$(inp d1_migrations)" DESCRIPTOR="${ENGINE_DESCRIPTOR:?a target descriptor is required}" \
       node "$TOOLS_DIR/cli.mjs" migration-gate --kind "$KIND";;
 
   prepare)
