@@ -294,6 +294,23 @@ Dev on one D1 migrate once; 4/5 D1-less or disabled migration deploys and never 
 8 a failed Migration starts no Delivery; 9 Smoke/Rollback isolated per target; 10 Release needs a verified Production; 11 deferred verification never repeats the Migration; 12
 cross-service ordering unchanged; 13 public outputs unchanged (`migration_status` now always `applied` / `none` / `failed`); 14 the Migration job runs in `<app>/prod` on main.
 
+### Real-runner evidence for the single Migration job (pinned to `e69365e4087fb3af0aa50629b79f368a8b4738e2`; later commits are docs only)
+
+Disposable private `firstsun-dev/cf-v2-scratch-caller`; public workflow and `tools_ref` both the SHA above; org `linux` runners; **no Cloudflare credentials and unprotected scratch
+Environments**, so nothing remote was touched and approval protection was not exercised. Fake D1 ids in the scratch `wrangler.toml`.
+
+| Run | What it proves | Observed |
+| --- | --- | --- |
+| [41575194834](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41575194834) (ref `feat/x`, Native Branch + Native Dev, `d1_migrations`) | Nested reusable-workflow resolution; the single `Database Migration` job runs in the plan's **dynamic Environment** (`scratch/preview`); validation of the non-owner target happens first | Plan success; Migration failed closed at the first validation step (`preview credentials not provided`); the always-run status step ran; **all Delivery calls skipped**; public `migration_status=failed` readable by the caller |
+| [41575205777](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41575205777) (ref `main`) | Production path: Environment `scratch/prod`, owner = production | Migration failed closed (`prod credentials not provided`), Deliveries skipped, `migration_status=failed` |
+| [41575198199](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41575198199) (`d1_migrations: false`) | **Skipped Migration does not block Delivery** | `Database Migration` skipped; Delivery (native-branch) and (native-dev) both started (Deploy failed closed on credentials, Smoke reported `none`); `migration_status=none` |
+| [41575202262](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41575202262) (`wrangler.two.toml`, Native Branch + persistent Dev on distinct D1s) | Single-DB rule on a real runner | Plan failed: `d1_migrations: the enabled targets name 2 distinct physical D1 databases: scratch-preview-db (native-branch) vs scratch-dev-db (persistent-dev) ... (nothing was changed)`; Migration and all Delivery calls skipped |
+| [41575755238](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41575755238) (`pipeline_phase: deploy` then `verify`) | `pipeline_phase` compatibility; the verify call never migrates | Deploy-phase plan, Migration skipped (no D1), Deploy failed closed on credentials; the verify call planned from the real `phase_state`, `Database Migration` skipped, Smoke ran |
+| [41575759173](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41575759173) (hand-built v1 `phase_state`) | Backward-compatible hand-off | success; Migration skipped, Production Smoke ran from the hand-off |
+
+YAML anchors (`&delivery_permissions`, `&delivery_secrets`, `&fetch_ci_tools`) were accepted by the GitHub parser in all runs; the permission ceilings did not produce a `startup_failure`.
+**Not demonstrated and not claimed:** a live D1 migration, publish, smoke against a live Worker, rollback, and Environment approval gates (no credentials / unprotected scratch Environments).
+
 ## Known limitations
 
 * **Hosted `ubuntu-latest` runners lack `pnpm`** (resolved for validation by using the org's provisioned `linux` runners; see the evidence above). `actions/setup` with `setup-pnpm: 'false'` (used by every validation job and the engine) assumes a runner image with pnpm
