@@ -45,6 +45,15 @@
 - [ ] No unresolved critical blockers (resource isolation, D1, Access, stale deploy/rollback, Release).
 - [ ] Main Session records **G1 = PASS**. No consumer implementation or sub-sessions may start before this line is checked.
 
+## Phase 1 simplification (PR #89 refactor, no behaviour change)
+
+- [x] `$/` self-repository references replace every `.cf-tools` checkout; `tools_ref` stays accepted (optional, ignored); runner floor 2.336.0 documented.
+- [x] `_cf-worker-ci.yml`: six parallel checks + fail-closed Validation Gate with a `validation=passed` verdict; one CI call; no duplicate CI between push and same-repo PR.
+- [x] ONE Migration job unchanged; Migration and Delivery depend on the plan only (the plan requires a passed CI).
+- [x] Preview lifecycle and manual persistent Dev extracted (`_cf-worker-lifecycle.yml`, `_cf-worker-persistent-dev.yml`); one shared Delivery engine kept; four thin calls kept (no matrix, rationale in docs).
+- [x] One scheduling-time `concurrency.group` expression; canonical `runLockGroup()` emitted by the Plan; `phase_state` without the redundant `d1` map.
+- [x] Contract + chain tests ported; cross-repository real-runner scenarios r1–r11 recorded in `docs/cf-worker-v2-refactor.md`.
+
 ## Phase 2 — AFTER G1 ONLY: consumer sub-sessions (parallel when independent)
 
 - [ ] **Sub-session A, blog:** Native Branch ON, Native Dev ON, Persistent Dev OFF; distinct Astro URL builds, shared Preview D1 audit, Preview GC protection; retain content-only CI optimization.

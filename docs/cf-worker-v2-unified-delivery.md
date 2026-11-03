@@ -5,6 +5,8 @@ It supersedes the job topology in `cf-worker-v2-refactor.md` ("Job DAG", "Shared
 and recovery rules described there still apply. `_cf-worker-v2.yml` remains the only public entrypoint; `_cf-worker-delivery.yml` is an
 **internal** reusable workflow called only by it. v1 / v1.5 and the floating `@v2` tag are untouched by this change.
 
+> **Revised again (PR #89 Phase 1 simplification):** validation lives in `_cf-worker-ci.yml`, the Preview lifecycle and manual persistent Dev in their own workflows, every shared action/workflow is referenced with `$/` — see [cf-worker-v2-refactor.md](cf-worker-v2-refactor.md#phase-1-simplification-pr-89-refactor--current-structure).
+>
 > **Revised (PR #89 simplification).** No separate Preflight stage. **One Migration job with integrated safety validation; reusable target-driven Delivery.**
 > The earlier Preflight-per-kind / Migration-per-D1-owner topology, and the real-runner tables further down that exercised it, describe the superseded design;
 > the sections "Topology", "Behaviour" and "Single Migration job" are current.
@@ -12,9 +14,9 @@ and recovery rules described there still apply. `_cf-worker-v2.yml` remains the 
 ## Topology (final DAG)
 
 ```
-Lint ‖ Typecheck ‖ Unit ‖ Integration ‖ Build Validation ‖ E2E        (unchanged, independent)
+CI call (_cf-worker-ci.yml): Lint ‖ Typecheck ‖ Unit ‖ Integration ‖ Build Validation ‖ E2E     (independent, parallel)
                          │
-                 Validation Gate        every CONFIGURED job succeeds, every unconfigured one is skipped, else fail closed
+                 Validation Gate        every CONFIGURED job succeeds, every unconfigured one is skipped, else fail closed; output validation=passed
                          │
                   Delivery plan         enabled kinds + smoke modes + ONE physical D1 (pure data, no credentials)
                          │                outputs: on_<kind>, descriptors, migration {owner kind, Environment, d1_id, kinds}
@@ -31,7 +33,7 @@ Lint ‖ Typecheck ‖ Unit ‖ Integration ‖ Build Validation ‖ E2E        
 
 Kinds: `production`, `native-branch` (per-branch Native Preview), `native-dev` (the stable Native Preview named `dev`),
 `persistent-dev` (the separate `[env.dev]` Dev Worker; Notification Hub). Only enabled kinds exist as calls (a disabled call is skipped by the
-plan flag `on_<kind>`), so no phantom delivery paths exist. **A delivery call waits only for the Validation Gate, the plan, and the
+plan flag `on_<kind>`), so no phantom delivery paths exist. **A delivery call waits only for the plan (which itself requires a passed CI) and the
 single Migration job (success, or skipped when there is nothing to migrate); it never waits for, and is never affected by, another kind's Deploy / Smoke / Rollback.** There is no
 matrix anywhere in the delivery graph: every `needs.<call>.outputs.*` belongs to exactly one target.
 
@@ -50,10 +52,10 @@ a Preview/Dev kind whose D1 is the Production D1; enabled kinds that name **two 
 
 | Constraint | How |
 | --- | --- |
-| Nesting depth | caller → `_cf-worker-v2.yml` → `_cf-worker-delivery.yml` = 3 levels (limit 10); the delivery workflow calls nothing further |
+| Nesting depth | caller → `_cf-worker-v2.yml` → `_cf-worker-delivery.yml` / `-ci` / `-lifecycle` / `-persistent-dev` = 3 levels (limit 10); none of them calls a further workflow |
 | Permission ceiling | each `uses:` job declares the permissions the called jobs need (`contents: read`; `deployments: read` for the Migration job, `deployments: write` + `pull-requests: write` for Delivery); the caller of the public workflow already had to grant these |
-| Static `uses:` | `./.github/workflows/_cf-worker-delivery.yml` per call (no expression); actions are fetched by `tools_ref` as before |
-| `tools_ref` | forwarded unchanged to every call; the engine always comes from the same pinned ref |
+| Static `uses:` | `$/.github/workflows/_cf-worker-delivery.yml` per call (no expression); actions are `uses: $/actions/<name>` (this repository at the running commit) |
+| `tools_ref` | deprecated and ignored: `$/` makes the engine always come from the commit of the running workflow |
 | Secrets | passed explicitly per call (smoke credentials only to Delivery); never `secrets: inherit` |
 | Environments | job property inside the called workflow (`<app>/prod`, `/preview`, `/native-dev`, `/dev`); the Migration job runs in the owner's Environment; Smoke has none |
 | Concurrency | the run-level group stays on the public workflow; the delivery workflow has **only job-level** groups (`cfv2-leg-<run>-<kind>[-rollback]`, persistent Dev keeps `cfv2-dev-<repo>-<scope>`) so nothing deadlocks |

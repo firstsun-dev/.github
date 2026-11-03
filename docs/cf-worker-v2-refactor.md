@@ -4,6 +4,151 @@
 
 > **Topology superseded:** the job set below (Migration → Deploy → Smoke → Rollback + Shared Dev trio) was replaced by the matrix topology in [cf-worker-v2-unified-delivery.md](cf-worker-v2-unified-delivery.md). Engine, security and recovery rules here still apply.
 
+## Phase 1 simplification (PR #89 refactor) — current structure
+
+Goal: less orchestration, no duplicated configuration, no needless set-up, **same behaviour, same public interface, same security boundaries**.
+The full-regression and real-runner evidence is at the end of this section.
+
+### Before / after
+
+```
+BEFORE  _cf-worker-v2.yml (1,081 lines, 17 jobs)                 AFTER  _cf-worker-v2.yml (769 lines, 11 jobs)
+  lint typecheck unit integration build e2e  (6 jobs, each           ci  ──► _cf-worker-ci.yml: lint ‖ typecheck ‖ unit ‖ integration ‖
+        its own .cf-tools checkout, 5 near-identical bodies)                build ‖ e2e  ─► Validation Gate  (output validation=passed)
+  gate                                                                │
+  plan  (checkout .cf-tools + npm ci)                               plan  (uses: $/actions/cf-tools, install)   needs: [ci]
+  migration (checkout .cf-tools)  needs: gate, plan                 migration (ONE job, unchanged)              needs: [plan]
+  delivery_production | _native_branch | _native_dev | _persistent_dev    delivery_* ×4 (thin calls)              needs: [plan, migration]
+        (uses ./.github/workflows/_cf-worker-delivery.yml,                (uses $/.github/workflows/_cf-worker-delivery.yml)
+         tools_ref forwarded, needs: gate, plan, migration)             release (Production only)
+  release   config-guard                                                config-guard
+  lifecycle (inline, 5 steps)                                           lifecycle      ─► _cf-worker-lifecycle.yml
+  persistent-dev (inline, two contracts)                                persistent-dev ─► _cf-worker-persistent-dev.yml
+```
+
+| File | Before | After |
+| --- | ---: | ---: |
+| `_cf-worker-v2.yml` (public workflow) | 1,081 | 769 |
+| `_cf-worker-delivery.yml` | 320 | 282 |
+| `_cf-worker-ci.yml` (new) | – | 263 |
+| `_cf-worker-lifecycle.yml` (new) | – | 93 |
+| `_cf-worker-persistent-dev.yml` (new) | – | 109 |
+| `actions/cf-tools` (new) | – | 26 |
+| `_cf-worker-preview-gc.yml` | 113 | 104 |
+| **pipeline workflows (v2 + delivery + ci + lifecycle + persistent-dev)** | 1,401 | 1,516 |
+
+Total lines grew by 8 % (each extracted workflow repeats its own `on:`/`permissions:`/`inputs:` header); what shrank is the **public** workflow (−29 %), the
+number of places where behaviour is defined once instead of five times, and the set-up: **0** checkouts of this repository remain (before: 6 definitions, up to
+11 executed in one feature-branch push: 5 CI checks + E2E + plan + Migration + Deploy + Smoke + Rollback). Defined jobs: 20 → 23 (the three new ones are the
+extracted event handlers and the CI call; jobs *executed* per event are unchanged). **No runtime improvement is claimed**: the real-runner pairs (same scenario before and after,
+n = 1 each) differ by less than runner-queue noise (plan 16 s → 18 s, Migration 15 s → 16 s, Build Validation 16 s → 17 s); a checkout of a sparse tree takes about a second.
+`cf-deploy` keeps its 391 lines (only its `setup` reference and header comment changed).
+
+### Duplicated sections removed
+
+* Six copies of the tool checkout + `cf-ci-check` call (one anchor + five aliases) → one reusable CI workflow; the `Validation Gate` script moved with it (and now also emits the verdict).
+* The 3.5 KB top-level `concurrency.group` expression existed **three times** (deploy call, verify call, `phase_state.group`) → once; see "Concurrency and phase_state".
+* `phase_state.d1` (a per-kind D1 map the descriptors already carry) is gone; `d1_migrations` is no longer forwarded to Delivery (it was unused there).
+* Four `Fetch delivery tooling` steps in Delivery/Migration/persistent-dev, the Preview lifecycle's and the plan's checkout + `npm ci` + `TOOLS_DIR` env → `uses: $/…`.
+* `tools_ref` plumbing (a required input forwarded to every call and compared in the verify identity check) → a deprecated, ignored input.
+
+### `$/` (self-repository reference) coverage
+
+GitHub changelog 2026-07-30: `uses: $/path` is *this workflow's repository at the exact commit that is running*, with no checkout (needs runner ≥ 2.336.0; not on GHES; no `@ref` suffix; docs:
+"always resolves against the repository of the file it appears in, not the repository that called it" — which is exactly what a cross-repository reusable workflow needs).
+
+| Was | Now |
+| --- | --- |
+| `actions/checkout` of `firstsun-dev/.github` @ `tools_ref` into `.cf-tools` + `uses: ./.cf-tools/actions/cf-deploy` (Delivery ×3, Migration ×3, persistent Dev) | `uses: $/actions/cf-deploy` |
+| same + `./.cf-tools/actions/cf-ci-check` (CI ×5) | `uses: $/actions/cf-ci-check` (inside `_cf-worker-ci.yml`) |
+| sparse checkout + `parse-env.mjs` (E2E), checkout + `npm ci` + `TOOLS_DIR` (plan, lifecycle, GC) | `uses: $/actions/cf-tools` (new, 25 lines: exports `TOOLS_DIR`, optional `npm ci`) |
+| `uses: ./.github/workflows/_cf-worker-delivery.yml` | `uses: $/.github/workflows/_cf-worker-delivery.yml` (also `-ci`, `-lifecycle`, `-persistent-dev`) |
+| `firstsun-dev/.github/actions/{setup,mailpit}@v1` inside the pipeline | `$/actions/{setup,mailpit}` (byte-identical to `v1`, so no behaviour change; exact-version coupling instead of a floating pin) |
+
+Sibling files are **not** assumed to land in `$GITHUB_WORKSPACE`. The runner downloads this repository at the running SHA; each action finds its scripts relative to itself
+(`$GITHUB_ACTION_PATH/../cf-preview`, already how `cf-deploy` and `cf-ci-check` worked), and `cf-tools` exports that path for the jobs that run the scripts directly. The application checkout
+is unchanged; nothing from this repository is ever in the application's workspace (the old `find .cf-tools … -delete` workaround in `cf-ci-check` is gone).
+`tools_ref` is still accepted (required → optional, default empty) and ignored; a caller passing a non-existent ref keeps working (scenario r6 below).
+**New environmental requirement:** every runner that executes a pipeline job (the `runner` input) must be ≥ 2.336.0; the org `linux` runners are 2.338.0 and GitHub-hosted images 2.338.2. A caller on an older self-hosted runner fails at "Prepare all required actions".
+`actionlint` 1.7.12 does not know `$/`; `.github/actionlint.yaml` ignores exactly those two message formats and the contract test validates every `$/` reference itself (static, no `@ref`, target exists).
+
+### CI validation workflow
+
+`_cf-worker-ci.yml` runs the six checks as independent jobs without `needs` between them (asserted by the contract test; in the real run r7 below all seven jobs — E2E counts twice for two variants — started within about one second, the last one after waiting for a free runner), reusing `actions/cf-ci-check`
+(E2E keeps its own set-up and test build, the variants matrix and the optional Mailpit). The **Validation Gate** (`if: always()`, so it fails instead of being skipped) accepts only
+`success` for a configured job and `skipped` for an unconfigured one; only then it writes `validation=passed`, which the workflow exposes. The public workflow calls it **once**, with the
+skip rules in one place (not on `delete`, not on the persistent-dev dispatch, not in a verify call, and not on a same-repo `pull_request` — the push run of the same SHA covers it; fork PRs run it credential-free, so CI is never duplicated).
+The Delivery plan runs only when `needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed'` (a skipped, failed or cancelled call, or a green call without the verdict, blocks it).
+Migration and the four Delivery calls depend on the plan only: a plan can only succeed after a passed CI (or in a verify call), so they no longer repeat the CI condition.
+Build Validation stays separate from the target build of Deploy. **Check names change:** the checks now appear as `<caller job> / CI / Lint` … `<caller job> / CI / Validation Gate` (was `<caller job> / Lint`). Callers with *required status checks* must update them; for the two consumer repositories that could be
+checked read-only (`heaven-monorepo`, `innovation-apps`) this cannot matter — GitHub rejects the branch-protection and ruleset API on their plan, so they have no required checks; the other consumers were not inspected.
+
+### Migration (unchanged guarantees)
+
+Exactly one remote-D1 job per pipeline, same order, same Environment protection: `Validation → Plan → Database Migration (resolve D1 · validate bindings · audit effective config · stale-SHA guard · apply once) → Delivery`.
+It stays inline in the public workflow: extracting it would add a workflow-call layer and re-plumb the descriptors, the inputs blob and the credentials without removing a stage or
+weakening anything, which the brief rules out. Preview/Dev still can never reach the Production D1 (plan + engine audit); the shared-D1 group still serialises Workers sharing one D1; distinct physical D1s are still rejected by the plan.
+
+### Delivery engine and the matrix question
+
+One engine (`cf-deploy` → `engine.sh`) and one delivery workflow serve all four kinds, driven by the target descriptor. **The four calls are not a matrix, on purpose:** the public outputs
+(`deploy_*`, `native_dev_*`, `dev_*`, `rollback_result`, `phase_state`), the per-kind hand-off of a deferred verify, Migration attribution and the Production Release gate each read *one* kind's outputs; a matrix call exposes only
+one unspecified leg's output per key, so keeping them apart would need a results-collector job (a new stage and a new JSON layer). The four 12-line calls share `permissions:` and `secrets:` through YAML anchors (accepted by the GitHub parser in every real run).
+
+### Event handlers
+
+`lifecycle` (PR comment of the verified Preview URL; branch-delete ledger retirement, only if this branch still owns the name and the branch does not exist again; the Cloudflare Native Preview is **kept**) and `persistent-dev`
+(Hybrid, protected dispatch of the approved ref, `<app>/dev` Environment; engine in manual mode when `dev_build_cmd` is set, the unchanged legacy two-command contract otherwise) are small reusable workflows. They contain no deployment
+implementation: the persistent-dev engine path is the same `$/actions/cf-deploy`. The legacy path stays because `heaven-monorepo` and `innovation-apps` pass `persistent_dev_ref`; it cannot move into the engine without changing its "one command builds and publishes" contract.
+
+### Concurrency and `phase_state`
+
+* GitHub evaluates workflow-level `concurrency.group` before any job, so it cannot read a Plan output. The scheduling-time expression therefore stays in YAML, **once** (previously three copies). Its tested twin is `runLockGroup()` in `delivery.mjs`; the Plan now *emits* that
+  canonical value (`group` output), `phase_state.group` is taken from it, and `test-workflow-contract.py` renders the YAML expression against `runLockGroup()` over 512 event/ref/input scenarios.
+* **One deliberate semantic note.** A verify call used to schedule under a group *recomputed* from `phase_state.inputs` (a second copy of the expression). It now schedules under `phase_state.group`, the value its own deploy call recorded. A forged or wrong value is rejected by the Plan job (`restoreDescriptors` compares it with `runLockGroup()` of the deploy inputs)
+  **before any job that can mutate**, so the worst outcome is a failed verify run that queued in the wrong group; it can never mutate under another lock. Tests: `test-jobs.py` (forged / foreign-family / missing group → Plan fails, nothing smoked or released), contract test (rejection executed against the real validator).
+* `phase_state` keeps its shape minus the redundant `d1` map: `{inputs, kinds, deploy, migration, group, descriptors}`. It is produced and consumed inside one run by the same ref, and hand-built legacy blobs still verify (scenario r5).
+
+### Public interface
+
+All 60 inputs and 20 outputs remain with their names, defaults and semantics (diffed against the PR base: **no input or output removed, renamed or re-typed**). Two values changed, both internal: `tools_ref` is now optional and ignored, and the *content* of the opaque `phase_state` output lost its redundant `d1` key (callers pass it through unchanged). Semantics unchanged: `deploy_url`, `deploy_verified_url`, `deploy_verified`, `dev_url`, `native_dev_url`, `migration_status`, `rollback_result`, `phase_state` (opaque), all others.
+Recorded for a later phase (not done, would be breaking or out of scope): drop `tools_ref`; collapse the `build_env_*`/`app_url_*` per-channel input families into one `targets` object; give Release its own verified-Production output so callers do not re-derive it; a results collector plus matrix once GitHub aggregates reusable-workflow matrix outputs; make `phase_state` keys kind-indexed so the Delivery workflow can read its hand-off itself.
+
+### Verification
+
+* **Static + contract** (`scripts/cf-preview/test-workflow-contract.py`, 546 checks): YAML parse, job set and `needs` (no serial dependency between the six checks), permission ceilings per called workflow, every `$/` reference static/no-`@ref`/existing,
+  call `with:` keys vs called inputs, secrets isolation, event matrix for every job `if`, Validation Gate **executed** over success/failure/cancelled/skipped for each check, Release gate, concurrency expression vs `runLockGroup()` (512 scenarios), forged-group rejection, interface (inputs/outputs/defaults).
+* **Behavioural chain** (`scripts/cf-preview/test-jobs.py`, 413 checks, 8 groups, real `run:` steps and the composite engine against stubbed `gh`/`pnpm`/`curl`, each job in a fresh workspace): main push → Production; non-main → Branch Preview; Native Dev; persistent Dev; production-only; Hybrid dispatch; D1 on/off and shared D1; distinct D1s rejected;
+  failed Migration blocks every Delivery; each failing validation job blocks Migration and Delivery; smoke success / failure / skip / Access liveness; Production rollback; Preview/Dev recovery; Release only after a verified Production delivery; `pipeline_phase` deploy/verify and the cross-service `upstream_gate`; PR comment and branch-delete lifecycle.
+* **CI on the PR** (`cf-worker-v2-ci.yml`, run 41589279882 @ `3bda5fb`): fast profile, chain profile, `shellcheck`, `shellcheck` of the composite scripts, `actionlint` — green.
+* **Cross-repository, real runner** — disposable private `firstsun-dev/cf-v2-scratch-caller` calling `firstsun-dev/.github/.github/workflows/_cf-worker-v2.yml@3bda5fb40ddde8091c320702f58f6efe40d6faae`, org `linux` runners (2.338.0), **no Cloudflare credentials, no live deployment**, so every failure below is the designed fail-closed one.
+  The runner log shows `Download action repository 'firstsun-dev/.github@3bda5fb…'` for the nested `$/` actions and workflows: they resolved to the called workflow's repository and SHA, not to the caller.
+
+| Scenario (run) | Observed (jobs that ran) |
+| --- | --- |
+| r7 six checks + 2 E2E variants (41589291655, `feat/x`) | Lint, Typecheck, Unit, Integration, Build, E2E(a), E2E(b) all `success` and started together → Validation Gate → plan → `Deploy` failed closed (`preview credentials not provided`) → Smoke `none`; `d1_migrations: false` ⇒ Migration skipped |
+| r8 `lint_cmd: exit 3` (41589295764) | Lint `failure`, the other five still ran and reported independently → Validation Gate `failure` (`LINT finished 'failure'`) → **plan, Migration, every Delivery and Release skipped** |
+| r1 Branch Preview + Native Dev + D1 (41589300476, `feat/x`; 41589322177, `main`) | Gate → plan → the single `Database Migration` (Environment of the owner) failed closed on credentials before any remote call; Deliveries skipped; `migration_status=failed`. `main`: `prod credentials not provided` |
+| r2 `d1_migrations: false` (41589304686) | Migration skipped, **both Deliveries started** (Deploy failed on credentials, Smoke `none`) |
+| r3 two distinct D1s (41589308923) | Plan failed: `… 2 distinct physical D1 databases: scratch-preview-db (native-branch) vs scratch-dev-db (persistent-dev) … (nothing was changed)`; Migration and all Deliveries skipped |
+| r6 caller still passing `tools_ref: this-ref-does-not-exist` (41589313763) | identical to r1 — the deprecated input is ignored |
+| r4 `pipeline_phase` deploy → verify (41589317795) | deploy-phase plan + Delivery; the verify call's plan accepted the real `phase_state` (group + descriptors) and its Smoke ran; no Migration in the verify call |
+| r5 hand-built legacy `phase_state` (41589326325) | success: plan + Production Smoke from the hand-off |
+| r9 persistent Dev, legacy contract (41589330341, `val/pd`) | success: `dev_deploy_cmd` / `dev_smoke_cmd` ran (`$/actions/setup` in the nested workflow) |
+| r10 persistent Dev, engine contract (41589334806) | `$/actions/cf-deploy` ran; failed closed on `dev credentials not provided` |
+| r11 same-repo PR (41589372547), push to `evt/a` (41589358522), branch delete (41589501121) | PR: only `Preview lifecycle` ran (CI/plan/Delivery skipped), success, comment skipped as no verified Preview exists; push: CI → plan → Deploy failed on credentials; delete (default-branch workflow): lifecycle success |
+
+**Not demonstrated, not claimed:** a live D1 migration, publish, smoke against a live Worker, rollback, Environment approval gates (scratch Environments are unprotected), Mailpit, a runner older than 2.336.0, `$/` on GHES, and any runtime improvement.
+
+### Remaining risks and limitations
+
+* **Runner floor 2.336.0** for every runner passed as `runner` (see above); GHES is unsupported by `$/`.
+* **Check names changed** (`<job> / CI / Lint`): required status checks in other consumers must be updated when they adopt this ref.
+* `actionlint` cannot lint `$/` yet (two message formats ignored, guarded by the contract test).
+* A verify call queues under the recorded group before the Plan proves it (see "Concurrency and phase_state").
+* The public workflow is 769 lines, above the 600–750 target: the remaining bulk is the 60-input / 20-output public interface (≈ 300 lines), which Phase 1 may not change.
+* Total pipeline lines grew (see table); the gain is separation of concerns and the removal of duplication, not volume.
+
 ## Job DAG and architecture (thin workflow, one delivery engine)
 
 ```
@@ -95,9 +240,9 @@ detect ─┬─ A (deploy call):   CI ‖ E2E ─► Migration ─► Deploy �
 
 * **Hand-off = data.** `phase_state` (workflow output of the deploy call) is `{inputs, deploy, migration, dev, group}`:
   the deploy call's inputs, its job outputs and its concurrency group. The verify call passes it unchanged; the engine takes
-  its inputs from `phase_state.inputs`, so the verify call only repeats `app_name`, `app_path`, `tools_ref`, `runner`,
+  its inputs from `phase_state.inputs`, so the verify call only repeats `app_name`, `app_path`, `runner`,
   `production_rollback_policy` (+ `release_cmd`, the secrets). `engine.sh init` compares `app_name`, `app_path`,
-  `production_rollback_policy` and `tools_ref` of the verify call with the blob and **refuses a mismatch**. `hydrate` still
+  and `production_rollback_policy` of the verify call with the blob and **refuses a mismatch**. `hydrate` still
   validates every field by regex and refuses a hand-off published from another SHA.
 * **Cross-service gate (`upstream_gate`).** The caller passes `needs.<other>.result`. `success` or `skipped` (the other Worker is
   unchanged: its existing verified environment is used) satisfy it. Anything else (failed, cancelled, unknown) makes the
@@ -141,7 +286,7 @@ detect ─┬─ A (deploy call):   CI ‖ E2E ─► Migration ─► Deploy �
 
 ### Local composite actions in a cross-repository reusable workflow
 
-A reusable workflow called from another repository resolves `uses: ./...` against the **caller's** workspace, and `uses:` cannot take an expression, so `uses: firstsun-dev/.github/actions/x@${{ inputs.tools_ref }}` is impossible and a pinned `@v2` would not contain the new actions until the tag moves. Each job therefore (1) checks out the app, (2) checks out `firstsun-dev/.github` at `inputs.tools_ref` into `.cf-tools` (sparse: only the action it uses plus `actions/cf-preview`), and (3) references the action by the **static** path `./.cf-tools/actions/cf-deploy` / `cf-ci-check`. `tools_ref` must equal the ref the caller pins the workflow at (required input, unchanged). `test-workflow-contract.py` enforces: static `./.cf-tools/actions/<name>` paths only, the tooling checkout precedes every such reference and includes the action directory, the action exists in this repository. Only the pre-existing `setup` / `mailpit` `@v1` shared actions are referenced remotely.
+**Superseded by `$/` (see "Phase 1 simplification").** The old pattern — check out `firstsun-dev/.github` at `tools_ref` into `.cf-tools` and reference `./.cf-tools/actions/<name>` — existed because `./` resolves against the *caller's* workspace and `uses:` cannot take an expression. Actions and nested workflows are now `uses: $/actions/<name>` / `uses: $/.github/workflows/<file>`, which resolve to this repository at the running commit.
 
 **Revision (issue #61):** the former single `CI` job (Lint → Typecheck → Unit → Integration → Build as steps) is split into independent jobs for failure isolation, per-check duration/conclusion and single-job reruns. Same v2 name and public inputs; no v3.
 
@@ -166,7 +311,7 @@ A reusable workflow called from another repository resolves `uses: ./...` agains
 
 | Group | Inputs |
 |---|---|
-| Identity | `tools_ref` (must equal the ref the caller pins), `app_name`, `app_path`, `app_version`, `runner`, `wrangler_config` |
+| Identity | `tools_ref` (deprecated, ignored), `app_name`, `app_path`, `app_version`, `runner`, `wrangler_config` |
 | Strategy | `deployment_strategy` (`production-preview` \| `hybrid` \| `production-only`), `preview_on_branch_push`, `shared_dev_on_branch_push` (default `false`), `preview_worker_name` |
 | Validation | `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `test_integration_cmd`, `build_cmd` (required), `ci_env`, `use_mailpit` |
 | E2E | `test_e2e_cmd`, `test_e2e_setup_cmd`, `test_e2e_build_cmd`, `test_e2e_env`, `test_e2e_variants` |
