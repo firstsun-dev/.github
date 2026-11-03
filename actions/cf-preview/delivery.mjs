@@ -500,7 +500,7 @@ export function validateInit({ inputs, target, kind = '', stage = 'all', mode = 
     let c;
     try { c = JSON.parse(callInputs); } catch { c = null; }
     if (c === null || typeof c !== 'object' || Array.isArray(c)) throw new Error('call inputs are not an object');
-    for (const k of ['app_name', 'app_path', 'production_rollback_policy', 'tools_ref']) {
+    for (const k of ['app_name', 'app_path', 'production_rollback_policy']) {
       if ((c[k] == null ? '' : String(c[k])) !== s(k)) throw new Error(`verify call input '${k}' differs from the deploy call that produced the hand-off; refusing to verify another deployment`);
     }
   }

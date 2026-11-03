@@ -5,26 +5,25 @@ name: CF Worker Pipeline v2
 # OpenSpec: openspec/changes/refactor-cloudflare-worker-cicd-v2 (PR #57), openspec/changes/add-cloudflare-shared-dev-channel.
 # Interface / migration guide: docs/cf-worker-v2-refactor.md
 #
-#   Lint  Typecheck  Unit  Integration  Build Validation  E2E        six independent, parallel jobs (no `needs` between them)
-#                         |
-#                  Validation Gate -> Delivery plan (enabled targets, ONE physical D1, the migration owner; pure data)
-#                         |
-#      Database Migration   ONE job. Its first steps are the read-only safety checks (target build, effective-config audit, exact D1 binding
-#                         |  of every enabled target), the last one applies the migration ONCE. No separate Preflight stage.
-#      Delivery  (one call per enabled target of _cf-worker-delivery.yml):  Deploy -> Smoke -> conditional Rollback,
-#                         |                                       independent of every other target
-#                      Release  optional, main only, only after a VERIFIED Production delivery with no rollback
+#   CI  (_cf-worker-ci.yml)   Lint | Typecheck | Unit | Integration | Build Validation | E2E in parallel -> Validation Gate (fail closed)
+#         |
+#   Delivery plan             enabled targets, ONE physical D1, the migration owner (pure data; runs only when CI passed)
+#         |
+#   Database Migration        ONE job: read-only safety checks first (target build, effective-config audit, exact D1 binding), then
+#         |                   the migration is applied ONCE. No separate Preflight stage.
+#   Delivery x enabled kinds  _cf-worker-delivery.yml, one call per kind: Deploy -> Smoke -> conditional Rollback, independent per kind
+#         |
+#   Release                   optional, main only, only after a VERIFIED Production delivery with no rollback
 #
-# ONE delivery implementation (_cf-worker-delivery.yml -> actions/cf-deploy -> engine.sh) serves every kind; a call handles exactly one
-# target, so job outputs are unambiguous (no matrix output merging). The run-level concurrency group below spans the whole run.
+# Event handlers outside that DAG: `lifecycle` (_cf-worker-lifecycle.yml: PR comment / branch delete), `persistent-dev`
+# (_cf-worker-persistent-dev.yml: Hybrid, protected manual dispatch, same engine in manual mode) and `config-guard`.
 # One pipeline migrates at most one physical D1: distinct databases among the enabled targets are rejected by the plan, before any mutation.
-# Event handlers outside the DAG: `lifecycle` (PR comment / branch delete), `config-guard` and `persistent-dev` (Hybrid, protected
-# manual dispatch; the same engine in one job, manual mode).
+# The run-level concurrency group below spans the whole run. Interface, design record and measurements: docs/cf-worker-v2-refactor.md.
 #
-# Local composite actions: a reusable workflow called from another repository resolves `uses: ./...` against the
-# CALLER's workspace and `uses:` cannot take an expression. Every job therefore checks out firstsun-dev/.github at
-# `tools_ref` into `.cf-tools` and references the actions as the static path `./.cf-tools/actions/<name>`.
-# `tools_ref` MUST equal the ref the caller pins this workflow at.
+# Shared actions / nested workflow: `uses: $/actions/<name>` and `uses: $/.github/workflows/...` (GitHub self-repository syntax,
+# runner >= 2.336.0) resolve to THIS repository at the exact commit of the running workflow, with no checkout into the caller's
+# workspace (a plain `./` would resolve against the CALLER's). Version coupling is therefore exact by construction; `tools_ref` is
+# a deprecated no-op. Scripts are located relative to their action (`$GITHUB_ACTION_PATH/../cf-preview`, or actions/cf-tools).
 #
 # Caller MUST trigger on: push (all branches), pull_request, delete, workflow_dispatch.
 # `delete` only fires from the DEFAULT branch's workflow file.
@@ -91,15 +90,17 @@ on:
         description: true when the cross-service gate (upstream_gate) blocked a verification - the deployment is published but NOT verified and was not rolled back (pipeline_phase verify)
         value: ${{ fromJSON(jobs.delivery_production.outputs.smoke_json || '{}').gate_blocked == 'true' || fromJSON(jobs.delivery_native_branch.outputs.smoke_json || '{}').gate_blocked == 'true' || fromJSON(jobs.delivery_native_dev.outputs.smoke_json || '{}').gate_blocked == 'true' || fromJSON(jobs.delivery_persistent_dev.outputs.smoke_json || '{}').gate_blocked == 'true' }}
       phase_state:
-        description: pipeline_phase deploy - the validated hand-off (inputs, enabled kinds, per-kind Deploy / Migration results, per-kind D1 ids, concurrency group) for the verify call. Pass it unchanged as phase_state
-        value: ${{ format('{{"inputs":{0},"kinds":{1},"deploy":{2},"migration":{3},"d1":{4},"group":"{5}","descriptors":{6}}}', toJSON(inputs), toJSON(fromJSON(jobs.plan.outputs.kinds || '[]')), format('{{"h_production":{0},"h_native_branch":{1},"h_native_dev":{2},"h_persistent_dev":{3}}}', toJSON(jobs.delivery_production.outputs.handoff), toJSON(jobs.delivery_native_branch.outputs.handoff), toJSON(jobs.delivery_native_dev.outputs.handoff), toJSON(jobs.delivery_persistent_dev.outputs.handoff)), format('{{"mj_production":{0},"mj_native_branch":{1},"mj_native_dev":{2},"mj_persistent_dev":{3}}}', toJSON(jobs.delivery_production.outputs.migration_used), toJSON(jobs.delivery_native_branch.outputs.migration_used), toJSON(jobs.delivery_native_dev.outputs.migration_used), toJSON(jobs.delivery_persistent_dev.outputs.migration_used)), format('{{"production":{0},"native_branch":{1},"native_dev":{2},"persistent_dev":{3}}}', toJSON(fromJSON(jobs.plan.outputs.descriptors || '{}')['production'].d1_expected_id || ''), toJSON(fromJSON(jobs.plan.outputs.descriptors || '{}')['native-branch'].d1_expected_id || ''), toJSON(fromJSON(jobs.plan.outputs.descriptors || '{}')['native-dev'].d1_expected_id || ''), toJSON(fromJSON(jobs.plan.outputs.descriptors || '{}')['persistent-dev'].d1_expected_id || '')), ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && (github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.preview_on_branch_push || inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id), toJSON(fromJSON(jobs.plan.outputs.descriptors || '{}'))) }}
+        description: pipeline_phase deploy - the validated hand-off (inputs, enabled kinds, per-kind Deploy / Migration results, concurrency group, target descriptors) for the verify call. Pass it unchanged as phase_state
+        value: ${{ format('{{"inputs":{0},"kinds":{1},"deploy":{2},"migration":{3},"group":{4},"descriptors":{5}}}', toJSON(inputs), toJSON(fromJSON(jobs.plan.outputs.kinds || '[]')), format('{{"h_production":{0},"h_native_branch":{1},"h_native_dev":{2},"h_persistent_dev":{3}}}', toJSON(jobs.delivery_production.outputs.handoff), toJSON(jobs.delivery_native_branch.outputs.handoff), toJSON(jobs.delivery_native_dev.outputs.handoff), toJSON(jobs.delivery_persistent_dev.outputs.handoff)), format('{{"mj_production":{0},"mj_native_branch":{1},"mj_native_dev":{2},"mj_persistent_dev":{3}}}', toJSON(jobs.delivery_production.outputs.migration_used), toJSON(jobs.delivery_native_branch.outputs.migration_used), toJSON(jobs.delivery_native_dev.outputs.migration_used), toJSON(jobs.delivery_persistent_dev.outputs.migration_used)), toJSON(jobs.plan.outputs.group || format('cfv2-run-{0}', github.run_id)), toJSON(fromJSON(jobs.plan.outputs.descriptors || '{}'))) }}
     inputs:
       tools_ref:
         description: >
-          Ref of firstsun-dev/.github providing actions/cf-preview tooling.
-          MUST equal the ref the caller pins this workflow at (SHA or immutable v2.x.y).
+          DEPRECATED, ignored (kept so existing callers keep working). The shared actions and the delivery workflow are referenced
+          with the self-repository syntax `$/`, which resolves to the repository AND commit of this workflow, so the tooling can no
+          longer drift from the workflow ref the caller pins. Safe to delete from callers.
         type: string
-        required: true
+        required: false
+        default: ''
       app_name:
         description: Unique deployment/identity name (e.g. www, heaven-id). Part of the Preview identity (Worker scope).
         type: string
@@ -412,25 +413,26 @@ on:
         description: Token for release_cmd (exported as GH_TOKEN); defaults to nothing, GITHUB_TOKEN is NOT used for releases
         required: false
 
-# One run-level concurrency group per piece of shared mutable state (GitHub `concurrency` cannot span two jobs, so
-# the whole RUN is the unit; CI and E2E still run in parallel inside a run). `queue: max` keeps FIFO instead of
-# cancelling an older pending run (beyond 100 GitHub cancels the extra run: fail-closed, it deploys nothing).
-# The identity is the RESOURCE, not the app: `d1_lock_scope` replaces app_name so apps that share one physical D1
-# share one group, and Production and non-Production are always different groups:
+# One run-level concurrency group per piece of shared mutable state (GitHub `concurrency` cannot span two jobs, so the whole RUN is the
+# unit; CI and E2E still run in parallel inside a run). `queue: max` keeps FIFO instead of cancelling an older pending run (beyond 100
+# GitHub cancels the extra run: fail-closed, it deploys nothing). The identity is the RESOURCE, not the app: `d1_lock_scope` replaces
+# app_name so apps that share one physical D1 share one group, and Production and non-Production are always different groups:
 #   main                               -> cfv2-prod-<d1_lock_scope|app_name>
 #   branch, d1_migrations, a non-main channel enabled (Preview and/or Shared Dev, strategy != production-only)
 #                                      -> cfv2-nonprod-d1-<d1_lock_scope|app_name>   (Preview AND Shared Dev D1)
 #   branch, Shared Dev on, no D1 lock  -> cfv2-shared-dev-<app_name>                  (the ONE Dev Worker)
 #   branch, both channels off          -> cfv2-<app_name>-preview-<branch>            (CI-only: no shared D1 serialization)
 #   PR / delete / persistent-dev / any other event -> a private group (never queues behind a deploy)
-# The Shared Dev and persistent-Dev jobs additionally share the job-level group cfv2-dev-<repo>-<scope|app_name>.
-# The `cfv2-` prefix is static on purpose: never reuse it (or ${{ github.workflow }}) in a CALLER group, or caller
-# and callee deadlock. A repo-local group does NOT protect a D1 shared with another repository.
-# `queue` is not known to actionlint 1.7.12: see .github/actionlint.yaml.
-# Scheduling-time lock. GitHub evaluates this BEFORE any job, so a later Plan check cannot repair it. For a verify call the SAME rule is applied to the
-# DEPLOY call's own inputs (phase_state.inputs) - never to a caller-supplied group string; the Plan job then requires phase_state.group to equal it.
+# The `cfv2-` prefix is static on purpose: never reuse it (or ${{ github.workflow }}) in a CALLER group, or caller and callee deadlock.
+# A repo-local group does NOT protect a D1 shared with another repository. `queue` is unknown to actionlint 1.7.12: .github/actionlint.yaml.
+#
+# GitHub evaluates this BEFORE any job, so it cannot read a Plan output: this is the one calculation that must live in YAML. Its canonical
+# twin is runLockGroup() in actions/cf-preview/delivery.mjs (the Plan emits it as `group`; test-workflow-contract.py renders this expression
+# and compares both over a scenario matrix). A verify call (pipeline_phase=verify) schedules under the group its DEPLOY call recorded in
+# phase_state; the Plan job then proves, before any mutation, that it equals runLockGroup() of the deploy call's own inputs - a wrong or
+# forged value fails the run there, it can never mutate under another lock.
 concurrency:
-  group: ${{ inputs.pipeline_phase == 'verify' && (((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && fromJSON(inputs.phase_state).inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && (github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', fromJSON(inputs.phase_state).inputs.d1_lock_scope != '' && fromJSON(inputs.phase_state).inputs.d1_lock_scope || fromJSON(inputs.phase_state).inputs.app_name) || (fromJSON(inputs.phase_state).inputs.deployment_strategy != 'production-only' && (fromJSON(inputs.phase_state).inputs.preview_on_branch_push || fromJSON(inputs.phase_state).inputs.shared_dev_on_branch_push || fromJSON(inputs.phase_state).inputs.shared_dev_native_preview_on_branch_push) && fromJSON(inputs.phase_state).inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', fromJSON(inputs.phase_state).inputs.d1_lock_scope != '' && fromJSON(inputs.phase_state).inputs.d1_lock_scope || fromJSON(inputs.phase_state).inputs.app_name) || (fromJSON(inputs.phase_state).inputs.deployment_strategy != 'production-only' && (fromJSON(inputs.phase_state).inputs.shared_dev_on_branch_push || fromJSON(inputs.phase_state).inputs.shared_dev_native_preview_on_branch_push) && format('cfv2-shared-dev-{0}', fromJSON(inputs.phase_state).inputs.app_name) || format('cfv2-{0}-preview-{1}', fromJSON(inputs.phase_state).inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id)) || (((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && (github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.preview_on_branch_push || inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id)) }}
+  group: ${{ inputs.pipeline_phase == 'verify' && (fromJSON(inputs.phase_state).group || format('cfv2-run-{0}', github.run_id)) || ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && (github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.preview_on_branch_push || inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id) }}
   queue: max
 
 permissions:
@@ -444,216 +446,37 @@ defaults:
 env:
   NODE_VERSION: 24
   PNPM_STORE_PATH: /cache/pnpm-store
-  TOOLS_DIR: .cf-tools/actions/cf-preview
   PLAYWRIGHT_BROWSERS_PATH: /opt/playwright-browsers
 
 jobs:
   # -------------------------------------------------------------------------
-  # Validation — six independent jobs, no `needs` between them: each has its own checkout / setup / logs / check
-  # conclusion and can be re-run alone. Bodies are actions/cf-ci-check. None receives Cloudflare credentials and
-  # none uploads a build artifact (Build Validation builds for validation only; the engine builds again for its
-  # real target). Same-repo PRs are covered by the push run of the same SHA; fork PRs run these credential-free.
+  # CI — ONE call of _cf-worker-ci.yml: Lint, Typecheck, Unit, Integration, Build Validation and E2E as six independent, parallel jobs,
+  # then the fail-closed Validation Gate. Credential-free; fork PRs run it, same-repo PRs are covered by the push run of the same SHA.
+  # Its result is the only upstream condition of the Delivery plan.
   # -------------------------------------------------------------------------
-  lint:
-    name: Lint
-    if: inputs.lint_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-      - &fetch_ci_tools
-        name: Fetch CI action and env-import tool
-        uses: actions/checkout@v6
-        with:
-          repository: firstsun-dev/.github
-          ref: ${{ inputs.tools_ref }}
-          path: .cf-tools
-          sparse-checkout: |
-            actions/cf-ci-check
-            actions/cf-preview/parse-env.mjs
-          sparse-checkout-cone-mode: false
-          persist-credentials: false
-      - uses: ./.cf-tools/actions/cf-ci-check
-        with:
-          title: Lint
-          cmd: ${{ inputs.lint_cmd }}
-          app_path: ${{ inputs.app_path }}
-          build_env_prod: ${{ inputs.build_env_prod }}
-          build_env_preview: ${{ inputs.build_env_preview }}
-          ci_env: ${{ inputs.ci_env }}
-          app_version: ${{ inputs.app_version }}
-  typecheck:
-    name: Typecheck
-    if: inputs.typecheck_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-      - *fetch_ci_tools
-      - uses: ./.cf-tools/actions/cf-ci-check
-        with:
-          title: Typecheck
-          cmd: ${{ inputs.typecheck_cmd }}
-          app_path: ${{ inputs.app_path }}
-          build_env_prod: ${{ inputs.build_env_prod }}
-          build_env_preview: ${{ inputs.build_env_preview }}
-          ci_env: ${{ inputs.ci_env }}
-          app_version: ${{ inputs.app_version }}
-  unit:
-    name: Unit Tests
-    if: inputs.test_unit_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-      - *fetch_ci_tools
-      - uses: ./.cf-tools/actions/cf-ci-check
-        with:
-          title: Unit Tests
-          cmd: ${{ inputs.test_unit_cmd }}
-          app_path: ${{ inputs.app_path }}
-          build_env_prod: ${{ inputs.build_env_prod }}
-          build_env_preview: ${{ inputs.build_env_preview }}
-          ci_env: ${{ inputs.ci_env }}
-          app_version: ${{ inputs.app_version }}
-          use_mailpit: ${{ inputs.use_mailpit }}
-  integration:
-    name: Integration Tests
-    if: inputs.test_integration_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-      - *fetch_ci_tools
-      - uses: ./.cf-tools/actions/cf-ci-check
-        with:
-          title: Integration Tests
-          cmd: ${{ inputs.test_integration_cmd }}
-          app_path: ${{ inputs.app_path }}
-          build_env_prod: ${{ inputs.build_env_prod }}
-          build_env_preview: ${{ inputs.build_env_preview }}
-          ci_env: ${{ inputs.ci_env }}
-          app_version: ${{ inputs.app_version }}
-          use_mailpit: ${{ inputs.use_mailpit }}
-  build:
-    name: Build Validation
+  ci:
+    name: CI
     if: github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-      - *fetch_ci_tools
-      - uses: ./.cf-tools/actions/cf-ci-check
-        with:
-          title: Build Validation
-          cmd: ${{ inputs.build_cmd }}
-          app_path: ${{ inputs.app_path }}
-          build_env_prod: ${{ inputs.build_env_prod }}
-          build_env_preview: ${{ inputs.build_env_preview }}
-          ci_env: ${{ inputs.ci_env }}
-          app_version: ${{ inputs.app_version }}
-
-  # E2E — own setup and own TEST build (local URLs, mock services); never reused for a deployment.
-  e2e:
-    name: E2E
-    if: inputs.test_e2e_cmd != '' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
-    strategy:
-      fail-fast: false
-      matrix:
-        e2e: ${{ fromJSON(inputs.test_e2e_variants) }}
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 45
-    env:
-      E2E_ENV: ${{ inputs.test_e2e_env }}
-    steps:
-      - uses: actions/checkout@v6
-      - name: Fetch env-import tool
-        uses: actions/checkout@v6
-        with:
-          repository: firstsun-dev/.github
-          ref: ${{ inputs.tools_ref }}
-          path: .cf-tools
-          sparse-checkout: actions/cf-preview/parse-env.mjs
-          sparse-checkout-cone-mode: false
-      - name: Import E2E env
-        run: |
-          node "$TOOLS_DIR/parse-env.mjs" E2E_ENV "$GITHUB_ENV"
-          rm -rf .cf-tools
-      - uses: firstsun-dev/.github/actions/setup@v1
-        with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Start Mailpit
-        if: inputs.use_mailpit
-        uses: firstsun-dev/.github/actions/mailpit@v1
-      - name: E2E setup
-        if: inputs.test_e2e_setup_cmd != ''
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.test_e2e_setup_cmd }}
-        run: bash -c "$CMD"
-      - name: E2E test build
-        if: inputs.test_e2e_build_cmd != ''
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.test_e2e_build_cmd }}
-        run: bash -c "$CMD"
-      - name: E2E tests
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.test_e2e_cmd }} ${{ matrix.e2e.args }}
-        run: bash -c "$CMD"
-      # Failure-only evidence with short retention; never a delivery dependency.
-      - name: Upload E2E report (failure only)
-        uses: actions/upload-artifact@v7
-        if: failure()
-        continue-on-error: true
-        with:
-          name: ${{ matrix.e2e.artifact_suffix != '' && format('e2e-report-{0}-{1}-{2}', inputs.app_name, matrix.e2e.artifact_suffix, github.run_id) || format('e2e-report-{0}-{1}', inputs.app_name, github.run_id) }}
-          path: |
-            ${{ inputs.app_path }}/playwright-report/
-            ${{ inputs.app_path }}/test-results/
-          if-no-files-found: ignore
-          retention-days: 3
-
-  # -------------------------------------------------------------------------
-  # Validation Gate — the ONE aggregation of the six independent validation jobs above. Every CONFIGURED job must have
-  # succeeded; an unconfigured one must have been skipped; anything else (failure, cancellation, unexpected skip) is
-  # fail-closed. Planning, Migration and every delivery depend on this gate and on nothing else upstream.
-  # -------------------------------------------------------------------------
-  gate:
-    name: Validation Gate
-    needs: [lint, typecheck, unit, integration, build, e2e]
-    if: always() && inputs.pipeline_phase != 'verify' && github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 5
-    steps:
-      - name: Every configured validation job succeeded
-        env:
-          LINT: ${{ needs.lint.result }}
-          LINT_CONFIGURED: ${{ inputs.lint_cmd != '' }}
-          TYPECHECK: ${{ needs.typecheck.result }}
-          TYPECHECK_CONFIGURED: ${{ inputs.typecheck_cmd != '' }}
-          UNIT: ${{ needs.unit.result }}
-          UNIT_CONFIGURED: ${{ inputs.test_unit_cmd != '' }}
-          INTEGRATION: ${{ needs.integration.result }}
-          INTEGRATION_CONFIGURED: ${{ inputs.test_integration_cmd != '' }}
-          BUILD: ${{ needs.build.result }}
-          BUILD_CONFIGURED: 'true'
-          E2E: ${{ needs.e2e.result }}
-          E2E_CONFIGURED: ${{ inputs.test_e2e_cmd != '' }}
-        run: |
-          bad=0
-          for j in LINT TYPECHECK UNIT INTEGRATION BUILD E2E; do
-            r="${j}"; c="${j}_CONFIGURED"
-            if [ "${!c}" = true ]; then
-              [ "${!r}" = success ] || { echo "::error::$j finished '${!r}' (configured: must succeed)"; bad=1; }
-            else
-              [ "${!r}" = skipped ] || { echo "::error::$j is not configured but finished '${!r}'"; bad=1; }
-            fi
-          done
-          [ "$bad" = 0 ] || exit 1
-          echo "Validation Gate passed."
+    uses: $/.github/workflows/_cf-worker-ci.yml
+    with:
+      app_name: ${{ inputs.app_name }}
+      app_path: ${{ inputs.app_path }}
+      app_version: ${{ inputs.app_version }}
+      runner: ${{ inputs.runner }}
+      lint_cmd: ${{ inputs.lint_cmd }}
+      typecheck_cmd: ${{ inputs.typecheck_cmd }}
+      test_unit_cmd: ${{ inputs.test_unit_cmd }}
+      test_integration_cmd: ${{ inputs.test_integration_cmd }}
+      build_cmd: ${{ inputs.build_cmd }}
+      ci_env: ${{ inputs.ci_env }}
+      use_mailpit: ${{ inputs.use_mailpit }}
+      build_env_prod: ${{ inputs.build_env_prod }}
+      build_env_preview: ${{ inputs.build_env_preview }}
+      test_e2e_cmd: ${{ inputs.test_e2e_cmd }}
+      test_e2e_setup_cmd: ${{ inputs.test_e2e_setup_cmd }}
+      test_e2e_build_cmd: ${{ inputs.test_e2e_build_cmd }}
+      test_e2e_variants: ${{ inputs.test_e2e_variants }}
+      test_e2e_env: ${{ inputs.test_e2e_env }}
 
   # -------------------------------------------------------------------------
   # Delivery plan — pure data, no Cloudflare credentials. Resolves the enabled delivery kinds of THIS event (production |
@@ -664,8 +487,8 @@ jobs:
   # -------------------------------------------------------------------------
   plan:
     name: Delivery plan
-    needs: [gate]
-    if: always() && (inputs.pipeline_phase == 'verify' || (needs.gate.result == 'success' && github.ref_type == 'branch' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')))
+    needs: [ci]
+    if: always() && (inputs.pipeline_phase == 'verify' || (needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed' && github.ref_type == 'branch' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')))
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     outputs:
@@ -678,24 +501,19 @@ jobs:
       on_native_branch: ${{ steps.plan.outputs.on_native_branch }}
       on_native_dev: ${{ steps.plan.outputs.on_native_dev }}
       on_persistent_dev: ${{ steps.plan.outputs.on_persistent_dev }}
+      group: ${{ steps.plan.outputs.group }}
     steps:
       - uses: actions/checkout@v6
         if: inputs.pipeline_phase != 'verify'
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Fetch delivery tooling
-        uses: actions/checkout@v6
-        with:
-          repository: firstsun-dev/.github
-          ref: ${{ inputs.tools_ref }}
-          path: .cf-tools
-          sparse-checkout: actions/cf-preview
-          persist-credentials: false
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: cd "$TOOLS_DIR" && npm ci --ignore-scripts --no-audit --no-fund
+      - uses: $/actions/cf-tools
+        with:
+          install: 'true'
       - id: plan
         env:
           INPUTS_JSON: ${{ toJSON(inputs) }}
@@ -719,8 +537,8 @@ jobs:
   # =========================================================================
   migration:
     name: Database Migration
-    needs: [gate, plan]
-    if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.gate.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.has_migrations == 'true'
+    needs: [plan]
+    if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.plan.result == 'success' && needs.plan.outputs.has_migrations == 'true'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     environment:
@@ -741,20 +559,9 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Fetch delivery tooling
-        uses: actions/checkout@v6
-        with:
-          repository: firstsun-dev/.github
-          ref: ${{ inputs.tools_ref }}
-          path: .cf-tools
-          sparse-checkout: |
-            actions/cf-deploy
-            actions/cf-preview
-          sparse-checkout-cone-mode: false
-          persist-credentials: false
       - name: Verify native-dev build and D1 binding
         if: needs.plan.outputs.on_native_dev == 'true' && fromJSON(needs.plan.outputs.migration).kind != 'native-dev'
-        uses: ./.cf-tools/actions/cf-deploy
+        uses: $/actions/cf-deploy
         with:
           target: ${{ fromJSON(needs.plan.outputs.descriptors)['native-dev'].target }}
           descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-dev']) }}
@@ -765,7 +572,7 @@ jobs:
           preview_secrets: ${{ fromJSON(needs.plan.outputs.descriptors)['native-dev'].target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
       - name: Verify persistent-dev build and D1 binding
         if: needs.plan.outputs.on_persistent_dev == 'true' && fromJSON(needs.plan.outputs.migration).kind != 'persistent-dev'
-        uses: ./.cf-tools/actions/cf-deploy
+        uses: $/actions/cf-deploy
         with:
           target: ${{ fromJSON(needs.plan.outputs.descriptors)['persistent-dev'].target }}
           descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
@@ -776,7 +583,7 @@ jobs:
           preview_secrets: ${{ fromJSON(needs.plan.outputs.descriptors)['persistent-dev'].target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
       - id: migrate
         name: Apply pending D1 migrations (once)
-        uses: ./.cf-tools/actions/cf-deploy
+        uses: $/actions/cf-deploy
         with:
           target: ${{ fromJSON(needs.plan.outputs.descriptors)[fromJSON(needs.plan.outputs.migration).kind].target }}
           descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)[fromJSON(needs.plan.outputs.migration).kind]) }}
@@ -802,21 +609,19 @@ jobs:
   # =========================================================================
   delivery_production:
     name: Delivery (production)
-    needs: [gate, plan, migration]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_production == 'true' && (inputs.pipeline_phase == 'verify' || needs.gate.result == 'success') && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
-    uses: ./.github/workflows/_cf-worker-delivery.yml
+    needs: [plan, migration]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_production == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
+    uses: $/.github/workflows/_cf-worker-delivery.yml
     permissions: &delivery_permissions
       contents: read
       deployments: write
       pull-requests: write
     with:
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['production']) }}
-      tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
       inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
       phase: ${{ inputs.pipeline_phase }}
-      d1_migrations: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).inputs.d1_migrations || inputs.d1_migrations }}
       migration_result: ${{ needs.migration.result }}
       migration_json: ${{ needs.migration.outputs.migration_json }}
       handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_production || '' }}
@@ -831,18 +636,16 @@ jobs:
 
   delivery_native_branch:
     name: Delivery (native-branch)
-    needs: [gate, plan, migration]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_native_branch == 'true' && (inputs.pipeline_phase == 'verify' || needs.gate.result == 'success') && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
-    uses: ./.github/workflows/_cf-worker-delivery.yml
+    needs: [plan, migration]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_native_branch == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
+    uses: $/.github/workflows/_cf-worker-delivery.yml
     permissions: *delivery_permissions
     with:
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-branch']) }}
-      tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
       inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
       phase: ${{ inputs.pipeline_phase }}
-      d1_migrations: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).inputs.d1_migrations || inputs.d1_migrations }}
       migration_result: ${{ needs.migration.result }}
       migration_json: ${{ needs.migration.outputs.migration_json }}
       handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_native_branch || '' }}
@@ -852,18 +655,16 @@ jobs:
 
   delivery_native_dev:
     name: Delivery (native-dev)
-    needs: [gate, plan, migration]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_native_dev == 'true' && (inputs.pipeline_phase == 'verify' || needs.gate.result == 'success') && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
-    uses: ./.github/workflows/_cf-worker-delivery.yml
+    needs: [plan, migration]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_native_dev == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
+    uses: $/.github/workflows/_cf-worker-delivery.yml
     permissions: *delivery_permissions
     with:
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-dev']) }}
-      tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
       inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
       phase: ${{ inputs.pipeline_phase }}
-      d1_migrations: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).inputs.d1_migrations || inputs.d1_migrations }}
       migration_result: ${{ needs.migration.result }}
       migration_json: ${{ needs.migration.outputs.migration_json }}
       handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_native_dev || '' }}
@@ -873,18 +674,16 @@ jobs:
 
   delivery_persistent_dev:
     name: Delivery (persistent-dev)
-    needs: [gate, plan, migration]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_persistent_dev == 'true' && (inputs.pipeline_phase == 'verify' || needs.gate.result == 'success') && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
-    uses: ./.github/workflows/_cf-worker-delivery.yml
+    needs: [plan, migration]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_persistent_dev == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
+    uses: $/.github/workflows/_cf-worker-delivery.yml
     permissions: *delivery_permissions
     with:
       descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
-      tools_ref: ${{ inputs.tools_ref }}
       runner: ${{ inputs.runner }}
       inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
       phase: ${{ inputs.pipeline_phase }}
-      d1_migrations: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).inputs.d1_migrations || inputs.d1_migrations }}
       migration_result: ${{ needs.migration.result }}
       migration_json: ${{ needs.migration.outputs.migration_json }}
       handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_persistent_dev || '' }}
@@ -910,7 +709,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - uses: firstsun-dev/.github/actions/setup@v1
+      - uses: $/actions/setup
         with:
           setup-node: 'false'
           setup-pnpm: 'false'
@@ -936,146 +735,43 @@ jobs:
           exit 1
 
   # -------------------------------------------------------------------------
-  # Lifecycle — event-specific handler outside the core DAG. Never deploys, no Cloudflare credentials.
-  #   same-repo PR : comment the branch's existing Preview URL
-  #   branch delete: retire the GitHub ledger only; the Native Preview is KEPT (owner policy)
+  # Event handlers outside the delivery DAG (each its own small reusable workflow; none of them touches the Migration or the Plan).
+  #   lifecycle      same-repo PR -> comment the branch's verified Preview URL; branch delete -> retire the ledger, the Preview is KEPT.
+  #   persistent-dev Hybrid, explicit dispatch on the approved ref only. dev_build_cmd set = the same cf-deploy engine in manual mode;
+  #                  empty = the unchanged legacy two-command contract. The `<app>/dev` Environment is a property of the called job.
   # -------------------------------------------------------------------------
   lifecycle:
     name: Preview lifecycle
     if: inputs.pipeline_phase != 'verify' && inputs.deployment_strategy != 'production-only' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'delete' && github.event.ref_type == 'branch'))
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 10
-    concurrency:
-      group: cfv2-lifecycle-${{ github.repository }}-${{ inputs.app_name }}-${{ github.event.pull_request.head.ref || github.event.ref }}
-      cancel-in-progress: false
+    uses: $/.github/workflows/_cf-worker-lifecycle.yml
     permissions:
       contents: read
       deployments: write
       pull-requests: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      BRANCH: ${{ github.event.pull_request.head.ref || github.event.ref }}
-      WORKER_NAME: ${{ inputs.preview_worker_name != '' && inputs.preview_worker_name || inputs.app_name }}
-    steps:
-      - name: Fetch tooling
-        uses: actions/checkout@v6
-        with:
-          repository: firstsun-dev/.github
-          ref: ${{ inputs.tools_ref }}
-          path: .cf-tools
-          sparse-checkout: actions/cf-preview
-          persist-credentials: false
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-      - run: cd "$TOOLS_DIR" && npm ci --ignore-scripts --no-audit --no-fund
-      - name: Compute and validate Preview identity
-        env:
-          APP: ${{ inputs.app_name }}
-        run: |
-          [ "$BRANCH" != main ] || { echo "main has no Preview"; echo "SKIP=true" >> "$GITHUB_ENV"; exit 0; }
-          NAME="$(node "$TOOLS_DIR/cli.mjs" identity --repo "$GITHUB_REPOSITORY" --worker "$APP" --host-worker "$WORKER_NAME" --ref "refs/heads/$BRANCH" --reserve-native-dev "${{ inputs.shared_dev_native_preview_on_branch_push }}" | sed -n 's/^preview_name=//p')"
-          [[ "$NAME" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "::error::unsafe name"; exit 1; }
-          { echo "PREVIEW_NAME=$NAME"; echo "ENV_NAME=$APP/preview/$NAME"; } >> "$GITHUB_ENV"
-      - name: Comment the existing VERIFIED Preview URL on the PR
-        if: env.SKIP != 'true' && github.event_name == 'pull_request'
-        env:
-          APP: ${{ inputs.app_name }}
-        run: |
-          # Host-bound known-good lookup: same repository, application, branch ref and HOST Worker, https URL and a
-          # content-level verified success. An old host (e.g. blog-preview), another branch or a liveness-only
-          # deployment is never advertised.
-          ROW="$("$TOOLS_DIR/gh.sh" last-good-preview "$ENV_NAME" "" "refs/heads/$BRANCH" "$WORKER_NAME" "$APP" || true)"
-          [ -n "$ROW" ] || { echo "No verified Preview for this branch on host Worker $WORKER_NAME; PR comment unchanged."; exit 0; }
-          "$TOOLS_DIR/gh.sh" comment "$BRANCH" "$APP" "${ROW#* }" "${ROW%% *}"
-      # Policy (owner decision): deleting a branch does NOT delete its Native Preview. The Preview and its stable
-      # URL are kept (Cloudflare cannot remove only the stable URL: Preview `urls` is read-only and
-      # `wrangler preview delete` removes the Preview with all deployments). Only the GitHub ledger is retired.
-      - name: Retire GitHub ledger (Preview is kept)
-        if: env.SKIP != 'true' && github.event_name == 'delete'
-        run: |
-          # Names are hashless: only touch the ledger if THIS branch owns the name, and not if the branch exists again.
-          OWNER="$("$TOOLS_DIR/gh.sh" owner "$ENV_NAME")"
-          if [ -n "$OWNER" ] && [ "$OWNER" != "refs/heads/$BRANCH" ]; then
-            echo "::notice::Name is owned by $OWNER, not this branch; leaving the ledger alone."; exit 0
-          fi
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
-            echo "::notice::Branch exists again; leaving the ledger alone."; exit 0
-          fi
-          "$TOOLS_DIR/gh.sh" retire "$ENV_NAME"
-          {
-            echo "### 📌 Branch \`$BRANCH\` deleted — Preview \`$PREVIEW_NAME\` is **kept**"
-            echo "- Cloudflare Preview and its stable URL were not touched; GitHub Deployments are marked inactive."
-            echo "- No automatic reclaim. To remove it manually:"
-            echo "  \`wrangler preview delete --name $PREVIEW_NAME --worker-name $WORKER_NAME --skip-confirmation\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+    with:
+      app_name: ${{ inputs.app_name }}
+      preview_worker_name: ${{ inputs.preview_worker_name }}
+      reserve_native_dev: ${{ inputs.shared_dev_native_preview_on_branch_push }}
+      runner: ${{ inputs.runner }}
 
-  # -------------------------------------------------------------------------
-  # Protected persistent Dev (Hybrid) — explicit dispatch on the approved ref only. Never a side effect of a
-  # feature-branch push. With dev_build_cmd it is the SAME engine in manual mode (build -> audit -> migration ->
-  # publish -> smoke -> ledger; no automatic recovery). Without it, the legacy two-command contract is unchanged.
-  # -------------------------------------------------------------------------
   persistent-dev:
     name: Persistent Dev (Hybrid)
     if: inputs.pipeline_phase != 'verify' && github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 45
-    environment: ${{ inputs.app_name }}/dev
-    concurrency:
-      group: cfv2-dev-${{ github.repository }}-${{ inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name }}
-      cancel-in-progress: false
+    uses: $/.github/workflows/_cf-worker-persistent-dev.yml
     permissions:
       contents: read
-      deployments: write # engine mode only: Dev ledger entry, recorded verified ONLY after the smoke passes
-    env:
-      GH_TOKEN: ${{ github.token }}
+      deployments: write
+    with:
+      inputs_json: ${{ toJSON(inputs) }}
+      app_name: ${{ inputs.app_name }}
+      app_path: ${{ inputs.app_path }}
+      d1_lock_scope: ${{ inputs.d1_lock_scope }}
+      dev_build_cmd: ${{ inputs.dev_build_cmd }}
+      dev_deploy_cmd: ${{ inputs.dev_deploy_cmd }}
+      dev_smoke_cmd: ${{ inputs.dev_smoke_cmd }}
+      runner: ${{ inputs.runner }}
+    secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      # ---- Legacy contract (dev_build_cmd empty): dev_deploy_cmd builds and publishes; never recorded in the Shared
-      # Dev last-good ledger, so automatic recovery can never treat it as a known-good release.
-      - uses: firstsun-dev/.github/actions/setup@v1
-        if: inputs.dev_build_cmd == ''
-        with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
-      - name: Deploy persistent Dev
-        if: inputs.dev_build_cmd == ''
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.dev_deploy_cmd }}
-        run: |
-          [ -n "$CMD" ] || { echo "::error::dev_deploy_cmd required"; exit 1; }
-          bash -c "$CMD"
-      - name: Dev smoke (Cron/Queue-adjacent checks)
-        if: inputs.dev_build_cmd == '' && inputs.dev_smoke_cmd != ''
-        working-directory: ${{ inputs.app_path }}
-        env:
-          CMD: ${{ inputs.dev_smoke_cmd }}
-        run: bash -c "$CMD"
-      # ---- Engine contract (dev_build_cmd set).
-      - name: Fetch delivery tooling
-        if: inputs.dev_build_cmd != ''
-        uses: actions/checkout@v6
-        with:
-          repository: firstsun-dev/.github
-          ref: ${{ inputs.tools_ref }}
-          path: .cf-tools
-          sparse-checkout: |
-            actions/cf-deploy
-            actions/cf-preview
-          sparse-checkout-cone-mode: false
-          persist-credentials: false
-      - id: engine
-        if: inputs.dev_build_cmd != ''
-        uses: ./.cf-tools/actions/cf-deploy
-        with:
-          target: dev
-          mode: manual
-          inputs_json: ${{ toJSON(inputs) }}
-          smoke_username: ${{ secrets.SMOKE_USERNAME }}
-          smoke_password: ${{ secrets.SMOKE_PASSWORD }}
+      SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
+      SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}

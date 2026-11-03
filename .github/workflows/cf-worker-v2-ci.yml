@@ -4,7 +4,11 @@ on:
   pull_request:
     paths:
       - '.github/workflows/_cf-worker-v2.yml'
+      - '.github/workflows/_cf-worker-ci.yml'
       - '.github/workflows/_cf-worker-delivery.yml'
+      - '.github/workflows/_cf-worker-lifecycle.yml'
+      - '.github/workflows/_cf-worker-persistent-dev.yml'
+      - 'actions/cf-tools/**'
       - '.github/workflows/cf-worker-v2-ci.yml'
       - '.github/actionlint.yaml'
       - 'actions/cf-preview/**'
@@ -17,8 +21,11 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/_cf-worker-v2.yml'
+      - '.github/workflows/_cf-worker-ci.yml'
       - '.github/workflows/_cf-worker-delivery.yml'
-      - '.github/workflows/_cf-worker-delivery.yml'
+      - '.github/workflows/_cf-worker-lifecycle.yml'
+      - '.github/workflows/_cf-worker-persistent-dev.yml'
+      - 'actions/cf-tools/**'
       - '.github/actionlint.yaml'
       - 'actions/cf-preview/**'
       - 'actions/cf-preview-gc/**'
@@ -60,4 +67,4 @@ jobs:
       - name: actionlint
         run: |
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
-          ./actionlint -color .github/workflows/_cf-worker-v2.yml .github/workflows/_cf-worker-delivery.yml .github/workflows/_cf-worker-delivery.yml .github/workflows/_cf-worker-preview-gc.yml .github/workflows/cf-worker-v2-ci.yml
+          ./actionlint -color .github/workflows/_cf-worker-v2.yml .github/workflows/_cf-worker-ci.yml .github/workflows/_cf-worker-delivery.yml .github/workflows/_cf-worker-lifecycle.yml .github/workflows/_cf-worker-persistent-dev.yml .github/workflows/_cf-worker-preview-gc.yml .github/workflows/cf-worker-v2-ci.yml

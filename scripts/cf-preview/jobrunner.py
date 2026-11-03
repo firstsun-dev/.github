@@ -2,7 +2,7 @@
 
 Evaluates step `if:`/`env:`/`${{ }}` with ghexpr, honours success()/failure() semantics, GITHUB_ENV /
 GITHUB_OUTPUT propagation, step outcomes, continue-on-error and job outputs. A LOCAL composite action
-(`uses: ./.cf-tools/actions/<name>`) is expanded: its `inputs` come from the caller's `with:`, its steps run with
+(`uses: $/actions/<name>`) is expanded: its `inputs` come from the caller's `with:`, its steps run with
 their own `steps`/`failure()` scope and share the job env, GITHUB_ENV and workspace, and its `outputs` are rendered
 back into the calling step. Other `uses:` steps are no-ops (the workspace is pre-populated). Test-only; this is not
 GitHub, see docs "Verified vs not verified".
@@ -120,9 +120,6 @@ def make_workspace(toml=APP_TOML, files=None):
     (ws / "w" / "migrations").mkdir(parents=True)
     (ws / "w" / "migrations" / "0001.sql").write_text("select 1;")
     (ws / "w" / "wrangler.toml").write_text(toml)
-    (ws / "w" / ".cf-tools" / "actions").mkdir(parents=True)
-    for tool in ("cf-preview", "cf-deploy", "cf-ci-check"):
-        (ws / "w" / ".cf-tools" / "actions" / tool).symlink_to(ROOT / "actions" / tool)
     for rel, body in (files or {}).items():
         (ws / "w" / rel).write_text(body)
     (ws / "tmp").mkdir()
@@ -131,6 +128,7 @@ def make_workspace(toml=APP_TOML, files=None):
 
 
 _NAME = r"[A-Za-z_][\w.-]*"
+EXPANDED_ACTIONS = {"actions/cf-deploy", "actions/cf-ci-check", "actions/cf-tools"}
 
 
 def output_file_violations(text):
@@ -203,7 +201,9 @@ class _Run:
                 continue
             if "uses" in step:
                 uses = render(step["uses"], ctx, failed)
-                adir = self.w / uses[2:] if uses.startswith("./") else None
+                # `$/actions/<name>` = this repository at the running commit; only the delivery/CI/tooling actions are expanded
+                # (setup / mailpit stay no-ops: the workspace is pre-populated).
+                adir = ROOT / uses[2:] if uses.startswith("$/") and uses[2:] in EXPANDED_ACTIONS else None
                 if adir is not None and (adir / "action.yml").exists():
                     outcome, outputs, inner_results = self.composite(step, adir, ctx, failed, verbose)
                     results.append((label, outcome))

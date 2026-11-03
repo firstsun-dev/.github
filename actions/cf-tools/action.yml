@@ -1,0 +1,26 @@
+name: CF tools
+description: >
+  Locate this repository's shared Cloudflare tooling (actions/cf-preview) for a job that runs its scripts directly (the delivery
+  plan, the Preview lifecycle, the E2E env import). Called as `uses: $/actions/cf-tools`: `$/` resolves to the repository AND the exact
+  commit of the running workflow, so the tooling always matches the workflow that is executing and nothing is checked out into the
+  caller's workspace. Exports TOOLS_DIR (absolute) and, with `install`, installs the tooling's locked dependencies (needs Node).
+inputs:
+  install:
+    description: Run `npm ci` for the tooling (the delivery plan and the lifecycle use cli.mjs; the E2E env import does not need it)
+    default: 'false'
+outputs:
+  tools_dir:
+    description: Absolute path of actions/cf-preview
+    value: ${{ steps.locate.outputs.tools_dir }}
+runs:
+  using: composite
+  steps:
+    - id: locate
+      shell: bash
+      env:
+        INSTALL: ${{ inputs.install }}
+      run: |
+        dir="$(cd "$GITHUB_ACTION_PATH/../cf-preview" && pwd)"
+        { echo "tools_dir=$dir"; } >> "$GITHUB_OUTPUT"
+        { echo "TOOLS_DIR=$dir"; } >> "$GITHUB_ENV"
+        if [ "$INSTALL" = true ]; then (cd "$dir" && npm ci --ignore-scripts --no-audit --no-fund); fi

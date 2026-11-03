@@ -1,0 +1,93 @@
+name: CF Worker Preview lifecycle
+
+# ---------------------------------------------------------------------------
+# INTERNAL — called ONLY by _cf-worker-v2.yml, on the two events that are not a delivery. Never deploys, no Cloudflare credentials.
+#   same-repository PR : comment the branch's existing, VERIFIED Preview URL on the PR
+#   branch delete      : retire the GitHub ledger only; the Cloudflare Native Preview is KEPT (owner policy)
+# Cloudflare cannot remove only a Preview's stable URL (`urls` is read-only; `wrangler preview delete` removes the Preview with all
+# its deployments), so deleting a branch never deletes its Preview.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        type: string
+        required: true
+      preview_worker_name:
+        description: Host Worker of the Native Previews (empty = app_name)
+        type: string
+        default: ''
+      reserve_native_dev:
+        description: shared_dev_native_preview_on_branch_push of the caller (the Preview name `dev` is reserved for Native Dev)
+        type: boolean
+        default: false
+      runner:
+        type: string
+        default: linux
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lifecycle:
+    name: Preview lifecycle
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    concurrency:
+      group: cfv2-lifecycle-${{ github.repository }}-${{ inputs.app_name }}-${{ github.event.pull_request.head.ref || github.event.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      deployments: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APP: ${{ inputs.app_name }}
+      BRANCH: ${{ github.event.pull_request.head.ref || github.event.ref }}
+      WORKER_NAME: ${{ inputs.preview_worker_name != '' && inputs.preview_worker_name || inputs.app_name }}
+      RESERVE_NATIVE_DEV: ${{ inputs.reserve_native_dev }}
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: $/actions/cf-tools
+        with:
+          install: 'true'
+      - name: Compute and validate Preview identity
+        run: |
+          [ "$BRANCH" != main ] || { echo "main has no Preview"; echo "SKIP=true" >> "$GITHUB_ENV"; exit 0; }
+          NAME="$(node "$TOOLS_DIR/cli.mjs" identity --repo "$GITHUB_REPOSITORY" --worker "$APP" --host-worker "$WORKER_NAME" --ref "refs/heads/$BRANCH" --reserve-native-dev "$RESERVE_NATIVE_DEV" | sed -n 's/^preview_name=//p')"
+          [[ "$NAME" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "::error::unsafe name"; exit 1; }
+          { echo "PREVIEW_NAME=$NAME"; echo "ENV_NAME=$APP/preview/$NAME"; } >> "$GITHUB_ENV"
+      - name: Comment the existing VERIFIED Preview URL on the PR
+        if: env.SKIP != 'true' && github.event_name == 'pull_request'
+        run: |
+          # Host-bound known-good lookup: same repository, application, branch ref and HOST Worker, https URL and a
+          # content-level verified success. An old host (e.g. blog-preview), another branch or a liveness-only
+          # deployment is never advertised.
+          ROW="$("$TOOLS_DIR/gh.sh" last-good-preview "$ENV_NAME" "" "refs/heads/$BRANCH" "$WORKER_NAME" "$APP" || true)"
+          [ -n "$ROW" ] || { echo "No verified Preview for this branch on host Worker $WORKER_NAME; PR comment unchanged."; exit 0; }
+          "$TOOLS_DIR/gh.sh" comment "$BRANCH" "$APP" "${ROW#* }" "${ROW%% *}"
+      - name: Retire GitHub ledger (Preview is kept)
+        if: env.SKIP != 'true' && github.event_name == 'delete'
+        run: |
+          # Names are hashless: only touch the ledger if THIS branch owns the name, and not if the branch exists again.
+          OWNER="$("$TOOLS_DIR/gh.sh" owner "$ENV_NAME")"
+          if [ -n "$OWNER" ] && [ "$OWNER" != "refs/heads/$BRANCH" ]; then
+            echo "::notice::Name is owned by $OWNER, not this branch; leaving the ledger alone."; exit 0
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
+            echo "::notice::Branch exists again; leaving the ledger alone."; exit 0
+          fi
+          "$TOOLS_DIR/gh.sh" retire "$ENV_NAME"
+          {
+            echo "### 📌 Branch \`$BRANCH\` deleted — Preview \`$PREVIEW_NAME\` is **kept**"
+            echo "- Cloudflare Preview and its stable URL were not touched; GitHub Deployments are marked inactive."
+            echo "- No automatic reclaim. To remove it manually:"
+            echo "  \`wrangler preview delete --name $PREVIEW_NAME --worker-name $WORKER_NAME --skip-confirmation\`"
+          } >> "$GITHUB_STEP_SUMMARY"

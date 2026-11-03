@@ -14,8 +14,8 @@ name: CF Worker delivery (one target)
 # Pre-mutation validation and the D1 migration are NOT here: the public workflow runs them once, in its single Migration job, and
 # passes the result in (`migration_result` / `migration_json`).
 #
-# Reusable-workflow constraints honoured here: static `uses:` in the caller; tools are fetched by `tools_ref` (a local
-# `uses: ./...` would resolve against the CALLER's workspace); permissions never exceed the calling job's; secrets are passed
+# Reusable-workflow constraints honoured here: static `uses:` in the caller; the engine is `uses: $/actions/cf-deploy` (the
+# self-repository syntax: this repository at the running commit, nothing checked out into the caller's workspace); permissions never exceed the calling job's; secrets are passed
 # explicitly; the GitHub Environment is a job property of the called workflow; job-level concurrency only (the workflow-level
 # group belongs to the public workflow, reusing it here would deadlock).
 # ---------------------------------------------------------------------------
@@ -23,9 +23,6 @@ name: CF Worker delivery (one target)
 on:
   workflow_call:
     inputs:
-      tools_ref:
-        type: string
-        required: true
       runner:
         type: string
         default: linux
@@ -137,19 +134,8 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Fetch delivery tooling
-        uses: actions/checkout@v6
-        with:
-          repository: firstsun-dev/.github
-          ref: ${{ inputs.tools_ref }}
-          path: .cf-tools
-          sparse-checkout: |
-            actions/cf-deploy
-            actions/cf-preview
-          sparse-checkout-cone-mode: false
-          persist-credentials: false
       - id: engine
-        uses: ./.cf-tools/actions/cf-deploy
+        uses: $/actions/cf-deploy
         with:
           target: ${{ fromJSON(inputs.descriptor).target }}
           descriptor: ${{ inputs.descriptor }}
@@ -195,21 +181,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Fetch delivery tooling
-        if: steps.go.outputs.go == 'true'
-        uses: actions/checkout@v6
-        with:
-          repository: firstsun-dev/.github
-          ref: ${{ inputs.tools_ref }}
-          path: .cf-tools
-          sparse-checkout: |
-            actions/cf-deploy
-            actions/cf-preview
-          sparse-checkout-cone-mode: false
-          persist-credentials: false
       - id: engine
         if: steps.go.outputs.go == 'true'
-        uses: ./.cf-tools/actions/cf-deploy
+        uses: $/actions/cf-deploy
         with:
           target: ${{ fromJSON(inputs.descriptor).target }}
           descriptor: ${{ inputs.descriptor }}
@@ -289,21 +263,9 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Fetch delivery tooling
-        if: steps.go.outputs.go == 'true'
-        uses: actions/checkout@v6
-        with:
-          repository: firstsun-dev/.github
-          ref: ${{ inputs.tools_ref }}
-          path: .cf-tools
-          sparse-checkout: |
-            actions/cf-deploy
-            actions/cf-preview
-          sparse-checkout-cone-mode: false
-          persist-credentials: false
       - id: engine
         if: steps.go.outputs.go == 'true'
-        uses: ./.cf-tools/actions/cf-deploy
+        uses: $/actions/cf-deploy
         with:
           target: ${{ fromJSON(inputs.descriptor).target }}
           descriptor: ${{ inputs.descriptor }}

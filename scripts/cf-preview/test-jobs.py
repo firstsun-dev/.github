@@ -28,6 +28,9 @@ WF = ".github/workflows/_cf-worker-v2.yml"
 DWF = ".github/workflows/_cf-worker-delivery.yml"
 doc = yaml.safe_load(open(WF))
 ddoc = yaml.safe_load(open(DWF))
+cdoc = yaml.safe_load(open(".github/workflows/_cf-worker-ci.yml"))
+ldoc = yaml.safe_load(open(".github/workflows/_cf-worker-lifecycle.yml"))
+pdoc = yaml.safe_load(open(".github/workflows/_cf-worker-persistent-dev.yml"))
 INPUT_DEFAULTS = {k: v.get("default", "") for k, v in doc[True]["workflow_call"]["inputs"].items()}
 DINPUT_DEFAULTS = {k: v.get("default", "") for k, v in ddoc[True]["workflow_call"]["inputs"].items()}
 SHA, OTHER = "abcdef1234567890", "ffffffffffffffff"
@@ -51,7 +54,7 @@ def check(ok, msg):
 def ctx(ref, inputs=None, secrets=None, needs=None, event="push"):
     # preview_host_check off: the job tests must not call the real Cloudflare API (test-deploy.sh covers it); the canonical
     # Preview URL is derived from preview_url_suffix exactly like the real one is derived from Cloudflare's preview_url_suffix.
-    i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", tools_ref="x", preview_host_check=False, preview_url_suffix=SUFFIX)
+    i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", preview_host_check=False, preview_url_suffix=SUFFIX)
     i.update(inputs or {})
     return Ctx({"github": {"event_name": event, "ref": ref, "ref_type": "branch", "ref_name": ref.split("/", 2)[-1],
                            "repository": "o/r", "sha": SHA, "run_id": "1", "event": {"head_commit": {"message": "feat: x\nbody"}}},
@@ -129,7 +132,34 @@ def call_workflow(job, c, ctl):
     return {"result": result, "outputs": outs, "jobs": inner}, logs, summ, steps
 
 
-CHAIN = ("gate", "plan", "migration") + tuple(f"delivery_{KEYED[k]}" for k in KINDS)
+CHAIN = ("ci", "plan", "migration") + tuple(f"delivery_{KEYED[k]}" for k in KINDS)
+
+
+def called(wf_doc, parent_name, inner_job, c, ws, env=None, needs=None):
+    """Runs ONE job of the workflow that `jobs.<parent_name>` of the public workflow calls (`with:` / `secrets:` rendered against the
+    caller like GitHub does) in a fresh workspace and returns the job record."""
+    pj = doc["jobs"][parent_name]
+    defaults = {k: v.get("default", "") for k, v in wf_doc[True]["workflow_call"]["inputs"].items()}
+    w = {k: render(v, c) for k, v in pj.get("with", {}).items()}
+    sec = {k: render(v, c) for k, v in pj.get("secrets", {}).items()}
+    ic = Ctx({"github": c["github"], "inputs": dict(defaults, **w), "needs": needs or {}, "jobs": {}}, sec)
+    return run_job(wf_doc, inner_job, ic, ws, env or {})
+
+
+VALIDATION_JOBS = ("lint", "typecheck", "unit", "integration", "build", "e2e")
+
+
+def call_ci(c, ctl):
+    """Emulates `uses: $/.github/workflows/_cf-worker-ci.yml`: the six validation jobs are faked by their `needs` results (their bodies are
+    the cf-ci-check action, covered by the contract test), the Validation Gate runs for REAL, and the call's result is GitHub's: failure
+    when any inner job failed, else success."""
+    vneeds = {j: c["needs"][j] for j in VALIDATION_JOBS if j in c["needs"]}
+    ws = make_workspace(ctl["toml"], ctl["files"])
+    g = called(cdoc, "ci", "gate", c, ws, needs=vneeds)
+    bad = [v["result"] for v in vneeds.values() if v["result"] in ("failure", "cancelled")] + ([g["result"]] if g["result"] != "success" else [])
+    result = "failure" if "failure" in bad or g["result"] == "failure" else ("cancelled" if bad else "success")
+    outs = {k: render(v["value"], Ctx({"jobs": {"gate": {"outputs": g["outputs"]}}}, {})) for k, v in cdoc[True]["workflow_call"]["outputs"].items()}
+    return {"result": result, "outputs": outs, "jobs": {"gate": {"result": g["result"], "outputs": g["outputs"]}}}, [g["log"]], [g["summary"]], list(g["steps"])
 
 
 def _run_jobs(names, ref, inputs, secrets, base_needs, event, env, toml, env_by_job, files, order=None):
@@ -142,6 +172,11 @@ def _run_jobs(names, ref, inputs, secrets, base_needs, event, env, toml, env_by_
         c = ctx(ref, inputs, secrets, dict(base_needs, **res), event)
         if not ev(job["if"], c):
             res[name] = {"result": "skipped", "outputs": {}}
+            continue
+        if name == "ci":
+            rec, lg, sm, st = call_ci(c, ctl)
+            res[name] = rec
+            logs.extend(lg); summ.extend(sm); steps.extend(st)
             continue
         if "uses" in job:
             rec, lg, sm, st = call_workflow(job, c, ctl)
@@ -192,7 +227,7 @@ def _compat(res):
         dj = d.get("jobs", {}).get("deploy", SKIPPED)
         raw["migration"]["outputs"][f"mj_{kk}"] = (dj["outputs"].get("migration_used") or "") if dj["result"] != "skipped" else ""
     raw["plan"] = res.get("plan", SKIPPED)
-    raw["gate"] = res.get("gate", SKIPPED)
+    raw["gate"] = res.get("ci", SKIPPED)
     mig = res.get("migration", SKIPPED)
     mres = [] if mig["result"] == "skipped" else [mig["result"]]
     mig_json = _j(mig["outputs"].get("migration_json", ""))
@@ -204,7 +239,7 @@ def _compat(res):
     smoke_o = _j(deliv[p]["outputs"].get("smoke_json", "")) if p else {}
     none_smoke = bool(p) and deliv[p]["outputs"].get("smoke_status", "") == "none"
     legacy = {
-        "gate": res.get("gate", SKIPPED), "plan": res.get("plan", SKIPPED),
+        "gate": res.get("ci", SKIPPED), "plan": res.get("plan", SKIPPED),
         "migration": {"result": "failure" if "failure" in mres else ("success" if mres else "skipped"), "outputs": mig_json},
         "deploy": {"result": dep["result"], "outputs": dict(handoff, target=TARGET_OF.get(p, ""))},
         "smoke": {"result": "skipped" if (none_smoke or smk["result"] == "skipped") else smk["result"], "outputs": smoke_o},
@@ -230,7 +265,7 @@ def run_chain(ref=MAIN, inputs=None, secrets=None, env=None, toml=APP_TOML, env_
     """Gate -> Plan -> Migration (validate every target, migrate once) -> Delivery (Deploy -> Smoke -> Rollback) like the scheduler would: each job's `if:` is
     evaluated against the real results/outputs of its `needs`; every kind is its OWN reusable-workflow call."""
     secrets = secrets if secrets is not None else (PROD_SECRETS)
-    i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", tools_ref="x", preview_host_check=False, preview_url_suffix=SUFFIX)
+    i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", preview_host_check=False, preview_url_suffix=SUFFIX)
     i.update(inputs or {})
     return _shape(*_run_jobs(CHAIN, ref, inputs, secrets, _validation_needs(i, needs_over), event, env, toml, env_by_job, files), toml)
 
@@ -353,7 +388,7 @@ def lifecycle(deps, status="success https://feat-x-app.example.workers.dev Servi
     ws = make_workspace(APP_TOML)
     c = ctx(FEAT, inputs, {}, event="pull_request")
     c["github"]["event"] = {"pull_request": {"head": {"ref": "feat/x", "repo": {"full_name": "o/r"}}}}
-    r = run_job(doc, "lifecycle", c, ws, {"STUB_DEPLOYMENTS": deps, "STUB_STATUS": status})
+    r = called(ldoc, "lifecycle", "lifecycle", c, ws, {"STUB_DEPLOYMENTS": deps, "STUB_STATUS": status})
     return r
 
 
@@ -370,7 +405,7 @@ PD = dict(DEV_INPUTS, deployment_strategy="hybrid", persistent_dev_ref="refs/hea
 
 def manual(inputs=None, env=None, toml=DEV_TOML):
     ws = make_workspace(toml)
-    r = run_job(doc, "persistent-dev", ctx("refs/heads/dev", dict(PD, **(inputs or {})), PROD_SECRETS, event="workflow_dispatch"), ws, dict({"STUB_TIPS": SHA}, **(env or {})))
+    r = called(pdoc, "persistent-dev", "persistent-dev", ctx("refs/heads/dev", dict(PD, **(inputs or {})), PROD_SECRETS, event="workflow_dispatch"), ws, dict({"STUB_TIPS": SHA}, **(env or {})))
     r["ws"] = ws
     return r
 
@@ -392,7 +427,7 @@ def leg(job, kind, ref=MAIN, inputs=None, needs=None, env=None, toml=APP_TOML, s
     """Runs ONE job of the internal delivery workflow for `kind` against hand-built `needs` (fresh workspace).
     A job whose `if:` is false is reported skipped without running any step (like the scheduler)."""
     c = ctx(ref, inputs, PROD_SECRETS if secrets is None else secrets, {})
-    dinputs = dict(DINPUT_DEFAULTS, descriptor=desc(kind), tools_ref="x", inputs_json=json.dumps(dict(c["inputs"])),
+    dinputs = dict(DINPUT_DEFAULTS, descriptor=desc(kind), inputs_json=json.dumps(dict(c["inputs"])),
                    phase=phase, handoff_json=handoff_json, migration_json_in=migration_json_in, upstream_gate=upstream_gate,
                    call_inputs_json=json.dumps(call_inputs) if call_inputs is not None else "")
     dc = Ctx({"github": c["github"], "inputs": dinputs, "needs": needs or {}, "jobs": {}}, c.secrets)
@@ -486,7 +521,7 @@ BD = dict(ND, preview_on_branch_push=True)
 
 
 def run_order(order, ref=FEAT, inputs=None, env=None, toml=APP_TOML, env_by_job=None):
-    i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", tools_ref="x", preview_host_check=False, preview_url_suffix=SUFFIX)
+    i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", preview_host_check=False, preview_url_suffix=SUFFIX)
     i.update(inputs or {})
     return _shape(*_run_jobs(order, ref, inputs, PROD_SECRETS, _validation_needs(i, None), "push", env, toml, env_by_job, None), toml)
 # (1)+(3) one target failing while the other succeeds, in both orders, and the public outputs stay per-target
@@ -841,7 +876,7 @@ def group_shared_dev():
             c_ = ctx(MAIN, dict(BADCFG, d1_migrations=True), PROD_SECRETS, {"gate": {"result": "success", "outputs": {}}, "plan": {"result": "success", "outputs": pj}})
             fr = run_job(doc, "migration", c_, ws_, {"STUB_TIPS": SHA})
         else:
-            dc_ = Ctx({"github": c_["github"], "inputs": dict(DINPUT_DEFAULTS, descriptor=desc("production"), tools_ref="x", inputs_json=json.dumps(dict(c_["inputs"]))), "needs": {}, "jobs": {}}, PROD_SECRETS)
+            dc_ = Ctx({"github": c_["github"], "inputs": dict(DINPUT_DEFAULTS, descriptor=desc("production"), inputs_json=json.dumps(dict(c_["inputs"]))), "needs": {}, "jobs": {}}, PROD_SECRETS)
             fr = run_job(ddoc, stage_job, dc_, ws_, {"STUB_TIPS": SHA})
         check(fr["result"] == "failure" and not published(fr) and "wrangler versions" not in fr["log"] and "migrations apply" not in fr["log"] and "-X POST" not in fr["log"], f"production-only + Shared Dev: the {stage_job} job fails at init (nothing remote)")
     for both in ({"shared_dev_on_branch_push": True, "shared_dev_native_preview_on_branch_push": True},):
@@ -982,7 +1017,7 @@ def group_chain_smoke_rollback():
                     ("a foreign Environment", desc("production", environment="app/preview")), ("an unknown key", desc("production", CLOUDFLARE_API_TOKEN="x"))):
         ws_ = make_workspace()
         c_ = ctx(MAIN, {}, PROD_SECRETS, {})
-        dc_ = Ctx({"github": c_["github"], "inputs": dict(DINPUT_DEFAULTS, stage="deliver", descriptor=bad, tools_ref="x", inputs_json=json.dumps(dict(c_["inputs"]))), "needs": {}, "jobs": {}}, PROD_SECRETS)
+        dc_ = Ctx({"github": c_["github"], "inputs": dict(DINPUT_DEFAULTS, stage="deliver", descriptor=bad, inputs_json=json.dumps(dict(c_["inputs"]))), "needs": {}, "jobs": {}}, PROD_SECRETS)
         fr = run_job(ddoc, "deploy", dc_, ws_, {"STUB_TIPS": SHA})
         check(fr["result"] == "failure" and not published(fr) and "-X POST" not in fr["log"], f"engine refuses {nm} in the target descriptor at init (nothing built, deployed or recorded)")
     check(res_of(r) == NOTHING, "branch delete: no delivery job")
@@ -1045,10 +1080,13 @@ def group_deferred_verification():
     check(vv["jobs"]["rollback"]["result"] == "failure" and "versions deploy" not in vv["log"], "deferred: another run published meanwhile (the live version is not ours) - the rollback is BLOCKED, never overwrites it")
     vv = deferred(inputs=dict(AUTO_P, **D1), env={"STUB_PROBES": "500 ;200 "})
     check(vv["jobs"]["rollback"]["result"] == "failure" and "versions deploy" not in vv["log"], "deferred: D1 migrations were applied - the D1 compatibility fail-closed rule still blocks the rollback")
-    for key, val in (("app_name", "other"), ("app_path", "apps/other"), ("production_rollback_policy", "manual"), ("tools_ref", "other-ref")):
+    for key, val in (("app_name", "other"), ("app_path", "apps/other"), ("production_rollback_policy", "manual")):
         vv = deferred(inputs=AUTO_P, call_over={key: val})
         check(vv["jobs"]["smoke"]["result"] in ("failure", "skipped") and vv["jobs"]["smoke"]["outputs"].get("deployed_and_verified") != "true" and not verify_release(vv),
               f"deferred: a verify call whose {key} differs from the deploy call's verifies nothing (identity check)")
+    vv = deferred(inputs=AUTO_P, call_over={"tools_ref": "some-other-ref"})
+    check(vv["jobs"]["smoke"]["result"] == "success" and vv["jobs"]["smoke"]["outputs"].get("deployed_and_verified") == "true",
+          "deferred: tools_ref is a deprecated no-op - a verify call that passes a different (or no) tools_ref still verifies the deploy call's deployment")
     # ---- Deferred verification keeps the DEPLOY call's descriptors (smoke policy, lock identity, D1, owner): never re-derived from the verify call
     vst = json.loads(v["state"])
     check(set(vst["descriptors"]) == {"production"} and vst["descriptors"]["production"]["phase"] == "deploy", "deferred: phase_state carries the deploy call's validated descriptors (phase deploy)")
@@ -1077,8 +1115,8 @@ def group_deferred_verification():
         check(tv["jobs"]["plan"]["result"] == "failure" and tv["jobs"]["smoke"]["result"] == "skipped" and not verify_release(tv), f"deferred: {what} fails the plan closed - nothing is smoked or released")
     sched = lambda inputs, state: render(doc["concurrency"]["group"], ctx(MAIN, dict(AUTO_P, pipeline_phase="verify", phase_state=json.dumps(state), **inputs), PROD_SECRETS, {}))
     check(sched({}, vst) == sched({"app_name": "other", "d1_lock_scope": "elsewhere"}, vst) == render(doc["concurrency"]["group"], ctx(MAIN, dict(AUTO_P), PROD_SECRETS, {})),
-          "deferred: the verify call's scheduling-time lock is derived from phase_state.inputs - its own app_name / d1_lock_scope and the handed-over group string cannot select another lock")
-    check(sched({}, dict(vst, group="IGNORED-BY-THE-EXPRESSION")) == sched({}, vst), "deferred: GitHub's top-level concurrency expression never reads phase_state.group")
+          "deferred: the verify call's scheduling-time lock is the deploy call's recorded group - its own app_name / d1_lock_scope cannot select another lock")
+    check(sched({}, dict(vst, group="IGNORED-BY-THE-EXPRESSION")) == "IGNORED-BY-THE-EXPRESSION" and json.loads(v["state"])["group"] == sched({}, vst), "deferred: GitHub's top-level concurrency expression schedules the verify call under the group its deploy call recorded - the Plan job (checks above) proves it before anything is mutated")
     pst = json.loads(pdv["state"])
     pdd = pst["descriptors"]["persistent-dev"]
     for what, mut in (("a modified Persistent Dev deploy group", lambda st: dict(st, descriptors={"persistent-dev": dict(pdd, deploy_group="cfv2-dev-o/r-other", rollback_group="cfv2-dev-o/r-other")})),
@@ -1227,7 +1265,7 @@ def group_review_regressions():
     """FIX REGRESSIONS (PR #89 review): P1-A, P1-B, P2-A, P2-B"""
     global FWD, REV, nm, inp, e, pf, order, rr, po, used, fr, over
     FWD = CHAIN
-    REV = ("gate", "plan", "migration") + tuple(f"delivery_{KEYED[k]}" for k in reversed(KINDS))
+    REV = ("ci", "plan", "migration") + tuple(f"delivery_{KEYED[k]}" for k in reversed(KINDS))
 
 
     # (2) results completing in REVERSED order: the public outputs and each kind's result are identical (nothing depends on completion order)
@@ -1307,7 +1345,7 @@ def group_review_regressions():
                      ("a migration result for another D1", gj(migration_json=json.dumps({"migration": "applied", "kind": "native-branch", "d1_id": "FOREIGN"}))),
                      ("a migration result of another kind", gj(migration_json=json.dumps({"migration": "applied", "kind": "persistent-dev", "d1_id": "PREV-ID"}))),
                      ("a missing migration result", gj(migration_result="", migration_json=""))):
-        dc = Ctx({"github": ctx(FEAT)["github"], "inputs": dict(DINPUT_DEFAULTS, descriptor=desc("native-branch", "PREV-ID", "native-branch"), d1_migrations="true", tools_ref="x", inputs_json=json.dumps(dict(ctx(FEAT)["inputs"], d1_migrations=True)), **over), "needs": {}}, PROD_SECRETS)
+        dc = Ctx({"github": ctx(FEAT)["github"], "inputs": dict(DINPUT_DEFAULTS, descriptor=desc("native-branch", "PREV-ID", "native-branch"), d1_migrations="true", inputs_json=json.dumps(dict(ctx(FEAT)["inputs"], d1_migrations=True)), **over), "needs": {}}, PROD_SECRETS)
         ws = make_workspace(APP_TOML)
         rr_ = run_job(ddoc, "deploy", dc, ws, {"STUB_TIPS": SHA})
         check(rr_["result"] == "failure" and not published({"log": rr_["log"]}), f"Deploy refuses to publish with {nm} (fail closed before checkout/build)")

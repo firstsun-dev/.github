@@ -9,7 +9,7 @@ import {
 } from './lib.mjs';
 import {
   DELIVERY_KINDS, ENGINE_TARGET, assertKind, branchPreviewIdentity, canonicalOrigin, checkBuildEnvOrigins, environmentName, foreignUrlsInBuildEnv, planMigrations, resolveCanonicalUrl, resolveDeliveryTargets, resolveSmokeMode,
-  buildDescriptors, parseDescriptor, resolveMigrationUsed, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors, validateInit,
+  buildDescriptors, parseDescriptor, resolveMigrationUsed, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
 } from './delivery.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -252,7 +252,12 @@ try {
       const [mig] = migrations;
       const migration = mig ? { kind: mig.owner, environment: descriptors[mig.owner].environment, d1_id: mig.databaseId, kinds: mig.members } : null;
       if (mig) console.error(`::notice::D1 ${mig.databaseName}: ONE migration (owner ${mig.owner}) serves ${mig.members.join(', ')}`);
-      out({ kinds: JSON.stringify(kinds), descriptors: JSON.stringify(descriptors), has_targets: String(kinds.length > 0), has_migrations: String(Boolean(mig)), migration: migration ? JSON.stringify(migration) : '', ...flat });
+      // The run-level lock identity (the canonical calculation; the workflow's scheduling-time `concurrency.group` expression is its tested
+      // YAML twin). A verify call already proved phase_state.group equals it inside restoreDescriptors.
+      const group = opt('phase') === 'verify'
+        ? String(JSON.parse(process.env.PHASE_STATE ?? '{}').group ?? '')
+        : runLockGroup({ event: opt('event'), ref: opt('ref'), inputs: i, runId: opt('run-id', '0') });
+      out({ kinds: JSON.stringify(kinds), group, descriptors: JSON.stringify(descriptors), has_targets: String(kinds.length > 0), has_migrations: String(Boolean(mig)), migration: migration ? JSON.stringify(migration) : '', ...flat });
       break;
     }
     case 'descriptor-check': { // --kind K --target T --d1 ID (descriptor JSON in env DESCRIPTOR): the stage's own bindings must match the record

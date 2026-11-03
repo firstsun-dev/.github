@@ -9,7 +9,7 @@ import tempfile
 import yaml
 
 rc = 0
-for name in ("cf-deploy", "cf-ci-check"):
+for name in ("cf-deploy", "cf-ci-check", "cf-tools"):
     steps = yaml.safe_load(open(f"actions/{name}/action.yml"))["runs"]["steps"]
     for s in steps:
         if "run" not in s:

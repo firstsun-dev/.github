@@ -16,8 +16,8 @@ description: >
               preview | dev = redeploy the last known-good deployment + re-smoke.
   Jobs share only validated DATA (deploy_outputs / migration_outputs / smoke_outputs), never runner files. The CALLER
   job owns the Environment, permissions, concurrency and which Cloudflare credentials exist (CLOUDFLARE_API_TOKEN /
-  CLOUDFLARE_ACCOUNT_ID in the job env). The caller must have checked out the app at the run SHA and then this
-  repository's `actions/` at `.cf-tools`.
+  CLOUDFLARE_ACCOUNT_ID in the job env). The caller must have checked out the app at the run SHA and references this action as
+  `$/actions/cf-deploy` (this repository at the running workflow's commit); the engine scripts are found next to it, in `../cf-preview`.
 inputs:
   target:
     description: prod | preview | dev (config / credential class). Bound once by the engine; application env can never change it.
@@ -207,7 +207,7 @@ runs:
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" guard start'
     - name: Setup dependencies
       if: env.STALE != 'true' && env.CFV2_DEPS != 'done'
-      uses: firstsun-dev/.github/actions/setup@v1
+      uses: $/actions/setup
       with:
         setup-node: 'false'
         setup-pnpm: 'false'

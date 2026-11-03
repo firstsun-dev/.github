@@ -527,9 +527,9 @@ test('init: env data - reserved/forbidden names rejected, foreign target URLs re
 });
 
 test('init: deferred verify identity inputs must equal the deploy call\'s; a descriptor must match the stage', () => {
-  const ci = (o = {}) => JSON.stringify({ app_name: 'app', app_path: '', production_rollback_policy: 'automatic', tools_ref: '', ...o });
+  const ci = (o = {}) => JSON.stringify({ app_name: 'app', app_path: '', production_rollback_policy: 'automatic', ...o });
   assert.doesNotThrow(() => INIT({ callInputs: ci() }));
-  for (const k of ['app_name', 'app_path', 'production_rollback_policy', 'tools_ref']) initFails(new RegExp(`'${k}' differs`), { callInputs: ci({ [k]: 'x' }) });
+  for (const k of ['app_name', 'app_path', 'production_rollback_policy']) initFails(new RegExp(`'${k}' differs`), { callInputs: ci({ [k]: 'x' }) });
   initFails(/call inputs are not an object/, { callInputs: '[1]' });
   const d = targetDescriptor({ kind: 'native-branch', app: 'app', runId: 1, repo: 'o/r', smokeMode: 'skip' });
   assert.equal(INIT({ descriptor: JSON.stringify(d) }).smokeMode, 'skip', 'the smoke policy comes from the descriptor');

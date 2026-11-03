@@ -15,10 +15,18 @@ import yaml
 
 WF = ".github/workflows/_cf-worker-v2.yml"
 DWF = ".github/workflows/_cf-worker-delivery.yml"
+CWF = ".github/workflows/_cf-worker-ci.yml"
+LWF = ".github/workflows/_cf-worker-lifecycle.yml"
+PWF = ".github/workflows/_cf-worker-persistent-dev.yml"
 doc = yaml.safe_load(open(WF))
 ddoc = yaml.safe_load(open(DWF))
+cdoc = yaml.safe_load(open(CWF))
+ldoc = yaml.safe_load(open(LWF))
+pdoc = yaml.safe_load(open(PWF))
 jobs = doc["jobs"]
 djobs = ddoc["jobs"]
+cjobs = cdoc["jobs"]            # CI: six validation jobs + Validation Gate
+ljobs, pjobs = ldoc["jobs"], pdoc["jobs"]
 inputs_def = doc[True]["workflow_call"]["inputs"]
 fail = 0
 
@@ -96,14 +104,19 @@ text_all = open(WF).read()
 KINDS = ["production", "native-branch", "native-dev", "persistent-dev"]
 KK = lambda k: k.replace("-", "_")
 CALL_JOBS = {f"delivery_{KK(k)}" for k in KINDS}
-check(set(jobs) == set(VALIDATION) | {"gate", "plan", "migration"} | CALL_JOBS | {"release", "config-guard", "lifecycle", "persistent-dev"},
-      "job set: six validation jobs, Validation Gate, Delivery plan, ONE Database Migration job, one Delivery CALL per kind (reusable workflow), Release + config-guard / lifecycle / manual persistent-dev handlers")
+check(set(jobs) == {"ci", "plan", "migration"} | CALL_JOBS | {"release", "config-guard", "lifecycle", "persistent-dev"},
+      "public job set: CI call, Delivery plan, ONE Database Migration job, one Delivery CALL per kind (reusable workflow), Release + config-guard / lifecycle / persistent-dev handlers")
+check(set(cjobs) == set(VALIDATION) | {"gate"}, "the CI workflow has exactly the six validation jobs and the Validation Gate")
 check(set(djobs) == {"deploy", "smoke", "rollback"}, "the internal delivery workflow has exactly: deploy, smoke, rollback (ONE target per call; no Preflight / Migration path)")
-for gone in ("dev-deploy", "dev-verify", "dev-rollback", "ci", "test", "prepare", "migrate", "test-gate", "preview", "production", "verify", "revert", "deploy", "smoke", "rollback", "preflight") + tuple(f"{s_}_{KK(k)}" for s_ in ("preflight", "migration") for k in KINDS):
-    check(gone not in jobs, f"obsolete / matrix job '{gone}' is gone from the public workflow (no matrix output merging, no Preflight stage, no per-kind Migration call)")
+check(set(ljobs) == {"lifecycle"} and set(pjobs) == {"persistent-dev"}, "the event handlers are one small workflow each (Preview lifecycle, manual persistent Dev)")
+for gone in ("dev-deploy", "dev-verify", "dev-rollback", "test", "prepare", "migrate", "test-gate", "preview", "production", "verify", "revert", "deploy", "smoke", "rollback", "preflight", "gate") + tuple(VALIDATION) + tuple(f"{s_}_{KK(k)}" for s_ in ("preflight", "migration") for k in KINDS):
+    check(gone not in jobs, f"obsolete / matrix / inlined job '{gone}' is gone from the public workflow (validation lives in _cf-worker-ci.yml; no matrix output merging, no Preflight stage, no per-kind Migration call)")
 check(sum(1 for j in jobs.values() if j.get("name") == "Database Migration") == 1 and len(re.findall(r"^  migration[\w_-]*:", text_all, re.M)) == 1, "exactly ONE Migration job definition exists in the public pipeline")
-check([jobs[j]["name"] for j in VALIDATION] == [JOB_NAME[j] for j in VALIDATION], "validation jobs are named Lint, Typecheck, Unit Tests, Integration Tests, Build Validation, E2E")
-check(jobs["gate"]["name"] == "Validation Gate" and jobs["plan"]["name"] == "Delivery plan" and jobs["migration"]["name"] == "Database Migration", "Validation Gate, Delivery plan and Database Migration are named jobs")
+check(sum(len(re.findall(r"^  (?:migration|preflight)[\w_-]*:", open(f).read(), re.M)) for f in (CWF, DWF, LWF, PWF)) == 0, "no other workflow of the pipeline defines a Migration or Preflight job")
+check([cjobs[j]["name"] for j in VALIDATION] == [JOB_NAME[j] for j in VALIDATION], "validation jobs are named Lint, Typecheck, Unit Tests, Integration Tests, Build Validation, E2E")
+check(cjobs["gate"]["name"] == "Validation Gate" and jobs["ci"]["name"] == "CI" and jobs["plan"]["name"] == "Delivery plan" and jobs["migration"]["name"] == "Database Migration", "CI, Validation Gate, Delivery plan and Database Migration are named jobs")
+check(jobs["ci"]["uses"] == "$/.github/workflows/_cf-worker-ci.yml", "CI is one STATIC `uses: $/.github/workflows/_cf-worker-ci.yml` call (this repository at the running commit)")
+check("strategy" not in jobs["ci"], "no matrix on the CI call (E2E variants are the only matrix, inside the CI workflow)")
 
 
 def needs_of(name, js=None):
@@ -112,21 +125,21 @@ def needs_of(name, js=None):
 
 
 for j in VALIDATION:
-    check(needs_of(j) == [], f"{j}: no needs (independent, schedulable immediately)")
-check(set(needs_of("gate")) == set(VALIDATION), "Validation Gate needs exactly the six validation jobs")
-check(needs_of("plan") == ["gate"], "Delivery plan needs only the Validation Gate")
-check(needs_of("migration") == ["gate", "plan"], "Database Migration needs exactly the Validation Gate and the plan - and NO Deploy / Smoke / Rollback")
+    check(needs_of(j, cjobs) == [], f"{j}: no needs (independent and parallel with the other five checks - no accidental serial dependency)")
+check(set(needs_of("gate", cjobs)) == set(VALIDATION), "Validation Gate needs exactly the six validation jobs")
+check(needs_of("ci") == [] and needs_of("plan") == ["ci"], "CI has no needs; the Delivery plan needs only the CI call")
+check(needs_of("migration") == ["plan"], "Database Migration needs exactly the plan (which itself requires a passed CI) - and NO Deploy / Smoke / Rollback")
 for k in KINDS:
-    check(set(needs_of(f"delivery_{KK(k)}")) == {"gate", "plan", "migration"}, f"delivery_{KK(k)}: Gate, plan and THE migration only")
+    check(set(needs_of(f"delivery_{KK(k)}")) == {"plan", "migration"}, f"delivery_{KK(k)}: the plan and THE migration only")
 check(not any(n.startswith("delivery_") for k in KINDS for n in needs_of(f"delivery_{KK(k)}")), "P2-A: NO Delivery call waits for another kind's Deploy / Smoke / Rollback")
 check(not any(n.startswith("delivery_") for n in needs_of("migration")), "the Migration job never waits for any Delivery call")
 check(set(needs_of("release")) == {"delivery_production"}, "Release reads ONLY the Production delivery call; Dev kinds can never gate it")
-check(all("strategy" not in jobs[j] for j in CALL_JOBS | {"gate", "plan", "migration", "release"}), "P1-A: no matrix anywhere in the delivery graph (outputs are never merged across legs)")
+check(all("strategy" not in jobs[j] for j in CALL_JOBS | {"ci", "plan", "migration", "release"}), "P1-A: no matrix anywhere in the delivery graph (outputs are never merged across legs)")
 check(all("strategy" not in j for j in djobs.values()), "P1-A: no matrix in the internal delivery workflow either")
 check(set(needs_of("smoke", djobs)) == {"deploy"} and set(needs_of("rollback", djobs)) == {"deploy", "smoke"} and needs_of("deploy", djobs) == [], "delivery workflow: Smoke needs only THIS call's Deploy; Rollback needs this call's Deploy and Smoke")
-DELIVERY_WF = "./.github/workflows/_cf-worker-delivery.yml"
-check(all(jobs[j]["uses"] == DELIVERY_WF for j in CALL_JOBS), "every per-kind call is a STATIC `uses: ./.github/workflows/_cf-worker-delivery.yml` of the SAME internal workflow (one delivery implementation)")
-check(not any("uses" in j for j in djobs.values()), "nesting depth: the delivery workflow calls no further reusable workflow (caller -> _cf-worker-v2 -> _cf-worker-delivery = 3 levels, limit 10)")
+DELIVERY_WF = "$/.github/workflows/_cf-worker-delivery.yml"
+check(all(jobs[j]["uses"] == DELIVERY_WF for j in CALL_JOBS), "every per-kind call is a STATIC `uses: $/.github/workflows/_cf-worker-delivery.yml` of the SAME internal workflow (one delivery implementation)")
+check(not any("uses" in j for d_ in (djobs, cjobs, ljobs, pjobs) for j in d_.values()), "nesting depth: the delivery workflow calls no further reusable workflow (caller -> _cf-worker-v2 -> _cf-worker-delivery = 3 levels, limit 10)")
 LEG = {"production": {"kind": "production", "target": "prod", "environment": "app/prod"}, "native-branch": {"kind": "native-branch", "target": "preview", "environment": "app/preview"},
        "native-dev": {"kind": "native-dev", "target": "preview", "environment": "app/native-dev"}, "persistent-dev": {"kind": "persistent-dev", "target": "dev", "environment": "app/dev"}}
 for k in KINDS:
@@ -137,21 +150,22 @@ for k in KINDS:
     check(w["migration_result"] == "${{ needs.migration.result }}" and w["migration_json"] == "${{ needs.migration.outputs.migration_json }}" and not set(w) & {"kinds", "peers", "own_migration_result", "own_migration_json", "owner_migration_result", "owner_migration_json"},
           f"delivery_{KK(k)}: receives the ONE migration result (no peer / owner / per-kind migration routing)")
 RANK = {"none": 0, "read": 1, "write": 2}
-need = {}
-for dj in djobs.values():
-    for p_, v in dj.get("permissions", {}).items():
-        need[p_] = max(need.get(p_, 0), RANK[v])
+CALLED = {"ci": cjobs, "lifecycle": ljobs, "persistent-dev": pjobs, **{c: djobs for c in CALL_JOBS}}
 for n, j in jobs.items():
     if "uses" not in j:
         continue
-    cp = j.get("permissions", {})
+    need = {}
+    for dj in CALLED[n].values():  # the ceiling a caller must grant is the maximum over ALL jobs of the called workflow, even ones skipped by `if`
+        for p_, v in {"contents": "read", **dj.get("permissions", {})}.items():
+            need[p_] = max(need.get(p_, 0), RANK[v])
+    cp = {"contents": "read", **j.get("permissions", {})}  # the workflow-level default is contents: read
     check(all(RANK[cp.get(p_, "none")] >= r_ for p_, r_ in need.items()),
           f"{n}: the calling job's permissions cover EVERY job of the called workflow (GitHub validates the ceiling for all jobs, including ones skipped by `if` - a lower ceiling is a startup_failure; found by the real-runner scratch run)")
-check(len(text_all.splitlines()) <= 1250, f"the workflow stays thin ({len(text_all.splitlines())} lines)")
+check(len(text_all.splitlines()) <= 780, f"the public workflow stays thin ({len(text_all.splitlines())} lines)")
 
 # ---------------------------------------------------------------- 2. one deployment implementation
-ENGINE_USE = "./.cf-tools/actions/cf-deploy"
-engine_jobs = {n: [s for s in j.get("steps", []) if s.get("uses") == ENGINE_USE] for n, j in {**{f"d.{k}": v for k, v in djobs.items()}, **jobs}.items()}
+ENGINE_USE = "$/actions/cf-deploy"
+engine_jobs = {n: [s for s in j.get("steps", []) if s.get("uses") == ENGINE_USE] for n, j in {**{f"d.{k}": v for k, v in djobs.items()}, **jobs, "persistent-dev": pjobs["persistent-dev"]}.items()}
 check({n for n, s in engine_jobs.items() if s} == {"d.deploy", "d.smoke", "d.rollback", "migration", "persistent-dev"} and all(len(s) == 1 for n, s in engine_jobs.items() if s and n != "migration") and len(engine_jobs["migration"]) == 3,
       "the three delivery-workflow jobs and the manual persistent Dev each call the SAME delivery engine action exactly once; the Migration job calls it for the owner's migration and for each non-owner target's validation (no second deployment implementation)")
 eng = {n.replace("d.", ""): s[0] for n, s in engine_jobs.items() if s and n != "migration"}
@@ -174,33 +188,53 @@ for n, j in {**{f"d.{k}": v for k, v in djobs.items()}, **jobs}.items():
     check(not IMPL.search(runs_txt), f"{n}: no deployment implementation inline in YAML")
 
 # ---------------------------------------------------------------- 3. gating over the event matrix
-for name in VALIDATION:
-    check(runs(name, scenario("push", FEAT)), f"{name}: runs on a feature push")
-    check(runs(name, scenario("push", MAIN)), f"{name}: runs on a main push")
-    check(not runs(name, scenario("delete", FEAT, ev_ref_type="branch")), f"{name}: not on branch delete")
-    check(not runs(name, scenario("pull_request", "refs/pull/1/merge", head_repo="o/r")), f"{name}: same-repo PR is covered by the push run")
-    check(runs(name, scenario("pull_request", "refs/pull/1/merge", head_repo="fork/r")), f"{name}: fork PR runs (credential-free)")
-    check(not runs(name, scenario("workflow_dispatch", "refs/heads/dev", {"dispatch_target": "persistent-dev"})), f"{name}: not on persistent-dev dispatch")
+# CI call: the event/skip rules live in ONE place (the call job's `if`)
+check(runs("ci", scenario("push", FEAT)) and runs("ci", scenario("push", MAIN)), "ci: runs on feature and main pushes")
+check(not runs("ci", scenario("delete", FEAT, ev_ref_type="branch")), "ci: not on branch delete")
+check(not runs("ci", scenario("pull_request", "refs/pull/1/merge", head_repo="o/r")), "ci: a same-repo PR is covered by the push run of the same SHA (no duplicate CI)")
+check(runs("ci", scenario("pull_request", "refs/pull/1/merge", head_repo="fork/r")), "ci: fork PR runs (credential-free)")
+check(not runs("ci", scenario("workflow_dispatch", "refs/heads/dev", {"dispatch_target": "persistent-dev"})), "ci: not on the persistent-dev dispatch")
+check(not runs("ci", scenario("push", FEAT, {"pipeline_phase": "verify"})), "ci: not in a verify call (it never re-validates)")
+check(runs("ci", scenario("workflow_dispatch", FEAT)), "ci: runs on a regular workflow_dispatch")
+# Inside the CI workflow the only per-job switch is "is the command configured"
+cruns = lambda name, **inp: bool(ev(strip_expr(cjobs[name].get("if", "true")) or cjobs[name].get("if", "true"), Ctx({"inputs": dict({"lint_cmd": "x", "typecheck_cmd": "x", "test_unit_cmd": "x", "test_integration_cmd": "x", "test_e2e_cmd": "x", "build_cmd": "x"}, **inp)}, {})))
 for name, inp in CMD_INPUT.items():
-    check(not runs(name, scenario("push", FEAT, {inp: ""})), f"{name}: intentionally skipped when {inp} is empty")
-    check(runs(name, scenario("push", FEAT, {inp: "x"})), f"{name}: runs when {inp} is configured")
-check(runs("build", scenario("push", FEAT, {"build_cmd": ""})), "build: build_cmd is required, never optional")
-
-gate_ok = lambda **kw: scenario(**dict(dict(event="push", ref=FEAT, needs=GREEN), **kw))
-check(runs("gate", gate_ok()) and runs("gate", gate_ok(ref=MAIN)), "Validation Gate: evaluated for feature and main pushes")
-check(not runs("gate", gate_ok(event="pull_request", ref="refs/pull/1/merge", head_repo="o/r")) and not runs("gate", gate_ok(event="delete")), "Validation Gate: not for same-repo PRs / branch deletes")
-check(not runs("gate", scenario("workflow_dispatch", "refs/heads/dev", {"dispatch_target": "persistent-dev"}, GREEN)), "Validation Gate: not for the manual persistent-dev dispatch")
-check(not runs("gate", gate_ok(inputs={"pipeline_phase": "verify"})), "Validation Gate: not in a verify call")
-gate_step = jobs["gate"]["steps"][0]
+    check(not cruns(name, **{inp: ""}), f"{name}: intentionally skipped when {inp} is empty")
+    check(cruns(name), f"{name}: runs when {inp} is configured")
+check("if" not in cjobs["build"], "build: build_cmd is required, never optional")
+check(all(not any(k in cj for k in ("strategy",)) for n, cj in cjobs.items() if n != "e2e") and "matrix" in cjobs["e2e"]["strategy"] and cjobs["e2e"]["strategy"].get("fail-fast") is False, "only E2E has a matrix (variants, fail-fast off)")
+gate_step = cjobs["gate"]["steps"][0]
+check(cjobs["gate"]["if"] == "always()", "Validation Gate: always() - it runs (and fails) even when a job it needs failed or was cancelled")
 check(all(f"{v.upper()}_CONFIGURED" in gate_step["env"] for v in VALIDATION) and 'success' in gate_step["run"] and 'skipped' in gate_step["run"], "Validation Gate: configured jobs must succeed; unconfigured ones must be skipped (fail closed otherwise)")
 check(all(f"needs.{v}.result" in gate_step["env"][v.upper()] for v in VALIDATION), "Validation Gate reads the result of every validation job")
+check(cjobs["gate"]["outputs"]["validation"] == "${{ steps.gate.outputs.validation }}" and 'echo "validation=passed" >> "$GITHUB_OUTPUT"' in gate_step["run"] and gate_step["run"].index("exit 1") < gate_step["run"].index("validation=passed"), "Validation Gate: `validation=passed` is written only after every check passed")
+check(cdoc[True]["workflow_call"]["outputs"]["validation"]["value"] == "${{ jobs.gate.outputs.validation }}" and "concurrency" not in cdoc, "CI workflow exposes the gate's verdict and has no workflow-level concurrency (the public workflow's group would deadlock)")
+# Gate semantics over every outcome, executed by the real script
+import subprocess
+def gate_run(unconfigured=(), **o):
+    import tempfile
+    env = {"PATH": "/usr/bin:/bin"}
+    for v in VALIDATION:
+        env[v.upper()] = o.get(v, "success")
+        env[f"{v.upper()}_CONFIGURED"] = "false" if v in unconfigured else "true"
+    out = tempfile.NamedTemporaryFile("w+", delete=False)
+    env["GITHUB_OUTPUT"] = out.name
+    r = subprocess.run(["bash", "-eo", "pipefail", "-c", gate_step["run"]], env=env, capture_output=True, text=True)
+    return r.returncode, open(out.name).read().strip()
+check(gate_run() == (0, "validation=passed"), "Validation Gate (executed): all six configured and green -> passed")
+for res_ in ("failure", "cancelled", "skipped"):
+    check(all(gate_run(**{v: res_})[0] == 1 and gate_run(**{v: res_})[1] == "" for v in VALIDATION), f"Validation Gate (executed): a configured job that finished '{res_}' fails the gate and writes no verdict")
+check(gate_run(("e2e",), e2e="skipped") == (0, "validation=passed") and gate_run(("e2e",), e2e="success")[0] == 1, "Validation Gate (executed): an UNCONFIGURED job must be skipped (an unexpected run is fail-closed too)")
 
-plan_if = lambda **kw: runs("plan", scenario(**dict(dict(event="push", ref=FEAT, needs=res(gate="success")), **kw)))
-check(plan_if() and plan_if(ref=MAIN), "plan: runs after a passed gate on feature and main pushes")
+ci_ok = lambda **kw: dict(dict(event="push", ref=FEAT, needs={"ci": {"result": "success", "outputs": {"validation": "passed"}}}), **kw)
+plan_if = lambda **kw: runs("plan", scenario(**dict(ci_ok(), **kw)))
+check(plan_if() and plan_if(ref=MAIN), "plan: runs after a passed CI on feature and main pushes")
+check(plan_if(event="workflow_dispatch"), "plan: runs on a workflow_dispatch after a passed CI")
 for bad in ("failure", "cancelled", "skipped"):
-    check(not plan_if(needs=res(gate=bad)), f"plan: blocked when the Validation Gate is {bad}")
+    check(not plan_if(needs={"ci": {"result": bad, "outputs": {"validation": "passed"}}}), f"plan: blocked when the CI call is {bad}")
+check(not plan_if(needs={"ci": {"result": "success", "outputs": {"validation": ""}}}) and not plan_if(needs={"ci": {"result": "success", "outputs": {}}}), "plan: a green CI call without the gate's `validation=passed` verdict is still blocked (fail closed)")
 check(not plan_if(event="pull_request", ref="refs/pull/1/merge") and not plan_if(event="delete") and not plan_if(ref="refs/tags/v1"), "plan: never for PRs, deletes or tags")
-check(plan_if(inputs={"pipeline_phase": "verify", "phase_state": "{}"}, needs=res(gate="skipped")), "plan: a verify call plans from the hand-off, not from the gate")
+check(plan_if(inputs={"pipeline_phase": "verify", "phase_state": "{}"}, needs={"ci": {"result": "skipped", "outputs": {}}}), "plan: a verify call plans from the hand-off, not from CI")
 # ---------------------------------------------------------------- call-job gating (plan outputs are the only per-kind switch)
 # Routing stub of the plan's descriptor: the call jobs only ROUTE it (delivery.test.mjs proves its content).
 DESC_FIX = {"production": ("prod", "app/prod"), "native-branch": ("preview", "app/preview"), "native-dev": ("preview", "app/native-dev"), "persistent-dev": ("dev", "app/dev")}
@@ -226,15 +260,15 @@ def pl(kinds=("native_branch",), d1=False, owner=None, result="success", **extra
 
 G_OK = {"result": "success", "outputs": {}}
 import json  # noqa: E402
-mig_if = lambda kinds=("native_branch",), d1=True, gate="success", plan_result="success", **kw: runs("migration", scenario("push", kw.pop("ref", FEAT), dict({"d1_migrations": d1}, **kw.pop("inputs", {})), {"gate": {"result": gate, "outputs": {}}, "plan": pl(kinds, d1, result=plan_result)}))
+mig_if = lambda kinds=("native_branch",), d1=True, plan_result="success", **kw: runs("migration", scenario("push", kw.pop("ref", FEAT), dict({"d1_migrations": d1}, **kw.pop("inputs", {})), {"plan": pl(kinds, d1, result=plan_result)}))
 check(mig_if() and mig_if(("production",), ref=MAIN), "Migration: ONE job runs for a main push (Production D1) and for a feature push (Preview/Dev D1) when d1_migrations is on")
 check(mig_if(("native_branch", "native_dev")) and mig_if(("native_branch", "persistent_dev")), "Migration: Native Branch + Native Dev (or persistent Dev) sharing one D1 still run ONE migration job")
 check(not mig_if(d1=False), "Migration: D1-less app / d1_migrations=false -> skipped, and Delivery proceeds (see below)")
 check(not mig_if(inputs={"pipeline_phase": "verify"}), "Migration: never in a verify call (deferred verification never repeats a migration)")
-check(not mig_if(gate="failure") and not mig_if(gate="skipped") and not mig_if(plan_result="failure") and not mig_if(plan_result="skipped"), "Migration: needs a passed Validation Gate and a successful plan (a failed or invalid plan mutates nothing)")
-check(not runs("migration", scenario("pull_request", "refs/pull/1/merge", {"d1_migrations": True}, {"gate": {"result": "skipped", "outputs": {}}, "plan": {"result": "skipped", "outputs": {}}})) and not runs("migration", scenario("delete", FEAT, {"d1_migrations": True}, {"gate": {"result": "skipped", "outputs": {}}, "plan": {"result": "skipped", "outputs": {}}})),
+check(not mig_if(plan_result="failure") and not mig_if(plan_result="skipped") and not mig_if(plan_result="cancelled"), "Migration: needs a successful plan - the plan only runs after a passed CI, so a failed CI, a failed or an invalid plan mutates nothing")
+check(not runs("migration", scenario("pull_request", "refs/pull/1/merge", {"d1_migrations": True}, {"plan": {"result": "skipped", "outputs": {}}})) and not runs("migration", scenario("delete", FEAT, {"d1_migrations": True}, {"plan": {"result": "skipped", "outputs": {}}})),
       "Migration: no migration on a PR or a lifecycle-only (delete) event")
-check(not runs("migration", scenario("push", FEAT, {"d1_migrations": True}, {"gate": G_OK, "plan": pl((), True)})), "Migration: nothing enabled (CI-only run) -> no migration")
+check(not runs("migration", scenario("push", FEAT, {"d1_migrations": True}, {"plan": pl((), True)})), "Migration: nothing enabled (CI-only run) -> no migration")
 mj = jobs["migration"]
 env_expr = mj["environment"]["name"]
 check(render(env_expr, scenario("push", MAIN, {"d1_migrations": True}, {"plan": pl(("production",), True)})) == "app/prod"
@@ -253,13 +287,13 @@ gate_i = next(n for n, x in enumerate(ACT_STEPS) if x.get("id") == "migration_ga
 first_work = next(n for n, x in enumerate(ACT_STEPS) if "Stale-SHA guard (start)" in x.get("name", ""))
 check(gate_i < first_work and ACT_STEPS[gate_i]["if"] == "inputs.stage == 'publish'" and "migration-gate" in ACT_STEPS[gate_i]["run"],
       "Migration gate: runs in the engine right after init - before the stale guard, setup, build and publish - for the publish stage only")
-dl_if = lambda k, kinds=None, gate="success", plan_result="success", inputs=None, mig="skipped", **kw: runs(f"delivery_{KK(k)}", scenario("push", kw.pop("ref", FEAT), inputs or {}, {"gate": {"result": gate, "outputs": {}}, "plan": pl(kinds or (KK(k),), False, result=plan_result), "migration": {"result": mig, "outputs": {}}}))
-check(dl_if("native-branch") and dl_if("production", ref=MAIN) and dl_if("native-dev") and dl_if("persistent-dev"), "Delivery: runs when the gate passed and ITS kind is enabled - a SKIPPED migration (d1_migrations=false) never blocks it")
+dl_if = lambda k, kinds=None, plan_result="success", inputs=None, mig="skipped", **kw: runs(f"delivery_{KK(k)}", scenario("push", kw.pop("ref", FEAT), inputs or {}, {"plan": pl(kinds or (KK(k),), False, result=plan_result), "migration": {"result": mig, "outputs": {}}}))
+check(dl_if("native-branch") and dl_if("production", ref=MAIN) and dl_if("native-dev") and dl_if("persistent-dev"), "Delivery: runs when the plan succeeded and ITS kind is enabled - a SKIPPED migration (d1_migrations=false) never blocks it")
 check(all(dl_if(k, mig="success", ref=MAIN if k == "production" else FEAT) for k in KINDS), "Delivery: runs after a successful migration")
 check(not any(dl_if(k, mig=m, ref=MAIN if k == "production" else FEAT) for k in KINDS for m in ("failure", "cancelled")), "Delivery: a failed or cancelled Migration prevents EVERY dependent deployment")
 check(not dl_if("native-dev", kinds=("native_branch",)) and not dl_if("production", kinds=("native_branch",), ref=FEAT), "Delivery: a disabled kind creates no delivery (no phantom paths)")
-check(not dl_if("native-branch", gate="failure") and not dl_if("native-branch", gate="skipped") and not dl_if("native-branch", plan_result="failure"), "Delivery: blocked by a failed Validation Gate or a failed plan (invalid configuration deploys nothing)")
-check(dl_if("native-branch", gate="skipped", inputs={"pipeline_phase": "verify"}), "Delivery: a verify call plans from the hand-off, not from the gate (and the migration is skipped there: it already ran in the deploy call)")
+check(not dl_if("native-branch", plan_result="failure") and not dl_if("native-branch", plan_result="skipped"), "Delivery: blocked by a failed or skipped plan (a failed CI skips the plan; invalid configuration fails it: nothing deploys)")
+check(dl_if("native-branch", inputs={"pipeline_phase": "verify"}), "Delivery: a verify call plans from the hand-off, not from CI (and the migration is skipped there: it already ran in the deploy call)")
 pub = next(x for x in djobs["deploy"]["steps"] if x.get("id") == "engine")["with"]
 check(all(pub[k] == "${{ inputs." + k + " }}" for k in ("migration_result", "migration_json")) and djobs["deploy"]["outputs"]["migration_used"] == "${{ steps.engine.outputs.migration_used }}"
       and "run" not in djobs["deploy"]["steps"][0],
@@ -347,7 +381,7 @@ for n in djobs:
         c = Ctx({"inputs": {"kind": k, "descriptor": json.dumps(desc(k))}}, SECRETS)
         got = render(w["preview_secrets"], c)
         check((got == "K=v") == (k in ("native-branch", "native-dev")) and (k in ("native-branch", "native-dev") or "PREVIEW_SECRETS" not in c.secret_reads), f"{n}: Preview-only secrets reach {k} only if it is a Preview kind")
-ptxt = yaml.dump(jobs["persistent-dev"])
+ptxt = yaml.dump(pjobs["persistent-dev"])
 check("secrets.CLOUDFLARE_API_TOKEN" in ptxt and "secrets.CLOUDFLARE_ACCOUNT_ID" in ptxt and "CLOUDFLARE_PREVIEW" not in ptxt and "PREVIEW_SECRETS" not in ptxt, "persistent-dev reuses account credentials, not Preview secrets")
 check(not any(k in j.get("env", {}) for j in list(jobs.values()) + list(djobs.values()) for k in ("TARGET", "BUILD_ENV", "SMOKE_ENV", "DEV_ENV", "EXPECTED_SHA", "RUN_SHA")),
       "no job exports TARGET / BUILD_ENV / DEV_ENV / EXPECTED_SHA ...: the delivery target is bound by the engine action input, not by environment")
@@ -356,71 +390,76 @@ check(all(djobs[n]["environment"]["name"] == ENVEXPR for n in ("deploy", "rollba
 check(all(render(ENVEXPR, Ctx({"inputs": {"descriptor": json.dumps(desc(k))}}, SECRETS)) == DESC_FIX[k][1] for k in KINDS), "descriptor environments are <app>/prod | preview | native-dev | dev")
 check("environment" not in djobs["smoke"], "Smoke: no Environment (no protection prompt; it mutates nothing)")
 check(djobs["deploy"]["environment"]["url"] == "${{ steps.engine.outputs.url }}", "Deploy: the job shows the actual deployed URL (environment.url)")
-check(jobs["persistent-dev"]["environment"] == "${{ inputs.app_name }}/dev", "manual persistent Dev runs in the <app>/dev Environment (same as the automatic persistent-dev kind)")
-allj = {**jobs, **{f"d.{k}": v for k, v in djobs.items()}}
+check(pjobs["persistent-dev"]["environment"] == "${{ inputs.app_name }}/dev", "manual persistent Dev runs in the <app>/dev Environment (same as the automatic persistent-dev kind)")
+allj = {**jobs, **{f"d.{k}": v for k, v in djobs.items()}, **{f"ci.{k}": v for k, v in cjobs.items()}, **{f"l.{k}": v for k, v in ljobs.items()}, **{f"p.{k}": v for k, v in pjobs.items()}}
 check(all(j.get("permissions", {}).get("contents", "read") == "read" for n, j in allj.items() if n != "release"), "no job except Release can write repository contents")
 check(jobs["migration"]["permissions"].get("deployments") == "read", "Migration can READ (not write) Deployments: the Preview identity guard reads the ledger owner")
 check(ddoc.get("permissions") == {"contents": "read"} and "concurrency" not in ddoc, "delivery workflow: read-only default token and NO workflow-level concurrency (the public workflow's group would deadlock)")
 check("contents: write" not in yaml.dump({k: allj[k] for k in allj if k != "release"}) and not any(w in text_all for w in ("lock.sh", "cfv2-locks", "refs/cfv2")), "no custom Git-ref lock and no content-write permission outside Release")
-for name in VALIDATION + ["lifecycle"]:
-    text = yaml.dump(jobs[name])
+for name, job_ in [(f"ci.{v}", cjobs[v]) for v in VALIDATION + ["gate"]] + [("lifecycle", ljobs["lifecycle"])]:
+    text = yaml.dump(job_)
     check("secrets." not in text and "CLOUDFLARE" not in text, f"{name}: no secrets and no Cloudflare credentials of any kind")
-check("secrets.SMOKE_PASSWORD" not in yaml.dump({k: jobs[k] for k in VALIDATION}) and eng["smoke"]["with"]["smoke_password"] == "${{ secrets.SMOKE_PASSWORD }}" and "smoke_password" not in eng["deploy"]["with"] and not any("smoke_password" in x["with"] for x in MIG_STEPS),
+check(not ({"secrets"} & set(cdoc[True]["workflow_call"])) and not ({"secrets"} & set(ldoc[True]["workflow_call"])) and "secrets" not in jobs["ci"] and "secrets" not in jobs["lifecycle"], "the CI and lifecycle calls pass NO secrets at all (credential-free by construction)")
+check("secrets.SMOKE_PASSWORD" not in yaml.dump(cjobs) and eng["smoke"]["with"]["smoke_password"] == "${{ secrets.SMOKE_PASSWORD }}" and "smoke_password" not in eng["deploy"]["with"] and not any("smoke_password" in x["with"] for x in MIG_STEPS),
       "smoke credentials reach only the engine actions that smoke (Smoke Tests, Rollback re-smoke, Dev)")
 for n in ("deploy", "smoke", "rollback", "migration"):
     cks = [s for s in (djobs.get(n) or jobs[n])["steps"] if str(s.get("uses", "")).startswith("actions/checkout")]
     check(cks and all(s["with"].get("persist-credentials") is False for s in cks), f"{n}: checkouts do not persist the GitHub token into the workspace")
-check(all(s["with"].get("persist-credentials") is False for s in jobs["persistent-dev"]["steps"] if str(s.get("uses", "")).startswith("actions/checkout") and s.get("with", {}).get("path")), "persistent-dev: tooling checkout does not persist the GitHub token")
+check(all(s["with"].get("persist-credentials") is False for s in pjobs["persistent-dev"]["steps"] if str(s.get("uses", "")).startswith("actions/checkout")), "persistent-dev: the checkout does not persist the GitHub token")
 
 # ---------------------------------------------------------------- 6. cross-repository reusable workflow + local composite action references
-action_uses = [(n, i, s, j) for n, j in allj.items() for i, s in enumerate(j.get("steps", [])) if str(s.get("uses", "")).startswith("./")]
-check(action_uses and all("${{" not in s["uses"] and s["uses"].startswith("./.cf-tools/actions/") for _, _, s, _ in action_uses),
-      "every local ACTION reference is a STATIC `./.cf-tools/actions/<name>` path (uses: cannot take an expression; `./` alone would resolve against the CALLER's workspace)")
-for n, i, s, j in action_uses:
-    name = s["uses"].split("/actions/", 1)[1]
-    prior = [p for p in j["steps"][:i] if p.get("with", {}).get("path") == ".cf-tools"]
-    sp = prior[-1]["with"].get("sparse-checkout", "") if prior else ""
-    check(pathlib.Path(f"actions/{name}/action.yml").exists(), f"{n}: referenced action actions/{name}/action.yml exists in this repository")
-    check(len(prior) == 1 and prior[0]["with"]["repository"] == "firstsun-dev/.github" and prior[0]["with"]["ref"] == "${{ inputs.tools_ref }}" and f"actions/{name}" in sp,
-          f"{n}: firstsun-dev/.github is checked out at tools_ref into .cf-tools, including actions/{name}, BEFORE `uses: {s['uses']}`")
-    first_ck = next(i_ for i_, p in enumerate(j["steps"]) if str(p.get("uses", "")).startswith("actions/checkout"))
-    check(j["steps"][first_ck].get("with", {}).get("path") is None or n == "persistent-dev", f"{n}: the app checkout (workspace root) happens before the tooling checkout")
-check(all(jobs[j]["with"]["tools_ref"] == "${{ inputs.tools_ref }}" for j in CALL_JOBS), "tools_ref: every per-kind call forwards the caller's tools_ref (the engine is fetched at the SAME pinned ref)")
-check(set(ddoc[True]["workflow_call"]["inputs"]) >= {"descriptor", "tools_ref", "inputs_json", "migration_result", "migration_json"} and "stage" not in ddoc[True]["workflow_call"]["inputs"] and not set(ddoc[True]["workflow_call"]["inputs"]) & {"kind", "target", "environment", "deploy_group", "rollback_group", "d1_expected_id", "d1_owner_kind"} and ddoc[True]["workflow_call"]["inputs"]["tools_ref"].get("required") is True, "delivery workflow: tools_ref is a required input")
+USES_ALL = [(n, i, s_["uses"]) for n, j in allj.items() for i, s_ in enumerate(j.get("steps", [])) if "uses" in s_] + [(n, -1, j["uses"]) for n, j in allj.items() if "uses" in j]
+SELF = [(n, i, u) for n, i, u in USES_ALL if u.startswith("$/")]
+check(SELF and all("${{" not in u and "@" not in u for _, _, u in SELF), "every `$/` reference is STATIC and carries no @ref suffix (uses: cannot take an expression; the ref is always the running commit)")
+check(all(pathlib.Path(u[2:]).exists() and (pathlib.Path(u[2:] + "/action.yml").exists() or pathlib.Path(u[2:]).suffix == ".yml") for _, _, u in SELF), "every `$/` target exists in this repository (actions/<name>/action.yml or a workflow file)")
+check(not any(u.startswith("./") or u.startswith("firstsun-dev/.github") for _, _, u in USES_ALL), "no `./` (resolves against the CALLER's workspace) and no pinned `firstsun-dev/.github/...@ref` reference remains in the pipeline")
+CHECKOUTS = [(n, s_) for n, j in allj.items() for s_ in j.get("steps", []) if str(s_.get("uses", "")).startswith("actions/checkout")]
+check(CHECKOUTS and not any("repository" in s_.get("with", {}) or s_.get("with", {}).get("path") == ".cf-tools" for _, s_ in CHECKOUTS if s_.get("with", {}).get("path") != "recover"), "no job checks out firstsun-dev/.github: the only checkouts are the application at the run SHA (and the recovery checkout of the last good SHA)")
+ALLTXT = "".join(open(f).read() for f in (WF, DWF, CWF, LWF, PWF, ".github/workflows/_cf-worker-preview-gc.yml", "actions/cf-deploy/action.yml", "actions/cf-ci-check/action.yml", "actions/cf-tools/action.yml"))
+check(".cf-tools" not in re.sub(r"#.*", "", ALLTXT).replace("`.cf-tools`", ""), "no `.cf-tools` workspace path remains in any workflow or action")
+check(all(pathlib.Path(f"actions/{n}/action.yml").exists() for n in ("cf-deploy", "cf-ci-check", "cf-tools", "setup", "mailpit")), "all referenced shared actions exist")
+check(not any(f"{k}: ${{{{ inputs.tools_ref }}}}" in ALLTXT for k in ("ref", "tools_ref")), "tools_ref is not forwarded anywhere (the tooling is the running commit by construction)")
+check(inputs_def["tools_ref"].get("required") is not True and inputs_def["tools_ref"]["default"] == "" and "tools_ref" not in ddoc[True]["workflow_call"]["inputs"], "tools_ref stays ACCEPTED for existing callers but is optional and ignored")
+check(set(ddoc[True]["workflow_call"]["inputs"]) >= {"descriptor", "inputs_json", "migration_result", "migration_json"} and "stage" not in ddoc[True]["workflow_call"]["inputs"] and not set(ddoc[True]["workflow_call"]["inputs"]) & {"kind", "target", "environment", "deploy_group", "rollback_group", "d1_expected_id", "d1_owner_kind"}, "delivery workflow: the descriptor, inputs and the one migration result are its interface")
 _ci = open("actions/cf-ci-check/action.yml").read()
-check("rm -rf .cf-tools" not in _ci and "'.cf-tools/actions/cf-ci-check/action.yml' -delete" in _ci,
-      "cf-ci-check never deletes its own action.yml (the runner re-reads it for the post step; Blog run 39722027184 failed that way)")
-check(all("cf-preview" in (s["with"].get("sparse-checkout", "") if s.get("with") else "") for n in djobs for s in djobs[n]["steps"] if s.get("with", {}).get("path") == ".cf-tools"), "every delivery job fetches the engine scripts (actions/cf-preview) together with the action")
-pins = [s["uses"] for j in allj.values() for s in j.get("steps", []) if str(s.get("uses", "")).startswith("firstsun-dev/.github/")]
-check(all(re.fullmatch(r"firstsun-dev/\.github/actions/[a-z0-9-]+@v1", u) for u in pins), "remaining remote references are the existing pinned shared actions (setup / mailpit @v1)")
-check("tools_ref" in inputs_def and inputs_def["tools_ref"].get("required") is True, "tools_ref stays a required input (must equal the ref the caller pins this workflow at)")
+check("rm -rf" not in _ci and "-delete" not in _ci, "cf-ci-check deletes nothing (nothing from this repository is in the app's workspace)")
+CT = action("cf-tools")
+check(CT["runs"]["using"] == "composite" and "$GITHUB_ACTION_PATH/../cf-preview" in CT["runs"]["steps"][0]["run"] and 'TOOLS_DIR=' in CT["runs"]["steps"][0]["run"], "cf-tools locates actions/cf-preview relative to itself and exports TOOLS_DIR")
+check(all(re.search(r"GITHUB_ACTION_PATH/\.\./cf-preview/", x.get("run", "")) for x in ASTEPS if "engine.sh" in x.get("run", "")), "cf-deploy finds the engine scripts next to itself ($GITHUB_ACTION_PATH/../cf-preview), independent of any checkout path")
+for n, i, u in SELF:
+    if u.endswith("cf-tools"):
+        j = allj[n]
+        prev = [x for x in j["steps"][:i] if str(x.get("uses", "")).startswith("actions/setup-node")]
+        w = j["steps"][i].get("with", {})
+        check(w.get("install") != "true" or prev, f"{n}: cf-tools with install: true is preceded by setup-node")
+check(inputs_def["tools_ref"]["description"].lstrip().startswith("DEPRECATED"), "tools_ref is documented as deprecated")
 
 # ---------------------------------------------------------------- 7. validation jobs use the common CI action
 CMDS = {"lint": "lint_cmd", "typecheck": "typecheck_cmd", "unit": "test_unit_cmd", "integration": "test_integration_cmd", "build": "build_cmd"}
 for j, inp in CMDS.items():
-    steps = jobs[j]["steps"]
-    ci = [s for s in steps if s.get("uses") == "./.cf-tools/actions/cf-ci-check"]
-    t = yaml.dump(jobs[j])
+    steps = cjobs[j]["steps"]
+    ci = [s for s in steps if s.get("uses") == "$/actions/cf-ci-check"]
+    t = yaml.dump(cjobs[j])
     others = [i for k, i in CMDS.items() if k != j] + ["test_e2e_cmd"]
     check(len(ci) == 1 and ci[0]["with"]["cmd"] == "${{ inputs." + inp + " }}" and not any(f"inputs.{o}" in t for o in others), f"{j}: runs {inp} exactly once through actions/cf-ci-check, and no other job's command")
     check(ci[0]["with"]["title"] == JOB_NAME[j], f"{j}: the check summary carries its own name")
     check(not any("playwright" in yaml.dump(s_).lower() for s_ in steps) and "upload-artifact" not in t and "download-artifact" not in t, f"{j}: installs no browsers and uses no artifacts")
-    check(jobs[j].get("continue-on-error") is None, f"{j}: failures are never hidden by continue-on-error")
-    check("cf-ci-check" in next(s for s in steps if s.get("with", {}).get("path") == ".cf-tools")["with"]["sparse-checkout"], f"{j}: fetches the CI action it uses")
+    check(cjobs[j].get("continue-on-error") is None, f"{j}: failures are never hidden by continue-on-error")
+    check(steps[0].get("uses") == "actions/checkout@v6" and steps[1].get("uses") == "$/actions/cf-ci-check", f"{j}: checks out the app, then runs the CI action (nothing else)")
 ci_steps = CI_ACTION["runs"]["steps"]
 check(ci_steps[0]["name"].startswith("Import validation env") and "parse-env.mjs\" TARGET_BUILD_ENV" in ci_steps[0]["run"] and ci_steps[0]["run"].index("TARGET_BUILD_ENV") < ci_steps[0]["run"].index("CI_ENV"),
       "cf-ci-check imports the target build env, then ci_env, through the safe importer (precedence preserved)")
 ck = next(s for s in ci_steps if s.get("id") == "check")
 check(ck["env"]["CMD"] == "${{ inputs.cmd }}" and ck["run"] == 'bash -c "$CMD"' and "continue-on-error" not in ck, "cf-ci-check runs its one command via env (never interpolated) and never hides a failure")
 check(any("GITHUB_STEP_SUMMARY" in s.get("run", "") and s.get("if") == "always()" for s in ci_steps), "cf-ci-check always writes a short Step Summary")
-check(any(s.get("uses", "").startswith("firstsun-dev/.github/actions/mailpit") and s.get("if") == "inputs.use_mailpit == 'true'" for s in ci_steps) and
-      all(("use_mailpit" in str(next(s for s in jobs[j]["steps"] if s.get("uses") == "./.cf-tools/actions/cf-ci-check")["with"])) == (j in ("unit", "integration")) for j in CMDS),
+check(any(s.get("uses", "").startswith("$/actions/mailpit") and s.get("if") == "inputs.use_mailpit == 'true'" for s in ci_steps) and
+      all(("use_mailpit" in str(next(s for s in cjobs[j]["steps"] if s.get("uses") == "$/actions/cf-ci-check")["with"])) == (j in ("unit", "integration")) for j in CMDS),
       "Mailpit starts only for Unit and Integration tests")
 check("build_env_prod" in ci_steps[0]["env"]["TARGET_BUILD_ENV"] and "build_env_preview" in ci_steps[0]["env"]["TARGET_BUILD_ENV"], "validation jobs use the Production build env on main and the Preview build env elsewhere")
-e2e_text = yaml.dump(jobs["e2e"])
+e2e_text = yaml.dump(cjobs["e2e"])
 check("test_e2e_build_cmd" in e2e_text and "test_e2e_env" in e2e_text and "inputs.build_cmd" not in e2e_text, "E2E builds with its own test build command and env")
 uploads = [(j, s) for j, job in allj.items() for s in job.get("steps", []) if "upload-artifact" in str(s.get("uses", ""))]
-check("download-artifact" not in text_all + open(DWF).read() and sorted(j for j, _ in uploads) == ["d.smoke", "e2e"], "no build artifact hand-off between jobs; the only uploads are the failure-only E2E and smoke reports")
+check("download-artifact" not in text_all + open(DWF).read() and sorted(j for j, _ in uploads) == ["ci.e2e", "d.smoke"], "no build artifact hand-off between jobs; the only uploads are the failure-only E2E and smoke reports")
 for j_, u in uploads:
     check(u.get("if") == "failure()" and u.get("continue-on-error") is True and 0 < u["with"]["retention-days"] <= 7, f"{j_} report: failure-only, never fails the job, short retention")
 check(not any(k in inputs_def for k in ("preview_build_cmd", "preview_provision_cmd", "preview_migrate_cmd", "preview_cleanup_cmd", "preview_smoke_cmd", "preview_smoke_env", "verify_cmd", "migrate_cmd_prod", "migrate_cmd_preview")), "obsolete v2 inputs are removed; no custom migration command exists (the target D1 check cannot be bypassed)")
@@ -531,15 +570,15 @@ def js_group(scope, app):
 
 
 check(djobs["deploy"]["concurrency"]["group"] == "${{ fromJSON(inputs.descriptor).deploy_group }}" and djobs["rollback"]["concurrency"]["group"] == "${{ fromJSON(inputs.descriptor).rollback_group }}", "delivery jobs take their concurrency groups from the descriptor")
-manual_group = lambda scope, app: render(jobs["persistent-dev"]["concurrency"]["group"], scenario(inputs={"app_name": app, "d1_lock_scope": scope}))
+manual_group = lambda scope, app: render(pjobs["persistent-dev"]["concurrency"]["group"], scenario(inputs={"app_name": app, "d1_lock_scope": scope}))
 for scope, app in (("shared-db", "blog"), ("", "blog"), ("", "wiki")):
     check(js_group(scope, app) == manual_group(scope, app), f"persistent-dev: the descriptor's Deploy/Rollback group equals the manual dispatch's group (scope={scope or '-'}, app={app}) - one serialisation domain per shared D1")
 check(js_group("", "blog") != js_group("", "wiki"), "without a scope the Dev group is keyed by app")
 for n in ("deploy", "rollback"):
     check(djobs[n]["concurrency"]["cancel-in-progress"] is False, f"{n}: job-level groups never cancel in-flight work")
 for j in ("smoke", "migration") + tuple(VALIDATION):
-    check("concurrency" not in (djobs.get(j) or jobs.get(j)), f"{j}: no job-level concurrency (a second, nested group could deadlock with the workflow-level one)")
-check(jobs["persistent-dev"]["concurrency"]["group"] == "cfv2-dev-${{ github.repository }}-${{ inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name }}", "manual persistent Dev uses the same job-level group (automatic and manual Dev never overlap)")
+    check("concurrency" not in (djobs.get(j) or jobs.get(j) or cjobs.get(j)), f"{j}: no job-level concurrency (a second, nested group could deadlock with the workflow-level one)")
+check(pjobs["persistent-dev"]["concurrency"]["group"] == "cfv2-dev-${{ github.repository }}-${{ inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name }}", "manual persistent Dev uses the same job-level group (automatic and manual Dev never overlap)")
 check(all(not g(r, {"d1_migrations": True}).startswith("cfv2-dev-") for r in (MAIN, FEAT)), "workflow-level groups can never equal the job-level Dev group")
 ND_ON = {"preview_on_branch_push": False, "shared_dev_native_preview_on_branch_push": True}
 check(g(FEAT, ND_ON) == "cfv2-shared-dev-app" == g("refs/heads/other", ND_ON), "group: Native Dev (fixed target `dev`) serializes ALL branches of the app on one group")
@@ -562,20 +601,20 @@ check(all("jobs.delivery_production.outputs." in OUTS[k]["value"] and "jobs.deli
 check("delivery_persistent_dev" in OUTS["dev_url"]["value"] and "delivery_native_dev" in OUTS["native_dev_url"]["value"] and "delivery_native_dev" not in OUTS["dev_url"]["value"], "outputs: dev_* stay persistent Dev; native_dev_* are Native Dev")
 check(all("outputs.smoke_json" in OUTS[k]["value"] and ".handoff" not in OUTS[k]["value"] for k in ("deploy_verified_url", "deploy_verified", "native_dev_verified", "dev_verified_url")), "outputs: *_verified come from the Smoke result only (the only place a deployment becomes verified)")
 check(all(re.search(r"jobs\.plan\.outputs\.on_\w+ == 'true'", OUTS[k]["value"]) for k in ("deploy_url", "deploy_verified", "rollback_result")) and "jobs.migration.outputs.migration_status" in OUTS["migration_status"]["value"], "P1-A: every per-kind public output SELECTS its source by the plan (on_<kind>); migration_status is the ONE Migration job's result")
-pd = jobs["persistent-dev"]
-check(pd["if"] == "inputs.pipeline_phase != 'verify' && github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref" and pd["environment"] == "${{ inputs.app_name }}/dev",
+pd = pjobs["persistent-dev"]
+check(jobs["persistent-dev"]["if"] == "inputs.pipeline_phase != 'verify' && github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref" and pd["environment"] == "${{ inputs.app_name }}/dev",
       "persistent-dev keeps the approved-ref gate and protected Environment")
 legacy = [x for x in pd["steps"] if x.get("if", "").startswith("inputs.dev_build_cmd == ''")]
 engine_side = [x for x in pd["steps"] if x.get("if") == "inputs.dev_build_cmd != ''"]
-check(len(legacy) == 3 and len(engine_side) == 2 and all("gh.sh" not in x.get("run", "") for x in legacy), "persistent-dev: legacy (dev_build_cmd empty) and engine (set) paths are mutually exclusive; legacy never writes the known-good ledger")
+check(len(legacy) == 3 and len(engine_side) == 1 and all("gh.sh" not in x.get("run", "") for x in legacy), "persistent-dev: legacy (dev_build_cmd empty) and engine (set) paths are mutually exclusive; legacy never writes the known-good ledger")
 check(next(x for x in pd["steps"] if x.get("name") == "Deploy persistent Dev")["env"]["CMD"] == "${{ inputs.dev_deploy_cmd }}", "persistent-dev manual dispatch (legacy contract) still runs dev_deploy_cmd")
 check("shared_dev_on_branch_push" not in ptxt, "persistent-dev does not depend on the automatic Shared Dev switch")
-check("wrangler preview delete" not in "\n".join(s.get("run", "").replace("\\`wrangler preview delete", "") for s in jobs["lifecycle"]["steps"] if "echo" not in s.get("run", "")), "branch delete never executes `wrangler preview delete` (Native Preview is retained)")
-retire = next(s for s in jobs["lifecycle"]["steps"] if "Retire GitHub ledger" in s.get("name", ""))
+check("wrangler preview delete" not in "\n".join(s.get("run", "").replace("\\`wrangler preview delete", "") for s in ljobs["lifecycle"]["steps"] if "echo" not in s.get("run", "")), "branch delete never executes `wrangler preview delete` (Native Preview is retained)")
+retire = next(s for s in ljobs["lifecycle"]["steps"] if "Retire GitHub ledger" in s.get("name", ""))
 check('gh.sh" retire' in retire["run"] and "Branch exists again" in retire["run"] and "Name is owned by" in retire["run"], "branch delete retires only this branch's ledger (and not if recreated / owned by another ref)")
 all_run = "\n".join(s_.get("run", "") for j in allj.values() for s_ in j.get("steps", [])) + "\n".join(s.get("run", "") for s in ASTEPS)
 check("wrangler delete" not in all_run, "no job deletes a Worker; branch deletion retains the Shared Dev Worker and Native Previews")
-check(not re.search(r"CLOUDFLARE_DEV|dev-deploy|shared_dev_on_branch_push|app_url_dev|dev_deploy_cmd", yaml.dump(jobs["lifecycle"])), "branch-delete lifecycle never references Dev")
+check(not re.search(r"CLOUDFLARE_DEV|dev-deploy|shared_dev_on_branch_push|app_url_dev|dev_deploy_cmd", yaml.dump(ljobs["lifecycle"])), "branch-delete lifecycle never references Dev")
 
 # ---------------------------------------------------------------- pipeline_phase: deferred verification (opt-in, default unchanged)
 PINPUTS = doc[True]["workflow_call"]["inputs"]
@@ -588,7 +627,7 @@ for k in KINDS:
     w = jobs[f"delivery_{kk}"]["with"]
     c = lambda ph, deploy=None: scenario("push", MAIN, {"pipeline_phase": ph, "phase_state": json.dumps({"inputs": {"app_name": "app", "d1_migrations": True}, "kinds": [k], "deploy": {f"h_{kk}": deploy or ""}, "migration": {f"mj_{kk}": "MJ"}, "d1": {kk: "DB9"}, "group": "g"}), "upstream_gate": "failure"})
     check(render(w["handoff_json"], c("verify", '{"published":"true"}')) == '{"published":"true"}' and render(w["handoff_json"], c("deploy")) == "" and render(w["handoff_json"], c("all")) == "", f"{k}: handoff_json comes from phase_state ONLY for this kind and ONLY in a verify call")
-    check(render(w["migration_json_in"], c("verify")) == "MJ", f"{k}: the migration result is this kind's own entry of phase_state (its D1 id travels in the plan's descriptor, built from phase_state.d1)")
+    check(render(w["migration_json_in"], c("verify")) == "MJ", f"{k}: the migration result is this kind's own entry of phase_state (its D1 id travels in the plan's descriptor)")
     check(render(w["upstream_gate"], c("verify")) == "failure" and render(w["upstream_gate"], c("all")) == "" and render(w["phase"], c("verify")) == "verify", f"{k}: upstream_gate is forwarded only in a verify call")
 PLAN_OK = {"gate": {"result": "skipped", "outputs": {}}, "plan": pl(("production",)), "migration": {"result": "skipped", "outputs": {}}}
 check(runs("delivery_production", scenario("push", MAIN, {"pipeline_phase": "verify", "phase_state": PS()}, PLAN_OK)), "verify phase: the delivery call runs from the hand-off even though Gate / Deploy are not part of this call")
@@ -597,22 +636,18 @@ check(not runs("delivery_production", scenario("push", MAIN, {"pipeline_phase": 
 dctx = lambda **i: Ctx({"inputs": dict({"phase": "all"}, **i), "needs": {"deploy": {"result": "success", "outputs": {}}, "smoke": {"result": "failure", "outputs": {"smoke_status": "failure"}}}}, {})
 check(not ev(djobs["smoke"]["if"], dctx(phase="deploy")) and not ev(djobs["rollback"]["if"], dctx(phase="deploy")) and ev(djobs["deploy"]["if"], dctx(phase="deploy")) and not ev(djobs["deploy"]["if"], dctx(phase="verify")),
       "pipeline_phase: deploy phase = deploy only; verify phase = smoke + rollback only (no publish)")
-for job in VALIDATION + ["gate"] + ["migration", "config-guard", "lifecycle", "persistent-dev"]:
+for job in ["ci", "migration", "config-guard", "lifecycle", "persistent-dev"]:
     ctxv = scenario("push", MAIN, {"pipeline_phase": "verify", "phase_state": PS(), "deployment_strategy": "production-only", "shared_dev_on_branch_push": True, "d1_migrations": True}, dict(GREEN, plan=pl(("production",), True)))
     check(not runs(job, ctxv), f"verify phase: {job} never runs (no CI, Migration, Deploy or publish in the verify call)")
 check(runs("release", scenario("push", MAIN, {"release_cmd": "x", "pipeline_phase": "verify"}, {"delivery_production": dout("production")})) and not runs("release", scenario("push", MAIN, {"release_cmd": "x", "pipeline_phase": "verify"}, {"delivery_production": dout("production", smoke_json=json.dumps({"deployed_and_verified": "false"}))})), "verify phase: Release runs only from a content-verified Production smoke")
 ps_val = OUTS["phase_state"]["value"]
-check(ps_val.count("toJSON(inputs)") == 1 and '"kinds"' in ps_val and '"d1"' in ps_val and all(f"jobs.delivery_{KK(k)}.outputs.handoff" in ps_val and f"jobs.delivery_{KK(k)}.outputs.migration_used" in ps_val for k in KINDS),
-      "phase_state hands over the inputs once, the enabled kinds, each kind's OWN deploy / migration result, the per-kind D1 ids and the concurrency group")
+check(ps_val.count("toJSON(inputs)") == 1 and '"kinds"' in ps_val and '"group"' in ps_val and '"descriptors"' in ps_val and '"d1"' not in ps_val and all(f"jobs.delivery_{KK(k)}.outputs.handoff" in ps_val and f"jobs.delivery_{KK(k)}.outputs.migration_used" in ps_val for k in KINDS),
+      "phase_state hands over the inputs once, the enabled kinds, each kind's OWN deploy / migration result, the concurrency group and the target descriptors (which already carry each D1 id: no second per-kind D1 map)")
+check("jobs.plan.outputs.group" in ps_val and ps_val.count("github.ref") == 0 and "cfv2-prod" not in ps_val, "phase_state takes the lock identity from the Plan's canonical calculation - the lock expression is NOT duplicated into the output")
 grp_expr = re.search(r"concurrency:\n  group: \$\{\{ (.*) \}\}\n  queue: max", text_all).group(1)
-PHASE_IN = "fromJSON(inputs.phase_state).inputs."
-VPFX = "inputs.pipeline_phase == 'verify' && "
-rest = grp_expr[len(VPFX):] if grp_expr.startswith(VPFX) else ""
-splits = [i for i in range(len(rest)) if rest.startswith(" || ", i) and rest[i + 4:].replace("inputs.", PHASE_IN) == rest[:i]]
-base_expr = rest[splits[0] + 4:] if splits else ""
-base_core = base_expr[1:-1] if base_expr.startswith("(") and base_expr.endswith(")") else base_expr
-check(bool(splits) and "phase_state).group" not in grp_expr and base_core in ps_val,
-      "concurrency: the verify branch is EXACTLY the deploy expression applied to phase_state.inputs (never a caller-supplied group string), and the deploy call hands over the same expression's value")
+VPFX = "inputs.pipeline_phase == 'verify' && (fromJSON(inputs.phase_state).group || format('cfv2-run-{0}', github.run_id)) || "
+check(grp_expr.startswith(VPFX) and "phase_state" not in grp_expr[len(VPFX):] and grp_expr.count("fromJSON") == 1,
+      "concurrency: ONE scheduling-time expression for the deploy call (no copy for verify); a verify call schedules under the group its deploy call recorded")
 import itertools  # noqa: E402
 
 
@@ -628,13 +663,20 @@ def lock_cases():
 cases = list(lock_cases())
 GRP = "${{ " + grp_expr + " }}"
 yaml_deploy = [render(GRP, scenario(e, r, dict(i, pipeline_phase="all"))) for e, r, i in cases]
-yaml_verify = [render(GRP, scenario(e, r, {"app_name": "other", "d1_lock_scope": "ignored", "pipeline_phase": "verify", "phase_state": json.dumps({"inputs": i, "group": "IGNORED"})})) for e, r, i in cases]
+yaml_verify = None  # filled below, once the canonical groups are known
 js_code = ("import('./actions/cf-preview/delivery.mjs').then(async m=>{let t='';for await(const c of process.stdin)t+=c;const c=JSON.parse(t);console.log(JSON.stringify(c.map(([e,r,i])=>m.runLockGroup({event:e,ref:r,inputs:i,runId:'1'}))))})")
 js_groups = json.loads(subprocess.run(["node", "-e", js_code], input=json.dumps(cases), capture_output=True, text=True, check=True).stdout)
 norm = lambda g: re.sub(r"^cfv2-run-.*$", "cfv2-run-N", g)
 check(len(cases) > 200 and [norm(g) for g in yaml_deploy] == [norm(g) for g in js_groups], f"concurrency: the workflow expression and delivery.mjs runLockGroup agree on all {len(cases)} event/ref/input scenarios (deploy call)")
-check(yaml_verify == yaml_deploy, "concurrency: a verify call computes the SAME lock as its deploy call from phase_state.inputs alone, ignoring its own app_name / d1_lock_scope and the handed-over group string")
+yaml_verify = [render(GRP, scenario(e, r, {"app_name": "other", "d1_lock_scope": "ignored", "pipeline_phase": "verify", "phase_state": json.dumps({"inputs": i, "group": g})})) for (e, r, i), g in zip(cases, js_groups)]
+check(yaml_verify == js_groups, "concurrency: a verify call schedules under exactly the canonical group its deploy call recorded - its own app_name / d1_lock_scope are ignored")
+check(render(GRP, scenario("push", MAIN, {"pipeline_phase": "verify", "phase_state": "{}"})).startswith("cfv2-run-"), "concurrency: a verify call without a recorded group falls back to a private group (the Plan then fails it before any mutation)")
 check(len({g for g in yaml_deploy if g.startswith("cfv2-prod-shared-db")}) == 1 and any(g == "cfv2-nonprod-d1-shared-db" for g in yaml_verify), "concurrency: the shared-D1 scope selects the lock in verify mode too")
+def forged(group, inputs):  # the REAL plan-side validation (restoreDescriptors) over a forged / wrong recorded group
+    code = ("import('./actions/cf-preview/delivery.mjs').then(m=>{try{m.restoreDescriptors({inputs:JSON.parse(process.argv[1]),kinds:['production'],group:process.argv[2],deploy:{},migration:{}},{repo:'o/r',runId:'7',event:'push',ref:'refs/heads/main'});console.log('accepted')}catch(e){console.log('rejected:'+e.message)}})")
+    return subprocess.run(["node", "-e", code, json.dumps(inputs), group], capture_output=True, text=True, check=True).stdout.strip()
+check(all(forged(g, {"app_name": "app"}).startswith("rejected:phase_state.group") or forged(g, {"app_name": "app"}).startswith("rejected:") for g in ("attacker-group", "cfv2-nonprod-d1-app", "cfv2-prod-other", "")) and "lock identity" in forged("cfv2-nonprod-d1-app", {"app_name": "app"}),
+      "concurrency: a forged or wrong recorded group is rejected by the Plan (restoreDescriptors) BEFORE any mutation - it can only ever cost a failed verify run")
 gate = astep("Cross-service gate")
 check(gate["id"] == "gate" and "inputs.stage == 'verify'" in gate["if"] and "'success'" in gate["if"] and "'skipped'" in gate["if"] and "exit 1" in gate["run"] and aidx("Cross-service gate") < aidx("Stale-SHA guard (start)")
       and DEPLOY_ACTION["outputs"]["gate_blocked"]["value"].startswith("${{ steps.gate.outputs.blocked"),
