@@ -48,6 +48,22 @@ Rejected (plan fails closed, `config-guard` also reports): `production-only` wit
 `shared_dev_native_preview_on_branch_push`; unknown `smoke_mode` / `smoke_mode_overrides`; an unknown kind in a `phase_state` hand-off;
 a Preview/Dev kind whose D1 is the Production D1; enabled kinds that name **two or more distinct physical D1 databases** while `d1_migrations` is on (single-DB rule).
 
+### P1 fix: a stale-skipped migration never authorizes a publish (PR #89 review of `f3325f5`)
+
+**Root cause.** `resolveMigrationUsed()` (the Migration Gate every Delivery runs before anything is built or published) skipped the result, owner and physical-D1 checks when the migration result carried `stale=true`.
+A Migration job superseded by a newer push succeeds *as a skip* (nothing applied), so with `needs.migration.result == success` the gate accepted it. The Delivery's own branch-tip check then decided alone: if the branch was
+force-pushed back to the original commit in between (A → B → A) the tip looked fresh and the Publish proceeded **without the required migration**. Found by code review; a potential race, not a confirmed incident.
+
+**Fix** (`actions/cf-preview/delivery.mjs`, no other production file): the gate now fails closed, in this order — `d1_migrations=false` → no migration needed; no planned owner; Migration job result ≠ `success` (failed, cancelled, skipped, missing); result missing / invalid JSON / not an object;
+**`stale` is `true` or `"true"` → rejected, whatever else the result contains**; `migration` ≠ `applied`; owner kind ≠ planned owner; D1 id ≠ planned physical D1. The branch-tip check stays as an additional guard but is no longer relied on.
+
+**Authorization invariant.** *No completed migration (applied, by the planned owner, on exactly this call's physical D1) = no Publish authorization.* Nothing infers "none" from a skip, nothing re-runs a stale migration, and the gate (engine step `Migration gate`) runs before the stale guard, set-up, prepare, build and publish of the publish stage.
+
+**Behaviour change to know.** A genuinely superseded run (branch moved and stayed moved) used to end green with nothing published; with `d1_migrations: true` its Delivery now **fails at the Migration Gate** (red, nothing built, published, smoked or rolled back). `migration_status` is unchanged (`none` for a stale-skipped migration). `d1_migrations: false` and `pipeline_phase: verify` (which never runs the gate and never migrates) are unaffected.
+
+**Tests.** `delivery.test.mjs` (the old "stale is accepted" test is replaced by rejection of `stale: true` / `"true"`, with and without valid metadata or owner/D1, plus missing / invalid / non-object JSON, `none`, wrong owner, wrong D1, failed / cancelled / skipped job, migration disabled);
+`test-workflow-contract.py` (the real `cli.mjs migration-gate` executed for each case; gate precedes every other publish-stage step); `test-jobs.py` chain (stale branch and "superseded after the build" now fail at the gate; **A → B → A**: Migration superseded, Delivery sees a fresh tip, gate rejects before the build, nothing published, smoked, rolled back or released; deferred verification unchanged).
+
 ### Reusable-workflow limits honoured
 
 | Constraint | How |

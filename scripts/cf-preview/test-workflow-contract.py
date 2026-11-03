@@ -287,6 +287,27 @@ gate_i = next(n for n, x in enumerate(ACT_STEPS) if x.get("id") == "migration_ga
 first_work = next(n for n, x in enumerate(ACT_STEPS) if "Stale-SHA guard (start)" in x.get("name", ""))
 check(gate_i < first_work and ACT_STEPS[gate_i]["if"] == "inputs.stage == 'publish'" and "migration-gate" in ACT_STEPS[gate_i]["run"],
       "Migration gate: runs in the engine right after init - before the stale guard, setup, build and publish - for the publish stage only")
+# P1 (PR #89 review): a stale-skipped migration never authorizes a publish - executed through the REAL engine gate command (cli.mjs migration-gate)
+def gate_cli(result, mj, d1="true", kind="native-branch", owner="native-branch", d1id="DB1"):
+    d = subprocess.run(["node", "-e", "import('./actions/cf-preview/delivery.mjs').then(m=>console.log(JSON.stringify(m.targetDescriptor({kind:process.argv[1],app:'app',runId:1,repo:'o/r',d1ExpectedId:process.argv[2],ownerKind:process.argv[3]}))))", kind, d1id, owner], capture_output=True, text=True, check=True).stdout.strip()
+    env = {"PATH": "/usr/bin:/bin:" + __import__("os").path.dirname(__import__("shutil").which("node") or "/usr/bin/node"), "DESCRIPTOR": d, "D1_MIGRATIONS": d1, "MIGRATION_RESULT": result, "MIGRATION_JSON": mj}
+    r = subprocess.run(["node", "actions/cf-preview/cli.mjs", "migration-gate", "--kind", kind], env=env, capture_output=True, text=True)
+    return r.returncode, (r.stdout + r.stderr)
+import subprocess  # noqa: E402
+APPLIED = json.dumps({"migration": "applied", "kind": "native-branch", "d1_id": "DB1"})
+check(gate_cli("success", APPLIED)[0] == 0, "Migration Gate (executed): a succeeded Migration job with an applied migration of the planned owner on the planned D1 authorizes the publish")
+check(gate_cli("skipped", "", d1="false")[0] == 0, "Migration Gate (executed): d1_migrations=false needs no migration result")
+for what, args in (("stale=true", ("success", json.dumps({"stale": True}))), ("stale='true'", ("success", json.dumps({"stale": "true"}))),
+                   ("stale=true with otherwise valid metadata", ("success", json.dumps({"migration": "applied", "kind": "native-branch", "d1_id": "DB1", "stale": "true"}))),
+                   ("migration none", ("success", json.dumps({"migration": "none", "kind": "native-branch", "d1_id": "DB1"}))),
+                   ("empty result", ("success", "")), ("invalid JSON", ("success", "{x")), ("owner mismatch", ("success", json.dumps({"migration": "applied", "kind": "persistent-dev", "d1_id": "DB1"}))),
+                   ("D1 mismatch", ("success", json.dumps({"migration": "applied", "kind": "native-branch", "d1_id": "OTHER"}))),
+                   ("Migration job failed", ("failure", APPLIED)), ("Migration job cancelled", ("cancelled", APPLIED)), ("Migration job skipped while required", ("skipped", APPLIED))):
+    rc, out = gate_cli(*args)
+    check(rc != 0, f"Migration Gate (executed): {what} blocks the publish")
+check("stale" in gate_cli("success", json.dumps({"stale": "true"}))[1], "Migration Gate (executed): the stale refusal says why")
+_gi = aidx("Migration gate")
+check(all(_gi < aidx(n) for n in ("Stale-SHA guard (start)", "Setup dependencies", "Prepare", "Build and audit", "Publish the audited artifact", "Smoke the exact deployed URL")), "Migration Gate: runs before the stale guard, set-up, prepare, build, publish and smoke of the publish stage - a fresh branch tip can never substitute for it")
 dl_if = lambda k, kinds=None, plan_result="success", inputs=None, mig="skipped", **kw: runs(f"delivery_{KK(k)}", scenario("push", kw.pop("ref", FEAT), inputs or {}, {"plan": pl(kinds or (KK(k),), False, result=plan_result), "migration": {"result": mig, "outputs": {}}}))
 check(dl_if("native-branch") and dl_if("production", ref=MAIN) and dl_if("native-dev") and dl_if("persistent-dev"), "Delivery: runs when the plan succeeded and ITS kind is enabled - a SKIPPED migration (d1_migrations=false) never blocks it")
 check(all(dl_if(k, mig="success", ref=MAIN if k == "production" else FEAT) for k in KINDS), "Delivery: runs after a successful migration")

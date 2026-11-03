@@ -140,6 +140,8 @@ Recorded for a later phase (not done, would be breaking or out of scope): drop `
 
 **Not demonstrated, not claimed:** a live D1 migration, publish, smoke against a live Worker, rollback, Environment approval gates (scratch Environments are unprotected), Mailpit, a runner older than 2.336.0, `$/` on GHES, and any runtime improvement.
 
+* **P1 follow-up (stale migration):** fixed after review — see "P1 fix" in [cf-worker-v2-unified-delivery.md](cf-worker-v2-unified-delivery.md). A stale-skipped migration no longer authorizes a publish; a superseded run's Delivery now fails at the Migration Gate instead of ending green.
+
 ### Remaining risks and limitations
 
 * **Runner floor 2.336.0** for every runner passed as `runner` (see above); GHES is unsupported by `$/`.

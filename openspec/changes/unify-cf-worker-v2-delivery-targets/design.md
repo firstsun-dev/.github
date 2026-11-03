@@ -134,7 +134,7 @@ Gate -> Delivery plan -> Database Migration (ONE job) -> Delivery(kind)* -> Rele
   stops the job before the migrate step - no peer-result mapping. The engine (not YAML) implements every check; the owner is validated inside its own
   migrate stage, so a shared-D1 run builds each target once for validation (N targets = N builds, previously N + 1).
 * **Handoff.** `migration_json` (the `migrate` step outputs) + `migration_result` go to every Delivery call; its publish gate requires `success`, the planned
-  owner kind and exactly the call's D1 id (a stale-superseded migration is accepted: nothing is published). `d1_migrations=false` skips the job; Delivery proceeds.
+  owner kind and exactly the call's D1 id (a stale-superseded migration is **rejected** since the P1 fix: it authorizes nothing, see the unified-delivery doc). `d1_migrations=false` skips the job; Delivery proceeds.
 * **Deferred verification** never migrates: the job is skipped in a `verify` call and each kind uses its own `migration_json_in` from `phase_state`.
 * **Compatibility restriction.** A pipeline that enables targets with distinct D1s in one invocation (e.g. Native Branch on the `[previews]` D1 together with
   `shared_dev_on_branch_push` on a different `[env.dev]` D1) is rejected by the plan. None of the planned consumers (blog, innovation-apps Notification Hub,

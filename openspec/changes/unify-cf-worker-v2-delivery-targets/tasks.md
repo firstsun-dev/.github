@@ -52,6 +52,7 @@
 - [x] ONE Migration job unchanged; Migration and Delivery depend on the plan only (the plan requires a passed CI).
 - [x] Preview lifecycle and manual persistent Dev extracted (`_cf-worker-lifecycle.yml`, `_cf-worker-persistent-dev.yml`); one shared Delivery engine kept; four thin calls kept (no matrix, rationale in docs).
 - [x] One scheduling-time `concurrency.group` expression; canonical `runLockGroup()` emitted by the Plan; `phase_state` without the redundant `d1` map.
+- [x] P1 review fix: `resolveMigrationUsed` rejects `stale` migration results (no stale-skipped migration authorizes a publish); regression tests incl. A→B→A.
 - [x] Contract + chain tests ported; cross-repository real-runner scenarios r1–r11 recorded in `docs/cf-worker-v2-refactor.md`.
 
 ## Phase 2 — AFTER G1 ONLY: consumer sub-sessions (parallel when independent)

@@ -307,17 +307,36 @@ test('migration used: fails closed on a missing, failed, foreign or malformed mi
   assert.throws(() => U({ result: '' }), /finished 'missing'/);
   assert.throws(() => U({ result: 'skipped' }), /finished 'skipped'/);
   assert.throws(() => U({ json: MJ({ migration: 'none' }) }), /no applied migration/);
-  assert.throws(() => U({ json: '' }), /no applied migration/);
-  assert.throws(() => U({ json: '[1]' }), /no applied migration/);
+  assert.throws(() => U({ json: '' }), /missing or not valid JSON/);
+  assert.throws(() => U({ json: '{not json' }), /missing or not valid JSON/);
+  assert.throws(() => U({ json: '[1]' }), /malformed/);
+  assert.throws(() => U({ json: 'null' }), /malformed/);
+  assert.throws(() => U({ json: '"applied"' }), /malformed/);
+  assert.throws(() => U({ json: '{}' }), /no applied migration/);
   assert.throws(() => U({ json: MJ({ kind: 'persistent-dev' }) }), /another kind/);
   assert.throws(() => U({ json: MJ({ d1_id: 'FOREIGN' }) }), /another D1/);
   assert.throws(() => U({ expectedId: 'OTHER' }), /another D1/);
 });
 
-test('migration used: a stale-skipped migration is accepted (nothing was applied, nothing will be published)', () => {
-  assert.equal(U({ json: JSON.stringify({ stale: 'true' }) }).stale, 'true');
-  assert.equal(U({ json: JSON.stringify({ stale: true }) }).stale, true);
+test('migration used: a stale-skipped migration NEVER authorizes a publish (P1: the branch can point at this commit again, A -> B -> A)', () => {
+  // The Migration job succeeds when it was superseded (nothing applied); its result then carries stale=true. Every shape of it is refused.
+  for (const stale of [true, 'true']) {
+    assert.throws(() => U({ json: JSON.stringify({ stale }) }), /became stale/, `stale=${JSON.stringify(stale)} without owner/D1 metadata`);
+    assert.throws(() => U({ json: MJ({ stale }) }), /became stale/, `stale=${JSON.stringify(stale)} with otherwise valid applied/owner/D1 metadata`);
+    assert.throws(() => U({ json: JSON.stringify({ stale, migration: 'none', kind: 'native-branch', d1_id: 'DB1' }) }), /became stale/);
+  }
+  // stale is checked before the owner / D1 comparison, but those stay mandatory for everything else
+  assert.throws(() => U({ json: MJ({ stale: 'true', kind: 'persistent-dev', d1_id: 'FOREIGN' }) }), /became stale/);
+  // only an explicit non-stale flag value passes through
+  assert.equal(U({ json: MJ({ stale: 'false' }) }).d1_id, 'DB1');
+  assert.equal(U({ json: MJ({ stale: false }) }).kind, 'native-branch');
+  // 'none' (nothing pending is still reported as applied by the engine; a bare none/absent migration is not an authorization)
+  assert.throws(() => U({ json: MJ({ migration: 'none' }) }), /no applied migration/);
+  assert.throws(() => U({ json: JSON.stringify({ stale: 'false', kind: 'native-branch', d1_id: 'DB1' }) }), /no applied migration/);
+  // d1_migrations=false stays migration-free, even with a stale-looking or garbage result lying around
+  assert.deepEqual(resolveMigrationUsed({ d1Migrations: false, kind: 'production', result: 'skipped', json: JSON.stringify({ stale: 'true' }) }), {});
 });
+
 
 // ---- verification and recovery decisions ---------------------------------------------------------------------------------
 test('verification: ONLY a content-level smoke verifies a deployment', () => {

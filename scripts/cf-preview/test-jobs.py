@@ -702,7 +702,19 @@ def group_migration_d1():
     m = deploy(FEAT, inputs=D1, env={"STUB_OWNER_REF": "refs/heads/Feat/X"})
     check(m["result"] == "failure" and not migrated(m) and not published(m), "name collision: second branch fails BEFORE any remote migration")
     m = deploy(FEAT, inputs=D1, env={"STUB_TIPS": OTHER})
-    check(m["result"] == "success" and not migrated(m) and not published(m) and m["outputs"]["deployed_and_verified"] == "false", "stale branch: no migration applied, nothing published")
+    check(m["result"] == "failure" and not migrated(m) and not published(m) and m["outputs"]["deployed_and_verified"] == "false", "stale branch: no migration applied, nothing published; the superseded run's Delivery fails at the Migration Gate (a stale-skipped migration authorizes nothing)")
+    check(m["jobs"]["migration"]["result"] == "success" and m["jobs"]["migration"]["outputs"].get("stale") == "true" and "BUILD" not in m["log"], "stale branch: the Migration job itself still succeeds as a skip (stale=true), and nothing is built")
+    # P1 (PR #89 review): branch A -> B -> A. The Migration job runs while the tip is B (stale, skipped), the Delivery runs after a force-push back to A (fresh).
+    m = deploy(FEAT, inputs=D1, env_by_job={"migration": {"STUB_TIPS": OTHER}, "deploy": {"STUB_TIPS": SHA}})
+    check(m["jobs"]["migration"]["result"] == "success" and m["jobs"]["migration"]["outputs"].get("stale") == "true" and not migrated(m), "A->B->A: the Migration job was superseded and skipped the migration")
+    check(m["res"]["delivery_native_branch"]["jobs"]["deploy"]["result"] == "failure" and any(n.endswith("Migration gate (fail closed before any build, migration or publish)") and o == "failure" for n, o in m["steps"])
+          and "BUILD" not in m["log"] and not published(m) and json.loads(m["res"]["delivery_native_branch"]["outputs"]["handoff"] or "{}").get("published", "false") != "true",
+          "A->B->A: the Delivery sees a FRESH tip but the Migration Gate rejects the stale result BEFORE the build; nothing is built or published")
+    check(m["res"]["delivery_native_branch"]["jobs"]["smoke"]["outputs"] == {} or m["outputs"]["deployed_and_verified"] == "false", "A->B->A: nothing is smoked or verified")
+    check(m["res"]["delivery_native_branch"]["jobs"]["rollback"]["result"] == "skipped" and m["outputs"]["rollback_result"] == "", "A->B->A: the failed Migration Gate never triggers a rollback of an artifact that was never published")
+    check(not release_runs(m), "A->B->A: no Release")
+    fm = deploy(FEAT, inputs=D1, env_by_job={"migration": {"STUB_TIPS": OTHER}, "deploy": {"STUB_TIPS": SHA}})
+    check(fm["jobs"]["migration"]["outputs"].get("migration") in (None, "", "none") or fm["jobs"]["migration"]["outputs"].get("stale") == "true", "A->B->A: the stale Migration result is not represented as an applied migration")
     m = deploy(FEAT, inputs=D1, env={"STUB_TIPS": "GONE"})
     check(m["result"] == "failure" and not migrated(m), "deleted branch: fails closed, no migration")
     # P2: a push that lands DURING the (long) migration must not let the old code be published afterwards
@@ -858,7 +870,7 @@ def group_shared_dev():
     r = dev(env={"STUB_TIPS": OTHER})
     check(r["result"] == "success" and not ran(r, "BUILD") and not ran(r, "PUBLISH") and r["outputs"]["deployed_and_verified"] == "false", "stale run: nothing built, migrated or published")
     r = dev(env={"STUB_TIPS": f"{SHA},{OTHER}"}, inputs=D1)
-    check(r["result"] == "success" and ran(r, "BUILD") and not ran(r, "migrations apply") and not ran(r, "PUBLISH"), "superseded after the build: no migration and no publish")
+    check(r["result"] == "failure" and not ran(r, "migrations apply") and not ran(r, "PUBLISH"), "superseded after the build: no migration and no publish (the Delivery fails at the Migration Gate on the stale-skipped migration)")
     r = dev(inputs=D1, env_by_job={"deploy": {"STUB_TIPS": OTHER}})
     check(r["result"] == "success" and ran(r, "migrations apply") and not ran(r, "PUBLISH"), "branch advanced during the Dev migration: old code is not published")
 

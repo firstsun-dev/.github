@@ -307,9 +307,10 @@ export function parseDescriptor(text, expectKind = '') {
 // ---------------------------------------------------------------------------------------------------------------------
 /**
  * Publish stage: the result of THE Migration job this kind's deployment depends on. Fails closed unless that job succeeded and
- * reports an applied migration of the planned owner on exactly this kind's D1 (a stale-skipped migration is accepted: nothing was
- * applied, nothing is published). Returns the (validated, normalised) migration result object, or {} when the app has no D1
- * migrations.
+ * reports an APPLIED migration of the planned owner on exactly this kind's D1. A stale-skipped migration (`stale` true) is NEVER
+ * authorization: nothing was applied, and the branch may point at this commit again by the time the Delivery runs (A -> B -> A), so
+ * the later branch-tip check cannot prove the migration happened. Returns the validated migration result, or {} when the app has no
+ * D1 migrations.
  */
 export function resolveMigrationUsed({ d1Migrations, kind, ownerKind = '', expectedId = '', result = '', json = '' }) {
   if (!d1Migrations) return {};
@@ -317,13 +318,12 @@ export function resolveMigrationUsed({ d1Migrations, kind, ownerKind = '', expec
   if (!ownerKind) throw new Error(`no migration owner is planned for ${kind}; nothing is published`);
   if (result !== 'success') throw new Error(`the D1 migration ${kind} depends on (owner ${ownerKind}) finished '${result || 'missing'}'; nothing is published`);
   let m;
-  try { m = JSON.parse(json); } catch { m = {}; }
-  if (m === null || typeof m !== 'object' || Array.isArray(m)) m = {};
-  if (m.stale !== true && m.stale !== 'true') {
-    if (m.migration !== 'applied') throw new Error(`the migration result for ${kind} reports no applied migration; nothing is published`);
-    if (m.kind !== ownerKind) throw new Error(`the migration result belongs to another kind than the planned owner ${ownerKind}; refusing`);
-    if (m.d1_id !== expectedId) throw new Error(`the migration result is for another D1 than ${kind}'s (${expectedId}); refusing`);
-  }
+  try { m = JSON.parse(json); } catch { throw new Error(`the migration result for ${kind} is missing or not valid JSON; nothing is published`); }
+  if (m === null || typeof m !== 'object' || Array.isArray(m)) throw new Error(`the migration result for ${kind} is malformed; nothing is published`);
+  if (m.stale === true || m.stale === 'true') throw new Error(`the migration for ${kind} was skipped because its run became stale; it does not authorize a publish (nothing is published)`);
+  if (m.migration !== 'applied') throw new Error(`the migration result for ${kind} reports no applied migration; nothing is published`);
+  if (m.kind !== ownerKind) throw new Error(`the migration result belongs to another kind than the planned owner ${ownerKind}; refusing`);
+  if (m.d1_id !== expectedId) throw new Error(`the migration result is for another D1 than ${kind}'s (${expectedId}); refusing`);
   return m;
 }
 
