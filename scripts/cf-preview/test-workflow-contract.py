@@ -433,6 +433,18 @@ for n, i, u in SELF:
         w = j["steps"][i].get("with", {})
         check(w.get("install") != "true" or prev, f"{n}: cf-tools with install: true is preceded by setup-node")
 check(inputs_def["tools_ref"]["description"].lstrip().startswith("DEPRECATED"), "tools_ref is documented as deprecated")
+# Every call passes exactly the inputs the called workflow declares (an unknown `with` key or a missing required input is a startup_failure on GitHub)
+for n, called_doc in (("ci", cdoc), ("lifecycle", ldoc), ("persistent-dev", pdoc), *[(c, ddoc) for c in sorted(CALL_JOBS)]):
+    decl = called_doc[True]["workflow_call"]["inputs"]
+    given = jobs[n].get("with", {})
+    check(set(given) <= set(decl) and all(k in given for k, v in decl.items() if v.get("required")), f"{n}: its `with:` keys are declared inputs of the called workflow and every required input is supplied")
+    sec_decl = set(called_doc[True]["workflow_call"].get("secrets", {}))
+    check(set(jobs[n].get("secrets", {})) <= sec_decl, f"{n}: only secrets the called workflow declares are passed")
+check(all(jobs["ci"]["with"][k] == "${{ inputs." + k + " }}" for k in cdoc[True]["workflow_call"]["inputs"]), "ci: every CI input is wired 1:1 from the SAME-named public input (no renamed or re-derived command)")
+ALINT = yaml.safe_load(open(".github/actionlint.yaml"))["paths"]
+check(sorted(len(v["ignore"]) for v in ALINT.values()) == [1, 2] and all("queue" in x for x in ALINT[WF]["ignore"]) and all("$/" in x or "\\$/" in x for x in ALINT[".github/workflows/_cf-worker-*.yml"]["ignore"]),
+      "actionlint: exactly three message ignores - `concurrency.queue` and the two `$/` formats - everything else is still linted")
+check("2.336.0" in text_all, "the public workflow documents the minimum runner version for `$/` (2.336.0)")
 
 # ---------------------------------------------------------------- 7. validation jobs use the common CI action
 CMDS = {"lint": "lint_cmd", "typecheck": "typecheck_cmd", "unit": "test_unit_cmd", "integration": "test_integration_cmd", "build": "build_cmd"}

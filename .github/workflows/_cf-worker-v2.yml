@@ -21,7 +21,7 @@ name: CF Worker Pipeline v2
 # The run-level concurrency group below spans the whole run. Interface, design record and measurements: docs/cf-worker-v2-refactor.md.
 #
 # Shared actions / nested workflow: `uses: $/actions/<name>` and `uses: $/.github/workflows/...` (GitHub self-repository syntax,
-# runner >= 2.336.0) resolve to THIS repository at the exact commit of the running workflow, with no checkout into the caller's
+# needs runner >= 2.336.0; observed: org `linux` runners 2.338.0, GitHub-hosted 2.338.2) resolve to THIS repository at the exact commit of the running workflow, with no checkout into the caller's
 # workspace (a plain `./` would resolve against the CALLER's). Version coupling is therefore exact by construction; `tools_ref` is
 # a deprecated no-op. Scripts are located relative to their action (`$GITHUB_ACTION_PATH/../cf-preview`, or actions/cf-tools).
 #
@@ -450,6 +450,9 @@ env:
 
 jobs:
   # -------------------------------------------------------------------------
+  # CI — ONE call of _cf-worker-ci.yml (six parallel checks + the fail-closed Validation Gate). Credential-free; fork PRs run it, same-repo
+  # PRs are covered by the push run of the same SHA. Its verdict is the only upstream condition of the Delivery plan.
+  # -------------------------------------------------------------------------
   # CI — ONE call of _cf-worker-ci.yml: Lint, Typecheck, Unit, Integration, Build Validation and E2E as six independent, parallel jobs,
   # then the fail-closed Validation Gate. Credential-free; fork PRs run it, same-repo PRs are covered by the push run of the same SHA.
   # Its result is the only upstream condition of the Delivery plan.
@@ -479,11 +482,9 @@ jobs:
       test_e2e_env: ${{ inputs.test_e2e_env }}
 
   # -------------------------------------------------------------------------
-  # Delivery plan — pure data, no Cloudflare credentials. Resolves the enabled delivery kinds of THIS event (production |
-  # native-branch | native-dev | persistent-dev: exactly the enabled ones, no phantom paths), validates smoke modes and the Dev
-  # channel combination, and resolves the ONE PHYSICAL D1 (account/database id) all enabled kinds share (distinct databases fail the plan): the migration owner and, per kind, `on_<kind>` and the versioned
-  # target `descriptors` (engine target, Environment, groups, D1 id, migration owner, smoke mode). pipeline_phase verify re-uses the kinds handed over
-  # in phase_state. Everything downstream is one `uses:` call of the internal _cf-worker-delivery.yml per kind (no matrix).
+  # Delivery plan — pure data, no Cloudflare credentials: the enabled delivery kinds of THIS event, the ONE physical D1 they share (distinct
+  # databases fail the plan) and its migration owner, the per-kind `on_<kind>` switches and target `descriptors`, the canonical lock `group`.
+  # Runs only after a passed CI, so every job below that needs the plan is implicitly gated by CI. A verify call plans from phase_state.
   # -------------------------------------------------------------------------
   plan:
     name: Delivery plan
@@ -524,16 +525,12 @@ jobs:
           node "$TOOLS_DIR/cli.mjs" plan --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" --phase "$PHASE" --run-id "$GITHUB_RUN_ID" --app-dir "$GITHUB_WORKSPACE/${{ inputs.app_path }}" | tee -a "$GITHUB_OUTPUT"
 
   # =========================================================================
-  # Migration — the ONE job that mutates a database. There is no separate Preflight stage: the read-only safety checks run as the
-  # first steps of this job, in order, and every one of them precedes the single remote mutation (a failing step stops the job).
-  #   1. Delivery plan: ONE physical D1 for all enabled targets (identical D1s deduplicated, distinct D1s rejected before any
-  #      mutation, Production D1 never reachable from Preview/Dev). The plan names the owner kind and its GitHub Environment.
-  #   2. every enabled target that is not the owner: target build, effective-config audit, exact D1 binding == the plan's D1
-  #      (stage preflight, nothing remote is changed). At most Native Dev / persistent Dev: Native Branch, when enabled, is the owner.
-  #   3. the owner: target build, effective-config audit, exact D1 binding, stale-SHA guard, then the migration (stage migrate).
-  # Main push -> Production D1 (Environment <app>/prod, approvals apply); other branch push -> the shared Preview/Dev D1.
-  # Skipped (Delivery proceeds) when d1_migrations is false; never on pull_request, delete or pipeline_phase verify.
-  # The D1 schema is never rolled back automatically.
+  # Migration — the ONE job that mutates a database; there is no separate Preflight stage. Its steps run in this order and a failing step
+  # stops the job, so every read-only check precedes the single remote mutation:
+  #   1. each enabled target that is not the owner: target build, effective-config audit, exact D1 binding (stage preflight)
+  #   2. the owner: target build, audit, exact D1 binding, stale-SHA guard, then the migration (stage migrate)
+  # The plan picked the owner and its Environment (main -> <app>/prod with its approvals; else the shared Preview/Dev D1). Skipped (Delivery
+  # proceeds) without d1_migrations; never on pull_request, delete or a verify call. The D1 schema is never rolled back automatically.
   # =========================================================================
   migration:
     name: Database Migration
@@ -602,10 +599,8 @@ jobs:
         run: echo "status=$([ "$JOB_STATUS" = success ] && echo "${STATE:-none}" || echo failed)" >> "$GITHUB_OUTPUT"
 
   # =========================================================================
-  # Delivery — ONE call per enabled kind of the SAME internal workflow (deploy -> smoke -> conditional rollback). A kind needs only
-  # the Validation Gate, the plan and the single Migration job (success, or skipped when there is nothing to migrate); it never waits
-  # for, and is never touched by, another kind's Deploy / Smoke / Rollback. Each call receives the one migration result, validated
-  # inside the call by kind + D1 id, and only its own hand-off.
+  # Delivery — ONE call per enabled kind of _cf-worker-delivery.yml (deploy -> smoke -> conditional rollback). A kind needs only the plan and
+  # the single Migration job (success, or skipped when nothing is migrated) and is never touched by another kind's Deploy / Smoke / Rollback.
   # =========================================================================
   delivery_production:
     name: Delivery (production)
@@ -720,9 +715,8 @@ jobs:
         run: bash -c "$CMD"
 
   # -------------------------------------------------------------------------
-  # Config guard — a production-only Worker must never expose a Dev deployment. Fails the run on ANY event so a
-  # misconfigured caller is visible, instead of silently skipping. (A production-only Worker keeps ignoring
-  # preview_on_branch_push, whose default is true, for backward compatibility.)
+  # Config guard — a production-only Worker must never expose a Dev deployment, and the two automatic Dev channels conflict. Fails the run
+  # on ANY event so a misconfigured caller is visible. (production-only keeps ignoring preview_on_branch_push=true, for compatibility.)
   # -------------------------------------------------------------------------
   config-guard:
     name: Config guard
@@ -735,10 +729,8 @@ jobs:
           exit 1
 
   # -------------------------------------------------------------------------
-  # Event handlers outside the delivery DAG (each its own small reusable workflow; none of them touches the Migration or the Plan).
-  #   lifecycle      same-repo PR -> comment the branch's verified Preview URL; branch delete -> retire the ledger, the Preview is KEPT.
-  #   persistent-dev Hybrid, explicit dispatch on the approved ref only. dev_build_cmd set = the same cf-deploy engine in manual mode;
-  #                  empty = the unchanged legacy two-command contract. The `<app>/dev` Environment is a property of the called job.
+  # Event handlers outside the delivery DAG, one small reusable workflow each: `lifecycle` (same-repo PR -> comment the verified Preview URL;
+  # branch delete -> retire the ledger, the Preview is KEPT) and `persistent-dev` (Hybrid, explicit dispatch on the approved ref only).
   # -------------------------------------------------------------------------
   lifecycle:
     name: Preview lifecycle
