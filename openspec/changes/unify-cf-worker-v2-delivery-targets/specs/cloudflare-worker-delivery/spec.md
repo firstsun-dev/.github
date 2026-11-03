@@ -112,3 +112,27 @@ Where Smoke is enabled, it SHALL operate against the exact deployed target URL a
 #### Scenario: App config requires full OIDC smoke
 - **WHEN** Heaven ID's full smoke is enabled
 - **THEN** it SHALL wait for the correct test-client deployment and required ID readiness without forcing unrelated build/deploy jobs to wait.
+
+## MODIFIED Requirements (PR #89 simplification)
+
+### Requirement: Migration SHALL be ONE job that validates every target before its single mutation
+
+The public pipeline SHALL declare exactly one Migration job and no Preflight stage. Its read-only steps SHALL validate, for every enabled target, the effective Wrangler
+configuration and the exact D1 binding before the job applies a migration, and SHALL reject any Preview/Dev target bound to the Production D1. The Delivery plan SHALL
+admit at most one distinct physical D1 per pipeline and SHALL fail closed on two or more before any mutation. The job SHALL run in the GitHub Environment of the
+migration owner (Production approvals apply on main), SHALL be skipped when `d1_migrations` is false or in a `pipeline_phase=verify` call, and SHALL never roll back schema.
+
+#### Scenario: Main push
+- **WHEN** a push to main enables Production with D1 migrations
+- **THEN** the Production D1 SHALL be migrated exactly once by the single Migration job after the Environment approval, and Delivery SHALL wait for it.
+
+#### Scenario: Native Branch and Native Dev share one D1
+- **WHEN** both map to the same nonproduction D1
+- **THEN** each target SHALL be validated (build, effective-config audit, D1 binding), the D1 SHALL be migrated once, and both deliveries SHALL consume that one result.
+
+#### Scenario: Distinct D1s in one invocation
+- **WHEN** two enabled targets name different physical D1 databases
+- **THEN** the plan SHALL fail before any build or mutation with a message naming both databases.
+
+#### Scenario: Migration disabled or failed
+- **WHEN** `d1_migrations` is false **THEN** Delivery SHALL proceed with `migration_status=none`. **WHEN** the Migration job fails **THEN** no Delivery call SHALL start and nothing SHALL be published.

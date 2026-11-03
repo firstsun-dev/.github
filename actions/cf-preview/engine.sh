@@ -126,7 +126,9 @@ case "$PHASE" in
 
   init)
     # One job may run several engine invocations (the Migration job validates every target, then migrates): each starts from a clean state.
-    rm -rf "$S"; mkdir -p "$S"; chmod 700 "$S"; umask 077
+    # Only the engine's own default state dir (<runner temp>/cfv2) is ever wiped - never a path an earlier step could have redirected.
+    [ "$S" != "${RUNNER_TEMP:-}/cfv2" ] || rm -rf -- "$S"
+    mkdir -p "$S"; chmod 700 "$S"; umask 077
     printf '%s' "${INPUTS_JSON:?}" > "$IN"
     # ONE Node process validates everything pure (target/kind/stage/mode binding, descriptor, strategy and policy enums, enabled kind of
     # this event, per-target requirements, URL isolation, env data) and writes the validated state files. Nothing is mutated if it fails.
@@ -147,6 +149,7 @@ case "$PHASE" in
 
   prepare)
     ctx
+    setenv CFV2_DEPS "done"   # the dependencies are installed (Setup step precedes this phase): a later engine call of the same job skips the install
     if [ "$TARGET" != prod ]; then
       VER="$(cd "$APP_DIR" && pnpm exec wrangler --version | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
       node "$TOOLS_DIR/cli.mjs" wrangler-check --version "$VER"

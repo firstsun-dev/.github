@@ -513,7 +513,7 @@ def group_production_release():
 
     r = deploy(env={"STUB_TIPS": OTHER})
     check(r["result"] == "success" and r["outputs"]["deployed_and_verified"] == "false" and not published(r), "stale main run: the job succeeds, nothing built or published, not verified")
-    check("pnpm" not in r["log"] and "BUILD" not in r["log"] and r["log"].count("npm ci") == 2, "stale main run: only the tooling installs (the plan job and the engine itself) ran; no application install or build")
+    check("pnpm" not in r["log"] and "BUILD" not in r["log"] and 1 <= r["log"].count("npm ci") <= 2, "stale main run: only the tooling installs (the plan job, and the engine itself unless the harness's tooling dir already has node_modules) ran; no application install or build")
     check(not release_runs(r), "REGRESSION stale main run -> Release does NOT run although Deploy succeeded")
 
     r = deploy(env={"STUB_TIPS": f"{SHA},{OTHER}"})

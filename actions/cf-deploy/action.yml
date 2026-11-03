@@ -150,7 +150,8 @@ runs:
     # Must run before `init`: engine.sh init calls cli.mjs, which imports `smol-toml` from this directory.
     - name: Install tooling deps
       shell: bash
-      run: cd "$GITHUB_ACTION_PATH/../cf-preview" && npm ci --ignore-scripts --no-audit --no-fund
+      # The Migration job calls this action once per validated target: install the tooling once per job.
+      run: cd "$GITHUB_ACTION_PATH/../cf-preview" && { [ -d node_modules/smol-toml ] || npm ci --ignore-scripts --no-audit --no-fund; }
     - name: Initialise (bind target and stage, validate credentials and env as data)
       id: init
       shell: bash
@@ -205,7 +206,7 @@ runs:
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" guard start'
     - name: Setup dependencies
-      if: env.STALE != 'true'
+      if: env.STALE != 'true' && env.CFV2_DEPS != 'done'
       uses: firstsun-dev/.github/actions/setup@v1
       with:
         setup-node: 'false'

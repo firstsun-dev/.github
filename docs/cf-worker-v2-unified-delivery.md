@@ -5,21 +5,24 @@ It supersedes the job topology in `cf-worker-v2-refactor.md` ("Job DAG", "Shared
 and recovery rules described there still apply. `_cf-worker-v2.yml` remains the only public entrypoint; `_cf-worker-delivery.yml` is an
 **internal** reusable workflow called only by it. v1 / v1.5 and the floating `@v2` tag are untouched by this change.
 
+> **Revised (PR #89 simplification).** No separate Preflight stage. **One Migration job with integrated safety validation; reusable target-driven Delivery.**
+> The earlier Preflight-per-kind / Migration-per-D1-owner topology, and the real-runner tables further down that exercised it, describe the superseded design;
+> the sections "Topology", "Behaviour" and "Single Migration job" are current.
+
 ## Topology (final DAG)
 
 ```
 Lint ‖ Typecheck ‖ Unit ‖ Integration ‖ Build Validation ‖ E2E        (unchanged, independent)
                          │
-                 Validation Gate        every CONFIGURED job succeeded, every unconfigured one skipped, else fail closed
+                 Validation Gate        every CONFIGURED job succeeds, every unconfigured one is skipped, else fail closed
                          │
-                  Delivery plan         enabled kinds of this event + smoke-mode validation + D1 plan (pure data, no credentials)
-                         │                outputs per kind: on_<kind>, d1_<kind>, owns_<kind>, owner_of_<kind>
-        ┌────────────────┼───────────────────┐
- preflight_production  preflight_native_branch  preflight_native_dev  preflight_persistent_dev     one CALL per enabled kind (only with d1_migrations)
-        └────────────────┼───────────────────┘      non-publishing: canonical URL, target build, effective-config audit, exact D1 binding
-                         │   (every migration waits for the preflight of EVERY enabled kind: nothing mutates while a target is unvalidated)
- migration_<owner kind>  one CALL per OWNER of a distinct physical D1 (Native Branch + Native Dev on one D1 -> one migration)
+                  Delivery plan         enabled kinds + smoke modes + ONE physical D1 (pure data, no credentials)
+                         │                outputs: on_<kind>, descriptors, migration {owner kind, Environment, d1_id, kinds}
                          │
+              Database Migration        ONE job, Environment of the owner (<app>/prod on main)
+                │   1. each enabled target that is not the owner: build + effective-config audit + exact D1 binding (nothing remote)
+                │   2. the owner: build + audit + D1 binding + stale-SHA guard, then the ONE migration
+                         │                skipped when d1_migrations is false / verify phase; never rolls schema back
  delivery_production | delivery_native_branch | delivery_native_dev | delivery_persistent_dev      one CALL per enabled kind, mutually independent
       └─ deploy ──► smoke ──► (conditional) rollback          jobs of the SAME internal workflow, scoped to that one target
                          │
@@ -29,7 +32,7 @@ Lint ‖ Typecheck ‖ Unit ‖ Integration ‖ Build Validation ‖ E2E        
 Kinds: `production`, `native-branch` (per-branch Native Preview), `native-dev` (the stable Native Preview named `dev`),
 `persistent-dev` (the separate `[env.dev]` Dev Worker; Notification Hub). Only enabled kinds exist as calls (a disabled call is skipped by the
 plan flag `on_<kind>`), so no phantom delivery paths exist. **A delivery call waits only for the Validation Gate, the plan, and the
-migration call(s) of ITS OWN D1; it never waits for, and is never affected by, another kind's Deploy / Smoke / Rollback.** There is no
+single Migration job (success, or skipped when there is nothing to migrate); it never waits for, and is never affected by, another kind's Deploy / Smoke / Rollback.** There is no
 matrix anywhere in the delivery graph: every `needs.<call>.outputs.*` belongs to exactly one target.
 
 | Event | Kinds |
@@ -41,18 +44,18 @@ matrix anywhere in the delivery graph: every `needs.<call>.outputs.*` belongs to
 
 Rejected (plan fails closed, `config-guard` also reports): `production-only` with any Dev channel; `shared_dev_on_branch_push` together with
 `shared_dev_native_preview_on_branch_push`; unknown `smoke_mode` / `smoke_mode_overrides`; an unknown kind in a `phase_state` hand-off;
-a Preview/Dev kind whose D1 is the Production D1.
+a Preview/Dev kind whose D1 is the Production D1; enabled kinds that name **two or more distinct physical D1 databases** while `d1_migrations` is on (single-DB rule).
 
 ### Reusable-workflow limits honoured
 
 | Constraint | How |
 | --- | --- |
 | Nesting depth | caller → `_cf-worker-v2.yml` → `_cf-worker-delivery.yml` = 3 levels (limit 10); the delivery workflow calls nothing further |
-| Permission ceiling | each `uses:` job declares the permissions the called jobs need (`contents: read`; `deployments: read` for Preflight / Migration, `deployments: write` + `pull-requests: write` for Delivery); the caller of the public workflow already had to grant these |
+| Permission ceiling | each `uses:` job declares the permissions the called jobs need (`contents: read`; `deployments: read` for the Migration job, `deployments: write` + `pull-requests: write` for Delivery); the caller of the public workflow already had to grant these |
 | Static `uses:` | `./.github/workflows/_cf-worker-delivery.yml` per call (no expression); actions are fetched by `tools_ref` as before |
 | `tools_ref` | forwarded unchanged to every call; the engine always comes from the same pinned ref |
 | Secrets | passed explicitly per call (smoke credentials only to Delivery); never `secrets: inherit` |
-| Environments | job property inside the called workflow (`<app>/prod`, `/preview`, `/native-dev`, `/dev`); Smoke and Preflight have none |
+| Environments | job property inside the called workflow (`<app>/prod`, `/preview`, `/native-dev`, `/dev`); the Migration job runs in the owner's Environment; Smoke has none |
 | Concurrency | the run-level group stays on the public workflow; the delivery workflow has **only job-level** groups (`cfv2-leg-<run>-<kind>[-rollback]`, persistent Dev keeps `cfv2-dev-<repo>-<scope>`) so nothing deadlocks |
 
 ## Inputs
@@ -78,8 +81,7 @@ describe the Production / per-branch Preview delivery; `dev_*` describe `persist
 Added: `native_dev_url`, `native_dev_verified_url`, `native_dev_published_unverified`, `native_dev_verified`, `native_dev_smoke_level`.
 `deploy_smoke_level` / `native_dev_smoke_level` may now be `skipped`. `phase_state` is opaque: pass it unchanged to the verify call.
 
-**Output determinism.** Every per-kind output SELECTS its source call from the plan (`jobs.plan.outputs.on_<kind> == 'true'`, or `owns_<kind>`
-for `migration_status`) and then reads that call's own result — never "whichever string is non-empty". `deploy_*` read Production, else
+**Output determinism.** Every per-kind output SELECTS its source call from the plan (`jobs.plan.outputs.on_<kind> == 'true'`) and then reads that call's own result - never "whichever string is non-empty". `migration_status` is the single Migration job's always-run status step: `applied`, `none` (nothing pending, superseded, `d1_migrations` false or a verify call) or `failed`. `deploy_*` read Production, else
 Native Branch (mutually exclusive by event: `main` vs. other branches); `dev_*` read `persistent-dev`; `native_dev_*` read `native-dev`;
 `rollback_result` is the first rolled-back kind in the order production, native-branch, native-dev, persistent-dev.
 
@@ -97,17 +99,16 @@ Native Branch (mutually exclusive by event: `main` vs. other branches); `dev_*` 
   * Build-env checks before the build: another target's public URL is rejected; this application's own callback / redirect / app-origin / site
     variables (`*CALLBACK*`, `*REDIRECT_URI/URL*`, `*APP_ORIGIN*`, `*APP_URL*`, `*SITE_URL*`) must be **same-origin with the target URL**.
     An IdP issuer / `IDP_URL` names another service and is not verifiable, so it is only checked against this app's other targets.
-* **Preflight → Migration (P2-B).** The plan groups kinds by `account_id/database_id` of the source config. Each Preflight (one per enabled kind) builds
-  non-publishingly, audits the *effective* (adapter-generated) config and requires that the built config binds **exactly** the plan's D1 id.
-  Every Migration call waits for the Preflight of **all** enabled kinds, so no schema changes while a target sharing or using a D1 is unvalidated.
-  Branch + Native Dev on one preview D1 are migrated **once** (owner: Native Branch); distinct D1s migrate independently; D1-less targets skip
-  the stage. A Preview/Dev kind mapped to the Production D1 fails the plan. The publish stage re-audits the built config against the migrated D1 id,
-  and the Delivery call validates that the migration result it received has the planned owner kind and D1 id. A failed migration blocks only the
-  deliveries on that D1. Stale-SHA checks run before migration and again before publish; D1 is never rolled back. Same-repository serialization is
+* **Single Migration job (replaces Preflight → Migration, P2-B).** The plan groups the enabled kinds by `account_id/database_id` of the source config and admits
+  **one** group; identical D1s are deduplicated (Native Branch + Native Dev on one preview D1), distinct ones fail the plan before any build. The `migration`
+  job then validates every enabled target that is not the owner (engine stage `preflight`: non-publishing build, effective-config audit, built config binds
+  **exactly** the plan's D1) and finally runs the owner's `migrate` stage (the same checks for the owner, a stale-SHA guard, then the one `d1 migrations apply`).
+  Step order is the guarantee: no mutation can precede a failed validation. A Preview/Dev kind mapped to the Production D1 fails the plan. Each Delivery call's
+  publish stage re-audits the built config against the migrated D1 id and validates that the migration result has the planned owner kind and D1 id. A failed
+  migration starts no Delivery. Stale-SHA checks run before migration and again before publish; D1 is never rolled back. Same-repository serialization is
   the workflow-level concurrency group (`cfv2-nonprod-d1-<scope>` / `cfv2-shared-dev-<app>` also cover Native Dev); a D1 shared with **another
   repository** is not locked (GitHub limitation, see limits).
-* **Result routing (P1-A).** Each Delivery call receives only its own hand-off and its own migration result (its own call, or the shared-D1
-  owner's — validated by kind and D1 id inside the call). The Smoke and Rollback jobs refuse a hand-off whose `kind`, `published_sha` or URL belong
+* **Result routing (P1-A).** Each Delivery call receives only its own hand-off and THE migration result (validated by the planned owner kind and the call's D1 id inside the call). The Smoke and Rollback jobs refuse a hand-off whose `kind`, `published_sha` or URL belong
   to anything else (fail closed on missing / ambiguous / stale / mismatched data).
 * **Native Dev.** Fixed name `dev`, own ledger environment `<app>/native-dev/dev`, own GitHub Environment `<app>/native-dev`, never
   advertised on PRs. The name `dev` is reserved: with Native Dev on, a branch named `dev` gets Preview `b-dev`; Preview GC never collects `dev`.
@@ -116,7 +117,7 @@ Native Branch (mutually exclusive by event: `main` vs. other branches); `dev_*` 
   only in the failing kind's call: `native-dev` / `persistent-dev` redeploy the last known-good deployment of the same ledger unless a newer one
   exists; Production keeps its fail-closed policy; a blocked cross-service gate never rolls back.
 * **Release** requires the Production Smoke to be content-verified and no Rollback to have run; it reads only `delivery_production`.
-* **`pipeline_phase`.** `deploy` runs Preflight, Migration and each call's Deploy only; the `phase_state` output carries each kind's own Deploy
+* **`pipeline_phase`.** `deploy` runs the Migration job and each call's Deploy only; the `phase_state` output carries each kind's own Deploy
   result, its migration result and D1 id, the kinds, the inputs and the concurrency group. `verify` (second call) runs only each kind's Smoke and
   Rollback from that data (`handoff_json`, `migration_json_in`, `d1_expected_id` are that kind's own entries) and `upstream_gate`; Heaven's
   ID ↔ Test Client ↔ Check-in dependencies are expressed by the caller's `needs` between the deploy and verify calls, unchanged.
@@ -244,11 +245,60 @@ Local suites on the same code: 404 chain checks, 131 Node tests, 626 workflow-co
 recovery — they need approved non-production Cloudflare credentials and are covered only by the local suites. The queue timeline shows GitHub's behaviour for the scheduling
 lock on `workflow_dispatch` callers; it was not exercised for every event type.
 
+## Single Migration job (PR #89 simplification) - protections, removed complexity, measurements
+
+**Decision.** No separate Preflight stage. One Migration job with integrated safety validation. Reusable target-driven Delivery. (The earlier requirement of a
+Preflight matrix is superseded.) No new reusable-workflow layer, no matrix, no generated YAML.
+
+**Protections that remain** (all enforced by the engine / `delivery.mjs`, none re-implemented in YAML): physical D1 identity from the plan; effective (adapter-generated)
+Wrangler config audit per target; exact D1 binding per enabled target before any mutation; Preview/Dev never on the Production D1; stale-SHA guard before the
+migration and before publish; Environment protection (`<app>/prod`) on the Migration job; one migration result validated by owner kind + D1 id in every Delivery call;
+Production/non-production isolation; never an automatic schema rollback; per-target Smoke and Rollback; deferred verification never migrates.
+
+**Complexity removed.** 8 reusable-workflow calls (4 Preflight, 4 Migration) and their `peers`/`kinds` strings, the per-kind `owns_<kind>` plan outputs, `own_`/`owner_`
+migration inputs and the Native-Branch-as-owner special case, `checkPeerPreflights`, the `stage` input and the `preflight`/`migrate` jobs of the delivery workflow.
+
+**Engine changes for several calls in one job:** `init` starts from a clean state directory; the tooling `npm ci` and the application `Setup dependencies` run once per job
+(`CFV2_DEPS`, reserved name); the migration gate only guards `publish`.
+
+Measured locally on the original PR head (`aa19cf6`) and this branch, same machine, same suites (mocked Cloudflare/GitHub; this is **not** a live-run measurement):
+
+| Metric | Before (`aa19cf6`) | After |
+| --- | --- | --- |
+| `_cf-worker-v2.yml` lines | 1249 | 1081 |
+| `_cf-worker-delivery.yml` lines | 446 | 320 |
+| Preflight calls | 4 | 0 |
+| Migration job declarations | 4 calls | 1 job |
+| Migration executions per run (`d1 migrations apply`) | 1 (deduplicated by owner) | 1 (at most 1; distinct D1s rejected) |
+| Runner jobs after the gate - main push + D1 | 6 | 5 |
+| Runner jobs - feature push + D1 (Native Branch) | 6 | 5 |
+| Runner jobs - Native Branch + Native Dev on one D1 | 9 | 7 |
+| Runner jobs - no D1 | 4 | 4 |
+| Application builds - main + D1 / feature + D1 / Branch + Dev on one D1 / no D1 | 3 / 3 / 5 / 1 | 2 / 2 / 4 / 1 |
+| Engine `init` calls (same four scenarios) | 4 / 4 / 7 / 2 | 3 / 3 / 6 / 2 |
+| Fast profile | ~12.1 s | ~11.7 s |
+| Chain profile (parallelism 4) | 103 s | 92 s |
+| Full profile | 1m54s | 1m43s |
+| Chain checks | 404 | 413 |
+| Workflow-contract checks | 626 | 583 |
+| Node tests (lib + delivery + cli) | 131 | 130 |
+| Harness workspaces / step subprocesses | 1456 / 7668 | 1285 / 6878 |
+
+Contract checks fell by 43 because the per-kind loops over eight removed call jobs (needs, stage literals, descriptors, secrets, permission ceilings) no longer exist; each
+protection they covered has a counterpart on the single job (needs, Environment expression, permissions, secrets, engine-step order, status step). One Node test (the peer
+gate) was replaced by the migration-result test. Chain manifest minimums were only raised (`migration-d1` 55 → 62, `review-regressions` 34 → 36). Saved wall time comes from fewer
+runner jobs and builds; fewer YAML lines alone are not claimed as a performance gain, and no live-runner timing exists.
+
+**Required scenarios** (all in `test-jobs.py` / `test-workflow-contract.py` / `delivery.test.mjs`): 1 main migrates Production once; 2 feature push migrates Preview once; 3 Branch + Native
+Dev on one D1 migrate once; 4/5 D1-less or disabled migration deploys and never blocks; 6 Preview mapped to Production D1 fails before mutation; 7 distinct D1s fail the plan;
+8 a failed Migration starts no Delivery; 9 Smoke/Rollback isolated per target; 10 Release needs a verified Production; 11 deferred verification never repeats the Migration; 12
+cross-service ordering unchanged; 13 public outputs unchanged (`migration_status` now always `applied` / `none` / `failed`); 14 the Migration job runs in `<app>/prod` on main.
+
 ## Known limitations
 
 * **Hosted `ubuntu-latest` runners lack `pnpm`** (resolved for validation by using the org's provisioned `linux` runners; see the evidence above). `actions/setup` with `setup-pnpm: 'false'` (used by every validation job and the engine) assumes a runner image with pnpm
   baked in (the org's `linux` runners). On `ubuntu-latest` the Validation jobs fail with `pnpm: command not found`, so a full real chain
-  (Gate → Plan → Preflight → …) cannot be exercised on a hosted runner. This is pre-existing behaviour and unchanged by this fix.
+  (Gate → Plan → Migration → …) cannot be exercised on a hosted runner. This is pre-existing behaviour and unchanged by this fix.
 * A caller of the public workflow must grant at least `contents: write` (Release job), `deployments: write` and `pull-requests: write`
   (ceiling of the called jobs), as before.
 
@@ -258,5 +308,8 @@ lock on `workflow_dispatch` callers; it was not exercised for every event type.
 * `wrangler preview --name dev` custom-domain attachment is unverified and not assumed; custom-domain Preview hosting needs `preview_url_suffix`.
 * Preview URL derivation depends on the Workers subdomain API reporting `preview_url_suffix`. If the API is unreadable and no suffix / declared URL
   is supplied, Native Branch / Native Dev fail before the build (by design) rather than build for a guessed URL.
-* Migration calls of different D1s are not ordered against each other's *Deploy*, but Native Dev / persistent Dev deliveries statically `need` the
-  Native Branch migration call (to read the shared-D1 result); that is a wait for a migration call, never for a Branch Deploy / Smoke / Rollback.
+* **Single-DB rule (compatibility restriction).** One pipeline migrates at most one physical D1. A caller that enables targets with distinct D1s in one
+  invocation (typically Native Branch on `[previews]` plus `shared_dev_on_branch_push` on a different `[env.dev]` D1, with `d1_migrations: true`) now fails the plan
+  with a message naming both databases. Nothing is changed before it fails. The consumer plan (blog, innovation-apps, heaven-monorepo, anas-mcp, heaven-www) does not
+  need this, but each caller must be confirmed before the `@v2` move; the rollout stays blocked on that confirmation.
+* The Migration job runs in the owner's Environment, so on main the `<app>/prod` approval is requested **before** the read-only validation steps as well as before the migration.

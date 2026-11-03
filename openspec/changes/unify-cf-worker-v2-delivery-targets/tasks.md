@@ -26,6 +26,17 @@
 - [x] Final review fixes: lock-identity integrity (scheduling-time lock derived from `phase_state.inputs`, group/descriptor/owner/D1 cross-checks, documented trust boundary), CLI annotations on stderr, legacy D1 ownership proof, fail-fast `test.sh full`.
 - [ ] Merge the fully tested shared implementation to **.github/main**; record frozen immutable SHA, exact interface, compatibility proof and explicit G1 pass/fail. Do not move `@v2` yet.
 
+## Phase 1b — PR #89 simplification (supersedes the Preflight matrix / per-target Migration calls)
+
+- [x] Remove the four Preflight calls and the four Migration calls; add ONE `migration` job (validation steps first, one migration last). No matrix, no new reusable layer.
+- [x] Plan: one physical D1 per pipeline (dedupe identical, reject distinct), `migration` output replaces `owns_<kind>`; Production D1 never reachable from Preview/Dev.
+- [x] Delivery workflow: only deploy / smoke / rollback; `migration_result` + `migration_json` replace the stage, peer and owner inputs; a failed Migration skips every Delivery.
+- [x] Engine: state is fresh per `init`; tooling and application dependencies install once per job; migration gate only for publish.
+- [x] Tests updated in the same slices (contract, job chain, `delivery.mjs`, `cli.mjs`); required scenarios 1-14 covered; manifest minimums only raised.
+- [x] Measured before/after (docs/cf-worker-v2-unified-delivery.md, "Single Migration job").
+- [ ] Real-runner scratch-caller evidence for the final SHA (recorded in the PR description); live Cloudflare migration/deploy remain unproven (no credentials).
+- [ ] Confirm that no supported caller needs distinct D1s in one invocation before the `@v2` move.
+
 ## G1 — MANDATORY HARD GATE (all conditions required)
 
 - [ ] Shared .github implementation is complete and merged to main (not merely proposed).

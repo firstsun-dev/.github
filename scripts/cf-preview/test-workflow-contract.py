@@ -440,6 +440,8 @@ need = ["Install tooling deps", "Initialise", "Stale-SHA guard (start)", "Setup 
 order = [aidx(n) for n in need]
 check(order == sorted(order) and len(set(order)) == len(order),
       "engine order: install tooling deps FIRST (cli.mjs needs smol-toml) -> init -> stale -> setup -> prepare -> BUILD+audit -> D1 target check -> stale -> MIGRATE -> stale -> PUBLISH -> smoke -> verified")
+check("node_modules/smol-toml" in astep("Install tooling deps")["run"] and "env.CFV2_DEPS != 'done'" in astep("Setup dependencies")["if"] and 'setenv CFV2_DEPS "done"' in open("actions/cf-preview/engine.sh").read(),
+      "engine: several engine calls in ONE job (the Migration job) install the tooling and the application dependencies once")
 check(aidx("Build and audit") < aidx("Apply pending D1 migrations"), "no schema migration runs before the deployable build and the target config were validated")
 check(aidx("Validate the exact migration target") < aidx("Apply pending D1 migrations") < aidx("Publish the audited artifact"), "the exact D1 target is validated before the migration, which precedes the publish")
 mig = astep("Apply pending D1 migrations")
