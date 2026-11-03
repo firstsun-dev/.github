@@ -21,7 +21,7 @@ Spec: `openspec/changes/redesign-cloudflare-worker-cicd-v2`; tracking issue #43.
 | `@v2` | floating major tag (same convention as `@v1`); always the latest compatible 2.x |
 | `@v2.x.y` | immutable release |
 
-`uses:` and the `tools_ref:` input **must be the same ref** (the workflow checks out the tooling at `tools_ref`).
+The shared actions and nested workflows are referenced with the self-repository syntax `$/`, i.e. at the **same commit as the workflow you pin in `uses:`** - nothing to keep in sync. `tools_ref:` is accepted for compatibility but **ignored**; you can delete it. The runner must be **>= 2.336.0** (the org `linux` runners are 2.338.0).
 
 | Release | Change |
 |---|---|
@@ -81,7 +81,6 @@ jobs:
   cf:
     uses: firstsun-dev/.github/.github/workflows/_cf-worker-v2.yml@v2
     with:
-      tools_ref: v2
       app_name: www
       build_cmd: pnpm run build
       deployment_strategy: production-preview

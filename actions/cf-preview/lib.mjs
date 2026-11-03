@@ -122,7 +122,7 @@ export async function previewHostReadiness(fetchFn, { accountId, token, worker, 
   let body;
   try { body = await res.json(); } catch { return { ok: false, level: 'unknown', message: 'Preview host check returned an unreadable body' }; }
   const r = body?.result ?? {};
-  if (r.previews_enabled === true) return { ok: true, level: 'ok', message: `Worker ${worker} has Preview URLs enabled` };
+  if (r.previews_enabled === true) return { ok: true, level: 'ok', message: `Worker ${worker} has Preview URLs enabled`, suffix: typeof r.preview_url_suffix === 'string' ? r.preview_url_suffix : '' };
   if (r.previews_enabled === false) {
     return { ok: false, level: 'block', message: `Worker "${worker}" has previews_enabled=false: no Preview URL host exists. Enable Preview URLs for that Worker (Settings > Domains & Routes > Preview URLs, or deploy it with \`preview_urls = true\`) — this pipeline never changes the Worker automatically. For custom-domain Preview hosting set preview_host_check: false.` };
   }

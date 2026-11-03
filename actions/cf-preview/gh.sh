@@ -63,6 +63,11 @@ JSON
     scan_good "$1" "${2:-}" --arg repo "$R" --arg dev "$3" --arg app "$4" -- \
       'select(.payload.repo == $repo and .payload.dev_worker == $dev and .payload.worker == $app)'
     ;;
+  last-good-native-dev) # <env> <exclude-id> <host_worker> <app> -> "<sha> <url>" of the newest verified Native Dev deployment
+    # (any branch; Native Dev is ONE stable Preview `dev`) recorded for THIS host Worker, app and repository.
+    scan_good "$1" "${2:-}" --arg repo "$R" --arg host "$3" --arg app "$4" -- \
+      'select(.payload.repo == $repo and .payload.kind == "native-dev" and .payload.preview_name == "dev" and .payload.host_worker == $host and .payload.worker == $app)'
+    ;;
   comment) # <branch> <app_name> <url> <sha> [note] : only same-repo PRs from this exact head branch
     owner="${R%%/*}"
     marker="<!-- cf-preview:$2 -->"

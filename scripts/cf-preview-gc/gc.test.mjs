@@ -78,10 +78,17 @@ test('fixed Dev preview in the allowlist is never deleted, even without a branch
   assert.equal(r.summary.protected, 2);
 });
 
+test('the reserved Native Dev name `dev` is never collected, with NO allowlist entry (a legacy `dev` branch ledger cannot delete it)', async () => {
+  const w = world({ deployments: [dep('dev', [tomb(400)])], cfPreviews: [cfKey('dev')] });
+  const r = await run(w);
+  assert.equal(deletes(w).length, 0);
+  assert.equal(r.summary.protected, 1);
+});
+
 test('allowlist matches the full account + worker + name tuple', async () => {
-  const w = world({ deployments: [dep('dev', [tomb(40)])], cfPreviews: [cfKey('dev')] });
-  const r = await run(w, cfg({ protected: [{ accountId: 'other', hostWorker: 'blog-preview', previewName: 'dev' }] }));
-  assert.equal(byPreview(r, 'dev').status, 'DELETE'); // a different account's allowlist entry does not protect this one
+  const w = world({ deployments: [dep('stable', [tomb(40)])], cfPreviews: [cfKey('stable')] });
+  const r = await run(w, cfg({ protected: [{ accountId: 'other', hostWorker: 'blog-preview', previewName: 'stable' }] }));
+  assert.equal(byPreview(r, 'stable').status, 'DELETE'); // a different account's allowlist entry does not protect this one
 });
 
 test('branch deleted then recreated (before or after a new push): not deleted', async () => {

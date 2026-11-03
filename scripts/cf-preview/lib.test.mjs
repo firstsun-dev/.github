@@ -455,6 +455,9 @@ const apiRes = (status, body) => async () => ({ ok: status < 300, status, json: 
 test('previewHostReadiness: blocks only on a definitive previews_enabled=false', async () => {
   const a = { accountId: 'a', token: 't', worker: 'blog' };
   assert.equal((await previewHostReadiness(apiRes(200, { result: { previews_enabled: true } }), a)).level, 'ok');
+  // the Workers subdomain API's preview_url_suffix is what the canonical Preview URL is derived from (before the build)
+  assert.equal((await previewHostReadiness(apiRes(200, { result: { previews_enabled: true, preview_url_suffix: '-blog.acme.workers.dev' } }), a)).suffix, '-blog.acme.workers.dev');
+  assert.equal((await previewHostReadiness(apiRes(200, { result: { previews_enabled: true } }), a)).suffix, '');
   const off = await previewHostReadiness(apiRes(200, { result: { previews_enabled: false, enabled: false } }), a);
   assert.equal(off.level, 'block');
   assert.match(off.message, /preview_urls = true|Preview URLs/);

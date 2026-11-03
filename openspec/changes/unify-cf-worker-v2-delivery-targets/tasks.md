@@ -9,16 +9,34 @@
 
 ## Phase 1 — .github shared engine ONLY (MAIN SESSION; no sub-sessions)
 
-- [ ] Implement shared Validation Gate with independent parallel lint/typecheck/unit/integration/build-validation/E2E.
-- [ ] Implement standalone audited, target-bound Migration Stage after Validation, grouped by physical D1, including no-D1 bypass and DB locking.
-- [ ] Refactor target-parameterized Delivery (Production / Native Branch / Native Dev / Persistent Dev) around one engine, with no unconditional cross-target `needs`.
-- [ ] Add opt-in Native Dev named Preview `dev`, protected identity, separate ledger/recovery and concurrent-branch serialization.
-- [ ] Add target-specific URL pre-resolution/build-env, build/artifact audit, no shared compiled bundle, and post-publish URL assertion.
-- [ ] Add `smoke_mode=full|basic|skip` and target overrides, explicit Published/Unverified semantics and conditional target-owned Recovery.
-- [ ] Preserve `pipeline_phase`/`phase_state`, public caller inputs/outputs, release gates, v1/v1.5 and the currently deployed `@v2` behavior.
-- [ ] Add/extend contract, shell/unit, DAG, smoke, skip, migration, DB lock, stale SHA, rollback, Access, preview cleanup and cross-service handoff tests.
-- [ ] Run actionlint and relevant OpenSpec checks; prove reusable workflow calls from a separate scratch repository/runnable caller; record evidence.
+- [x] Implement shared Validation Gate with independent parallel lint/typecheck/unit/integration/build-validation/E2E.
+- [x] Implement standalone audited, target-bound Migration Stage after Validation, grouped by physical D1, including no-D1 bypass and DB locking.
+- [x] Refactor target-parameterized Delivery (Production / Native Branch / Native Dev / Persistent Dev) around one engine, with no unconditional cross-target `needs`.
+- [x] Add opt-in Native Dev named Preview `dev`, protected identity, separate ledger/recovery and concurrent-branch serialization.
+- [x] Add target-specific URL pre-resolution/build-env, build/artifact audit, no shared compiled bundle, and post-publish URL assertion.
+- [x] Add `smoke_mode=full|basic|skip` and target overrides, explicit Published/Unverified semantics and conditional target-owned Recovery.
+- [x] Preserve `pipeline_phase`/`phase_state`, public caller inputs/outputs, release gates, v1/v1.5 and the currently deployed `@v2` behavior. (Contract + 404 chain checks; deferred verification now keeps the deploy call's descriptors; real-runner evidence in docs.)
+- [x] Add/extend contract, shell/unit, DAG, smoke, skip, migration, DB lock, stale SHA, rollback, Access, preview cleanup and cross-service handoff tests.
+- [x] Run actionlint and relevant OpenSpec checks; prove reusable workflow calls from a separate scratch repository/runnable caller; record evidence. (actionlint+shellcheck green in CI on 8ad9f5f; scratch-caller runs 41062254408, 41062261540, 41062268866, 41062278092. Live Cloudflare behaviour is NOT proven — no credentials.)
+- [x] Review finding 1 (P1): deferred verification restores the deploy call's validated descriptors; verify-call defaults never replace deployment-time policy.
+- [x] Review finding 2 (P2): structural refactor — descriptor replaces seven per-call fields, inline migration/rollback/verification policy moved to `delivery.mjs`, one build and one publish primitive, `engine.sh init` is one validated Node process.
+- [x] Review finding 3 (P2): AST-based test grouping replaced by explicit `group_*` functions + manifest-checked launcher.
+- [x] Review finding 4 (P2): measured subprocess/CPU reduction inside the engine (init 213 ms -> 58 ms; Node processes per chain 17 -> 9); the harness step-shell count is NOT reduced (documented).
+- [x] Review finding 5 (P1): final-SHA scratch-caller validation on org runners; credential-less scope stated.
+- [x] Final review fixes: lock-identity integrity (scheduling-time lock derived from `phase_state.inputs`, group/descriptor/owner/D1 cross-checks, documented trust boundary), CLI annotations on stderr, legacy D1 ownership proof, fail-fast `test.sh full`.
 - [ ] Merge the fully tested shared implementation to **.github/main**; record frozen immutable SHA, exact interface, compatibility proof and explicit G1 pass/fail. Do not move `@v2` yet.
+
+## Phase 1b — PR #89 simplification (supersedes the Preflight matrix / per-target Migration calls)
+
+- [x] Remove the four Preflight calls and the four Migration calls; add ONE `migration` job (validation steps first, one migration last). No matrix, no new reusable layer.
+- [x] Plan: one physical D1 per pipeline (dedupe identical, reject distinct), `migration` output replaces `owns_<kind>`; Production D1 never reachable from Preview/Dev.
+- [x] Delivery workflow: only deploy / smoke / rollback; `migration_result` + `migration_json` replace the stage, peer and owner inputs; a failed Migration skips every Delivery.
+- [x] Engine: state is fresh per `init`; tooling and application dependencies install once per job; migration gate only for publish.
+- [x] Tests updated in the same slices (contract, job chain, `delivery.mjs`, `cli.mjs`); required scenarios 1-14 covered; manifest minimums only raised.
+- [x] Measured before/after (docs/cf-worker-v2-unified-delivery.md, "Single Migration job").
+- [x] Real-runner scratch-caller evidence for the final SHA `8ad4d40` (docs/cf-worker-v2-refactor.md, "Final-SHA merge-readiness validation"), including the real Migration Gate entrypoint with stale handoffs on the `linux` and `ubuntu-latest` runners; live Cloudflare migration/deploy remain unproven (no approved non-production credentials — BLOCKED).
+- [x] Confirm that no supported caller needs distinct D1s in one invocation: the real planner over blog, heaven-monorepo (3 apps), innovation-apps (2 apps), anas-mcp and heaven-www × push/dispatch/PR/delete never plans two distinct physical D1s. Re-confirm if a caller's `wrangler` config or switches change before the `@v2` move.
+- [ ] **Before the `@v2` move** (procedure and rollback: docs/cf-worker-v2-rollout.md; fix PRs blog#461 and heaven-www#56 prepared, not merged): remove the undeclared `CLOUDFLARE_PREVIEW_API_TOKEN` / `CLOUDFLARE_PREVIEW_ACCOUNT_ID` secrets from blog `cicd.yml`, heaven-www `cicd.yml` and blog `preview-gc.yml` (they cause `startup_failure`), have an administrator confirm/update Required Checks for the renamed contexts in blog, heaven-monorepo, innovation-apps and heaven-www (unreadable on the Free plan), and run a live non-production deployment/smoke/recovery exercise.
 
 ## G1 — MANDATORY HARD GATE (all conditions required)
 
@@ -27,6 +45,16 @@
 - [ ] Final inputs/outputs and verified immutable implementation SHA are documented.
 - [ ] No unresolved critical blockers (resource isolation, D1, Access, stale deploy/rollback, Release).
 - [ ] Main Session records **G1 = PASS**. No consumer implementation or sub-sessions may start before this line is checked.
+
+## Phase 1 simplification (PR #89 refactor, no behaviour change)
+
+- [x] `$/` self-repository references replace every `.cf-tools` checkout; `tools_ref` stays accepted (optional, ignored); runner floor 2.336.0 documented.
+- [x] `_cf-worker-ci.yml`: six parallel checks + fail-closed Validation Gate with a `validation=passed` verdict; one CI call; no duplicate CI between push and same-repo PR.
+- [x] ONE Migration job unchanged; Migration and Delivery depend on the plan only (the plan requires a passed CI).
+- [x] Preview lifecycle and manual persistent Dev extracted (`_cf-worker-lifecycle.yml`, `_cf-worker-persistent-dev.yml`); one shared Delivery engine kept; four thin calls kept (no matrix, rationale in docs).
+- [x] One scheduling-time `concurrency.group` expression; canonical `runLockGroup()` emitted by the Plan; `phase_state` without the redundant `d1` map.
+- [x] P1 review fix: `resolveMigrationUsed` rejects `stale` migration results (no stale-skipped migration authorizes a publish); regression tests incl. A→B→A.
+- [x] Contract + chain tests ported; cross-repository real-runner scenarios r1–r11 recorded in `docs/cf-worker-v2-refactor.md`.
 
 ## Phase 2 — AFTER G1 ONLY: consumer sub-sessions (parallel when independent)
 

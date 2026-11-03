@@ -1,0 +1,263 @@
+name: CF Worker CI (validation)
+
+# ---------------------------------------------------------------------------
+# INTERNAL — called ONLY by _cf-worker-v2.yml (one `uses:` per run). Not a public entrypoint. Contract: docs/cf-worker-v2-refactor.md
+#
+#   Lint  Typecheck  Unit  Integration  Build Validation  E2E        six independent, PARALLEL jobs (no `needs` between them)
+#                         |
+#                  Validation Gate   the ONE aggregation: every CONFIGURED job succeeded, every unconfigured one was skipped
+#
+# Bodies are actions/cf-ci-check (E2E has its own setup and own TEST build). None receives Cloudflare credentials and none uploads a
+# build artifact: Build Validation builds for validation only, the delivery engine builds again for its real target.
+# No workflow-level `concurrency` here (the public workflow owns the run-level group; reusing it would deadlock).
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        type: string
+        required: true
+      app_path:
+        type: string
+        default: .
+      app_version:
+        type: string
+        default: ''
+      runner:
+        type: string
+        default: linux
+      lint_cmd:
+        type: string
+        default: ''
+      typecheck_cmd:
+        type: string
+        default: ''
+      test_unit_cmd:
+        type: string
+        default: ''
+      test_integration_cmd:
+        type: string
+        default: ''
+      build_cmd:
+        type: string
+        required: true
+      ci_env:
+        type: string
+        default: ''
+      use_mailpit:
+        type: boolean
+        default: false
+      build_env_prod:
+        type: string
+        default: ''
+      build_env_preview:
+        type: string
+        default: ''
+      test_e2e_cmd:
+        type: string
+        default: ''
+      test_e2e_setup_cmd:
+        type: string
+        default: ''
+      test_e2e_build_cmd:
+        type: string
+        default: ''
+      test_e2e_variants:
+        type: string
+        default: '[{"name":"","args":"","artifact_suffix":""}]'
+      test_e2e_env:
+        type: string
+        default: ''
+    outputs:
+      validation:
+        description: passed ONLY when every configured validation job succeeded (the Validation Gate); empty otherwise
+        value: ${{ jobs.gate.outputs.validation }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PLAYWRIGHT_BROWSERS_PATH: /opt/playwright-browsers
+
+jobs:
+  lint:
+    name: Lint
+    if: inputs.lint_cmd != ''
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: $/actions/cf-ci-check
+        with:
+          title: Lint
+          cmd: ${{ inputs.lint_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
+  typecheck:
+    name: Typecheck
+    if: inputs.typecheck_cmd != ''
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: $/actions/cf-ci-check
+        with:
+          title: Typecheck
+          cmd: ${{ inputs.typecheck_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
+  unit:
+    name: Unit Tests
+    if: inputs.test_unit_cmd != ''
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: $/actions/cf-ci-check
+        with:
+          title: Unit Tests
+          cmd: ${{ inputs.test_unit_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
+          use_mailpit: ${{ inputs.use_mailpit }}
+  integration:
+    name: Integration Tests
+    if: inputs.test_integration_cmd != ''
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: $/actions/cf-ci-check
+        with:
+          title: Integration Tests
+          cmd: ${{ inputs.test_integration_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
+          use_mailpit: ${{ inputs.use_mailpit }}
+  build:
+    name: Build Validation
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: $/actions/cf-ci-check
+        with:
+          title: Build Validation
+          cmd: ${{ inputs.build_cmd }}
+          app_path: ${{ inputs.app_path }}
+          build_env_prod: ${{ inputs.build_env_prod }}
+          build_env_preview: ${{ inputs.build_env_preview }}
+          ci_env: ${{ inputs.ci_env }}
+          app_version: ${{ inputs.app_version }}
+
+  # E2E — own setup and own TEST build (local URLs, mock services); never reused for a deployment.
+  e2e:
+    name: E2E
+    if: inputs.test_e2e_cmd != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        e2e: ${{ fromJSON(inputs.test_e2e_variants) }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    env:
+      E2E_ENV: ${{ inputs.test_e2e_env }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: $/actions/cf-tools
+      - name: Import E2E env
+        run: node "$TOOLS_DIR/parse-env.mjs" E2E_ENV "$GITHUB_ENV"
+      - uses: $/actions/setup
+        with:
+          setup-node: 'false'
+          setup-pnpm: 'false'
+      - name: Start Mailpit
+        if: inputs.use_mailpit
+        uses: $/actions/mailpit
+      - name: E2E setup
+        if: inputs.test_e2e_setup_cmd != ''
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CMD: ${{ inputs.test_e2e_setup_cmd }}
+        run: bash -c "$CMD"
+      - name: E2E test build
+        if: inputs.test_e2e_build_cmd != ''
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CMD: ${{ inputs.test_e2e_build_cmd }}
+        run: bash -c "$CMD"
+      - name: E2E tests
+        working-directory: ${{ inputs.app_path }}
+        env:
+          CMD: ${{ inputs.test_e2e_cmd }} ${{ matrix.e2e.args }}
+        run: bash -c "$CMD"
+      # Failure-only evidence with short retention; never a delivery dependency.
+      - name: Upload E2E report (failure only)
+        uses: actions/upload-artifact@v7
+        if: failure()
+        continue-on-error: true
+        with:
+          name: ${{ matrix.e2e.artifact_suffix != '' && format('e2e-report-{0}-{1}-{2}', inputs.app_name, matrix.e2e.artifact_suffix, github.run_id) || format('e2e-report-{0}-{1}', inputs.app_name, github.run_id) }}
+          path: |
+            ${{ inputs.app_path }}/playwright-report/
+            ${{ inputs.app_path }}/test-results/
+          if-no-files-found: ignore
+          retention-days: 3
+
+  # Validation Gate — fail closed. A configured job must be `success`; an unconfigured one must be `skipped`; anything else (failure,
+  # cancelled, an unexpected skip) fails the gate. `always()` makes the gate run (and fail) even when a job it needs failed, so the
+  # called workflow's conclusion is never a skipped-looking green.
+  gate:
+    name: Validation Gate
+    needs: [lint, typecheck, unit, integration, build, e2e]
+    if: always()
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    outputs:
+      validation: ${{ steps.gate.outputs.validation }}
+    steps:
+      - id: gate
+        name: Every configured validation job succeeded
+        env:
+          LINT: ${{ needs.lint.result }}
+          LINT_CONFIGURED: ${{ inputs.lint_cmd != '' }}
+          TYPECHECK: ${{ needs.typecheck.result }}
+          TYPECHECK_CONFIGURED: ${{ inputs.typecheck_cmd != '' }}
+          UNIT: ${{ needs.unit.result }}
+          UNIT_CONFIGURED: ${{ inputs.test_unit_cmd != '' }}
+          INTEGRATION: ${{ needs.integration.result }}
+          INTEGRATION_CONFIGURED: ${{ inputs.test_integration_cmd != '' }}
+          BUILD: ${{ needs.build.result }}
+          BUILD_CONFIGURED: 'true'
+          E2E: ${{ needs.e2e.result }}
+          E2E_CONFIGURED: ${{ inputs.test_e2e_cmd != '' }}
+        run: |
+          bad=0
+          for j in LINT TYPECHECK UNIT INTEGRATION BUILD E2E; do
+            r="${j}"; c="${j}_CONFIGURED"
+            if [ "${!c}" = true ]; then
+              [ "${!r}" = success ] || { echo "::error::$j finished '${!r}' (configured: must succeed)"; bad=1; }
+            else
+              [ "${!r}" = skipped ] || { echo "::error::$j is not configured but finished '${!r}'"; bad=1; }
+            fi
+          done
+          [ "$bad" = 0 ] || exit 1
+          echo "validation=passed" >> "$GITHUB_OUTPUT"
+          echo "Validation Gate passed."

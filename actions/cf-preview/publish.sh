@@ -56,6 +56,11 @@ if [ "$TARGET" = preview ]; then
   fi
   PREVIEW_URL="$(printf '%s\n' "$EXTRACTED" | sed -n 's/^preview_url=//p')"
   [[ "$PREVIEW_URL" =~ ^https://[^[:space:]]+$ ]] || { echo "::error::Preview URL missing or not https after extraction" >&2; exit 1; }
+  # Pre-resolved URL (Native Dev): the published URL must be exactly the one the artifact was BUILT for.
+  if [ -n "${EXPECTED_URL:-}" ] && ! node -e 'const n=(u)=>u.replace(/\/+$/,"").toLowerCase();process.exit(n(process.argv[1])===n(process.argv[2])?0:1)' "$PREVIEW_URL" "$EXPECTED_URL"; then
+    echo "::error::published Preview URL $PREVIEW_URL differs from the URL this artifact was built for ($EXPECTED_URL); the build embeds the wrong URL" >&2
+    exit 1
+  fi
   echo "url=$PREVIEW_URL"
   exit 0
 fi

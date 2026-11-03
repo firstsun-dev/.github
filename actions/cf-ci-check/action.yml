@@ -2,8 +2,8 @@ name: CF Worker CI check
 description: >
   One validation job body (Lint, Typecheck, Unit, Integration, Build Validation): import the target build env and
   ci_env as data, set up dependencies, run exactly ONE command, write a short summary. Never receives Cloudflare
-  credentials. The caller must have checked out the app and then this repository's `actions/cf-ci-check` and
-  `actions/cf-preview/parse-env.mjs` at `.cf-tools` (the checkout is removed again so linters never see it).
+  credentials. The caller only checks out the app: the action itself is referenced as `$/actions/cf-ci-check` (this repository at the
+  running workflow's commit), so nothing from this repository ever lands in the app's workspace.
 inputs:
   title:
     description: Check name for the summary
@@ -40,15 +40,12 @@ runs:
       run: |
         node "$GITHUB_ACTION_PATH/../cf-preview/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
         node "$GITHUB_ACTION_PATH/../cf-preview/parse-env.mjs" CI_ENV "$GITHUB_ENV"
-        # Keep the tool checkout out of lint/typecheck scope, but NEVER delete this action's own action.yml: the runner
-        # re-reads it for the post step of the nested `setup` action ("Can't find action.yml" fails the job otherwise).
-        find .cf-tools -type f ! -path '.cf-tools/.git/*' ! -path '.cf-tools/actions/cf-ci-check/action.yml' -delete
-    - uses: firstsun-dev/.github/actions/setup@v1
+    - uses: $/actions/setup
       with:
         setup-node: 'false'
         setup-pnpm: 'false'
     - if: inputs.use_mailpit == 'true'
-      uses: firstsun-dev/.github/actions/mailpit@v1
+      uses: $/actions/mailpit
     - name: ${{ inputs.title }}
       id: check
       shell: bash

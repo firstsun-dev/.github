@@ -6,7 +6,8 @@
 Detect (consumer-specific, optional)
   -> Lint || Typecheck || Unit || Integration || Build Validation || E2E
   -> Validation Gate
-  -> Migration Stage [target preflight; unique physical D1; resource lock]
+  -> Delivery plan [enabled targets; ONE physical D1; migration owner]
+  -> Database Migration (ONE job) [validate every target's effective config + D1 binding -> migrate once; resource lock]
   -> Target Delivery [one independent build + publish per enabled target]
   -> Smoke [full | basic | skip]
      pass -> Verified ---------> Production Release (main only)
@@ -62,6 +63,9 @@ For Native Dev, protect `dev` from Preview GC and branch deletion. Use the same 
 
 Validation checks stay parallel and separately visible. The Gate succeeds only when every configured check succeeds; intentionally omitted optional checks may be skipped. Fail/cancel/unexpected skip is fail-closed.
 
+> **Superseded (PR #89 simplification).** There is no separate Preflight stage and no per-target Migration call. One `migration` job holds the read-only safety
+> checks as its first steps and the single remote mutation as its last; the plan admits at most one physical D1 per pipeline. See "Single Migration job (revised decision)" at the end.
+
 The independent **Migration Stage** is downstream of the Gate and upstream of every relevant target's publish. Plan migrations by validated physical D1 identity (`account_id/database_id`), with target-specific effective-config preflight in the Migration Stage **before executing any remote schema change**. Where adapters materialize Wrangler configuration at build time, preflight may run a nonpublishing target-specific config-generation/build command; do not confuse this with the later target-specific deploy build. Before publish, verify the independently rebuilt artifact still binds the exact audited D1. If identities disagree, fail without publishing.
 
 - Build the unique-D1 migration plan across enabled targets; two Native Preview URLs sharing one D1 yield **one** migration execution for that D1, not two.
@@ -112,3 +116,26 @@ Phase 1 complete on .github/main + all tests + contract freeze
 After G1, create independent sub-sessions in isolated clean worktrees: one for `blog`, one for `innovation-apps`, one for `heaven-monorepo`, one for `infra-config`, and one read-only compatibility session covering `anas-mcp`/`heaven-www`. The main session reviews integration and changes to the frozen contract; consumer sessions do not edit `.github`.
 
 Do not move floating `@v2` before all compatibility tests and coordinated rollout are complete. Retain legacy Dev Workers, custom domains, Access rules and stateful resources until their replacements are verified and a separate cleanup is approved.
+
+## Single Migration job (revised decision, PR #89 simplification)
+
+**No separate Preflight stage. One Migration job with integrated safety validation. Reusable target-driven Delivery.** The earlier requirement of a Preflight
+matrix / four Preflight calls and four Migration calls is superseded.
+
+```text
+Gate -> Delivery plan -> Database Migration (ONE job) -> Delivery(kind)* -> Release
+                           1. non-owner targets: build + effective-config audit + exact D1 binding (engine stage preflight; nothing remote)
+                           2. owner: build + effective-config audit + exact D1 binding + stale-SHA guard + migrate ONCE (engine stage migrate)
+```
+
+* **Plan.** Resolves every enabled kind's physical D1 (`account_id/database_id`), deduplicates identical ones and **fails closed on two distinct databases**
+  (single-DB rule) or on a Preview/Dev kind that maps to the Production D1 - before any mutation. `migration` = `{kind (owner), environment, d1_id, kinds}`.
+* **Job.** Environment = the owner's (`<app>/prod` on main: the approval gate is unchanged and not optional). Steps run in order, so a failing validation
+  stops the job before the migrate step - no peer-result mapping. The engine (not YAML) implements every check; the owner is validated inside its own
+  migrate stage, so a shared-D1 run builds each target once for validation (N targets = N builds, previously N + 1).
+* **Handoff.** `migration_json` (the `migrate` step outputs) + `migration_result` go to every Delivery call; its publish gate requires `success`, the planned
+  owner kind and exactly the call's D1 id (a stale-superseded migration is **rejected** since the P1 fix: it authorizes nothing, see the unified-delivery doc). `d1_migrations=false` skips the job; Delivery proceeds.
+* **Deferred verification** never migrates: the job is skipped in a `verify` call and each kind uses its own `migration_json_in` from `phase_state`.
+* **Compatibility restriction.** A pipeline that enables targets with distinct D1s in one invocation (e.g. Native Branch on the `[previews]` D1 together with
+  `shared_dev_on_branch_push` on a different `[env.dev]` D1) is rejected by the plan. None of the planned consumers (blog, innovation-apps Notification Hub,
+  heaven-monorepo, anas-mcp, heaven-www) is specified to need this; each caller must be confirmed before the rollout, and the `@v2` move stays blocked until then.
