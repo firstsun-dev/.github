@@ -34,8 +34,9 @@
 - [x] Engine: state is fresh per `init`; tooling and application dependencies install once per job; migration gate only for publish.
 - [x] Tests updated in the same slices (contract, job chain, `delivery.mjs`, `cli.mjs`); required scenarios 1-14 covered; manifest minimums only raised.
 - [x] Measured before/after (docs/cf-worker-v2-unified-delivery.md, "Single Migration job").
-- [ ] Real-runner scratch-caller evidence for the final SHA (recorded in the PR description); live Cloudflare migration/deploy remain unproven (no credentials).
-- [ ] Confirm that no supported caller needs distinct D1s in one invocation before the `@v2` move.
+- [x] Real-runner scratch-caller evidence for the final SHA `8ad4d40` (docs/cf-worker-v2-refactor.md, "Final-SHA merge-readiness validation"), including the real Migration Gate entrypoint with stale handoffs on the `linux` and `ubuntu-latest` runners; live Cloudflare migration/deploy remain unproven (no approved non-production credentials — BLOCKED).
+- [x] Confirm that no supported caller needs distinct D1s in one invocation: the real planner over blog, heaven-monorepo (3 apps), innovation-apps (2 apps), anas-mcp and heaven-www × push/dispatch/PR/delete never plans two distinct physical D1s. Re-confirm if a caller's `wrangler` config or switches change before the `@v2` move.
+- [ ] **Before the `@v2` move:** remove the undeclared `CLOUDFLARE_PREVIEW_API_TOKEN` / `CLOUDFLARE_PREVIEW_ACCOUNT_ID` secrets from blog `cicd.yml`, heaven-www `cicd.yml` and blog `preview-gc.yml` (they cause `startup_failure`), have an administrator confirm/update Required Checks for the renamed contexts in blog, heaven-monorepo, innovation-apps and heaven-www (unreadable on the Free plan), and run a live non-production deployment/smoke/recovery exercise.
 
 ## G1 — MANDATORY HARD GATE (all conditions required)
 

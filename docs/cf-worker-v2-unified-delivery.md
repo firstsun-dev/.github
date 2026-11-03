@@ -329,6 +329,14 @@ Environments**, so nothing remote was touched and approval protection was not ex
 YAML anchors (`&delivery_permissions`, `&delivery_secrets`, `&fetch_ci_tools`) were accepted by the GitHub parser in all runs; the permission ceilings did not produce a `startup_failure`.
 **Not demonstrated and not claimed:** a live D1 migration, publish, smoke against a live Worker, rollback, and Environment approval gates (no credentials / unprotected scratch Environments).
 
+### Final-SHA verification (implementation `8ad4d4029b42f173dec5b6c39ddc8738fc6bf0a8`)
+
+* Fast + Full profiles, ShellCheck and `actionlint 1.7.12` pass at this SHA (PR CI [41595263650](https://github.com/firstsun-dev/.github/actions/runs/41595263650); local re-run: 561 contract + 420 chain checks).
+* **Stale-migration gate on real runners:** [41598319442](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598319442) runs the real `cli.mjs migration-gate` entrypoint from `8ad4d40` on the org `linux` runner and `ubuntu-latest` with a validated descriptor and synthetic handoffs. `stale=true`, `stale="true"`, stale + valid metadata, empty, malformed, `none`, owner mismatch, D1 mismatch and a failed Migration job all exit `1` with no call to `wrangler`/`gh`/`curl`/`pnpm`/`npx` (PATH shims record none); the valid and `d1_migrations=false` controls exit `0`. The full A → B → A race is covered by the chain regression only, not reproduced on Actions.
+* Cross-repository scratch scenarios, every nested `$/` reference and the public workflow resolved to `8ad4d40`, per-scenario run links and expected-failure classification: [cf-worker-v2-refactor.md](cf-worker-v2-refactor.md#final-sha-merge-readiness-validation-implementation-8ad4d4029b42f173dec5b6c39ddc8738fc6bf0a8).
+* Single-D1 rule against the real consumers: the planner was run over all eight consumer calls × seven event/ref scenarios; none plans two distinct physical D1s.
+* Not demonstrated: a live migration/publish/smoke/recovery, Environment approval, GHES, a runner older than 2.336.0.
+
 ## Known limitations
 
 * **Hosted `ubuntu-latest` runners lack `pnpm`** (resolved for validation by using the org's provisioned `linux` runners; see the evidence above). `actions/setup` with `setup-pnpm: 'false'` (used by every validation job and the engine) assumes a runner image with pnpm

@@ -142,10 +142,92 @@ Recorded for a later phase (not done, would be breaking or out of scope): drop `
 
 * **P1 follow-up (stale migration):** fixed after review — see "P1 fix" in [cf-worker-v2-unified-delivery.md](cf-worker-v2-unified-delivery.md). A stale-skipped migration no longer authorizes a publish; a superseded run's Delivery now fails at the Migration Gate instead of ending green.
 
+### Final-SHA merge-readiness validation (implementation `8ad4d4029b42f173dec5b6c39ddc8738fc6bf0a8`)
+
+Everything below was run against exactly `8ad4d40`; no implementation file was changed afterwards (this section is docs only). Nothing was merged, `@v2` was not moved, no consumer or Cloudflare resource was changed.
+
+**Regression (Phase 1).** PR CI [41595263650](https://github.com/firstsun-dev/.github/actions/runs/41595263650) passed at this SHA. Independently re-run locally on the detached checkout of `8ad4d40`: `scripts/cf-preview/test.sh fast` and `full` → `PASSED` (561 contract checks, 420 chain checks in 8 groups), `shellcheck 0.11.0 -x -S warning` over `actions/cf-preview/*.sh scripts/cf-preview/*.sh` + `shellcheck-actions.py` clean, `actionlint 1.7.12` over the seven workflows clean. Required assertions and the test that proves each:
+
+| Assertion | Evidence |
+| --- | --- |
+| `stale=true` / `stale="true"` never authorizes publishing | contract: `Migration Gate (executed): stale=true / stale='true' / stale=true with otherwise valid metadata blocks the publish` |
+| Missing or malformed result fails closed | contract: empty result, invalid JSON, `migration none`, owner mismatch, D1 mismatch, failed / cancelled / skipped-while-required job all block |
+| Valid Migration + matching owner and physical D1 succeeds | contract: `a succeeded Migration job with an applied migration of the planned owner on the planned D1 authorizes the publish` |
+| `d1_migrations=false` does not block Delivery | contract: `Migration Gate (executed): d1_migrations=false needs no migration result`; chain: `d1_migrations=false … Delivery is NOT blocked` |
+| A → B → A cannot bypass | chain group `migration-d1`: `A->B->A: the Delivery sees a FRESH tip but the Migration Gate rejects the stale result BEFORE the build; nothing is built or published` (+ nothing smoked, no rollback, no Release) |
+| Failed Migration cannot start publishing | chain: `Migration failure -> the dependent Delivery never starts …, nothing published, Release blocked` |
+| Deferred verification never repeats Migration | contract: `Migration: never in a verify call`; real runner r4 below |
+| Smoke / Rollback target-isolated | chain: forged / cross-target / tampered `phase_state` descriptors fail the plan closed; Native Dev recovery never touches a Production version |
+| Production Release requires verified success | chain group `production-release`; contract: `Release reads ONLY the Production delivery call` |
+
+**Stale Migration gate on a real runner (r12).** [41598319442](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598319442) checks out `8ad4d40` of this repository and runs the actual engine entrypoint (`actions/cf-preview/cli.mjs migration-gate`, the command `engine.sh migration-gate` runs in the publish stage) with a descriptor built by `delivery.mjs` and synthetic handoffs, on the org `linux` runner (`heavenweb-runner-3`) **and** `ubuntu-latest`. No Cloudflare secret exists in the repository, the environment is `env -i`, and `wrangler gh curl pnpm npx` are PATH shims that record any call. Result on both runners: `stale=true`, `stale="true"`, stale + otherwise valid metadata, empty, malformed JSON, `none`, owner mismatch, D1 mismatch and a failed Migration job all exit `1` (the stale refusal prints `the migration for native-branch was skipped because its run became stale; it does not authorize a publish (nothing is published)`); the valid and `d1_migrations=false` controls exit `0`; the shim log is empty (no publish-side tool was invoked). The first dispatch ([41598162595](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598162595)) failed because of a bug in the test script itself (`bash -e` aborted on the first expected non-zero exit) and is not an implementation result. This is a single-gate smoke test: the full A → B → A sequence needs a force-push race between a Migration and its Delivery against a live Cloudflare account and is **not** reproduced on GitHub Actions; its evidence remains the chain regression above.
+
+**Scratch caller pinned to `8ad4d40` (Phase 2).** `firstsun-dev/cf-v2-scratch-caller`, org `linux` runners (all `2.338.0`), no Cloudflare credentials. `referenced_workflows` of the run lists `_cf-worker-v2/ci/delivery/lifecycle/persistent-dev.yml` all at `@8ad4d40…`, and the nested `$/actions/cf-deploy`, `cf-tools`, `cf-ci-check` steps log `@8ad4d4029b42f173dec5b6c39ddc8738fc6bf0a8`, i.e. the public workflow and every `$/` reference resolved to the same revision. Overall `failure` below is the designed fail-closed result (no credentials), not an implementation regression.
+
+| Scenario | Run | Observed | Expected? |
+| --- | --- | --- | --- |
+| Parallel CI (6 checks, 2 E2E variants) | [41598183911](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598183911) | Lint, Typecheck, Unit, Integration, Build, E2E(a), E2E(b) `success`; Validation Gate, Plan `success`; Migration skipped (`d1_migrations: false`); `Deploy` failed `preview credentials not provided`; Smoke ran with status `none` | yes (conclusion `failure` from missing credentials) |
+| Validation failure | [41598188577](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598188577) | Lint `failure`, the other checks still ran; Gate `failure` (`LINT finished 'failure'`); Plan, Migration, every Delivery, Release **skipped** | yes |
+| Single D1 Migration | [41598193186](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598193186) (`feat/final`), [41598197646](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598197646) (`main`) | exactly one `Database Migration` job; failed closed on `preview` / `prod credentials not provided` before any remote call; every Delivery skipped | yes |
+| Migration disabled | [41598201733](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598201733) | Migration skipped; Native Branch **and** Native Dev Deliveries started (failed on credentials) | yes |
+| Multiple distinct D1s | [41598206295](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598206295) | Plan failed `… 2 distinct physical D1 databases: scratch-preview-db (native-branch) vs scratch-dev-db (persistent-dev) … (nothing was changed)`; Migration and Deliveries skipped | yes |
+| Stale Migration | r12 above (real gate on runner); chain tests for the full path | gate exits nonzero before any publish-side call | yes |
+| Deferred verification | [41598211512](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598211512), [41598215678](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598215678) | deploy-phase Plan + Delivery (failed on credentials); the verify call's Plan accepted the handoff, **Database Migration skipped** in both calls, Smoke ran from the original handoff (status `none`: nothing was published); hand-built legacy `phase_state` → success | yes |
+| Deprecated `tools_ref` | [41598219951](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598219951) | `tools_ref: this-ref-does-not-exist` ignored; same fail-closed result as r1 | yes |
+| Same-repo PR | [41598279417](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598279417) | only `Preview lifecycle` ran (no CI, Plan or Delivery); `success`; PR comment step success without a verified Preview | yes |
+| Branch push / Branch Delete | [41598264159](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598264159) / [41598501202](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598501202) | push: CI → Plan → Deploy failed on credentials; delete (default-branch workflow): `Retire GitHub ledger (Preview is kept)` success; the lifecycle job's only mutating step is the ledger retire (the `wrangler preview delete` command appears only as a manual hint in the summary) | yes |
+| Manual Persistent Dev | [41598224024](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598224024) (legacy contract), [41598228322](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41598228322) (engine contract) | legacy `dev_deploy_cmd` / `dev_smoke_cmd` ran → success; engine path failed closed on `dev credentials not provided` | yes |
+
+The scratch Environments are unprotected and hold fake D1 ids, so Environment approval and every remote Cloudflare effect remain undemonstrated. The pre-existing `call.yml`/`v_*` workflows of the scratch repository are pinned to older SHAs and also fire on pushes; their runs are not evidence for `8ad4d40`.
+
+**Consumer compatibility (Phase 3, read from each default branch on 2026-11-03).** Callers: blog, heaven-monorepo (3 apps), innovation-apps (2 apps), anas-mcp, heaven-www — an org-wide code search for `_cf-worker-v2.yml` found no others (the `cf-v2-scratch-caller` is the disposable test repository). All call `_cf-worker-v2.yml@v2` and pass `tools_ref: v2` (deprecated, ignored). Every `with:` key and every output they read exists in the 60-input / 20-output interface. The **real planner** (`cli.mjs plan`, data only) was run over every call's actual `wrangler` config for push `main`, push `feat/x`, dispatch `main` (default and `persistent-dev`), dispatch `feat/x`, `pull_request` and `delete`:
+
+| Repository / App | Runner compatible | Required Checks compatible | D1 compatible | Deployment compatible | Action |
+| --- | --- | --- | --- | --- | --- |
+| blog | yes — `runner: linux` (ten org runners, all `2.338.0` ≥ 2.336.0); `[self-hosted, linux]` jobs run in the same pool | **UNVERIFIED — ADMIN ACCESS REQUIRED** (see below) | yes — main: prod `45031ada…`; branch push / dispatch: preview `feb45b04…`; one D1 per invocation (Shared Dev off) | yes (Native Branch + Production) | **fix `secrets:` (see rollout blocker 1)**; update Required Checks |
+| heaven-monorepo / heaven-id | yes | UNVERIFIED | yes — main: prod `193440aa…`; branch push / `persistent-dev` dispatch: dev `ca755ecb…` | yes (hybrid + Shared Dev) | update Required Checks |
+| heaven-monorepo / heaven-checkin | yes | UNVERIFIED | yes — prod `41fa4337…`; branch push: dev `8e3f8323…` | yes | update Required Checks |
+| heaven-monorepo / test-client | yes | UNVERIFIED | yes — no D1, `d1_migrations: false` | yes | update Required Checks |
+| innovation-apps / diet-manager | yes | UNVERIFIED | yes — prod `e12e2d9e…`; branch push: preview `b9421085…` | yes (Native Branch) | update Required Checks |
+| innovation-apps / notification-hub | yes | UNVERIFIED | yes — prod `311ab3c8…`; branch push / dispatch: dev `9a69f8e9…` | yes (hybrid, Native Preview off) | update Required Checks |
+| anas-mcp | yes — default `runner: linux` | **yes — verified: public repo, `main` not protected, no rulesets** | yes — no D1 | yes (`production-only`) | none required for checks; context names change but nothing requires them |
+| heaven-www | yes | UNVERIFIED | yes — no D1 | yes (`production-preview`) | **fix `secrets:` (rollout blocker 1)**; update Required Checks |
+
+No call enables two distinct physical D1s in any modeled event, so the single-D1 rule does not reject any supported configuration. Not modeled: the post-build effective-config audit of Astro/adapter-generated configs (blog Shared Dev is off; it runs only in a live Migration/Deploy).
+
+**Required Checks.** Branch protection and rulesets could not be read for the four private repositories: the API answers `403 Upgrade to GitHub Pro or make this repository public` although the token has repository admin rights (organization plan: `free`; organization rulesets: `Upgrade to GitHub Team`). This is a plan limit, not a permissions gap, and it makes enforcement unlikely, but it is not proof — a rule configured under an earlier plan would be invisible here. Treat them as **UNVERIFIED — ADMIN ACCESS REQUIRED** and have an administrator confirm in the repository settings that none of the following contexts is required (`<job>` is the caller's job name: `Pipeline` for blog, innovation-apps and heaven-www; `Heaven ID`, `Heaven Checkin`, `Heaven ID Test Client` for heaven-monorepo; `cf` for anas-mcp). Required-check names as seen on the consumers' recent default-branch runs ("today") and in the `8ad4d40` scratch runs ("after"):
+
+| Today (consumer runs) | After `8ad4d40` |
+| --- | --- |
+| `<job> / Lint` | `<job> / CI / Lint` |
+| `<job> / Typecheck` | `<job> / CI / Typecheck` |
+| `<job> / Unit Tests` | `<job> / CI / Unit Tests` |
+| `<job> / Integration Tests` | `<job> / CI / Integration Tests` |
+| `<job> / Build Validation` | `<job> / CI / Build Validation` |
+| `<job> / E2E` and `<job> / E2E (<name>, <args>, <suffix>)` (blog: four variants) | `<job> / CI / E2E` and `<job> / CI / E2E (<name>, <args>, <suffix>)` |
+| — | `<job> / CI / Validation Gate` (new aggregate) |
+| `<job> / Migration` | `<job> / Database Migration` |
+| `<job> / Deploy`, `Smoke Tests`, `Revert on Verify Failure`, `Shared Dev`, `Shared Dev Smoke Tests`, `Shared Dev Revert on Verify Failure` | `<job> / Delivery (production\|native-branch\|native-dev\|persistent-dev) / Deploy\|Smoke Tests\|Revert on Verify Failure` |
+| `<job> / Release`, `Config guard`, `Preview lifecycle`, `Persistent Dev (Hybrid)` | unchanged; new `<job> / Delivery plan` |
+
+Skipped jobs (unconfigured checks) report as skipped; a required context that is never emitted blocks merging. Nothing was modified in any repository's protection settings.
+
+**Runner findings.** All ten org runners (`heavenweb-runner-1…10`, labels `self-hosted, Linux, X64, 32gb-ram, e2e, docker, playwright`) report `2.338.0` through the API (confirmed, not assumed); the label match `linux`/`Linux` is case-insensitive and the scratch jobs ran on `heavenweb-runner-3`. No repository-level runners exist. Hosted `ubuntu-latest` accepted `$/` as well (r12) but lacks `pnpm`, so full pipelines still need the org pool. The runner binary auto-updates, so the floor must be re-checked if a runner is rebuilt from an older image. Setup expectations are unchanged from `main` (same `actions/setup` with `setup-node`/`setup-pnpm: 'false'`, same `PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers`, same optional Mailpit action). No consumer uses `pipeline_phase`/`phase_state`/`upstream_gate`.
+
+**Environments.** No consumer Environment (`*/prod`, `*/dev`, `*/dev/shared`, `*/preview*`, in all five repositories) has required reviewers, a wait timer or a deployment-branch policy. The Migration job now runs in the owner's Environment, so the `<app>/prod` approval is only as strong as these (currently absent) protections; approval behaviour was **not** exercised anywhere.
+
+**Non-production deployment evidence (Phase 4): BLOCKED.** The only Cloudflare credentials reachable from this organization are the Production-scoped `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` org secrets; the scratch repository has none, and no disposable, explicitly approved Cloudflare account/zone/D1 or protected scratch Environment exists or is documented. Missing prerequisites: a scratch Cloudflare account (or an API token scoped to disposable Workers, a throw-away D1 with a `migrations_dir`, and a Worker name prefix), repository secrets in `cf-v2-scratch-caller`, and a protected Environment with a reviewer (needs a paid plan for private repositories, or a public scratch repository). Nothing in this section is live deployment evidence.
+
+#### Rollout blockers found (not caused by this PR, must be resolved before `@v2` moves)
+
+1. **Undeclared secrets → `startup_failure`.** `blog/.github/workflows/cicd.yml` and `heaven-www/.github/workflows/cicd.yml` pass `CLOUDFLARE_PREVIEW_API_TOKEN` / `CLOUDFLARE_PREVIEW_ACCOUNT_ID`, and `blog/.github/workflows/preview-gc.yml` passes them to `_cf-worker-preview-gc.yml`. Neither the current `@v2` (`def3679`) nor `8ad4d40` declares them (commit `5def01d`, already on `main`: Native Preview uses the shared `CLOUDFLARE_API_TOKEN`/`ACCOUNT_ID`). GitHub rejects such a caller before any job starts — reproduced with [41599151750](https://github.com/firstsun-dev/cf-v2-scratch-caller/actions/runs/41599151750) (`startup_failure`). The consumers' own history is consistent with this (runs that ended `startup_failure` with zero jobs; the cause was inferred from the matching interface, not read from a log): heaven-www `CI/CD` runs [41017574023](https://github.com/firstsun-dev/heaven-www/actions/runs/41017574023) / [41017577275](https://github.com/firstsun-dev/heaven-www/actions/runs/41017577275) (2026-10-30) and blog `Preview GC` ([41559816233](https://github.com/firstsun-dev/blog/actions/runs/41559816233) and earlier nightly runs). Minimum remediation: remove the two `CLOUDFLARE_PREVIEW_*` lines from those three callers (the shared token must be allowed to manage Previews), or re-declare them as optional secrets in the called workflows.
+2. Required Checks audit and update as tabulated above.
+3. Live non-production evidence (Phase 4) and a staged rollout pinned to an immutable SHA.
+
 ### Remaining risks and limitations
 
-* **Runner floor 2.336.0** for every runner passed as `runner` (see above); GHES is unsupported by `$/`.
-* **Check names changed** (`<job> / CI / Lint`): required status checks in other consumers must be updated when they adopt this ref.
+* **Runner floor 2.336.0** for every runner passed as `runner` (see above); GHES is unsupported by `$/`. Confirmed `2.338.0` on all ten org runners on 2026-11-03.
+* **Check names changed** (`<job> / CI / Lint`, `<job> / Database Migration`, `<job> / Delivery (<kind>) / …`): required status checks in other consumers must be updated when they adopt this ref; they are unreadable on four of the five consumers (Free plan), see the table above.
 * `actionlint` cannot lint `$/` yet (two message formats ignored, guarded by the contract test).
 * A verify call queues under the recorded group before the Plan proves it (see "Concurrency and phase_state").
 * The public workflow is 769 lines, above the 600–750 target: the remaining bulk is the 60-input / 20-output public interface (≈ 300 lines), which Phase 1 may not change.
