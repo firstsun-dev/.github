@@ -62,7 +62,7 @@ on:
         type: string
         default: ''
       descriptor:
-        description: toJSON of THIS kind's target descriptor (versioned, validated by the Delivery plan and re-validated by the engine). Carries the engine target, GitHub Environment, concurrency groups, expected physical D1, migration owner and smoke mode; never a secret.
+        description: toJSON of THIS kind's target descriptor (versioned, validated by the Plan job and re-validated by the engine). Carries the engine target, GitHub Environment, concurrency groups, expected physical D1, migration owner and smoke mode; never a secret.
         type: string
         required: true
     outputs:

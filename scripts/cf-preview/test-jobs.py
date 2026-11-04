@@ -2,9 +2,9 @@
 """Scenario groups (explicit `group_*` functions registered in GROUPS): `test-jobs.py [--list] [--group ID]...`; no flag runs all.
 run-job-groups.py runs each group in its own process, in parallel, against the manifest of expected groups.
 
-Executes the REAL steps of the ONE Database Migration job (pre-mutation validation of every enabled target, then the single
+Executes the REAL steps of the ONE Migrate job (pre-mutation validation of every enabled target, then the single
 migration), the per-kind Delivery calls (the internal reusable workflow _cf-worker-delivery.yml: deploy -> smoke -> rollback), the
-Delivery plan, and the persistent-Dev job - including the
+Plan, and the persistent-Dev job - including the
 composite delivery engine (actions/cf-deploy -> actions/cf-preview/engine.sh) - against stub gh/pnpm/curl, and feeds each job's
 result into the next job's `if:` and `needs.*.outputs`. EVERY job runs in a FRESH workspace (a different runner): anything the
 chain needs must travel through job outputs, never through local files. A reusable-workflow CALL is emulated like GitHub does:
@@ -761,7 +761,7 @@ def group_migration_d1():
     # a build COMMAND that writes TARGET/DEV_ENV into GITHUB_ENV still cannot redirect the migration: the engine binds the target
     m = deploy(FEAT, inputs=dict(D1, build_cmd='echo TARGET=prod >> "$GITHUB_ENV"; echo DEV_ENV=prod >> "$GITHUB_ENV"; echo D1_BINDING=NOPE >> "$GITHUB_ENV"'))
     check(m["result"] == "success" and "PREV-ID" in mig_file(m, "preview") and not (m["ws"] / "w" / ".wrangler" / "migrate.prod.json").exists(), "a build writing TARGET=prod into GITHUB_ENV cannot move the Preview migration to Production")
-    # ---- ONE Database Migration job: the required scenarios (PR #89 simplification), each as an explicit check
+    # ---- ONE Migrate job: the required scenarios (PR #89 simplification), each as an explicit check
     e200 = {"STUB_PROBES": "200 "}
     m = deploy(MAIN, inputs=D1, env=e200)
     mo = public_outputs(m, D1, MAIN)
