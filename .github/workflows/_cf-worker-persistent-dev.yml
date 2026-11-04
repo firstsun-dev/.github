@@ -58,7 +58,7 @@ defaults:
 
 jobs:
   persistent-dev:
-    name: Persistent Dev (Hybrid)
+    name: manual
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     environment: ${{ inputs.app_name }}/dev

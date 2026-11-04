@@ -18,10 +18,10 @@ CI call (_cf-worker-ci.yml): Lint ‖ Typecheck ‖ Unit ‖ Integration ‖ Bui
                          │
                  Validation Gate        every CONFIGURED job succeeds, every unconfigured one is skipped, else fail closed; output validation=passed
                          │
-                  Delivery plan         enabled kinds + smoke modes + ONE physical D1 (pure data, no credentials)
+                  Plan                  enabled kinds + smoke modes + ONE physical D1 (pure data, no credentials)
                          │                outputs: on_<kind>, descriptors, migration {owner kind, Environment, d1_id, kinds}
                          │
-              Database Migration        ONE job, Environment of the owner (<app>/prod on main)
+              Migrate                   ONE job, Environment of the owner (<app>/prod on main)
                 │   1. each enabled target that is not the owner: build + effective-config audit + exact D1 binding (nothing remote)
                 │   2. the owner: build + audit + D1 binding + stale-SHA guard, then the ONE migration
                          │                skipped when d1_migrations is false / verify phase; never rolls schema back

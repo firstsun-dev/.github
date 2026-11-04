@@ -105,16 +105,24 @@ KINDS = ["production", "native-branch", "native-dev", "persistent-dev"]
 KK = lambda k: k.replace("-", "_")
 CALL_JOBS = {f"delivery_{KK(k)}" for k in KINDS}
 check(set(jobs) == {"ci", "plan", "migration"} | CALL_JOBS | {"release", "config-guard", "lifecycle", "persistent-dev"},
-      "public job set: CI call, Delivery plan, ONE Database Migration job, one Delivery CALL per kind (reusable workflow), Release + config-guard / lifecycle / persistent-dev handlers")
+      "public job set: CI call, Plan, ONE Migrate job, one Delivery CALL per kind (reusable workflow), Release + config-guard / lifecycle / persistent-dev handlers")
 check(set(cjobs) == set(VALIDATION) | {"gate"}, "the CI workflow has exactly the six validation jobs and the Validation Gate")
 check(set(djobs) == {"deploy", "smoke", "rollback"}, "the internal delivery workflow has exactly: deploy, smoke, rollback (ONE target per call; no Preflight / Migration path)")
 check(set(ljobs) == {"lifecycle"} and set(pjobs) == {"persistent-dev"}, "the event handlers are one small workflow each (Preview lifecycle, manual persistent Dev)")
 for gone in ("dev-deploy", "dev-verify", "dev-rollback", "test", "prepare", "migrate", "test-gate", "preview", "production", "verify", "revert", "deploy", "smoke", "rollback", "preflight", "gate") + tuple(VALIDATION) + tuple(f"{s_}_{KK(k)}" for s_ in ("preflight", "migration") for k in KINDS):
     check(gone not in jobs, f"obsolete / matrix / inlined job '{gone}' is gone from the public workflow (validation lives in _cf-worker-ci.yml; no matrix output merging, no Preflight stage, no per-kind Migration call)")
-check(sum(1 for j in jobs.values() if j.get("name") == "Database Migration") == 1 and len(re.findall(r"^  migration[\w_-]*:", text_all, re.M)) == 1, "exactly ONE Migration job definition exists in the public pipeline")
+check(sum(1 for j in jobs.values() if j.get("name") == "Migrate") == 1 and len(re.findall(r"^  migration[\w_-]*:", text_all, re.M)) == 1, "exactly ONE Migration job definition exists in the public pipeline")
 check(sum(len(re.findall(r"^  (?:migration|preflight)[\w_-]*:", open(f).read(), re.M)) for f in (CWF, DWF, LWF, PWF)) == 0, "no other workflow of the pipeline defines a Migration or Preflight job")
 check([cjobs[j]["name"] for j in VALIDATION] == [JOB_NAME[j] for j in VALIDATION], "validation jobs are named Lint, Typecheck, Unit Tests, Integration Tests, Build Validation, E2E")
-check(cjobs["gate"]["name"] == "Validation Gate" and jobs["ci"]["name"] == "CI" and jobs["plan"]["name"] == "Delivery plan" and jobs["migration"]["name"] == "Database Migration", "CI, Validation Gate, Delivery plan and Database Migration are named jobs")
+check(cjobs["gate"]["name"] == "Validation Gate" and jobs["ci"]["name"] == "CI" and jobs["plan"]["name"] == "Plan" and jobs["migration"]["name"] == "Migrate", "CI, Validation Gate, Plan and Migrate are named jobs")
+# Displayed check = `<caller job> / <name>...`; consumers call this workflow from a job named `CD`, so names carry no repeated words.
+check({k: jobs["delivery_" + KK(k)]["name"] for k in KINDS} == {k: k for k in KINDS}, "check names: each Delivery call is named just its kind (production / native-branch / native-dev / persistent-dev)")
+check([djobs[j]["name"] for j in ("deploy", "smoke", "rollback")] == ["Deploy", "Smoke Tests", "Revert on Verify Failure"], "check names: inner delivery jobs stay Deploy / Smoke Tests / Revert on Verify Failure")
+check((jobs["config-guard"]["name"], jobs["lifecycle"]["name"], jobs["persistent-dev"]["name"], jobs["release"]["name"]) == ("Guard", "lifecycle", "persistent-dev", "Release"), "check names: Guard, lifecycle, persistent-dev, Release")
+check((ljobs["lifecycle"]["name"], pjobs["persistent-dev"]["name"]) == ("ledger", "manual"), "check names: handler inner jobs (ledger, manual) never repeat their caller's name")
+_names = [j["name"] for j in jobs.values()]
+check(sorted(n for n in set(_names) if _names.count(n) > 1) == ["persistent-dev"], "check names: public job names are unique except persistent-dev (auto Delivery kind vs manual dispatch handler, never on the same event)")
+check(not any(re.search(r"Delivery \(|Preview lifecycle|Database Migration|Config guard|Persistent Dev \(Hybrid\)|Delivery plan", str(j.get("name", ""))) for d in (jobs, cjobs, djobs, ljobs, pjobs) for j in d.values()), "check names: none of the old verbose names remain in any v2 workflow")
 check(jobs["ci"]["uses"] == "$/.github/workflows/_cf-worker-ci.yml", "CI is one STATIC `uses: $/.github/workflows/_cf-worker-ci.yml` call (this repository at the running commit)")
 check("strategy" not in jobs["ci"], "no matrix on the CI call (E2E variants are the only matrix, inside the CI workflow)")
 
@@ -127,8 +135,8 @@ def needs_of(name, js=None):
 for j in VALIDATION:
     check(needs_of(j, cjobs) == [], f"{j}: no needs (independent and parallel with the other five checks - no accidental serial dependency)")
 check(set(needs_of("gate", cjobs)) == set(VALIDATION), "Validation Gate needs exactly the six validation jobs")
-check(needs_of("ci") == [] and needs_of("plan") == ["ci"], "CI has no needs; the Delivery plan needs only the CI call")
-check(needs_of("migration") == ["plan"], "Database Migration needs exactly the plan (which itself requires a passed CI) - and NO Deploy / Smoke / Rollback")
+check(needs_of("ci") == [] and needs_of("plan") == ["ci"], "CI has no needs; the Plan needs only the CI call")
+check(needs_of("migration") == ["plan"], "Migrate needs exactly the plan (which itself requires a passed CI) - and NO Deploy / Smoke / Rollback")
 for k in KINDS:
     check(set(needs_of(f"delivery_{KK(k)}")) == {"plan", "migration"}, f"delivery_{KK(k)}: the plan and THE migration only")
 check(not any(n.startswith("delivery_") for k in KINDS for n in needs_of(f"delivery_{KK(k)}")), "P2-A: NO Delivery call waits for another kind's Deploy / Smoke / Rollback")

@@ -218,7 +218,7 @@ export function checkBuildEnvOrigins(buildEnvText, targetUrl) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Target descriptor: ONE versioned, validated record per enabled kind, produced by the Delivery plan job and consumed by the
+// Target descriptor: ONE versioned, validated record per enabled kind, produced by the Plan job and consumed by the
 // thin per-kind workflow calls (and by every engine stage). It replaces the per-field `with:` copies (engine target, GitHub
 // Environment, concurrency groups, expected D1, migration owner, smoke policy). Pure data: never a secret, never a URL
 // (URLs are resolved against Cloudflare before each build), validated at generation AND at every consumer.

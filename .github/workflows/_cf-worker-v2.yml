@@ -7,9 +7,9 @@ name: CF Worker Pipeline v2
 #
 #   CI  (_cf-worker-ci.yml)   Lint | Typecheck | Unit | Integration | Build Validation | E2E in parallel -> Validation Gate (fail closed)
 #         |
-#   Delivery plan             enabled targets, ONE physical D1, the migration owner (pure data; runs only when CI passed)
+#   Plan                      enabled targets, ONE physical D1, the migration owner (pure data; runs only when CI passed)
 #         |
-#   Database Migration        ONE job: read-only safety checks first (target build, effective-config audit, exact D1 binding), then
+#   Migrate                  ONE job: read-only safety checks first (target build, effective-config audit, exact D1 binding), then
 #         |                   the migration is applied ONCE. No separate Preflight stage.
 #   Delivery x enabled kinds  _cf-worker-delivery.yml, one call per kind: Deploy -> Smoke -> conditional Rollback, independent per kind
 #         |
@@ -451,11 +451,11 @@ env:
 jobs:
   # -------------------------------------------------------------------------
   # CI — ONE call of _cf-worker-ci.yml (six parallel checks + the fail-closed Validation Gate). Credential-free; fork PRs run it, same-repo
-  # PRs are covered by the push run of the same SHA. Its verdict is the only upstream condition of the Delivery plan.
+  # PRs are covered by the push run of the same SHA. Its verdict is the only upstream condition of the Plan.
   # -------------------------------------------------------------------------
   # CI — ONE call of _cf-worker-ci.yml: Lint, Typecheck, Unit, Integration, Build Validation and E2E as six independent, parallel jobs,
   # then the fail-closed Validation Gate. Credential-free; fork PRs run it, same-repo PRs are covered by the push run of the same SHA.
-  # Its result is the only upstream condition of the Delivery plan.
+  # Its result is the only upstream condition of the Plan.
   # -------------------------------------------------------------------------
   ci:
     name: CI
@@ -482,12 +482,12 @@ jobs:
       test_e2e_env: ${{ inputs.test_e2e_env }}
 
   # -------------------------------------------------------------------------
-  # Delivery plan — pure data, no Cloudflare credentials: the enabled delivery kinds of THIS event, the ONE physical D1 they share (distinct
+  # Plan — pure data, no Cloudflare credentials: the enabled delivery kinds of THIS event, the ONE physical D1 they share (distinct
   # databases fail the plan) and its migration owner, the per-kind `on_<kind>` switches and target `descriptors`, the canonical lock `group`.
   # Runs only after a passed CI, so every job below that needs the plan is implicitly gated by CI. A verify call plans from phase_state.
   # -------------------------------------------------------------------------
   plan:
-    name: Delivery plan
+    name: Plan
     needs: [ci]
     if: always() && (inputs.pipeline_phase == 'verify' || (needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed' && github.ref_type == 'branch' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')))
     runs-on: ${{ inputs.runner }}
@@ -533,7 +533,7 @@ jobs:
   # proceeds) without d1_migrations; never on pull_request, delete or a verify call. The D1 schema is never rolled back automatically.
   # =========================================================================
   migration:
-    name: Database Migration
+    name: Migrate
     needs: [plan]
     if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.plan.result == 'success' && needs.plan.outputs.has_migrations == 'true'
     runs-on: ${{ inputs.runner }}
@@ -603,7 +603,7 @@ jobs:
   # the single Migration job (success, or skipped when nothing is migrated) and is never touched by another kind's Deploy / Smoke / Rollback.
   # =========================================================================
   delivery_production:
-    name: Delivery (production)
+    name: production
     needs: [plan, migration]
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_production == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
     uses: $/.github/workflows/_cf-worker-delivery.yml
@@ -630,7 +630,7 @@ jobs:
       SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
 
   delivery_native_branch:
-    name: Delivery (native-branch)
+    name: native-branch
     needs: [plan, migration]
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_native_branch == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
     uses: $/.github/workflows/_cf-worker-delivery.yml
@@ -649,7 +649,7 @@ jobs:
     secrets: *delivery_secrets
 
   delivery_native_dev:
-    name: Delivery (native-dev)
+    name: native-dev
     needs: [plan, migration]
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_native_dev == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
     uses: $/.github/workflows/_cf-worker-delivery.yml
@@ -668,7 +668,7 @@ jobs:
     secrets: *delivery_secrets
 
   delivery_persistent_dev:
-    name: Delivery (persistent-dev)
+    name: persistent-dev
     needs: [plan, migration]
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_persistent_dev == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
     uses: $/.github/workflows/_cf-worker-delivery.yml
@@ -719,7 +719,7 @@ jobs:
   # on ANY event so a misconfigured caller is visible. (production-only keeps ignoring preview_on_branch_push=true, for compatibility.)
   # -------------------------------------------------------------------------
   config-guard:
-    name: Config guard
+    name: Guard
     if: inputs.pipeline_phase != 'verify' && ((inputs.deployment_strategy == 'production-only' && (inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push)) || (inputs.shared_dev_on_branch_push && inputs.shared_dev_native_preview_on_branch_push))
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 2
@@ -733,7 +733,7 @@ jobs:
   # branch delete -> retire the ledger, the Preview is KEPT) and `persistent-dev` (Hybrid, explicit dispatch on the approved ref only).
   # -------------------------------------------------------------------------
   lifecycle:
-    name: Preview lifecycle
+    name: lifecycle
     if: inputs.pipeline_phase != 'verify' && inputs.deployment_strategy != 'production-only' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'delete' && github.event.ref_type == 'branch'))
     uses: $/.github/workflows/_cf-worker-lifecycle.yml
     permissions:
@@ -747,7 +747,7 @@ jobs:
       runner: ${{ inputs.runner }}
 
   persistent-dev:
-    name: Persistent Dev (Hybrid)
+    name: persistent-dev
     if: inputs.pipeline_phase != 'verify' && github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref
     uses: $/.github/workflows/_cf-worker-persistent-dev.yml
     permissions:

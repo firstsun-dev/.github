@@ -35,7 +35,7 @@ defaults:
 
 jobs:
   lifecycle:
-    name: Preview lifecycle
+    name: ledger
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     concurrency:

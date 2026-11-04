@@ -85,7 +85,7 @@ checked read-only (`heaven-monorepo`, `innovation-apps`) this cannot matter — 
 
 ### Migration (unchanged guarantees)
 
-Exactly one remote-D1 job per pipeline, same order, same Environment protection: `Validation → Plan → Database Migration (resolve D1 · validate bindings · audit effective config · stale-SHA guard · apply once) → Delivery`.
+Exactly one remote-D1 job per pipeline, same order, same Environment protection: `Validation → Plan → Migrate (resolve D1 · validate bindings · audit effective config · stale-SHA guard · apply once) → Delivery`.
 It stays inline in the public workflow: extracting it would add a workflow-call layer and re-plumb the descriptors, the inputs blob and the credentials without removing a stage or
 weakening anything, which the brief rules out. Preview/Dev still can never reach the Production D1 (plan + engine audit); the shared-D1 group still serialises Workers sharing one D1; distinct physical D1s are still rejected by the plan.
 
@@ -195,7 +195,7 @@ The scratch Environments are unprotected and hold fake D1 ids, so Environment ap
 
 No call enables two distinct physical D1s in any modeled event, so the single-D1 rule does not reject any supported configuration. Not modeled: the post-build effective-config audit of Astro/adapter-generated configs (blog Shared Dev is off; it runs only in a live Migration/Deploy).
 
-**Required Checks.** Branch protection and rulesets could not be read for the four private repositories: the API answers `403 Upgrade to GitHub Pro or make this repository public` although the token has repository admin rights (organization plan: `free`; organization rulesets: `Upgrade to GitHub Team`). This is a plan limit, not a permissions gap, and it makes enforcement unlikely, but it is not proof — a rule configured under an earlier plan would be invisible here. Treat them as **UNVERIFIED — ADMIN ACCESS REQUIRED** and have an administrator confirm in the repository settings that none of the following contexts is required (`<job>` is the caller's job name: `Pipeline` for blog, innovation-apps and heaven-www; `Heaven ID`, `Heaven Checkin`, `Heaven ID Test Client` for heaven-monorepo; `cf` for anas-mcp). Required-check names as seen on the consumers' recent default-branch runs ("today") and in the `8ad4d40` scratch runs ("after"):
+**Required Checks.** Branch protection and rulesets could not be read for the four private repositories: the API answers `403 Upgrade to GitHub Pro or make this repository public` although the token has repository admin rights (organization plan: `free`; organization rulesets: `Upgrade to GitHub Team`). This is a plan limit, not a permissions gap, and it makes enforcement unlikely, but it is not proof — a rule configured under an earlier plan would be invisible here. Treat them as **UNVERIFIED — ADMIN ACCESS REQUIRED** and have an administrator confirm in the repository settings that none of the following contexts is required (`<job>` is the caller's job name: `Pipeline` for blog, innovation-apps and heaven-www (blog and heaven-www move to `CD`); `Heaven ID`, `Heaven Checkin`, `Heaven ID Test Client` for heaven-monorepo; `cf` for anas-mcp). Required-check names as seen on the consumers' recent default-branch runs ("today") and in the `8ad4d40` scratch runs ("after"):
 
 | Today (consumer runs) | After `8ad4d40` |
 | --- | --- |
@@ -206,9 +206,10 @@ No call enables two distinct physical D1s in any modeled event, so the single-D1
 | `<job> / Build Validation` | `<job> / CI / Build Validation` |
 | `<job> / E2E` and `<job> / E2E (<name>, <args>, <suffix>)` (blog: four variants) | `<job> / CI / E2E` and `<job> / CI / E2E (<name>, <args>, <suffix>)` |
 | — | `<job> / CI / Validation Gate` (new aggregate) |
-| `<job> / Migration` | `<job> / Database Migration` |
-| `<job> / Deploy`, `Smoke Tests`, `Revert on Verify Failure`, `Shared Dev`, `Shared Dev Smoke Tests`, `Shared Dev Revert on Verify Failure` | `<job> / Delivery (production\|native-branch\|native-dev\|persistent-dev) / Deploy\|Smoke Tests\|Revert on Verify Failure` |
-| `<job> / Release`, `Config guard`, `Preview lifecycle`, `Persistent Dev (Hybrid)` | unchanged; new `<job> / Delivery plan` |
+| `<job> / Migration` | `<job> / Migrate` |
+| `<job> / Deploy`, `Smoke Tests`, `Revert on Verify Failure`, `Shared Dev`, `Shared Dev Smoke Tests`, `Shared Dev Revert on Verify Failure` | `<job> / <kind> / Deploy\|Smoke Tests\|Revert on Verify Failure` (`<kind>` = `production\|native-branch\|native-dev\|persistent-dev`) |
+| `<job> / Release` | unchanged |
+| `<job> / Config guard`, `Preview lifecycle`, `Persistent Dev (Hybrid)` | `<job> / Guard`, `<job> / lifecycle / ledger`, `<job> / persistent-dev / manual`; new `<job> / Plan` |
 
 Skipped jobs (unconfigured checks) report as skipped; a required context that is never emitted blocks merging. Nothing was modified in any repository's protection settings.
 
@@ -227,7 +228,7 @@ Skipped jobs (unconfigured checks) report as skipped; a required context that is
 ### Remaining risks and limitations
 
 * **Runner floor 2.336.0** for every runner passed as `runner` (see above); GHES is unsupported by `$/`. Confirmed `2.338.0` on all ten org runners on 2026-11-03.
-* **Check names changed** (`<job> / CI / Lint`, `<job> / Database Migration`, `<job> / Delivery (<kind>) / …`): required status checks in other consumers must be updated when they adopt this ref; they are unreadable on four of the five consumers (Free plan), see the table above.
+* **Check names changed** (`<job> / CI / Lint`, `<job> / Migrate`, `<job> / <kind> / …`): required status checks in other consumers must be updated when they adopt this ref; they are unreadable on four of the five consumers (Free plan), see the table above.
 * `actionlint` cannot lint `$/` yet (two message formats ignored, guarded by the contract test).
 * A verify call queues under the recorded group before the Plan proves it (see "Concurrency and phase_state").
 * The public workflow is 769 lines, above the 600–750 target: the remaining bulk is the 60-input / 20-output public interface (≈ 300 lines), which Phase 1 may not change.
