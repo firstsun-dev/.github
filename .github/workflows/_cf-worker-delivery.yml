@@ -176,6 +176,21 @@ jobs:
         run: |
           h="${HANDOFF:-}"; [ -n "$h" ] || h='{}'
           echo "go=$(printf '%s' "$h" | jq -r '.published == "true"')" >> "$GITHUB_OUTPUT"
+      # GitHub appends `success` (with no environment_url: nothing was published) to the Environment deployment when the Deploy
+      # job ends, even when the stale guard skipped every publish step. This job runs after Deploy ended, so it can correct that
+      # record: a superseded Production run is "inactive", not a successful deployment with a blank URL. Production only.
+      - name: Mark a superseded Production deployment inactive
+        if: steps.go.outputs.go != 'true' && fromJSON(inputs.descriptor).kind == 'production'
+        env:
+          ENV_NAME: ${{ fromJSON(inputs.descriptor).environment }}
+        run: |
+          h="${HANDOFF:-}"; [ -n "$h" ] || h='{}'
+          [ "$(printf '%s' "$h" | jq -r '.stale == "true"')" = true ] || exit 0
+          id="$(gh api "repos/$GITHUB_REPOSITORY/deployments?environment=$(printf %s "$ENV_NAME" | jq -sRr @uri)&sha=$GITHUB_SHA&per_page=1" -q '.[0].id // empty')" || id=""
+          if [ -z "$id" ]; then echo "::warning::no $ENV_NAME deployment at $GITHUB_SHA to mark as superseded"; exit 0; fi
+          gh api "repos/$GITHUB_REPOSITORY/deployments/$id/statuses" -f state=inactive -f log_url="${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/${GITHUB_RUN_ID:-0}" \
+            -f description="Superseded by a newer push before publish; nothing deployed" >/dev/null \
+            || echo "::warning::could not mark the superseded $ENV_NAME deployment inactive"
       - uses: actions/checkout@v6
         if: steps.go.outputs.go == 'true'
         with:
