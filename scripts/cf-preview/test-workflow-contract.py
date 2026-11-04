@@ -293,6 +293,7 @@ def gate_cli(result, mj, d1="true", kind="native-branch", owner="native-branch",
     env = {"PATH": "/usr/bin:/bin:" + __import__("os").path.dirname(__import__("shutil").which("node") or "/usr/bin/node"), "DESCRIPTOR": d, "D1_MIGRATIONS": d1, "MIGRATION_RESULT": result, "MIGRATION_JSON": mj}
     r = subprocess.run(["node", "actions/cf-preview/cli.mjs", "migration-gate", "--kind", kind], env=env, capture_output=True, text=True)
     return r.returncode, (r.stdout + r.stderr)
+import os
 import subprocess  # noqa: E402
 APPLIED = json.dumps({"migration": "applied", "kind": "native-branch", "d1_id": "DB1"})
 check(gate_cli("success", APPLIED)[0] == 0, "Migration Gate (executed): a succeeded Migration job with an applied migration of the planned owner on the planned D1 authorizes the publish")
@@ -721,5 +722,34 @@ check("CLOUDFLARE_API_TOKEN" not in yaml.dump(djobs["smoke"]) and not any("secre
 ENGINE_SH = open("actions/cf-preview/engine.sh").read()
 check(ENGINE_SH.count('"$TOOLS_DIR/build.sh"') == 1 and ENGINE_SH.count('"$TOOLS_DIR/publish.sh"') == 1 and ENGINE_SH.count("run_build ") == 2 and ENGINE_SH.count("run_publish ") == 2,
       "engine: ONE audited build primitive and ONE publish primitive, shared by the normal run and the recovery rebuild (recovery only supplies its state dir, rebound env/version, no host re-check)")
+
+# ---------------------------------------------------------------- superseded Production deployments are not "success + blank URL"
+# GitHub appends `success` to the Environment deployment when the Deploy job ends, even when the stale guard skipped every
+# publish step (hand-off: stale=true, published unset). The Smoke job (which runs after the Deploy job ended) must then
+# append `inactive` to THAT deployment - for Production only, never for a published or failed deployment.
+import tempfile as _tf
+SUP = next((st for st in djobs["smoke"]["steps"] if st.get("name", "").startswith("Mark a superseded")), None)
+check(SUP is not None, "Smoke: a step marks a superseded Production deployment inactive")
+def sup_run(handoff, kind="production", env_name="app/prod", sha="abc1234"):
+    if SUP is None:
+        return None
+    d = _tf.mkdtemp()
+    open(f"{d}/gh", "w").write('#!/usr/bin/env bash\necho "gh $*" >> "$LOG"\ncase "$*" in *"deployments?environment"*) echo 77;; esac\n')
+    os.chmod(f"{d}/gh", 0o755)
+    env = {"PATH": f"{d}:/usr/bin:/bin", "LOG": f"{d}/log", "HANDOFF": handoff, "GITHUB_REPOSITORY": "o/r", "GITHUB_SHA": sha, "KIND": kind, "ENV_NAME": env_name,
+           "GITHUB_RUN_ID": "1", "GITHUB_SERVER_URL": "https://github.com", "GH_TOKEN": "x"}
+    ran = bool(ev(SUP.get("if", "true"), Ctx({"steps": {"go": {"outputs": {"go": "false"}}}, "inputs": {"descriptor": json.dumps({"kind": kind, "environment": env_name})}}, {})))
+    if not ran:
+        return "skipped"
+    r = subprocess.run(["bash", "-eo", "pipefail", "-c", SUP["run"]], env=env, capture_output=True, text=True)
+    return r.returncode, open(f"{d}/log").read() if os.path.exists(f"{d}/log") else ""
+if SUP is not None:
+    rc_, log_ = sup_run('{"stale":"true","kind":"production"}')
+    check(rc_ == 0 and "deployments?environment=app%2Fprod&sha=abc1234" in log_ and "deployments/77/statuses" in log_ and "state=inactive" in log_ and "Superseded" in log_, "Smoke (executed): a superseded Production run appends `inactive` to its newest Environment deployment at this SHA")
+    check(sup_run('{"stale":"false","published":"true"}') in ("skipped",) or "statuses" not in (sup_run('{"stale":"false","published":"true"}')[1]), "Smoke (executed): a fresh run never marks its deployment inactive")
+    check("statuses" not in sup_run('{}')[1], "Smoke (executed): an empty hand-off marks nothing")
+    check(sup_run('{"stale":"true"}', kind="native-branch", env_name="app/preview") in ("skipped",) or "statuses" not in sup_run('{"stale":"true"}', kind="native-branch", env_name="app/preview")[1], "Smoke: Preview kinds keep their behaviour (only Production is touched)")
+    check(djobs["smoke"]["permissions"].get("deployments") == "write" and "secrets" not in yaml.dump(SUP), "Smoke: the step needs only deployments:write and uses no secrets")
+
 
 sys.exit(fail)
