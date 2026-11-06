@@ -57,6 +57,9 @@ export function resolveDeliveryTargets({
   if (sharedDevOnPush && sharedDevNativeOnPush) {
     throw new Error('shared_dev_on_branch_push (separate persistent Dev Worker) and shared_dev_native_preview_on_branch_push (named Native Preview "dev") are conflicting automatic Dev channels; enable only one');
   }
+  // Fail closed: an explicit deployment request is honoured exactly or refused - never ignored. A non-empty dispatch_target is only
+  // meaningful for a workflow_dispatch (push / pull_request / delete / anything else with a target is a conflicting request).
+  if (dispatchTarget !== '' && event !== 'workflow_dispatch') throw new Error(`dispatch_target '${dispatchTarget}' is only valid for a workflow_dispatch (event: ${event || 'unknown'}); refusing to ignore it or fall back to another target (nothing was changed)`);
   if (event === 'workflow_dispatch' && dispatchTarget !== '') {
     if (dispatchTarget !== 'persistent-dev') throw new Error(`dispatch_target '${dispatchTarget}' is not valid (expected persistent-dev or empty); refusing to fall back to another target`);
     const r = String(ref).startsWith('refs/heads/') ? classifyEvent({ event, ref, strategy, devRef, dispatchTarget }) : { action: 'skip', reason: 'not a branch ref' };
@@ -345,6 +348,129 @@ export function verificationOutcome(level) {
   return { verified: false, kind: level === 'skipped' ? 'skipped' : 'liveness' };
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Publish-only contract of a caller's `dev_deploy_cmd`. Two layers, neither relies on matching the command STRING alone:
+//   1. wranglerPublishBlock: judges the ARGUMENT VECTOR of every Wrangler invocation the command actually makes (the guard shim
+//      calls it before delegating) - so it applies to `pnpm run deploy`, scripts, nested shells, anything that reaches Wrangler.
+//   2. devPublishCmdBlock: an EARLY static rejection (before the migration) of the unambiguous legacy shapes, over the command and
+//      the package.json scripts it runs. Supplementary: an opaque command is still caught by layer 1 before any mutation.
+// ---------------------------------------------------------------------------------------------------------------------
+const WRANGLER_VALUE_FLAGS = new Set(['--config', '-c', '--env', '-e', '--name', '--cwd', '--message', '--tag', '--var', '--define', '--assets', '--compatibility-date', '--compatibility-flags', '--site', '--outdir', '--routes', '--route', '--triggers']);
+const WRANGLER_ALLOWED = new Set(['deploy', 'versions', 'deployments', 'whoami', 'version']);
+const WRANGLER_MUTATING = (cmd, sub) => cmd === 'deploy' || (cmd === 'versions' && (sub === 'upload' || sub === 'deploy'));
+
+/** null = the Wrangler call may proceed; else why it is refused BEFORE it can change anything. `auditedConfig` and `config` values are compared after path normalisation by the caller. */
+export function wranglerPublishBlock({ args = [], auditedConfig = '', normalize = (x) => x }) {
+  const positional = [];
+  const configs = [];
+  let env = false;
+  let name = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = String(args[i]);
+    if (a === '--') { positional.push(...args.slice(i + 1).map(String)); break; }
+    const eq = a.indexOf('=');
+    const flag = a.startsWith('--') && eq > 0 ? a.slice(0, eq) : a;
+    const inline = a.startsWith('--') && eq > 0 ? a.slice(eq + 1) : undefined;
+    if (a.startsWith('-') && a.length > 1) {
+      let val = inline;
+      if (val === undefined && WRANGLER_VALUE_FLAGS.has(flag)) { val = String(args[i + 1] ?? ''); i++; }
+      if (flag === '--config' || flag === '-c') configs.push(val ?? '');
+      else if (flag === '--env' || flag === '-e') env = true;
+      else if (flag === '--name') name = true;
+      continue;
+    }
+    positional.push(a);
+  }
+  const [cmd = '', sub = ''] = positional;
+  if (!cmd || cmd === 'help') return null;
+  if (!WRANGLER_ALLOWED.has(cmd) && !args.some((a) => ['--version', '-v', '--help', '-h'].includes(String(a)))) {
+    return { code: 'not_publish_only', why: `dev_deploy_cmd must only publish: \`wrangler ${cmd}\` is not allowed (migrations are applied by the Migrate job; nothing else may change the Worker or its resources from the publish command).` };
+  }
+  if (!WRANGLER_MUTATING(cmd, sub)) return null;
+  if (env) return { code: 'env_selection', why: 'the publish command selects a Wrangler environment (--env / -e) itself. The audited config is already the one effective configuration; publish with `wrangler deploy --config "$CF_AUDITED_CONFIG"` only.' };
+  if (name) return { code: 'name_override', why: 'the publish command overrides the Worker name (--name); the audited config alone defines the deployed Worker.' };
+  if (configs.length !== 1) return { code: 'config_not_audited', why: `the publish command must pass exactly one --config and it must be the audited config ("$CF_AUDITED_CONFIG"); it passed ${configs.length}.` };
+  if (normalize(configs[0]) !== normalize(auditedConfig)) return { code: 'config_not_audited', why: `the publish command uses --config ${configs[0]}, not the audited config ${auditedConfig}.` };
+  return null;
+}
+
+/**
+ * Early static check of a caller's dev_deploy_cmd (command text + the package.json scripts it runs, resolved recursively).
+ * Rejects the unambiguous legacy shapes - a Wrangler call that selects its own environment / name, or a command that BUILDS - before the
+ * Dev D1 is migrated. `scripts` = package.json "scripts". null = nothing objectionable found (the runtime guard still applies).
+ */
+export function devPublishCmdBlock(cmd, scripts = {}) {
+  const seen = new Set();
+  const expand = (text, depth) => {
+    if (depth > 6) return text;
+    let out = text;
+    for (const m of text.matchAll(/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?([A-Za-z0-9:_.-]+)/g)) {
+      const sc = m[1];
+      if (Object.prototype.hasOwnProperty.call(scripts, sc) && !seen.has(sc)) { seen.add(sc); out += `\n${expand(String(scripts[sc]), depth + 1)}`; }
+    }
+    return out;
+  };
+  const text = expand(String(cmd), 0);
+  for (const part of text.split(/&&|\|\||[;|\n]/)) {
+    const w = part.trim().split(/\s+/);
+    const at = w.findIndex((x) => /(^|\/)wrangler$/.test(x));
+    if (at >= 0) {
+      const b = wranglerPublishBlock({ args: w.slice(at + 1), auditedConfig: '$CF_AUDITED_CONFIG', normalize: (x) => String(x).replace(/^"|"$/g, '').replace(/^\$\{(\w+)\}$/, '$$$1') });
+      if (b && (b.code === 'env_selection' || b.code === 'name_override' || b.code === 'not_publish_only')) return b;
+    }
+    if (/(^|\s)(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?build(?:[:\w.-]*)(\s|$)|\b(?:vite|tsc|next|astro|webpack|rollup|esbuild)\s+build\b/.test(part)) {
+      return { code: 'rebuilds', why: 'dev_deploy_cmd builds. The audited artifact is produced by dev_build_cmd (build + audit); the publish command must only publish it (`wrangler deploy --config "$CF_AUDITED_CONFIG"`).' };
+    }
+  }
+  return null;
+}
+
+/**
+ * Which build env the CI validation commands import (and the value of VITE_APP_ENV): the INTENDED deployment target, resolved from
+ * pure event/input data because CI runs before the Plan (the Plan stays the authorization gate). JS twin of the `ci_target_env`
+ * expression of _cf-worker-v2.yml (the contract test compares them).
+ *   workflow_dispatch + dispatch_target persistent-dev (any ref, `main` included) -> dev
+ *   otherwise: refs/heads/main -> prod; everything else (feature branches, PRs, tags) -> preview
+ */
+export function ciTargetEnv({ event = '', ref = '', dispatchTarget = '' }) {
+  if (event === 'workflow_dispatch' && dispatchTarget === 'persistent-dev') return 'dev';
+  return ref === 'refs/heads/main' ? 'prod' : 'preview';
+}
+
+/**
+ * The ONE D1 compatibility rule for restoring older Worker code (Production rollback and non-Production recovery alike):
+ * after an applied schema change the older code must be attested (d1_rollback_compat) AND the applied migrations provably
+ * additive. D1 itself is never reverted. null = allowed.
+ */
+export function d1SchemaBlock({ d1Pending = false, d1Compat = '', d1Scan = '' }) {
+  if (!d1Pending) return null;
+  if (d1Compat !== 'expand-contract') return { code: 'd1_unattested', why: "This run applied D1 migrations and d1_rollback_compat is not 'expand-contract': compatibility of the previous Worker version with the new schema is unproven." };
+  if (d1Scan !== 'additive') return { code: 'd1_not_additive', why: `This run applied D1 migrations that are not provably additive (scan: ${d1Scan || 'unknown'}); the previous Worker version may not work on the new schema.` };
+  return null;
+}
+
+/**
+ * Non-Production recovery (Native Branch / Native Dev / Persistent Dev): may the last known-good code be redeployed?
+ * Fails closed on everything it cannot prove, using the migration result of THIS pipeline.
+ *   d1Migrations false            -> allowed (no D1 involved)
+ *   migration result missing/bad  -> blocked (state of D1 unknown)
+ *   result for another D1         -> blocked
+ *   schema_changed not true/false -> blocked; false -> allowed; true -> d1SchemaBlock
+ * `migration` = the parsed hand-off of the Migration job (or null). null = allowed.
+ */
+export function nonProdRecoveryBlock({ d1Migrations = false, migration = null, expectedId = '', d1Compat = '' }) {
+  if (!d1Migrations) return null;
+  if (migration === null || typeof migration !== 'object' || Array.isArray(migration) || migration.migration !== 'applied') {
+    return { code: 'migration_result_missing', why: 'D1 migrations are enabled but this pipeline handed over no valid applied-migration result: the D1 schema state is unknown, so older code cannot be proven compatible.' };
+  }
+  if (!expectedId || migration.d1_id !== expectedId) {
+    return { code: 'd1_identity_mismatch', why: `The migration result is for D1 '${migration.d1_id || 'unknown'}', not this target's D1 '${expectedId || 'unknown'}'.` };
+  }
+  const changed = String(migration.schema_changed ?? '');
+  if (changed !== 'true' && changed !== 'false') return { code: 'migration_result_invalid', why: `The migration result has no valid schema_changed value ('${changed || 'missing'}').` };
+  return d1SchemaBlock({ d1Pending: changed === 'true', d1Compat, d1Scan: String(migration.d1_scan ?? '') });
+}
+
 /**
  * Production automatic rollback: why it must NOT happen (null = allowed so far). Checked in this order, fail closed.
  * `live` = the version Cloudflare reports as live; pass undefined to skip that last, observation-based check.
@@ -355,10 +481,8 @@ export function prodRollbackBlock({ policy, previous = '', current = '', worker 
   if (!previous) return { code: 'no_previous_version', why: 'No previous Worker version id was recorded (first deployment, or the deployment list was unreadable); there is nothing safe to roll back to.' };
   if (!current || !worker) return { code: 'no_identity', why: 'The deployed version id or Worker name was not handed over.' };
   if (previous === current) return { code: 'same_version', why: 'The previous and the new version id are identical.' };
-  if (d1Pending) {
-    if (d1Compat !== 'expand-contract') return { code: 'd1_unattested', why: "This run applied D1 migrations and d1_rollback_compat is not 'expand-contract': compatibility of the previous Worker version with the new schema is unproven." };
-    if (d1Scan !== 'additive') return { code: 'd1_not_additive', why: `This run applied D1 migrations that are not provably additive (scan: ${d1Scan || 'unknown'}); the previous Worker version may not work on the new schema.` };
-  }
+  const d1 = d1SchemaBlock({ d1Pending, d1Compat, d1Scan });
+  if (d1) return d1;
   if (live !== undefined && live !== current) {
     return { code: 'live_version_changed', why: `The live version is '${live || 'unknown'}', not the version \`${current}\` this run deployed; refusing to replace someone else's deployment.` };
   }
@@ -376,7 +500,8 @@ export function rollbackVerdict({ target, rbResult = '', rbVerify = '', rbLevel 
     if (rbResult === 'rolled_back') {
       if (rbVerify === 'success') { result = isContentLevel(rbLevel) ? 'restored_verified' : 'restored_unverified'; level = rbLevel; } else result = 'restored_unhealthy';
     } else result = rbResult === 'blocked' ? 'blocked' : 'failed';
-  } else if (!goodSha) result = 'no_known_good';
+  } else if (rbResult === 'blocked') result = 'blocked';
+  else if (!goodSha) result = 'no_known_good';
   else if (recovered === 'success' && verified === 'success') { result = isContentLevel(smokeLevel) ? 'restored_verified' : 'restored_unverified'; level = smokeLevel; } else result = 'failed';
   return { result, level, ok: result === 'restored_verified' };
 }

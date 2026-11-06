@@ -242,7 +242,12 @@ check(plan_if(event="workflow_dispatch"), "plan: runs on a workflow_dispatch aft
 for bad in ("failure", "cancelled", "skipped"):
     check(not plan_if(needs={"ci": {"result": bad, "outputs": {"validation": "passed"}}}), f"plan: blocked when the CI call is {bad}")
 check(not plan_if(needs={"ci": {"result": "success", "outputs": {"validation": ""}}}) and not plan_if(needs={"ci": {"result": "success", "outputs": {}}}), "plan: a green CI call without the gate's `validation=passed` verdict is still blocked (fail closed)")
-check(not plan_if(event="pull_request", ref="refs/pull/1/merge") and not plan_if(event="delete") and not plan_if(ref="refs/tags/v1"), "plan: never for PRs, deletes or tags")
+check(not plan_if(event="pull_request", ref="refs/pull/1/merge") and not plan_if(event="delete") and not plan_if(ref="refs/tags/v1"), "plan: never for PRs, deletes or tags WITHOUT an explicit dispatch_target")
+check(all(plan_if(inputs={"dispatch_target": "persistent-dev"}, event=e, ref=r, needs=n) for e, r, n in (
+        ("workflow_dispatch", "refs/tags/v1", {"ci": {"result": "success", "outputs": {"validation": "passed"}}}),
+        ("pull_request", "refs/pull/1/merge", {"ci": {"result": "success", "outputs": {"validation": "passed"}}}),
+        ("delete", FEAT, {"ci": {"result": "skipped", "outputs": {}}}), ("push", "refs/tags/v1", {"ci": {"result": "failure", "outputs": {}}}))),
+      "plan: an EXPLICIT dispatch_target on a tag / PR / delete / push always reaches the Plan, which then fails it (an invalid explicit request cannot end green without deploying)")
 check(plan_if(inputs={"pipeline_phase": "verify", "phase_state": "{}"}, needs={"ci": {"result": "skipped", "outputs": {}}}), "plan: a verify call plans from the hand-off, not from CI")
 # ---------------------------------------------------------------- call-job gating (plan outputs are the only per-kind switch)
 # Routing stub of the plan's descriptor: the call jobs only ROUTE it (delivery.test.mjs proves its content).
@@ -472,7 +477,9 @@ for n, called_doc in (("ci", cdoc), ("lifecycle", ldoc), *[(c, ddoc) for c in so
     check(set(given) <= set(decl) and all(k in given for k, v in decl.items() if v.get("required")), f"{n}: its `with:` keys are declared inputs of the called workflow and every required input is supplied")
     sec_decl = set(called_doc[True]["workflow_call"].get("secrets", {}))
     check(set(jobs[n].get("secrets", {})) <= sec_decl, f"{n}: only secrets the called workflow declares are passed")
-check(all(jobs["ci"]["with"][k] == "${{ inputs." + k + " }}" for k in cdoc[True]["workflow_call"]["inputs"]), "ci: every CI input is wired 1:1 from the SAME-named public input (no renamed or re-derived command)")
+check(all(jobs["ci"]["with"][k] == "${{ inputs." + k + " }}" for k in cdoc[True]["workflow_call"]["inputs"] if k != "ci_target_env"), "ci: every CI input except the resolved `ci_target_env` is wired 1:1 from the SAME-named public input (no renamed or re-derived command)")
+check(set(jobs["ci"]["with"]) - set(cdoc[True]["workflow_call"]["inputs"]) == set() and "ci_target_env" in jobs["ci"]["with"] and jobs["ci"].get("needs") is None,
+      "ci: the CI environment is resolved by an expression on the CI call itself - no extra job and no dependency on the Plan")
 ALINT = yaml.safe_load(open(".github/actionlint.yaml"))["paths"]
 check(sorted(len(v["ignore"]) for v in ALINT.values()) == [1, 2] and all("queue" in x for x in ALINT[WF]["ignore"]) and all("$/" in x or "\\$/" in x for x in ALINT[".github/workflows/_cf-worker-*.yml"]["ignore"]),
       "actionlint: exactly three message ignores - `concurrency.queue` and the two `$/` formats - everything else is still linted")
@@ -491,7 +498,7 @@ for j, inp in CMDS.items():
     check(cjobs[j].get("continue-on-error") is None, f"{j}: failures are never hidden by continue-on-error")
     check(steps[0].get("uses") == "actions/checkout@v6" and steps[1].get("uses") == "$/actions/cf-ci-check", f"{j}: checks out the app, then runs the CI action (nothing else)")
 ci_steps = CI_ACTION["runs"]["steps"]
-check(ci_steps[0]["name"].startswith("Import validation env") and "parse-env.mjs\" TARGET_BUILD_ENV" in ci_steps[0]["run"] and ci_steps[0]["run"].index("TARGET_BUILD_ENV") < ci_steps[0]["run"].index("CI_ENV"),
+check(ci_steps[1]["name"].startswith("Import validation env") and "parse-env.mjs\" TARGET_BUILD_ENV" in ci_steps[1]["run"] and ci_steps[1]["run"].index("TARGET_BUILD_ENV") < ci_steps[1]["run"].index("CI_ENV"),
       "cf-ci-check imports the target build env, then ci_env, through the safe importer (precedence preserved)")
 ck = next(s for s in ci_steps if s.get("id") == "check")
 check(ck["env"]["CMD"] == "${{ inputs.cmd }}" and ck["run"] == 'bash -c "$CMD"' and "continue-on-error" not in ck, "cf-ci-check runs its one command via env (never interpolated) and never hides a failure")
@@ -499,7 +506,11 @@ check(any("GITHUB_STEP_SUMMARY" in s.get("run", "") and s.get("if") == "always()
 check(any(s.get("uses", "").startswith("$/actions/mailpit") and s.get("if") == "inputs.use_mailpit == 'true'" for s in ci_steps) and
       all(("use_mailpit" in str(next(s for s in cjobs[j]["steps"] if s.get("uses") == "$/actions/cf-ci-check")["with"])) == (j in ("unit", "integration")) for j in CMDS),
       "Mailpit starts only for Unit and Integration tests")
-check("build_env_prod" in ci_steps[0]["env"]["TARGET_BUILD_ENV"] and "build_env_preview" in ci_steps[0]["env"]["TARGET_BUILD_ENV"], "validation jobs use the Production build env on main and the Preview build env elsewhere")
+_tb = ci_steps[1]["env"]["TARGET_BUILD_ENV"]
+check(all(f"inputs.build_env_{k}" in _tb for k in ("prod", "dev", "preview")) and "github.ref" not in _tb, "validation jobs import exactly ONE build env, selected by the resolved target environment (never by the ref alone)")
+check(all(cjobs[j]["steps"][1]["with"]["target_env"] == "${{ inputs.ci_target_env }}" and cjobs[j]["steps"][1]["with"]["build_env_dev"] == "${{ inputs.build_env_dev }}" for j in CMDS), "every validation job passes the resolved target environment and the Dev build env to the CI action")
+_ck = next(s_ for s_ in ci_steps if s_.get("id") == "check")
+check(_ck["env"]["VITE_APP_ENV"] == "${{ steps.target.outputs.env }}", "VITE_APP_ENV is the resolved target environment (dev for a persistent-dev dispatch), not a function of the ref")
 e2e_text = yaml.dump(cjobs["e2e"])
 check("test_e2e_build_cmd" in e2e_text and "test_e2e_env" in e2e_text and "inputs.build_cmd" not in e2e_text, "E2E builds with its own test build command and env")
 uploads = [(j, s) for j, job in allj.items() for s in job.get("steps", []) if "upload-artifact" in str(s.get("uses", ""))]
@@ -757,3 +768,15 @@ if SUP is not None:
 
 
 sys.exit(fail)
+
+
+# ---------------------------------------------------------------- CI environment contract: expression == delivery.mjs ciTargetEnv, and the spec table
+CI_EXPR = jobs["ci"]["with"]["ci_target_env"]
+ci_cases = [(e, r, dt) for e in ("push", "workflow_dispatch", "pull_request", "delete") for r in ("refs/heads/main", "refs/heads/feat/x", "refs/heads/dev", "refs/pull/1/merge", "refs/tags/v1") for dt in ("", "persistent-dev", "Persistent-Dev", "production")]
+yaml_ci = [render(CI_EXPR, scenario(e, r, {"dispatch_target": dt})) for e, r, dt in ci_cases]
+js_ci = json.loads(subprocess.run(["node", "-e", "import('./actions/cf-preview/delivery.mjs').then(async m=>{let t='';for await(const c of process.stdin)t+=c;console.log(JSON.stringify(JSON.parse(t).map(([e,r,d])=>m.ciTargetEnv({event:e,ref:r,dispatchTarget:d}))))})"], input=json.dumps(ci_cases), capture_output=True, text=True, check=True).stdout)
+check(yaml_ci == js_ci and len(ci_cases) == 80, f"CI environment: the workflow expression and delivery.mjs ciTargetEnv agree on all {len(ci_cases)} event/ref/target scenarios")
+ci_of = lambda e, r, dt="": render(CI_EXPR, scenario(e, r, {"dispatch_target": dt}))
+check(ci_of("push", MAIN) == "prod" and ci_of("push", FEAT) == "preview" and ci_of("workflow_dispatch", "refs/heads/dev", "persistent-dev") == "dev"
+      and ci_of("workflow_dispatch", MAIN, "persistent-dev") == "dev" and ci_of("workflow_dispatch", MAIN) == "prod" and ci_of("pull_request", "refs/pull/1/merge") == "preview",
+      "CI environment table: push main -> prod, push feature -> preview, dispatch persistent-dev (approved feature OR main) -> dev, dispatch main without target -> prod, PR -> preview")

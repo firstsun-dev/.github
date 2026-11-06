@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // CLI used by _cf-worker-v2.yml. stdout carries ONLY key=value records (it is piped into $GITHUB_OUTPUT / captured by the shell); every
 // diagnostic and workflow annotation (::error:: / ::warning:: / ::notice:: / ::add-mask::) goes to stderr. Failure = non-zero exit.
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import {
   assertWranglerSupported, auditDevConfig, previewHostReadiness, auditPreviewConfig, auditProdConfig, classifyEvent, extractPreviewUrl,
@@ -9,7 +9,7 @@ import {
 } from './lib.mjs';
 import {
   DELIVERY_KINDS, ENGINE_TARGET, assertKind, branchPreviewIdentity, canonicalOrigin, checkBuildEnvOrigins, environmentName, foreignUrlsInBuildEnv, planMigrations, resolveCanonicalUrl, resolveDeliveryTargets, resolveSmokeMode,
-  buildDescriptors, parseDescriptor, resolveMigrationUsed, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
+  buildDescriptors, parseDescriptor, resolveMigrationUsed, verificationOutcome, prodRollbackBlock, nonProdRecoveryBlock, wranglerPublishBlock, devPublishCmdBlock, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
 } from './delivery.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -288,6 +288,28 @@ try {
         policy: e.POLICY ?? '', previous: e.PREVIOUS ?? '', current: e.CURRENT ?? '', worker: e.WORKER ?? '', d1Pending: e.D1_PENDING === 'true',
         d1Compat: e.D1_COMPAT ?? '', d1Scan: e.D1_SCAN ?? '', live: 'LIVE' in e ? e.LIVE : undefined,
       });
+      out({ block_code: b ? b.code : '', block_why: b ? b.why : '' });
+      break;
+    }
+    case 'wrangler-guard': { // --config <audited>  -- <wrangler args...>; prints block_code / block_why (always exits 0)
+      const norm = (x) => { try { return realpathSync(resolve(String(x))); } catch { return resolve(String(x)); } };
+      const at = process.argv.indexOf('--', 3);
+      const b = wranglerPublishBlock({ args: at < 0 ? [] : process.argv.slice(at + 1), auditedConfig: opt('config'), normalize: norm });
+      out({ block_code: b ? b.code : '', block_why: b ? b.why : '' });
+      break;
+    }
+    case 'publish-cmd-check': { // env: CMD; --package <package.json> (optional). Early static check of dev_deploy_cmd.
+      let scripts = {};
+      try { scripts = JSON.parse(readFileSync(opt('package'), 'utf8')).scripts ?? {}; } catch { scripts = {}; }
+      const b = devPublishCmdBlock(process.env.CMD ?? '', scripts);
+      out({ block_code: b ? b.code : '', block_why: b ? b.why : '' });
+      break;
+    }
+    case 'recovery-guard': { // non-Production recovery; env: D1_MIGRATIONS MIGRATION_JSON D1_EXPECT D1_COMPAT
+      const e = process.env;
+      let migration = null;
+      try { migration = JSON.parse(e.MIGRATION_JSON || 'null'); } catch { migration = null; }
+      const b = nonProdRecoveryBlock({ d1Migrations: e.D1_MIGRATIONS === 'true', migration, expectedId: e.D1_EXPECT ?? '', d1Compat: e.D1_COMPAT ?? '' });
       out({ block_code: b ? b.code : '', block_why: b ? b.why : '' });
       break;
     }

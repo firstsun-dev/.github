@@ -15,10 +15,16 @@ inputs:
     description: Working directory of the app
     default: .
   build_env_prod:
-    description: Production build env (KEY=VALUE lines); used on main
+    description: Production build env (KEY=VALUE lines); imported only when target_env is prod
     default: ''
   build_env_preview:
-    description: Preview build env (KEY=VALUE lines); used on every other ref
+    description: Preview build env (KEY=VALUE lines); imported only when target_env is preview
+    default: ''
+  build_env_dev:
+    description: Dev build env (KEY=VALUE lines); imported only when target_env is dev
+    default: ''
+  target_env:
+    description: prod | dev | preview - the INTENDED deployment target (resolved by the caller from event, ref and dispatch_target). Empty = derived from the ref (main -> prod, else preview).
     default: ''
   ci_env:
     description: Extra nonsecret env applied after the target build env
@@ -32,10 +38,22 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Resolve the CI environment
+      id: target
+      shell: bash
+      env:
+        TARGET_ENV_IN: ${{ inputs.target_env }}
+        REF: ${{ github.ref }}
+      run: |
+        t="$TARGET_ENV_IN"
+        if [ -z "$t" ]; then if [ "$REF" = refs/heads/main ]; then t=prod; else t=preview; fi; fi
+        case "$t" in prod|dev|preview) ;; *) echo "::error::unknown CI target environment '$t' (expected prod, dev or preview)"; exit 1;; esac
+        echo "env=$t" >> "$GITHUB_OUTPUT"
     - name: Import validation env (target env, then ci_env)
       shell: bash
       env:
-        TARGET_BUILD_ENV: ${{ github.ref == 'refs/heads/main' && inputs.build_env_prod || github.ref != 'refs/heads/main' && inputs.build_env_preview || '' }}
+        # Exactly ONE build env is ever imported: the one of the intended target. Another target's env (Production's above all) never is.
+        TARGET_BUILD_ENV: ${{ steps.target.outputs.env == 'prod' && inputs.build_env_prod || steps.target.outputs.env == 'dev' && inputs.build_env_dev || steps.target.outputs.env == 'preview' && inputs.build_env_preview || '' }}
         CI_ENV: ${{ inputs.ci_env }}
       run: |
         node "$GITHUB_ACTION_PATH/../cf-preview/parse-env.mjs" TARGET_BUILD_ENV "$GITHUB_ENV"
@@ -52,7 +70,7 @@ runs:
       working-directory: ${{ inputs.app_path }}
       env:
         CMD: ${{ inputs.cmd }}
-        VITE_APP_ENV: ${{ github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+        VITE_APP_ENV: ${{ steps.target.outputs.env }}
         VITE_APP_VERSION: ${{ inputs.app_version }}
       run: bash -c "$CMD"
     - name: Summary

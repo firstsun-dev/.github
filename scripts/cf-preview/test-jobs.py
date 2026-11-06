@@ -55,7 +55,7 @@ def ctx(ref, inputs=None, secrets=None, needs=None, event="push"):
     # Preview URL is derived from preview_url_suffix exactly like the real one is derived from Cloudflare's preview_url_suffix.
     i = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", app_url_prod="https://app.example.com", preview_host_check=False, preview_url_suffix=SUFFIX)
     i.update(inputs or {})
-    return Ctx({"github": {"event_name": event, "ref": ref, "ref_type": "branch", "ref_name": ref.split("/", 2)[-1],
+    return Ctx({"github": {"event_name": event, "ref": ref, "ref_type": "tag" if ref.startswith("refs/tags/") else "branch", "ref_name": ref.split("/", 2)[-1],
                            "repository": "o/r", "sha": SHA, "run_id": "1", "event": {"head_commit": {"message": "feat: x\nbody"}}},
                 "inputs": i, "needs": needs or {}}, secrets or {})
 
@@ -370,9 +370,9 @@ DEV_INPUTS = {
 }
 
 
-def dev(inputs=None, env=None, toml=DEV_TOML, needs=None, secrets=None, ref=FEAT, env_by_job=None):
+def dev(inputs=None, env=None, toml=DEV_TOML, needs=None, secrets=None, ref=FEAT, env_by_job=None, files=None):
     """persistent-dev (the separate Dev Worker) through the real chain: Gate -> Plan -> Migration -> Deploy -> Smoke -> Rollback."""
-    return run_chain(ref, inputs=dict(DEV_INPUTS, preview_on_branch_push=False, **(inputs or {})), secrets=secrets, env=env, toml=toml, env_by_job=env_by_job)
+    return run_chain(ref, inputs=dict(DEV_INPUTS, preview_on_branch_push=False, **(inputs or {})), secrets=secrets, env=env, toml=toml, env_by_job=env_by_job, files=files)
 
 
 def ran(r, what):
@@ -629,6 +629,12 @@ def group_preview_deploy():
     check("state=inactive" in r["log"] and "state=success" not in r["log"], "Preview liveness is never recorded as a success (known-good) ledger status")
     r = deploy(FEAT, inputs={"smoke_env": "PROBE_HEADERS=CF-Access-Client-Id: x"}, env={"STUB_PROBES": "200 "})
     check(r["outputs"]["smoke_level"] == "content" and r["outputs"]["deployed_and_verified"] == "true" and r["outputs"]["verified_url"] != "" and "state=success" in r["log"], "Preview with authenticated content smoke -> verified, success ledger status")
+    PD1 = dict(PREV_IN, **D1)
+    r = deploy(FEAT, inputs=dict(PD1, d1_rollback_compat="expand-contract"), files=DROP_SQL, env={"STUB_PROBES": "500 ;200 ", "STUB_DEPLOYMENTS": good_dep()})
+    check(r["result"] == "failure" and r["log"].count("preview --name feat-x") == 1 and "`d1_not_additive`" in r["summary"] and "UNVERIFIED" in r["summary"] and "migrations revert" not in r["log"],
+          "Native Branch: destructive migration + failed Smoke -> recovery BLOCKED, last-good code not republished, D1 never reverted")
+    r = deploy(FEAT, inputs=dict(PD1, d1_rollback_compat="expand-contract"), files=ADD_SQL, env={"STUB_PROBES": "500 ;200 ", "STUB_DEPLOYMENTS": good_dep()})
+    check(r["log"].count("preview --name feat-x") == 2, "Native Branch: additive + attested -> recovery proceeds")
     r = deploy(FEAT, inputs=PREV_IN, env={"STUB_PROBES": "500 ;200 ", "STUB_DEPLOYMENTS": good_dep()})
     check(r["result"] == "failure" and r["outputs"]["deployed_and_verified"] == "false", "preview smoke failure: job red, not verified (the failure stays visible although recovery succeeded)")
     check(r["log"].count("preview --name feat-x") == 2, "preview recovery redeploys the last good deployment")
@@ -955,6 +961,20 @@ def group_shared_dev():
         r = manual(**dict(kw, inputs=dict(D1, **kw.get("inputs", {}))))
         check(r["result"] == "failure" and r["res"]["plan"]["result"] == "failure" and nomut(r) and all(r["res"][f"delivery_{KEYED[k]}"]["result"] == "skipped" for k in KINDS) and r["res"]["migration"]["result"] == "skipped",
               f"manual dispatch with {label}: the Plan rejects it - no Migration, no Deploy, nothing built or published")
+    # ---- fail closed: an explicit dispatch_target on ANY event/ref that cannot serve it ends RED (never green with no deployment) and mutates nothing
+    HY = dict(PD, release_cmd="pnpm release", production_rollback_policy="automatic")
+    for label, ref, event, extra in (
+            ("a workflow_dispatch from a TAG ref", "refs/tags/v1", "workflow_dispatch", {"persistent_dev_ref": "refs/tags/v1"}),
+            ("a PUSH to main", MAIN, "push", {}), ("a PUSH to a feature branch", FEAT, "push", {}), ("a PUSH to the approved ref", "refs/heads/dev", "push", {}),
+            ("a pull_request event", "refs/pull/1/merge", "pull_request", {}), ("a branch delete event", FEAT, "delete", {})):
+        r = run_chain(ref, inputs=dict(HY, **D1, **extra), event=event)
+        check(r["result"] == "failure" and r["res"]["plan"]["result"] == "failure" and nomut(r) and r["res"]["migration"]["result"] == "skipped" and not release_runs(r, {"release_cmd": "pnpm release", "dispatch_target": "persistent-dev"})
+              and all(r["res"][f"delivery_{KEYED[k]}"]["result"] == "skipped" for k in KINDS) and "versions upload" not in r["log"],
+              f"explicit persistent-dev request via {label}: the Plan fails the run - no CI-green-and-nothing-deployed, no Production fallback, nothing built, migrated or published")
+    r = run_chain("refs/tags/v1", inputs=dict(PD, dispatch_target=""), event="workflow_dispatch")
+    check(r["result"] == "success" and r["res"]["plan"]["result"] == "skipped" and nomut(r), "a tag dispatch WITHOUT a target is unchanged: Plan skipped, nothing deployed (no explicit request was made)")
+    r = run_chain(MAIN, inputs=dict(HY, dispatch_target=""), event="push")
+    check(r["result"] == "success" and json.loads(r["res"]["plan"]["outputs"]["kinds"]) == ["production"], "a push to main without a target is unchanged: Production")
     # ---- from the approved main ref: persistent Dev, never Production
     r = manual(ref=MAIN, inputs=dict(D1, persistent_dev_ref=MAIN, release_cmd="pnpm release", production_rollback_policy="automatic"))
     check(r["result"] == "success" and json.loads(r["res"]["plan"]["outputs"]["kinds"]) == ["persistent-dev"] and r["res"]["delivery_production"]["result"] == "skipped" and "versions upload" not in r["log"] and "versions deploy" not in r["log"] and r["res"]["delivery_persistent_dev"]["result"] == "success",
@@ -988,6 +1008,32 @@ def group_shared_dev():
     check(r["result"] == "failure" and inner_of(r)["deploy"] == "failure" and inner_of(r)["rollback"] == "skipped" and dres["outputs"]["smoke_status"] == "none" and r["log"].count("PUBLISH") == 1
           and r["outputs"]["deployed_and_verified"] == "false" and not ran(r, "SMOKE") and "state=success" not in r["log"] and not release_runs(r, {"release_cmd": "pnpm release", "dispatch_target": "persistent-dev"}),
           "manual dispatch: a failing publish -> Deploy red, nothing is smoked or verified (smoke_status none), no recovery runs, never recorded known-good, no Release")
+    # ---- D1 compatibility guard for NON-Production recovery (the real migration -> deploy -> smoke -> revert hand-off)
+    ATT = dict(D1, d1_rollback_compat="expand-contract")
+    FAIL_GOOD = dict(GD, STUB_PROBES="500 ;200 ")
+    for label, runner in (("manual dispatch", manual), ("automatic Shared Dev push", lambda **k: dev(**k))):
+        r = runner(inputs=ATT, files=ADD_SQL, env=FAIL_GOOD)
+        check(inner_of(r) == {"deploy": "success", "smoke": "failure", "rollback": "success"} and r["log"].count("PUBLISH") == 2 and r["res"]["delivery_persistent_dev"]["outputs"]["rollback_result"] == "restored_verified",
+              f"{label}: additive migration + attested expand-contract + failed Smoke -> recovery allowed and verified")
+        r = runner(inputs=ATT, files=DROP_SQL, env=FAIL_GOOD)
+        check(inner_of(r)["rollback"] == "failure" and r["res"]["delivery_persistent_dev"]["outputs"]["rollback_result"] == "blocked" and r["log"].count("PUBLISH") == 1 and "`d1_not_additive`" in r["summary"]
+              and "UNVERIFIED" in r["summary"] and "NOT reverted" in r["summary"] and "state=success" not in r["log"] and "migrations revert" not in r["log"] and r["log"].count("migrations apply") == 1 and r["result"] == "failure",
+              f"{label}: destructive migration + failed Smoke -> recovery BLOCKED: old Worker not published, reason + manual recovery in the summary, run red, D1 never reverted")
+        r = runner(inputs=D1, files=ADD_SQL, env=FAIL_GOOD)
+        check(r["res"]["delivery_persistent_dev"]["outputs"]["rollback_result"] == "blocked" and r["log"].count("PUBLISH") == 1 and "`d1_unattested`" in r["summary"],
+              f"{label}: additive but compatibility NOT attested (unknown) + failed Smoke -> blocked")
+        r = runner(inputs=ATT, files=ADD_SQL, env=dict(FAIL_GOOD, STUB_PENDING_FILES=""))
+        check(r["res"]["delivery_persistent_dev"]["outputs"]["rollback_result"] == "blocked" and r["log"].count("PUBLISH") == 1 and "scan: unknown" in r["summary"],
+              f"{label}: scan unknown (pending files undeterminable) -> blocked even when attested")
+        r = runner(inputs=D1, env=dict(FAIL_GOOD, STUB_PENDING="0"))
+        check(r["res"]["delivery_persistent_dev"]["outputs"]["rollback_result"] == "restored_verified" and r["log"].count("PUBLISH") == 2, f"{label}: nothing pending this run (schema unchanged) -> recovery allowed without attestation")
+    r = manual(env=FAIL_GOOD)
+    check(r["res"]["delivery_persistent_dev"]["outputs"]["rollback_result"] == "restored_verified" and r["log"].count("PUBLISH") == 2, "no D1 migrations configured -> recovery unchanged")
+    # ---- a legacy dev_deploy_cmd (builds / selects its own Wrangler environment) is rejected before ANYTHING is built, migrated or published
+    for label, cmd_ in (("selects its own Wrangler environment", "pnpm exec wrangler deploy --env dev"), ("builds before publishing", "pnpm run build && pnpm exec wrangler deploy --config \"$CF_AUDITED_CONFIG\"")):
+        r = manual(inputs=dict(D1, dev_deploy_cmd=cmd_))
+        check(r["result"] == "failure" and not ran(r, "BUILD") and not ran(r, "PUBLISH") and "migrations apply" not in r["log"] and r["res"]["migration"]["result"] == "failure" and r["res"]["delivery_persistent_dev"]["result"] == "skipped",
+              f"manual dispatch with a legacy dev_deploy_cmd that {label}: rejected during the audit - nothing built, no D1 migration, nothing published")
     # ---- other kinds keep their pipelines
     r = deploy(MAIN, inputs={"release_cmd": "pnpm release"})
     check(r["result"] == "success" and r["res"]["delivery_persistent_dev"]["result"] == "skipped" and release_runs(r), "unchanged: a Production push still runs the Production delivery (and Release)")
@@ -1258,6 +1304,12 @@ def group_native_dev_smoke_modes():
     r = deploy(FEAT, inputs=ND, env=dict(GDN, STUB_PROBES="500 ;200 "))
     check(r["result"] == "failure" and r["raw"]["rollback"]["outputs"].get("rb_native_dev") == "restored_verified" and r["log"].count("preview --name dev") == 2 and r["log"].count("BUILD kind=native-dev") == 2 and "versions deploy" not in r["log"],
           "Native Dev: failed smoke -> last known-good Native Dev deployment rebuilt at the LAST-GOOD sha, republished to `dev`, re-verified; the run stays red; never a Production version")
+    NDD = dict(ND, **D1, d1_rollback_compat="expand-contract")
+    r = deploy(FEAT, inputs=NDD, files=ADD_SQL, env=dict(GDN, STUB_PROBES="500 ;200 "))
+    check(r["raw"]["rollback"]["outputs"].get("rb_native_dev") == "restored_verified" and r["log"].count("preview --name dev") == 2, "Native Dev: additive migration + attested + failed Smoke -> recovery allowed")
+    r = deploy(FEAT, inputs=NDD, files=DROP_SQL, env=dict(GDN, STUB_PROBES="500 ;200 "))
+    check(r["result"] == "failure" and r["raw"]["rollback"]["outputs"].get("rb_native_dev") == "blocked" and r["log"].count("preview --name dev") == 1 and "`d1_not_additive`" in r["summary"] and "migrations revert" not in r["log"],
+          "Native Dev: destructive migration + failed Smoke -> recovery BLOCKED, old Preview code never published, D1 never reverted")
     r = deploy(FEAT, inputs=ND, env=dict(GDN, STUB_PROBES="500 ;200 ", STUB_NEWEST="9999"))
     check(r["result"] == "failure" and r["log"].count("preview --name dev") == 1 and "newer native-dev deployment" in r["summary"], "Native Dev: a NEWER deployment of `dev` exists -> no rollback over it")
     r = deploy(FEAT, inputs=ND, env={"STUB_PROBES": "500 ;200 "})
@@ -1422,6 +1474,54 @@ def group_review_regressions():
 
 
 
+def group_ci_environment():
+    """CI environment follows the intended deployment target (executed cf-ci-check, real env values)"""
+    PRODV, DEVV, PREVV = "MARK=prod\nVITE_MODE=PRODCFG", "MARK=dev\nVITE_MODE=DEVCFG", "MARK=preview\nVITE_MODE=PREVCFG"
+    cmd = 'echo "CI app_env=$VITE_APP_ENV mark=${MARK:-none} mode=${VITE_MODE:-none} ci_env=${CI_ONLY:-none} prodsecret=${CLOUDFLARE_API_TOKEN:-none}" >> "$STUB_LOG"'
+
+    def ci_run(ref, event="push", dt="", job="lint", **extra):
+        inp = dict(INPUT_DEFAULTS, app_name="app", build_cmd="true", lint_cmd=cmd, typecheck_cmd=cmd, test_unit_cmd=cmd, test_integration_cmd=cmd, dispatch_target=dt,
+                   build_env_prod=PRODV, build_env_dev=DEVV, build_env_preview=PREVV, ci_env="CI_ONLY=yes")
+        inp.update(extra)
+        c = ctx(ref, inp, PROD_SECRETS, {}, event)
+        c["github"]["ref_type"] = "tag" if ref.startswith("refs/tags/") else "branch"
+        ws = make_workspace(APP_TOML)
+        r = called(cdoc, "ci", job, c, ws)
+        return r["result"], [l for l in r["log"].splitlines() if l.startswith("CI ")]
+
+    table = [  # (event, ref, dispatch_target) -> (VITE_APP_ENV, imported build env)
+        (("push", MAIN, ""), ("prod", "prod")), (("push", FEAT, ""), ("preview", "preview")),
+        (("workflow_dispatch", "refs/heads/dev", "persistent-dev"), ("dev", "dev")),
+        (("workflow_dispatch", MAIN, "persistent-dev"), ("dev", "dev")),
+        (("workflow_dispatch", MAIN, ""), ("prod", "prod")), (("workflow_dispatch", FEAT, ""), ("preview", "preview")),
+        (("pull_request", "refs/pull/1/merge", ""), ("preview", "preview")),
+    ]
+    for (event, ref, dt), (app_env, mark) in table:
+        res, lines = ci_run(ref, event, dt)
+        want = f"CI app_env={app_env} mark={mark} mode={ {"prod": "PRODCFG", "dev": "DEVCFG", "preview": "PREVCFG"}[mark] } ci_env=yes prodsecret=none"
+        check(res == "success" and lines == [want], f"CI env: {event} {ref} target={dt or '-'} -> VITE_APP_ENV={app_env}, the {mark} build env only (got {lines})")
+    # every validation command receives the same environment
+    for job in ("typecheck", "unit", "integration"):
+        res, lines = ci_run(MAIN, "workflow_dispatch", "persistent-dev", job=job)
+        check(lines == ["CI app_env=dev mark=dev mode=DEVCFG ci_env=yes prodsecret=none"], f"CI env: the {job} job of a persistent-dev dispatch from main sees Dev values, never Production's")
+    # a Dev dispatch never imports the Production env even when only the Production env is configured
+    res, lines = ci_run(MAIN, "workflow_dispatch", "persistent-dev", build_env_dev="")
+    check(lines == ["CI app_env=dev mark=none mode=none ci_env=yes prodsecret=none"], "CI env: persistent-dev dispatch with no build_env_dev imports NOTHING (Production env is never a fallback)")
+    # ci_env keeps its precedence over the target env
+    res, lines = ci_run(MAIN, "workflow_dispatch", "persistent-dev", build_env_dev="MARK=dev\nCI_ONLY=fromtarget")
+    check(lines == ["CI app_env=dev mark=dev mode=none ci_env=yes prodsecret=none"], "CI env: ci_env is applied after (and wins over) the target build env")
+    # an unknown resolved environment fails closed
+    saved = doc["jobs"]["ci"]["with"]["ci_target_env"]
+    doc["jobs"]["ci"]["with"]["ci_target_env"] = "staging"
+    try:
+        res, lines = ci_run(FEAT, "push", "")
+    finally:
+        doc["jobs"]["ci"]["with"]["ci_target_env"] = saved
+    check(res == "failure" and lines == [], "CI env: an unknown target environment fails the check instead of guessing")
+    # no Cloudflare credentials in the CI job
+    check(all("CLOUDFLARE" not in str(cdoc["jobs"][j]) for j in ("lint", "typecheck", "unit", "integration", "build", "e2e")), "CI jobs reference no Cloudflare credential")
+
+
 GROUPS = {
     "production-release": group_production_release,
     "preview-deploy": group_preview_deploy,
@@ -1431,6 +1531,7 @@ GROUPS = {
     "deferred-verification": group_deferred_verification,
     "native-dev-smoke-modes": group_native_dev_smoke_modes,
     "review-regressions": group_review_regressions,
+    "ci-environment": group_ci_environment,
 }
 
 

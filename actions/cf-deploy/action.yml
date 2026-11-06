@@ -283,6 +283,8 @@ runs:
       env:
         PREVIEW_MUTATED: ${{ steps.publish.outputs.preview_mutated }}
         PUBLISH_STARTED: ${{ steps.publish.outputs.publish_started }}
+        PUBLISH_BLOCKED: ${{ steps.publish.outputs.publish_blocked }}
+        PUBLISH_INTEGRITY_FAILED: ${{ steps.publish.outputs.publish_integrity_failed }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" fail-prepublish'
     - name: Published but smoke failed - mark unverified
       if: failure() && steps.smoke.outcome == 'failure' && (inputs.stage == 'verify' || steps.publish.outcome == 'success')
@@ -358,7 +360,7 @@ runs:
       if: '!cancelled() && inputs.stage == ''rollback'''
       shell: bash
       env:
-        RB_RESULT: ${{ steps.prodrb.outputs.rollback_result }}
+        RB_RESULT: ${{ steps.prodrb.outputs.rollback_result || (steps.good.outputs.blocked == 'true' && 'blocked' || '') }}
         RB_VERIFY: ${{ steps.prodverify.outcome }}
         RB_LEVEL: ${{ steps.prodverify.outputs.smoke_level }}
         GOOD_SHA: ${{ steps.good.outputs.sha }}

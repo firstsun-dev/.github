@@ -219,4 +219,33 @@ sed -i 's/x-evil/x-dev/' "$T/app/wrangler.toml"
 mkdir -p "$T/app/dist"; echo orig > "$T/app/dist/index.js"
 sed -i 's/^name = "x"$/name = "x"\nmain = "dist\/index.js"/' "$T/app/wrangler.toml"
 : > "$T/log"; env "${DEVV[@]}" BUILD_CMD=true PUBLISH_CMD='echo rebuilt > dist/index.js' bash -c "$(declare -f D); D" >/dev/null 2>&1 && bad "publish command replacing the artifact accepted" || ok "dev: a publish command that rebuilds/replaces the audited artifact fails the run"
+# ---- publish-only contract of dev_deploy_cmd: every Wrangler call the command makes goes through the guard (BEFORE the real Wrangler) ----
+echo orig > "$T/app/dist/index.js"
+mkdir -p "$T/app/node_modules/.bin"
+cat > "$T/app/node_modules/.bin/wrangler" <<'REAL'
+#!/usr/bin/env bash
+echo "REAL $*" >> "$STUB_REAL_LOG"
+REAL
+chmod +x "$T/app/node_modules/.bin/wrangler"; ORIG_SUM="$(sha256sum "$T/app/node_modules/.bin/wrangler" | cut -d' ' -f1)"
+export STUB_REAL_LOG="$T/real.log"
+Dg() { : > "$T/log"; : > "$STUB_REAL_LOG"; env "${DEVV[@]}" BUILD_CMD=true PUBLISH_CMD="$1" bash -c "$(declare -f D); D" 2>"$T/err"; }
+OUT="$(Dg './node_modules/.bin/wrangler deploy --config "$CF_AUDITED_CONFIG"')" && grep -q '^REAL deploy --config' "$STUB_REAL_LOG" && ok "dev publish guard: wrangler deploy --config <audited> reaches the real Wrangler" || bad "guarded audited deploy should pass"
+[ "$(sha256sum "$T/app/node_modules/.bin/wrangler" | cut -d' ' -f1)" = "$ORIG_SUM" ] && ok "dev publish guard: the project's node_modules/.bin/wrangler is restored after the command" || bad "project wrangler not restored"
+for label in '--env dev' '--config "$CF_AUDITED_CONFIG" --env dev' '--config "$CF_AUDITED_CONFIG" -e dev' '--config "$CF_AUDITED_CONFIG" --name other' '' '--config other.toml'; do
+  OUT="$(Dg "./node_modules/.bin/wrangler deploy $label")" && bad "guard accepted: deploy $label" || { [ ! -s "$STUB_REAL_LOG" ] && printf '%s\n' "$OUT" | grep -qx 'publish_blocked=true' && ok "dev publish guard: 'deploy $label' is refused BEFORE the real Wrangler runs (nothing changed, reported as blocked)" || bad "guard: deploy $label reached Wrangler or was not reported blocked"; }
+done
+OUT="$(Dg './node_modules/.bin/wrangler d1 migrations apply DB --remote')" && bad "d1 migrations accepted" || { [ ! -s "$STUB_REAL_LOG" ] && ok "dev publish guard: a D1 migration from the publish command is refused (the Migrate job owns migrations)" || bad "d1 reached wrangler"; }
+OUT="$(Dg 'echo rebuilt > dist/index.js; ./node_modules/.bin/wrangler deploy --config "$CF_AUDITED_CONFIG"')" && bad "rebuild-then-deploy accepted" || { [ ! -s "$STUB_REAL_LOG" ] && printf '%s\n' "$OUT" | grep -qx 'publish_blocked=true' && ok "dev publish guard: a command that REBUILT first is refused before the upload (artifact differs from the audited one) - not detected afterwards" || bad "rebuild then deploy reached wrangler"; }
+echo orig > "$T/app/dist/index.js"
+OUT="$(Dg './node_modules/.bin/wrangler deploy --config "$CF_AUDITED_CONFIG"; echo changed > dist/index.js')" && bad "post-publish artifact change accepted" || { grep -q '^REAL deploy' "$STUB_REAL_LOG" && printf '%s\n' "$OUT" | grep -qx 'publish_integrity_failed=true' && ! printf '%s\n' "$OUT" | grep -qx 'publish_blocked=true' && ok "dev publish guard: an artifact swapped AFTER the real publish is reported as integrity failure (potentially published, never 'unchanged')" || bad "post-publish integrity reporting"; }
+echo orig > "$T/app/dist/index.js"
+OUT="$(Dg 'exit 3')" && bad "failing publish command accepted" || { printf '%s\n' "$OUT" | grep -qx 'publish_started=true' && ! printf '%s\n' "$OUT" | grep -q 'publish_blocked\|publish_integrity_failed' && ok "dev publish guard: a plain failing command stays 'publish started, unverified' (not claimed unchanged, not claimed blocked)" || bad "plain failure reporting"; }
+rm -rf "$T/app/node_modules"
+cat > "$T/bin/wrangler" <<'REAL'
+#!/usr/bin/env bash
+echo "REAL $*" >> "$STUB_REAL_LOG"
+REAL
+chmod +x "$T/bin/wrangler"
+OUT="$(Dg 'wrangler deploy --env dev')" && bad "bare wrangler --env accepted" || { [ ! -s "$STUB_REAL_LOG" ] && ok "dev publish guard: a bare wrangler (npx / global, no project bin) is guarded through PATH too" || bad "bare wrangler reached real"; }
+rm -f "$T/bin/wrangler"
 exit $fail

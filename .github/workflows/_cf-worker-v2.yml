@@ -476,6 +476,11 @@ jobs:
       use_mailpit: ${{ inputs.use_mailpit }}
       build_env_prod: ${{ inputs.build_env_prod }}
       build_env_preview: ${{ inputs.build_env_preview }}
+      build_env_dev: ${{ inputs.build_env_dev }}
+      # The CI environment follows the INTENDED deployment target, not only the ref: a persistent-dev dispatch is validated against the
+      # Dev build env even from `main` (never Production env vars). Pure event/input resolution (CI runs before the Plan; the Plan stays
+      # the authorization gate). JS twin: delivery.mjs ciTargetEnv.
+      ci_target_env: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && 'dev' || github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
       test_e2e_cmd: ${{ inputs.test_e2e_cmd }}
       test_e2e_setup_cmd: ${{ inputs.test_e2e_setup_cmd }}
       test_e2e_build_cmd: ${{ inputs.test_e2e_build_cmd }}
@@ -490,7 +495,10 @@ jobs:
   plan:
     name: Plan
     needs: [ci]
-    if: always() && (inputs.pipeline_phase == 'verify' || (needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed' && github.ref_type == 'branch' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')))
+    # The last clause makes an explicit but unservable request (a dispatch_target on a tag / PR / push / delete event) reach the Plan even
+    # without a passed CI: the Plan then ALWAYS fails (resolveDeliveryTargets), so such a run is red instead of silently green, and it
+    # can never emit a target (no downstream job runs).
+    if: always() && (inputs.pipeline_phase == 'verify' || (needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed' && github.ref_type == 'branch' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) || (inputs.dispatch_target != '' && (github.event_name != 'workflow_dispatch' || github.ref_type != 'branch')))
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     outputs:

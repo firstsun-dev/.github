@@ -183,6 +183,13 @@ case "$PHASE" in
 
   build)
     ctx
+    # Early, pre-mutation rejection of a legacy dev_deploy_cmd that builds or selects its own Wrangler environment (before the build and
+    # long before the Dev D1 is migrated). The runtime guard in publish.sh still judges every actual Wrangler call.
+    if [ "$TARGET" = dev ] && [ -n "$(inp dev_deploy_cmd)" ]; then
+      PG="$(CMD="$(inp dev_deploy_cmd)" node "$TOOLS_DIR/cli.mjs" publish-cmd-check --package "$APP_DIR/package.json")"
+      PC="$(printf '%s\n' "$PG" | sed -n 's/^block_code=//p')"
+      [ -z "$PC" ] || die "dev_deploy_cmd is not publish-only ($PC): $(printf '%s\n' "$PG" | sed -n 's/^block_why=//p'). Nothing was built, migrated or published."
+    fi
     resolve_target_url "$S/build.env"
     run_build "$S" "$S/build.env" "$(inp app_version)" "$(inp preview_host_check)";;
 
@@ -213,7 +220,9 @@ case "$PHASE" in
     printf '%s' "$PENDING" > "$S/migration"
     echo "schema_changed=$PENDING"
     echo "kind=$KIND"; echo "d1_id=$(rd d1_id)"
-    echo "migration=applied";;
+    echo "migration=applied"
+    SCAN_L="$(printf '%s\n' "$OUT" | sed -n 's/^d1_scan=//p' | head -1)"
+    jq -cn --arg c "$PENDING" --arg s "$SCAN_L" --arg k "$KIND" --arg i "$(rd d1_id)" '{migration:"applied",schema_changed:$c,d1_scan:$s,kind:$k,d1_id:$i}' > "$S/migration.json";;
 
   report) # final, always-run state report of a stage (data only)
     ctx
@@ -271,6 +280,8 @@ case "$PHASE" in
     fi
     [ -z "$H_PUBSHA" ] || [ "$H_PUBSHA" = "$RUN_SHA" ] || die "hand-off was published from $H_PUBSHA, this run is $RUN_SHA; refusing to act on another deployment"
     [ "$TARGET" = prod ] || [ -n "$H_URL" ] || die "$TARGET hand-off has no published URL"
+    # The Migration job's validated result, kept for the non-Production recovery guard (recover-find). Absent when none was handed over.
+    if [ -n "${HANDOFF_MIGRATION:-}" ] && [ "$HANDOFF_MIGRATION" != '{}' ]; then printf '%s' "$M" > "$S/migration.json"; else rm -f "$S/migration.json"; fi
     printf '%s' "$H_LEDGER" > "$S/ledger_id"; printf '%s' "$H_PNAME" > "$S/preview_name"
     case "$KIND" in native-branch) printf '%s' "$APP_NAME/preview/$H_PNAME" > "$S/ledger_env";; native-dev) printf '%s' "$APP_NAME/native-dev/dev" > "$S/ledger_env";; persistent-dev) printf '%s' "$APP_NAME/dev/shared" > "$S/ledger_env";; esac
     [ "$TARGET" != preview ] || [ -n "$H_PNAME" ] || die "preview hand-off has no Preview identity"
@@ -359,7 +370,13 @@ case "$PHASE" in
           summary "### ❌ Failed before publish — existing Preview unchanged."
         fi;;
       dev)
-        if [ "${PUBLISH_STARTED:-}" = true ]; then
+        if [ "${PUBLISH_INTEGRITY_FAILED:-}" = true ]; then
+          [ -z "$LEDGER_ID" ] || "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" error "" "Publish integrity check failed; Dev potentially published but UNVERIFIED" || true
+          summary "### 🚨 Dev publish integrity check FAILED — the publish command changed the audited config or artifact after publishing. Dev is **potentially published but UNVERIFIED** (it may serve an unaudited build). Manual recovery: deploy a known-good commit with the standard pipeline (push a fix); do not assume Dev is unchanged."
+        elif [ "${PUBLISH_BLOCKED:-}" = true ]; then
+          [ -z "$LEDGER_ID" ] || "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" error "" "Publish command refused before any Wrangler publish call; Dev unchanged" || true
+          summary "### ❌ dev_deploy_cmd refused before any Wrangler publish call — it is not publish-only (see the job log for the reason). No Wrangler call changed Dev. Fix the command: \`wrangler deploy --config \"\$CF_AUDITED_CONFIG\"\` only, and build in \`dev_build_cmd\`."
+        elif [ "${PUBLISH_STARTED:-}" = true ]; then
           [ -z "$LEDGER_ID" ] || "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" error "" "Publish failed part-way; Dev UNVERIFIED" || true
           summary "### ❌ Shared Dev publish failed part-way — Dev may serve an unverified deployment."
         else
@@ -391,6 +408,22 @@ case "$PHASE" in
   recover-find)
     ctx
     ROW=""
+    # D1 compatibility guard (before anything is looked up or published): older code is only redeployed when the D1 state of
+    # THIS pipeline is known and the code is proven to cope. D1 is never reverted. Decision: delivery.mjs nonProdRecoveryBlock.
+    G="$(env D1_MIGRATIONS="$(inp d1_migrations)" MIGRATION_JSON="$([ -s "$S/migration.json" ] && cat "$S/migration.json" || echo null)" D1_EXPECT="$(rd d1_expect)" D1_COMPAT="$(inp d1_rollback_compat)" \
+      node "$TOOLS_DIR/cli.mjs" recovery-guard)"
+    BC="$(printf '%s\n' "$G" | sed -n 's/^block_code=//p')"
+    if [ -n "$BC" ]; then
+      BW="$(printf '%s\n' "$G" | sed -n 's/^block_why=//p')"
+      echo "::error::Automatic recovery of $TARGET is BLOCKED ($BC): $BW" >&2
+      summary "### 🛑 Automatic recovery of $TARGET **blocked** (\`$BC\`) — $TARGET serves \`$RUN_SHA\`, which FAILED its smoke, and is **UNVERIFIED**."
+      summary "- Why: $BW"
+      summary "- Nothing was redeployed and the D1 schema was NOT reverted. Required manual recovery: push a forward fix (preferred); or restore the last verified commit only after confirming it runs on the CURRENT D1 schema."
+      [ -z "$LEDGER_ID" ] || "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" failure "" "Smoke failed for $RUN_SHA; recovery blocked ($BC) — $TARGET UNVERIFIED" || true
+      "$TOOLS_DIR/gh.sh" mark-env-deployment "$(gh_env)" "$RUN_SHA" failure "Smoke failed, recovery blocked ($BC) — UNVERIFIED (served $RUN_SHA)" || echo "::warning::could not annotate the Environment deployment as unverified" >&2
+      echo "sha="; echo "url="; echo "blocked=true"; echo "block_code=$BC"
+      exit 0
+    fi
     case "$KIND" in
       native-branch) ROW="$("$TOOLS_DIR/gh.sh" last-good-preview "$(rd ledger_env)" "$LEDGER_ID" "$BRANCH_REF" "$HOST_WORKER" "$APP_NAME" || true)";;
       native-dev) ROW="$("$TOOLS_DIR/gh.sh" last-good-native-dev "$(rd ledger_env)" "$LEDGER_ID" "$HOST_WORKER" "$APP_NAME" || true)";;

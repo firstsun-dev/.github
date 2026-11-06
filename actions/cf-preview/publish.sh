@@ -70,12 +70,40 @@ if [ "$TARGET" = dev ]; then
   if [ -z "${PUBLISH_CMD:-}" ]; then
     pnpm exec wrangler deploy "${CFG_ARGS[@]}" --message "$MSG" >&2
   else
-    # Caller customization: runs with the audited config exported. It must only publish; any change to the audited
-    # config or deployable is detected below and fails the run (the Dev deployment is then reported unverified).
-    CF_AUDITED_CONFIG="$CONFIG_PATH" CLOUDFLARE_ENV="$DEV_ENV" bash -eo pipefail -c "$PUBLISH_CMD" >&2
-    [ "$(sha256sum "$CONFIG_PATH" | cut -d' ' -f1)" = "$(cat "$STATE_DIR/config.sha")" ] || { echo "::error::the publish command modified the audited Wrangler config" >&2; exit 1; }
+    # The caller's publish command is PUBLISH-ONLY. It runs with the audited config exported and every Wrangler call it makes goes through
+    # wrangler-guard.sh, which refuses (before the real Wrangler runs) any non-publish subcommand, any --env / --name / non-audited --config,
+    # and any call made after the audited config or artifact changed. The post-run checks below stay as the second, independent layer.
+    GUARD="$STATE_DIR/guard"; rm -rf "$GUARD"; mkdir -p "$GUARD/bin"
+    REAL_BIN="$PWD/node_modules/.bin/wrangler"; PROJECT_BIN_MOVED=""
+    cp "$TOOLS_DIR/wrangler-guard.sh" "$GUARD/bin/wrangler"; chmod +x "$GUARD/bin/wrangler"
+    if [ -e "$REAL_BIN" ] || [ -L "$REAL_BIN" ]; then
+      mv "$REAL_BIN" "$REAL_BIN.cfv2-real"; cp "$GUARD/bin/wrangler" "$REAL_BIN"; PROJECT_BIN_MOVED=1; REAL_WRANGLER="$REAL_BIN.cfv2-real"
+    else
+      REAL_WRANGLER="$(PATH="${PATH//$GUARD\/bin:/}" command -v wrangler || echo /nonexistent/wrangler)"
+    fi
+    restore_bin() { [ -z "$PROJECT_BIN_MOVED" ] || { rm -f "$REAL_BIN"; mv "$REAL_BIN.cfv2-real" "$REAL_BIN"; PROJECT_BIN_MOVED=""; }; }
+    trap restore_bin EXIT
+    CENV=""; [ "$MODE" != source ] || CENV="$DEV_ENV"   # a flattened audited config never takes a named env; a SOURCE config's audited env is DEV_ENV
+    set +e
+    PATH="$GUARD/bin:$PATH" CFV2_REAL_WRANGLER="$REAL_WRANGLER" CFV2_GUARD_DIR="$GUARD" CFV2_STATE_DIR="$STATE_DIR" CFV2_TOOLS_DIR="$TOOLS_DIR" \
+      CF_AUDITED_CONFIG="$CONFIG_PATH" CLOUDFLARE_ENV="$CENV" bash -eo pipefail -c "$PUBLISH_CMD" >&2
+    RC=$?
+    set -e
+    restore_bin
+    if [ "$RC" -ne 0 ]; then
+      if [ -f "$GUARD/blocked" ] && [ ! -f "$GUARD/mutating" ]; then
+        # Refused by the guard before any Wrangler call could change the Worker.
+        echo "publish_blocked=true"
+        echo "::error::dev_deploy_cmd was refused before any Wrangler publish call was made ($(sed -n 's/^code=//p' "$GUARD/blocked")); Dev was not changed by Wrangler" >&2
+      fi
+      exit 1
+    fi
+    [ -f "$GUARD/mutating" ] || echo "::warning::dev_deploy_cmd made no Wrangler publish call; nothing was published through the audited config" >&2
+    # Integrity after the fact: from here on a failure means the Worker MAY already have been replaced - never "unchanged".
+    integrity_fail() { echo "publish_integrity_failed=true"; echo "::error::$1" >&2; exit 1; }
+    [ "$(sha256sum "$CONFIG_PATH" | cut -d' ' -f1)" = "$(cat "$STATE_DIR/config.sha")" ] || integrity_fail "the publish command modified the audited Wrangler config; Dev is potentially published but UNVERIFIED"
     NOW="$(node "$TOOLS_DIR/cli.mjs" artifact-digest --config "$CONFIG_PATH" | sed -n 's/^artifact_digest=//p')"
-    [ "$NOW" = "$(cat "$STATE_DIR/artifact.sha")" ] || { echo "::error::the publish command rebuilt or replaced the audited artifact; Dev may serve an unaudited build" >&2; exit 1; }
+    [ "$NOW" = "$(cat "$STATE_DIR/artifact.sha")" ] || integrity_fail "the publish command rebuilt or replaced the audited artifact; Dev is potentially published from an unaudited build and UNVERIFIED"
   fi
   echo "url=${APP_URL:-}"
   exit 0

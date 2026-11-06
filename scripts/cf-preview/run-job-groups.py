@@ -22,13 +22,14 @@ ROOT = HERE.parents[1]
 # group id -> minimum number of checks (raise it when scenarios are added; never lower it to make a run pass)
 MANIFEST = {
     "production-release": 43,
-    "preview-deploy": 46,
+    "preview-deploy": 48,
     "migration-d1": 69,
-    "shared-dev": 74,
+    "shared-dev": 112,
     "chain-smoke-rollback": 54,
     "deferred-verification": 50,
-    "native-dev-smoke-modes": 48,
+    "native-dev-smoke-modes": 50,
     "review-regressions": 36,
+    "ci-environment": 14,
 }
 
 
