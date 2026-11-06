@@ -29,7 +29,7 @@ MANIFEST = {
     "deferred-verification": 50,
     "native-dev-smoke-modes": 50,
     "review-regressions": 36,
-    "ci-environment": 14,
+    "ci-environment": 18,
 }
 
 

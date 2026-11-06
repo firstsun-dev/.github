@@ -348,92 +348,20 @@ export function verificationOutcome(level) {
   return { verified: false, kind: level === 'skipped' ? 'skipped' : 'liveness' };
 }
 
-// ---------------------------------------------------------------------------------------------------------------------
-// Publish-only contract of a caller's `dev_deploy_cmd`. Two layers, neither relies on matching the command STRING alone:
-//   1. wranglerPublishBlock: judges the ARGUMENT VECTOR of every Wrangler invocation the command actually makes (the guard shim
-//      calls it before delegating) - so it applies to `pnpm run deploy`, scripts, nested shells, anything that reaches Wrangler.
-//   2. devPublishCmdBlock: an EARLY static rejection (before the migration) of the unambiguous legacy shapes, over the command and
-//      the package.json scripts it runs. Supplementary: an opaque command is still caught by layer 1 before any mutation.
-// ---------------------------------------------------------------------------------------------------------------------
-const WRANGLER_VALUE_FLAGS = new Set(['--config', '-c', '--env', '-e', '--name', '--cwd', '--message', '--tag', '--var', '--define', '--assets', '--compatibility-date', '--compatibility-flags', '--site', '--outdir', '--routes', '--route', '--triggers']);
-const WRANGLER_ALLOWED = new Set(['deploy', 'versions', 'deployments', 'whoami', 'version']);
-const WRANGLER_MUTATING = (cmd, sub) => cmd === 'deploy' || (cmd === 'versions' && (sub === 'upload' || sub === 'deploy'));
-
-/** null = the Wrangler call may proceed; else why it is refused BEFORE it can change anything. `auditedConfig` and `config` values are compared after path normalisation by the caller. */
-export function wranglerPublishBlock({ args = [], auditedConfig = '', normalize = (x) => x }) {
-  const positional = [];
-  const configs = [];
-  let env = false;
-  let name = false;
-  for (let i = 0; i < args.length; i++) {
-    const a = String(args[i]);
-    if (a === '--') { positional.push(...args.slice(i + 1).map(String)); break; }
-    const eq = a.indexOf('=');
-    const flag = a.startsWith('--') && eq > 0 ? a.slice(0, eq) : a;
-    const inline = a.startsWith('--') && eq > 0 ? a.slice(eq + 1) : undefined;
-    if (a.startsWith('-') && a.length > 1) {
-      let val = inline;
-      if (val === undefined && WRANGLER_VALUE_FLAGS.has(flag)) { val = String(args[i + 1] ?? ''); i++; }
-      if (flag === '--config' || flag === '-c') configs.push(val ?? '');
-      else if (flag === '--env' || flag === '-e') env = true;
-      else if (flag === '--name') name = true;
-      continue;
-    }
-    positional.push(a);
-  }
-  const [cmd = '', sub = ''] = positional;
-  if (!cmd || cmd === 'help') return null;
-  if (!WRANGLER_ALLOWED.has(cmd) && !args.some((a) => ['--version', '-v', '--help', '-h'].includes(String(a)))) {
-    return { code: 'not_publish_only', why: `dev_deploy_cmd must only publish: \`wrangler ${cmd}\` is not allowed (migrations are applied by the Migrate job; nothing else may change the Worker or its resources from the publish command).` };
-  }
-  if (!WRANGLER_MUTATING(cmd, sub)) return null;
-  if (env) return { code: 'env_selection', why: 'the publish command selects a Wrangler environment (--env / -e) itself. The audited config is already the one effective configuration; publish with `wrangler deploy --config "$CF_AUDITED_CONFIG"` only.' };
-  if (name) return { code: 'name_override', why: 'the publish command overrides the Worker name (--name); the audited config alone defines the deployed Worker.' };
-  if (configs.length !== 1) return { code: 'config_not_audited', why: `the publish command must pass exactly one --config and it must be the audited config ("$CF_AUDITED_CONFIG"); it passed ${configs.length}.` };
-  if (normalize(configs[0]) !== normalize(auditedConfig)) return { code: 'config_not_audited', why: `the publish command uses --config ${configs[0]}, not the audited config ${auditedConfig}.` };
-  return null;
-}
-
 /**
- * Early static check of a caller's dev_deploy_cmd (command text + the package.json scripts it runs, resolved recursively).
- * Rejects the unambiguous legacy shapes - a Wrangler call that selects its own environment / name, or a command that BUILDS - before the
- * Dev D1 is migrated. `scripts` = package.json "scripts". null = nothing objectionable found (the runtime guard still applies).
- */
-export function devPublishCmdBlock(cmd, scripts = {}) {
-  const seen = new Set();
-  const expand = (text, depth) => {
-    if (depth > 6) return text;
-    let out = text;
-    for (const m of text.matchAll(/\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?([A-Za-z0-9:_.-]+)/g)) {
-      const sc = m[1];
-      if (Object.prototype.hasOwnProperty.call(scripts, sc) && !seen.has(sc)) { seen.add(sc); out += `\n${expand(String(scripts[sc]), depth + 1)}`; }
-    }
-    return out;
-  };
-  const text = expand(String(cmd), 0);
-  for (const part of text.split(/&&|\|\||[;|\n]/)) {
-    const w = part.trim().split(/\s+/);
-    const at = w.findIndex((x) => /(^|\/)wrangler$/.test(x));
-    if (at >= 0) {
-      const b = wranglerPublishBlock({ args: w.slice(at + 1), auditedConfig: '$CF_AUDITED_CONFIG', normalize: (x) => String(x).replace(/^"|"$/g, '').replace(/^\$\{(\w+)\}$/, '$$$1') });
-      if (b && (b.code === 'env_selection' || b.code === 'name_override' || b.code === 'not_publish_only')) return b;
-    }
-    if (/(^|\s)(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?build(?:[:\w.-]*)(\s|$)|\b(?:vite|tsc|next|astro|webpack|rollup|esbuild)\s+build\b/.test(part)) {
-      return { code: 'rebuilds', why: 'dev_deploy_cmd builds. The audited artifact is produced by dev_build_cmd (build + audit); the publish command must only publish it (`wrangler deploy --config "$CF_AUDITED_CONFIG"`).' };
-    }
-  }
-  return null;
-}
-
-/**
- * Which build env the CI validation commands import (and the value of VITE_APP_ENV): the INTENDED deployment target, resolved from
+ * Which build env the CI validation commands import (and the value of VITE_APP_ENV): the env of the INTENDED deployment, resolved from
  * pure event/input data because CI runs before the Plan (the Plan stays the authorization gate). JS twin of the `ci_target_env`
- * expression of _cf-worker-v2.yml (the contract test compares them).
- *   workflow_dispatch + dispatch_target persistent-dev (any ref, `main` included) -> dev
- *   otherwise: refs/heads/main -> prod; everything else (feature branches, PRs, tags) -> preview
+ * expression of _cf-worker-v2.yml (the contract test compares them and checks `dev` against resolveDeliveryTargets).
+ *   dev     : the run's only automatic target is persistent-dev - a manual dispatch with dispatch_target persistent-dev (any ref, `main`
+ *             included), or a push / dispatch to a non-main branch where Shared Dev is the only enabled channel
+ *   prod    : refs/heads/main otherwise
+ *   preview : everything else - Native Branch, Native Dev, several kinds at once (their shared validation keeps the Preview contract;
+ *             each kind's own build and audit still validate its actual deployment configuration downstream), PRs, tags
  */
-export function ciTargetEnv({ event = '', ref = '', dispatchTarget = '' }) {
+export function ciTargetEnv({ event = '', ref = '', dispatchTarget = '', strategy = '', previewOnPush = true, sharedDevOnPush = false, sharedDevNativeOnPush = false }) {
   if (event === 'workflow_dispatch' && dispatchTarget === 'persistent-dev') return 'dev';
+  if ((event === 'push' || event === 'workflow_dispatch') && String(ref).startsWith('refs/heads/') && ref !== 'refs/heads/main' && dispatchTarget === ''
+      && strategy !== 'production-only' && sharedDevOnPush && !previewOnPush && !sharedDevNativeOnPush) return 'dev';
   return ref === 'refs/heads/main' ? 'prod' : 'preview';
 }
 

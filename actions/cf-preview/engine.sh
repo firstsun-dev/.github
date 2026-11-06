@@ -103,7 +103,7 @@ run_build() { # <state dir> <build env file> <app version> <preview host check>
 }
 run_publish() { # <state dir> <out file> <app version> <commit message>
   STATE_DIR="$1" APP_URL="$(target_url)" OUT_FILE="$2" APP_VERSION="$3" COMMIT_MSG="$4" \
-    WORKER_NAME="$(inp preview_worker_name)" PUBLISH_CMD="$([ "$TARGET" = dev ] && inp dev_deploy_cmd || true)" \
+    WORKER_NAME="$(inp preview_worker_name)" \
     PREVIEW_NAME="$PREVIEW_NAME" EXPECTED_URL="$([ "$TARGET" = preview ] && target_url || true)" "$TOOLS_DIR/publish.sh"
 }
 
@@ -183,13 +183,6 @@ case "$PHASE" in
 
   build)
     ctx
-    # Early, pre-mutation rejection of a legacy dev_deploy_cmd that builds or selects its own Wrangler environment (before the build and
-    # long before the Dev D1 is migrated). The runtime guard in publish.sh still judges every actual Wrangler call.
-    if [ "$TARGET" = dev ] && [ -n "$(inp dev_deploy_cmd)" ]; then
-      PG="$(CMD="$(inp dev_deploy_cmd)" node "$TOOLS_DIR/cli.mjs" publish-cmd-check --package "$APP_DIR/package.json")"
-      PC="$(printf '%s\n' "$PG" | sed -n 's/^block_code=//p')"
-      [ -z "$PC" ] || die "dev_deploy_cmd is not publish-only ($PC): $(printf '%s\n' "$PG" | sed -n 's/^block_why=//p'). Nothing was built, migrated or published."
-    fi
     resolve_target_url "$S/build.env"
     run_build "$S" "$S/build.env" "$(inp app_version)" "$(inp preview_host_check)";;
 
@@ -370,13 +363,7 @@ case "$PHASE" in
           summary "### ❌ Failed before publish — existing Preview unchanged."
         fi;;
       dev)
-        if [ "${PUBLISH_INTEGRITY_FAILED:-}" = true ]; then
-          [ -z "$LEDGER_ID" ] || "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" error "" "Publish integrity check failed; Dev potentially published but UNVERIFIED" || true
-          summary "### 🚨 Dev publish integrity check FAILED — the publish command changed the audited config or artifact after publishing. Dev is **potentially published but UNVERIFIED** (it may serve an unaudited build). Manual recovery: deploy a known-good commit with the standard pipeline (push a fix); do not assume Dev is unchanged."
-        elif [ "${PUBLISH_BLOCKED:-}" = true ]; then
-          [ -z "$LEDGER_ID" ] || "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" error "" "Publish command refused before any Wrangler publish call; Dev unchanged" || true
-          summary "### ❌ dev_deploy_cmd refused before any Wrangler publish call — it is not publish-only (see the job log for the reason). No Wrangler call changed Dev. Fix the command: \`wrangler deploy --config \"\$CF_AUDITED_CONFIG\"\` only, and build in \`dev_build_cmd\`."
-        elif [ "${PUBLISH_STARTED:-}" = true ]; then
+        if [ "${PUBLISH_STARTED:-}" = true ]; then
           [ -z "$LEDGER_ID" ] || "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" error "" "Publish failed part-way; Dev UNVERIFIED" || true
           summary "### ❌ Shared Dev publish failed part-way — Dev may serve an unverified deployment."
         else

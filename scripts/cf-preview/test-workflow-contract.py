@@ -767,16 +767,30 @@ if SUP is not None:
     check(djobs["smoke"]["permissions"].get("deployments") == "write" and "secrets" not in yaml.dump(SUP), "Smoke: the step needs only deployments:write and uses no secrets")
 
 
-sys.exit(fail)
 
 
 # ---------------------------------------------------------------- CI environment contract: expression == delivery.mjs ciTargetEnv, and the spec table
 CI_EXPR = jobs["ci"]["with"]["ci_target_env"]
-ci_cases = [(e, r, dt) for e in ("push", "workflow_dispatch", "pull_request", "delete") for r in ("refs/heads/main", "refs/heads/feat/x", "refs/heads/dev", "refs/pull/1/merge", "refs/tags/v1") for dt in ("", "persistent-dev", "Persistent-Dev", "production")]
-yaml_ci = [render(CI_EXPR, scenario(e, r, {"dispatch_target": dt})) for e, r, dt in ci_cases]
-js_ci = json.loads(subprocess.run(["node", "-e", "import('./actions/cf-preview/delivery.mjs').then(async m=>{let t='';for await(const c of process.stdin)t+=c;console.log(JSON.stringify(JSON.parse(t).map(([e,r,d])=>m.ciTargetEnv({event:e,ref:r,dispatchTarget:d}))))})"], input=json.dumps(ci_cases), capture_output=True, text=True, check=True).stdout)
-check(yaml_ci == js_ci and len(ci_cases) == 80, f"CI environment: the workflow expression and delivery.mjs ciTargetEnv agree on all {len(ci_cases)} event/ref/target scenarios")
-ci_of = lambda e, r, dt="": render(CI_EXPR, scenario(e, r, {"dispatch_target": dt}))
-check(ci_of("push", MAIN) == "prod" and ci_of("push", FEAT) == "preview" and ci_of("workflow_dispatch", "refs/heads/dev", "persistent-dev") == "dev"
-      and ci_of("workflow_dispatch", MAIN, "persistent-dev") == "dev" and ci_of("workflow_dispatch", MAIN) == "prod" and ci_of("pull_request", "refs/pull/1/merge") == "preview",
-      "CI environment table: push main -> prod, push feature -> preview, dispatch persistent-dev (approved feature OR main) -> dev, dispatch main without target -> prod, PR -> preview")
+ci_cases = []
+for e in ("push", "workflow_dispatch", "pull_request", "delete"):
+    for r in ("refs/heads/main", "refs/heads/feat/x", "refs/heads/dev", "refs/pull/1/merge", "refs/tags/v1"):
+        for dt in ("", "persistent-dev", "Persistent-Dev"):
+            for strat in ("hybrid", "production-only"):
+                for pre, sd, nd in itertools.product((True, False), repeat=3):
+                    ci_cases.append((e, r, dt, strat, pre, sd, nd))
+CIIN = lambda dt, strat, pre, sd, nd: {"dispatch_target": dt, "deployment_strategy": strat, "preview_on_branch_push": pre, "shared_dev_on_branch_push": sd, "shared_dev_native_preview_on_branch_push": nd, "persistent_dev_ref": "refs/heads/dev"}
+yaml_ci = [render(CI_EXPR, scenario(e, r, CIIN(*rest))) for e, r, *rest in ci_cases]
+JSCI = ("import('./actions/cf-preview/delivery.mjs').then(async m=>{let t='';for await(const c of process.stdin)t+=c;const c=JSON.parse(t);"
+        "console.log(JSON.stringify(c.map(([e,r,d,s,p,sd,nd])=>{const a=m.ciTargetEnv({event:e,ref:r,dispatchTarget:d,strategy:s,previewOnPush:p,sharedDevOnPush:sd,sharedDevNativeOnPush:nd});"
+        "let k;try{k=m.resolveDeliveryTargets({event:e,ref:r,strategy:s,previewOnPush:p,sharedDevOnPush:sd,sharedDevNativeOnPush:nd,dispatchTarget:d,devRef:'refs/heads/dev'})}catch{k=null}return [a,k]})))})")
+js_ci = json.loads(subprocess.run(["node", "-e", JSCI], input=json.dumps(ci_cases), capture_output=True, text=True, check=True).stdout)
+check(yaml_ci == [a for a, _ in js_ci] and len(ci_cases) > 900, f"CI environment: the workflow expression and delivery.mjs ciTargetEnv agree on all {len(ci_cases)} event/ref/target/strategy/channel scenarios")
+check(all((a == "dev") == (k == ["persistent-dev"]) for a, k in js_ci if k is not None), "CI environment: `dev` exactly when the run's ONLY delivery target (resolveDeliveryTargets) is persistent-dev - automatic and manual alike")
+check(all(a != "dev" for (a, k), c in zip(js_ci, ci_cases) if k is not None and len(k) > 1 or (k is not None and "persistent-dev" not in k)), "CI environment: several kinds at once, Native Branch / Native Dev only and Production never use the Dev env")
+ci_of = lambda e, r, dt="", strat="hybrid", pre=True, sd=False, nd=False: render(CI_EXPR, scenario(e, r, CIIN(dt, strat, pre, sd, nd)))
+check(ci_of("push", MAIN) == "prod" and ci_of("push", FEAT) == "preview" and ci_of("push", FEAT, pre=False, sd=True) == "dev" and ci_of("push", FEAT, pre=True, sd=True) == "preview"
+      and ci_of("push", FEAT, pre=False, nd=True) == "preview" and ci_of("workflow_dispatch", "refs/heads/dev", "persistent-dev") == "dev" and ci_of("workflow_dispatch", MAIN, "persistent-dev") == "dev"
+      and ci_of("workflow_dispatch", MAIN) == "prod" and ci_of("pull_request", "refs/pull/1/merge", pre=False, sd=True) == "preview",
+      "CI environment table: main -> prod; Native Branch / Native Dev -> preview; automatic Persistent-Dev-only push -> dev; manual dispatch (approved feature or main) -> dev; several kinds -> preview; PR -> preview")
+
+sys.exit(fail)

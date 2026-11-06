@@ -365,7 +365,6 @@ DEV_INPUTS = {
     "shared_dev_on_branch_push": True, "app_url_dev": "https://dev.example.com", "dev_worker_name": "app-dev",
     "app_version": SHA, "build_env_dev": f"PUBLIC_COMMIT_SHA={SHA}\nSITE=dev", "dev_wrangler_env": "dev",
     "dev_build_cmd": 'echo "BUILD ver=$VITE_APP_VERSION commit=$PUBLIC_COMMIT_SHA cfenv=$CLOUDFLARE_ENV" >> "$STUB_LOG"',
-    "dev_deploy_cmd": 'echo "PUBLISH cfg=$CF_AUDITED_CONFIG" >> "$STUB_LOG"',
     "dev_binding_allow": "r2_buckets:ASSETS=prod-assets services:AUTH=auth-dev",
 }
 
@@ -802,8 +801,8 @@ def group_shared_dev():
     r = dev(inputs=D1)
     check(r["result"] == "success" and "d1 migrations apply DB --remote" in r["log"] and "SHARED-ID" in mig_file(r, "dev") and "PROD-ID" not in mig_file(r, "dev"), "Shared Dev migrates the Dev D1 (env.dev), never the Production D1")
     check(r["log"].index("BUILD") < r["log"].index("migrations apply") < r["log"].index("PUBLISH"), "order in the executed Shared Dev job: build -> audit -> migration -> publish")
-    check("PUBLISH cfg=" in r["log"] and "wrangler.toml" in r["log"], "the caller's publish command receives the audited config (CF_AUDITED_CONFIG)")
-    r = dev(inputs={"dev_deploy_cmd": ""})
+    check("PUBLISH exec wrangler deploy --config" in r["log"] and "wrangler.toml" in r["log"], "the engine publishes the audited config itself (the only publisher)")
+    r = dev()
     check(r["result"] == "success" and "wrangler deploy --config" in r["log"] and "--env dev" in r["log"], "default publish is `wrangler deploy --config <audited config> --env <dev env>` (no reliance on CLOUDFLARE_ENV alone)")
 
     r = dev(inputs=dict(D1, dev_build_cmd="false"))
@@ -841,23 +840,17 @@ def group_shared_dev():
     r = dev(inputs={"dev_build_cmd": eff({"name": "app-dev", "d1_databases": [{"binding": "DB", "database_name": "shared-db", "database_id": "SHARED-ID"}],
                                             "r2_buckets": [{"binding": "ASSETS", "bucket_name": "prod-assets"}], "queues": {"producers": [{"binding": "Q", "queue": "dev-queue"}]},
                                             "services": [{"binding": "AUTH", "service": "auth-dev"}]})})
-    check(r["result"] == "success" and "PUBLISH cfg=" in r["log"] and "dist/wrangler.json" in r["log"], "a clean effective Dev config is audited AND is the exact config handed to the publish")
+    check(r["result"] == "success" and "PUBLISH exec wrangler deploy --config" in r["log"] and "dist/wrangler.json" in r["log"], "a clean effective Dev config is audited AND is the exact config handed to the publish")
 
     # P1: D1 consistency and same-artifact contract for Dev
     r = dev(inputs=dict(D1, dev_build_cmd=eff({"name": "app-dev", "d1_databases": [{"binding": "DB", "database_name": "elsewhere", "database_id": "ELSEWHERE-ID"}],
                                                  "r2_buckets": [{"binding": "ASSETS", "bucket_name": "prod-assets"}], "queues": {"producers": [{"binding": "Q", "queue": "dev-queue"}]},
                                                  "services": [{"binding": "AUTH", "service": "auth-dev"}]})))
     check(r["result"] == "failure" and not ran(r, "migrations apply") and not ran(r, "PUBLISH"), "Dev: deployed (effective) D1 differs from the migration target -> neither migrated nor published (no DB-A migration with a DB-B Worker)")
-    r = dev(inputs={"dev_deploy_cmd": 'echo PUBLISH >> "$STUB_LOG"; sed -i "s/app-dev/app-other/" "$CF_AUDITED_CONFIG"'})
-    check(r["result"] == "failure" and ran(r, "PUBLISH") and r["outputs"]["deployed_and_verified"] == "false" and "unverified" in r["summary"].lower() and "state=success" not in r["log"], "a publish command that MODIFIES the audited config fails the run and is never verified")
-    r = dev(inputs={"dev_deploy_cmd": 'echo PUBLISH >> "$STUB_LOG"; mkdir -p dist; echo rebuilt > dist/index.js; sed -i "s/^name = \\"app-dev\\"/name = \\"app-dev\\"\\nmain = \\"dist\\/index.js\\"/" wrangler.toml'})
-    check(r["result"] == "failure" and r["outputs"]["deployed_and_verified"] == "false", "a publish command that rewrites the config to point at a replaced artifact is detected")
     # the audited ARTIFACT (Worker entry), not only the config file, is protected: a publish command that rebuilds it is caught
     MAIN_TOML = DEV_TOML.replace('name = "app"\n', 'name = "app"\nmain = "dist/index.js"\n', 1)
     r = dev(toml=MAIN_TOML, inputs={"dev_build_cmd": BUILD_ENTRY})
     check(r["result"] == "success" and r["outputs"]["deployed_and_verified"] == "true", "Worker entry built by the build stage and published untouched: verified")
-    r = dev(toml=MAIN_TOML, inputs={"dev_build_cmd": BUILD_ENTRY, "dev_deploy_cmd": 'echo PUBLISH >> "$STUB_LOG"; echo replaced > dist/index.js'})
-    check(r["result"] == "failure" and ran(r, "PUBLISH") and r["outputs"]["deployed_and_verified"] == "false" and "state=success" not in r["log"], "a publish command that replaces the audited Worker entry (config untouched) fails the run and is never verified")
     # P1: build env / smoke env cannot redirect Dev
     for line in ("TARGET=prod", "DEV_ENV=prod", "GH_TOKEN=x", "EXPECTED_SHA=fake"):
         r = dev(inputs=dict(D1, build_env_dev=line))
@@ -879,7 +872,7 @@ def group_shared_dev():
     check(r["result"] == "success" and ran(r, "migrations apply") and not ran(r, "PUBLISH"), "branch advanced during the Dev migration: old code is not published")
 
     # (the old 'Shared-D1 guard' is superseded: Preview and Dev on one D1 now share ONE migration leg; see the multi-kind section)
-    r = dev(inputs={"dev_deploy_cmd": ""})
+    r = dev()
     check(r["result"] == "success" and "wrangler deploy --config " in r["log"] and "wrangler.toml --env dev" in r["log"] and r["log"].index("BUILD") < r["log"].index("wrangler deploy"), "Shared Dev built-in publish (no dev_deploy_cmd): wrangler deploy gets the audited --config (and the named env for a source config), after the build")
     r = deploy(MAIN, inputs=BADCFG)
     check(r["jobs"]["plan"]["result"] == "failure" and r["jobs"]["migration"]["result"] == r["jobs"]["deploy"]["result"] == "skipped" and "BUILD" not in r["log"] and not published(r), "production-only + Shared Dev: the plan fails; no delivery job is scheduled (no build, migration, publish)")
@@ -1003,7 +996,7 @@ def group_shared_dev():
     r = manual(inputs=D1, env={"STUB_APPLY_FAIL": "1"})
     check(r["result"] == "failure" and r["res"]["migration"]["result"] == "failure" and ran(r, "migrations apply") and not ran(r, "PUBLISH") and r["res"]["delivery_persistent_dev"]["result"] == "skipped" and r["outputs"]["migration"] == "failed",
           "manual dispatch: the migrate step itself fails -> the Migrate job is red and Deploy / Smoke / Revert never run, nothing is published")
-    r = manual(inputs={"dev_deploy_cmd": 'echo "PUBLISH" >> "$STUB_LOG"; exit 1', "release_cmd": "pnpm release"}, env=dict(GD))
+    r = manual(inputs={"release_cmd": "pnpm release"}, env=dict(GD, STUB_DEPLOY_FAIL="1"))
     dres = r["res"]["delivery_persistent_dev"]
     check(r["result"] == "failure" and inner_of(r)["deploy"] == "failure" and inner_of(r)["rollback"] == "skipped" and dres["outputs"]["smoke_status"] == "none" and r["log"].count("PUBLISH") == 1
           and r["outputs"]["deployed_and_verified"] == "false" and not ran(r, "SMOKE") and "state=success" not in r["log"] and not release_runs(r, {"release_cmd": "pnpm release", "dispatch_target": "persistent-dev"}),
@@ -1029,11 +1022,16 @@ def group_shared_dev():
         check(r["res"]["delivery_persistent_dev"]["outputs"]["rollback_result"] == "restored_verified" and r["log"].count("PUBLISH") == 2, f"{label}: nothing pending this run (schema unchanged) -> recovery allowed without attestation")
     r = manual(env=FAIL_GOOD)
     check(r["res"]["delivery_persistent_dev"]["outputs"]["rollback_result"] == "restored_verified" and r["log"].count("PUBLISH") == 2, "no D1 migrations configured -> recovery unchanged")
-    # ---- a legacy dev_deploy_cmd (builds / selects its own Wrangler environment) is rejected before ANYTHING is built, migrated or published
-    for label, cmd_ in (("selects its own Wrangler environment", "pnpm exec wrangler deploy --env dev"), ("builds before publishing", "pnpm run build && pnpm exec wrangler deploy --config \"$CF_AUDITED_CONFIG\"")):
-        r = manual(inputs=dict(D1, dev_deploy_cmd=cmd_))
-        check(r["result"] == "failure" and not ran(r, "BUILD") and not ran(r, "PUBLISH") and "migrations apply" not in r["log"] and r["res"]["migration"]["result"] == "failure" and r["res"]["delivery_persistent_dev"]["result"] == "skipped",
-              f"manual dispatch with a legacy dev_deploy_cmd that {label}: rejected during the audit - nothing built, no D1 migration, nothing published")
+    # ---- the retired dev_deploy_cmd input: any non-empty value fails the Plan before anything is built, migrated or published
+    for cmd_ in ("pnpm run deploy:dev", "pnpm exec wrangler deploy --config \"$CF_AUDITED_CONFIG\""):
+        for runner in (manual, dev):
+            r = runner(inputs=dict(D1, dev_deploy_cmd=cmd_))
+            check(r["result"] == "failure" and r["res"]["plan"]["result"] == "failure" and not ran(r, "BUILD") and not ran(r, "PUBLISH") and "migrations apply" not in r["log"] and r["res"]["migration"]["result"] == "skipped",
+                  f"retired dev_deploy_cmd ({cmd_[:20]}...) via {runner.__name__}: the Plan fails it - nothing built, migrated or published")
+    # ---- regression: Dev build -> audited config -> engine-owned publish -> Smoke -> verified; and a failed publish is never verified
+    r = manual()
+    check(r["result"] == "success" and r["log"].index("BUILD") < r["log"].index("PUBLISH exec wrangler deploy --config") and r["log"].count("PUBLISH") == 1 and r["outputs"]["deployed_and_verified"] == "true" and r["outputs"]["verified_url"] == "https://dev.example.com",
+          "Dev build -> audited config -> engine-owned publish -> content Smoke -> verified deployment")
     # ---- other kinds keep their pipelines
     r = deploy(MAIN, inputs={"release_cmd": "pnpm release"})
     check(r["result"] == "success" and r["res"]["delivery_persistent_dev"]["result"] == "skipped" and release_runs(r), "unchanged: a Production push still runs the Production delivery (and Release)")
@@ -1500,6 +1498,12 @@ def group_ci_environment():
         res, lines = ci_run(ref, event, dt)
         want = f"CI app_env={app_env} mark={mark} mode={ {"prod": "PRODCFG", "dev": "DEVCFG", "preview": "PREVCFG"}[mark] } ci_env=yes prodsecret=none"
         check(res == "success" and lines == [want], f"CI env: {event} {ref} target={dt or '-'} -> VITE_APP_ENV={app_env}, the {mark} build env only (got {lines})")
+    # automatic Shared Dev: the SAME Dev CI as the manual dispatch when it is the run's only target; several kinds keep the shared Preview contract
+    PDONLY = dict(preview_on_branch_push=False, shared_dev_on_branch_push=True, deployment_strategy="hybrid")
+    for label, extra, want in (("automatic Persistent Dev only", PDONLY, ("dev", "DEVCFG")), ("Persistent Dev + Native Branch", dict(PDONLY, preview_on_branch_push=True), ("preview", "PREVCFG")),
+                               ("Native Dev only", dict(preview_on_branch_push=False, shared_dev_native_preview_on_branch_push=True), ("preview", "PREVCFG")), ("Native Branch only", {}, ("preview", "PREVCFG"))):
+        res, lines = ci_run(FEAT, "push", "", **extra)
+        check(lines == [f"CI app_env={want[0]} mark={want[0]} mode={want[1]} ci_env=yes prodsecret=none"], f"CI env: push to a feature branch, {label} -> {want[0]} (manual dispatch of the same Dev target sees the same values)")
     # every validation command receives the same environment
     for job in ("typecheck", "unit", "integration"):
         res, lines = ci_run(MAIN, "workflow_dispatch", "persistent-dev", job=job)

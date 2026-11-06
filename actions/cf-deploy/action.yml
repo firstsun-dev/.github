@@ -283,8 +283,6 @@ runs:
       env:
         PREVIEW_MUTATED: ${{ steps.publish.outputs.preview_mutated }}
         PUBLISH_STARTED: ${{ steps.publish.outputs.publish_started }}
-        PUBLISH_BLOCKED: ${{ steps.publish.outputs.publish_blocked }}
-        PUBLISH_INTEGRITY_FAILED: ${{ steps.publish.outputs.publish_integrity_failed }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" fail-prepublish'
     - name: Published but smoke failed - mark unverified
       if: failure() && steps.smoke.outcome == 'failure' && (inputs.stage == 'verify' || steps.publish.outcome == 'success')

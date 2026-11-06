@@ -332,10 +332,9 @@ on:
         default: ''
       dev_deploy_cmd:
         description: >
-          OPTIONAL publish-only command for the Dev Worker (default: `wrangler deploy --config <audited config>`).
-          The engine builds with dev_build_cmd (or build_cmd) and audits the effective config FIRST; this command runs
-          afterwards with CF_AUDITED_CONFIG exported, must publish THAT config (`wrangler deploy --config
-          "$CF_AUDITED_CONFIG"`) and must not rebuild: a changed config or deployable fails the run.
+          RETIRED - must be empty. The engine is the only publisher (it publishes the audited Dev Wrangler config itself); a non-empty
+          value fails the Plan before anything is built, migrated or published. Build in dev_build_cmd (or build_cmd). The input is kept
+          declared only so a stale caller gets this explicit error instead of a workflow-syntax failure.
         type: string
         default: ''
       dev_smoke_cmd:
@@ -477,10 +476,11 @@ jobs:
       build_env_prod: ${{ inputs.build_env_prod }}
       build_env_preview: ${{ inputs.build_env_preview }}
       build_env_dev: ${{ inputs.build_env_dev }}
-      # The CI environment follows the INTENDED deployment target, not only the ref: a persistent-dev dispatch is validated against the
-      # Dev build env even from `main` (never Production env vars). Pure event/input resolution (CI runs before the Plan; the Plan stays
+      # The CI environment follows the INTENDED deployment target, not only the ref: a persistent-dev dispatch (even from `main`) and an
+      # automatic push whose ONLY target is Shared Dev are validated against the Dev build env (never Production env vars); several kinds
+      # at once keep the Preview contract. Pure event/input resolution (CI runs before the Plan; the Plan stays
       # the authorization gate). JS twin: delivery.mjs ciTargetEnv.
-      ci_target_env: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && 'dev' || github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
+      ci_target_env: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && 'dev' || (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main' && inputs.dispatch_target == '' && inputs.deployment_strategy != 'production-only' && inputs.shared_dev_on_branch_push && !inputs.preview_on_branch_push && !inputs.shared_dev_native_preview_on_branch_push && 'dev' || github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
       test_e2e_cmd: ${{ inputs.test_e2e_cmd }}
       test_e2e_setup_cmd: ${{ inputs.test_e2e_setup_cmd }}
       test_e2e_build_cmd: ${{ inputs.test_e2e_build_cmd }}

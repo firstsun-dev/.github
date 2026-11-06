@@ -90,6 +90,7 @@ def ev(expr, ctx, failed=False):
         "F_failure": lambda: failed,
         "F_cancelled": lambda: False,
         "F_format": lambda f, *a: re.sub(r"\{\{|\}\}|\{(\d+)\}", lambda m: {"{{": "{", "}}": "}"}.get(m.group(0)) or str(a[int(m.group(1))]), f),
+        "F_startswith": lambda a, b: str(a).lower().startswith(str(b).lower()),
         "F_contains": lambda a, b: str(b) in (a if isinstance(a, (list, tuple)) else str(a)),
         "F_fromjson": lambda s: _wrap(json.loads(s)),
         "F_tojson": lambda v: json.dumps(v),

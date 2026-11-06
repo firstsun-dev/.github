@@ -4,7 +4,7 @@ import {
   DELIVERY_KINDS, resolveDeliveryTargets, resolveSmokeMode, parseSmokeOverrides, planMigrations, branchPreviewIdentity, ENGINE_TARGET,
   canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins,
   targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor, resolveMigrationUsed,
-  isContentLevel, verificationOutcome, prodRollbackBlock, nonProdRecoveryBlock, wranglerPublishBlock, devPublishCmdBlock, ciTargetEnv, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
+  isContentLevel, verificationOutcome, prodRollbackBlock, nonProdRecoveryBlock, ciTargetEnv, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
 } from '../../actions/cf-preview/delivery.mjs';
 
 const base = { event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-preview', previewOnPush: true };
@@ -730,45 +730,17 @@ test('nonProdRecoveryBlock: non-Production recovery is fail-closed against the m
   assert.equal(rollbackVerdict({ target: 'dev', rbResult: 'blocked', goodSha: '' }).ok, false);
 });
 
-test('wranglerPublishBlock: the argument vector of every Wrangler call of dev_deploy_cmd is judged, not the command string', () => {
-  const A = '/w/audited.json';
-  const b = (...args) => wranglerPublishBlock({ args, auditedConfig: A })?.code ?? null;
-  assert.equal(b('deploy', '--config', A), null);
-  assert.equal(b('deploy', `--config=${A}`, '--message', 'x'), null);
-  assert.equal(b('versions', 'upload', '-c', A), null);
-  assert.equal(b('deployments', 'list', '--json'), null, 'read-only subcommands are fine');
-  assert.equal(b('--version'), null);
-  assert.equal(b('deploy', '--env', 'dev'), 'env_selection');
-  assert.equal(b('deploy', '--config', A, '-e', 'dev'), 'env_selection');
-  assert.equal(b('deploy', `--env=dev`, '--config', A), 'env_selection');
-  assert.equal(b('deploy', '--config', A, '--name', 'other'), 'name_override');
-  assert.equal(b('deploy'), 'config_not_audited');
-  assert.equal(b('deploy', '--config', '/other.json'), 'config_not_audited');
-  assert.equal(b('deploy', '--config', A, '--config', A), 'config_not_audited');
-  for (const sub of [['d1', 'migrations', 'apply', 'DB'], ['d1', 'execute', 'DB'], ['delete'], ['rollback'], ['secret', 'put', 'X'], ['kv', 'key', 'put'], ['r2', 'bucket', 'delete', 'x']]) assert.equal(b(...sub), 'not_publish_only', sub.join(' '));
-});
-test('devPublishCmdBlock: early static rejection of legacy publish commands (package scripts resolved), supplementary to the runtime guard', () => {
-  const scripts = { 'deploy:dev': 'pnpm run build:frontend && pnpm exec wrangler deploy --env dev', 'build:frontend': 'vite build', ship: 'pnpm exec wrangler deploy --config "$CF_AUDITED_CONFIG"', hop: 'pnpm run ship' };
-  assert.equal(devPublishCmdBlock('pnpm run deploy:dev', scripts)?.code, 'rebuilds');
-  assert.equal(devPublishCmdBlock('pnpm exec wrangler deploy --env dev').code, 'env_selection');
-  assert.equal(devPublishCmdBlock('wrangler deploy -e dev --config x').code, 'env_selection');
-  assert.equal(devPublishCmdBlock('pnpm run build && wrangler deploy --config "$CF_AUDITED_CONFIG"').code, 'rebuilds');
-  assert.equal(devPublishCmdBlock('npm run build:prod').code, 'rebuilds');
-  assert.equal(devPublishCmdBlock('vite build').code, 'rebuilds');
-  assert.equal(devPublishCmdBlock('pnpm exec wrangler d1 migrations apply DB').code, 'not_publish_only');
-  assert.equal(devPublishCmdBlock('pnpm exec wrangler deploy --config "$CF_AUDITED_CONFIG"'), null);
-  assert.equal(devPublishCmdBlock('pnpm run hop', scripts), null, 'a script that only publishes with the audited config passes');
-  assert.equal(devPublishCmdBlock('echo publish'), null);
-  assert.equal(devPublishCmdBlock('./opaque.sh'), null, 'an opaque command is NOT judged here: the runtime guard still sees every Wrangler call');
-});
-test('ciTargetEnv: the CI environment follows the intended target', () => {
-  const E = (event, ref, dispatchTarget = '') => ciTargetEnv({ event, ref, dispatchTarget });
-  assert.equal(E('push', 'refs/heads/main'), 'prod');
-  assert.equal(E('push', 'refs/heads/feat'), 'preview');
-  assert.equal(E('workflow_dispatch', 'refs/heads/dev', 'persistent-dev'), 'dev');
-  assert.equal(E('workflow_dispatch', 'refs/heads/main', 'persistent-dev'), 'dev');
-  assert.equal(E('workflow_dispatch', 'refs/heads/main'), 'prod');
-  assert.equal(E('pull_request', 'refs/pull/1/merge'), 'preview');
-  assert.equal(E('push', 'refs/heads/main', 'persistent-dev'), 'prod', 'a push never becomes dev (the Plan rejects the conflicting target)');
-  assert.equal(E('workflow_dispatch', 'refs/heads/main', 'Persistent-Dev'), 'prod', 'only the exact value selects dev (the Plan rejects the rest)');
+test('ciTargetEnv: the CI environment follows the intended target (automatic and manual Persistent Dev alike)', () => {
+  const E = (o) => ciTargetEnv({ strategy: 'hybrid', previewOnPush: true, ...o });
+  assert.equal(E({ event: 'push', ref: 'refs/heads/main' }), 'prod');
+  assert.equal(E({ event: 'push', ref: 'refs/heads/feat' }), 'preview', 'Native Branch');
+  assert.equal(E({ event: 'push', ref: 'refs/heads/feat', previewOnPush: false, sharedDevNativeOnPush: true }), 'preview', 'Native Dev only: existing contract');
+  assert.equal(E({ event: 'push', ref: 'refs/heads/feat', previewOnPush: false, sharedDevOnPush: true }), 'dev', 'automatic Persistent Dev only');
+  assert.equal(E({ event: 'push', ref: 'refs/heads/feat', sharedDevOnPush: true }), 'preview', 'several kinds: shared Preview contract');
+  assert.equal(E({ event: 'workflow_dispatch', ref: 'refs/heads/dev', dispatchTarget: 'persistent-dev' }), 'dev');
+  assert.equal(E({ event: 'workflow_dispatch', ref: 'refs/heads/main', dispatchTarget: 'persistent-dev' }), 'dev');
+  assert.equal(E({ event: 'workflow_dispatch', ref: 'refs/heads/main' }), 'prod');
+  assert.equal(E({ event: 'pull_request', ref: 'refs/pull/1/merge', previewOnPush: false, sharedDevOnPush: true }), 'preview');
+  assert.equal(E({ event: 'push', ref: 'refs/heads/main', dispatchTarget: 'persistent-dev' }), 'prod');
+  assert.equal(E({ event: 'workflow_dispatch', ref: 'refs/heads/main', dispatchTarget: 'Persistent-Dev' }), 'prod');
 });

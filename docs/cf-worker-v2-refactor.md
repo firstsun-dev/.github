@@ -364,7 +364,7 @@ detect ─┬─ A (deploy call):   CI ‖ E2E ─► Migration ─► Deploy �
 | Build env / vars | `build_env_prod` | `build_env_preview` | `build_env_dev`, `dev_build_cmd`, `CLOUDFLARE_ENV=dev_wrangler_env` |
 | D1 (same project SQL) | top-level `d1_databases` | `previews.d1_databases` | `env.<dev_wrangler_env>.d1_databases` |
 | Config audit on the published config | Preview-resource ban | Preview binding / auth isolation | Dev Worker identity + resource policy |
-| Publish | `versions upload` + `versions deploy @100` | `wrangler preview --name <slug>` | `wrangler deploy --config <audited> --env <dev env>` or the caller's `dev_deploy_cmd` |
+| Publish | `versions upload` + `versions deploy @100` | `wrangler preview --name <slug>` | `wrangler deploy --config <audited> [--env <dev env> for a source config]` (engine-owned) |
 | Smoke URL | `app_url_prod` | discovered Preview URL | `app_url_dev` |
 | Recovery | policy-driven rollback to the previous version | redeploy last-good of THIS branch + host Worker | redeploy last verified Dev SHA (any branch) |
 
@@ -402,8 +402,8 @@ detect ─┬─ A (deploy call):   CI ‖ E2E ─► Migration ─► Deploy �
 | Deploy | `build_env_prod`, `build_env_preview`, `smoke_cmd`, `smoke_env`, `probe_path`, `probe_expect_status`, `sha_path`, `app_url_prod`, `access_protected_targets`, `production_rollback_policy`, `preview_binding_allow`, `preview_deny_resources` |
 | Migration | `d1_migrations`, `d1_binding`, `d1_lock_scope` (names the shared-D1 concurrency group; no command override) |
 | Release | `release_cmd` (+ secret `RELEASE_TOKEN`) |
-| Hybrid | `persistent_dev_ref`, `dev_deploy_cmd`, `dev_smoke_cmd`, `dispatch_target` |
-| Shared Dev | `shared_dev_on_branch_push`, `app_url_dev`, `dev_deploy_cmd`, `dev_smoke_cmd`, `build_env_dev`, `dev_build_cmd`, `dev_wrangler_env` (default `dev`), `dev_worker_name`, `dev_binding_allow`, `dev_deny_resources`; reuses `d1_migrations`, `d1_binding`, `sha_path`, `smoke_env`, `access_protected_targets`, `preview_deny_resources` |
+| Hybrid | `persistent_dev_ref`, `dev_smoke_cmd`, `dispatch_target` |
+| Shared Dev | `shared_dev_on_branch_push`, `app_url_dev`, `dev_smoke_cmd`, `build_env_dev`, `dev_build_cmd`, `dev_wrangler_env` (default `dev`), `dev_worker_name`, `dev_binding_allow`, `dev_deny_resources`; reuses `d1_migrations`, `d1_binding`, `sha_path`, `smoke_env`, `access_protected_targets`, `preview_deny_resources` |
 
 Outputs: `deploy_url`, `deploy_target`, `version_id` (prod only), `dev_url` (Shared Dev). The internal `deployed_and_verified` Deploy output is what gates Release. Secrets: `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` (prod), `PREVIEW_SECRETS`, `SMOKE_USERNAME/PASSWORD`, `RELEASE_TOKEN`.
 
@@ -445,7 +445,7 @@ Two independent switches decide what a non-main push deploys. Neither requires t
 * A failed build, audit or stale run never changes the running Dev Worker or its D1. Production, Preview and Dev all build **before** they migrate.
 * Migration reuses `migrate.sh` with the engine-bound target `dev`: D1 = `env.<dev_wrangler_env>.d1_databases`, never top-level (Production); no fallback. The Preview D1 and the Dev D1 **may** be the same physical database (Blog); Production's may not. `migrations apply` is pending-only. Shared Dev has `needs: deploy` purely for ordering, so the two channels never migrate one shared D1 concurrently, plus the shared concurrency group below.
 * `dev_worker_name` is **required** and the audit runs on every Shared Dev run (automatic and manual): the adapter-generated effective config (`.wrangler/deploy/config.json`), or if none was generated the source `env.<dev_wrangler_env>` block, must have `name == dev_worker_name` and pass the resource policy below.
-* **Same artifact.** `build.sh` records the path, SHA-256 and a content fingerprint (`artifact-digest`: config + Worker entry directory + assets directory) of the audited config. `publish.sh` refuses to run without that record, refuses a config that changed in between, always passes `--config <audited config>` (and `--env <dev env>` only for an un-flattened source config) and clears `CLOUDFLARE_ENV`. A caller-supplied `dev_deploy_cmd` is **publish-only**: it runs with `CF_AUDITED_CONFIG` exported and must `wrangler deploy --config "$CF_AUDITED_CONFIG"`; a changed config or deployable afterwards fails the run and the deployment is reported unverified. (A command that ignores the variable and deploys something else cannot be proven wrong by static means; keep `dev_deploy_cmd` empty to use the default.)
+* **Same artifact.** `build.sh` records the path, SHA-256 and a content fingerprint (`artifact-digest`: config + Worker entry directory + assets directory) of the audited config. `publish.sh` refuses to run without that record, refuses a config that changed in between, always passes `--config <audited config>` (and `--env <dev env>` only for an un-flattened source config) and clears `CLOUDFLARE_ENV`. There is no caller-supplied publish command: the engine is the only publisher (`dev_deploy_cmd` is retired and fails the Plan when set).
 * **Same D1.** `cli.mjs d1-consistency` requires the D1 binding of the config that will be published (effective config, or the source for an un-flattened config) to have the same physical `database_id` as the validated migration target. A mismatch fails before the migration and the publish: DB-A is never migrated while a Worker bound to DB-B is deployed.
 * With `d1_migrations`, `dev_build_cmd` is **required**, so the Dev build always succeeds before the Dev D1 is migrated.
 * **Shared-D1 guard:** if the Preview and Dev D1 are the same physical database and the Preview Deploy job reported its migration `failed` (or was cancelled), Shared Dev stops before touching anything (D1 state unknown). With distinct D1s, Preview off, or a Preview failure after a successful migration (e.g. a failed smoke), Dev still deploys; a Preview failure never blocks Dev otherwise.
@@ -492,9 +492,9 @@ Rules: an unknown kind, a malformed entry, a duplicate entry, an entry that matc
 
 ### Manual vs automatic Dev contract
 
-Dev contract (automatic Shared Dev push and manual dispatch alike): `dev_build_cmd` builds only (falls back to `build_cmd`; required with `d1_migrations`), `dev_deploy_cmd` (optional) publishes only, `dev_smoke_cmd` verifies only. Both triggers run CI → Plan → Migrate → Deploy → Smoke → conditional Revert; both require `dev_worker_name` and `app_url_dev`, and a manual dispatch additionally keeps the approved-ref gate and the protected `<app>/dev` Environment.
+Dev contract (automatic Shared Dev push and manual dispatch alike): `dev_build_cmd` builds only (falls back to `build_cmd`; required with `d1_migrations`), the engine alone publishes the audited Dev config (no caller publish command), `dev_smoke_cmd` verifies only. Both triggers run CI → Plan → Migrate → Deploy → Smoke → conditional Revert; both require `dev_worker_name` and `app_url_dev`, and a manual dispatch additionally keeps the approved-ref gate and the protected `<app>/dev` Environment.
 
-The former manual-only "legacy contract" (`dev_build_cmd` empty, `dev_deploy_cmd` builds and publishes in one command) no longer exists: a dispatch cannot select a different implementation than a push. Migration: set `dev_build_cmd`, make `dev_deploy_cmd` publish the audited config only (`wrangler deploy --config "$CF_AUDITED_CONFIG"`), and set `dev_worker_name` / `app_url_dev`.
+The former "legacy contract" (`dev_deploy_cmd` builds and publishes in one command) no longer exists. `dev_deploy_cmd` is a retired input: a non-empty value fails the Plan before anything is built, migrated or published. Migration: build in `dev_build_cmd` (or `build_cmd`), delete `dev_deploy_cmd`, set `dev_worker_name` / `app_url_dev`, or move the app to Native Dev.
 
 ### Recovery limits
 
