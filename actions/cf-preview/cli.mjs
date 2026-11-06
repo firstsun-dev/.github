@@ -303,14 +303,14 @@ try {
     case 'init-checks': { // --state DIR --inputs FILE; env ENGINE_* GITHUB_EVENT_NAME GITHUB_REF CALL_INPUTS_JSON PREVIEW_SECRETS. ONE process for every init check.
       const e = process.env;
       const r = validateInit({
-        inputs: JSON.parse(readFileSync(opt('inputs'), 'utf8')), target: e.ENGINE_TARGET, kind: e.ENGINE_KIND ?? '', stage: e.ENGINE_STAGE || 'all', mode: e.ENGINE_MODE || 'auto',
+        inputs: JSON.parse(readFileSync(opt('inputs'), 'utf8')), target: e.ENGINE_TARGET, kind: e.ENGINE_KIND ?? '', stage: e.ENGINE_STAGE || 'all',
         d1Expect: e.ENGINE_D1_EXPECT ?? '', descriptor: e.ENGINE_DESCRIPTOR ?? '', callInputs: e.CALL_INPUTS_JSON ?? '', event: e.GITHUB_EVENT_NAME, ref: e.GITHUB_REF,
         previewSecrets: e.PREVIEW_SECRETS ?? '',
       });
       const dir = opt('state');
       const put = (name, text) => writeFileSync(resolve(dir, name), text, { mode: 0o600 });
       const env = (name, pairs) => { if (pairs?.length) appendFileSync(resolve(dir, name), pairs.map(([k, v]) => `${k}=${v}`).join('\n') + '\n', { mode: 0o600 }); };
-      put('kind', r.kind); put('smoke_mode', r.smokeMode); put('stage', r.stage); put('d1_expect', r.d1Expect); put('target', r.target); put('mode', r.mode);
+      put('kind', r.kind); put('smoke_mode', r.smokeMode); put('stage', r.stage); put('d1_expect', r.d1Expect); put('target', r.target);
       env('build.env', r.buildEnv); env('smoke.env', r.smokeEnv); env('preview.env', r.previewEnv);
       for (const [, v] of r.previewEnv ?? []) if (v) console.error(`::add-mask::${v}`);
       out({ kind: r.kind, smoke_mode: r.smokeMode });

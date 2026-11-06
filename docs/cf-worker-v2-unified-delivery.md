@@ -356,3 +356,24 @@ YAML anchors (`&delivery_permissions`, `&delivery_secrets`, `&fetch_ci_tools`) w
   with a message naming both databases. Nothing is changed before it fails. The consumer plan (blog, innovation-apps, heaven-monorepo, anas-mcp, heaven-www) does not
   need this, but each caller must be confirmed before the `@v2` move; the rollout stays blocked on that confirmation.
 * The Migration job runs in the owner's Environment, so on main the `<app>/prod` approval is requested **before** the read-only validation steps as well as before the migration.
+
+## Manual dispatch (persistent-dev) — one pipeline, trigger-independent
+
+Deployment **targets** decide what is deployed; **triggers** decide when. A `workflow_dispatch` with `dispatch_target: persistent-dev` therefore is not a delivery kind or a job of its own. It only makes `resolveDeliveryTargets()` return `["persistent-dev"]`, and the run is the standard
+
+`CI → Validation Gate → Plan → Migrate → persistent-dev / Deploy → Smoke Tests → Revert on Verify Failure`
+
+identical to a feature-branch Shared Dev push. The delivery workflow has exactly `deploy`, `smoke`, `rollback`; the `manual` job, its `manual` input and the engine's `mode` input are gone.
+
+| Event | Ref | Requested target | Resolved delivery |
+| --- | --- | --- | --- |
+| push | main | – | production |
+| push | feature | enabled channels | native-branch / native-dev / persistent-dev (as before) |
+| workflow_dispatch | = `persistent_dev_ref` (hybrid) | `persistent-dev` | persistent-dev only (also from `main`; never Production, never Release) |
+| workflow_dispatch | any other ref, non-hybrid, empty `persistent_dev_ref`, unknown target | `persistent-dev` / other | Plan **fails** before any mutation |
+| workflow_dispatch | main / feature | empty | unchanged (production / enabled previews) |
+| pull_request, delete | – | – | CI only / lifecycle only |
+
+Concurrency: the run-level group of a persistent-dev dispatch is the same as for the automatic Shared Dev push (`cfv2-nonprod-d1-<scope>` with `d1_migrations`, else `cfv2-shared-dev-<app>`; never the Production group, even from `main`), so the Migrate job cannot race a feature-branch Dev push. Deploy and Revert keep the descriptor's job-level group `cfv2-dev-<repo>-<scope|app>` (a different name, so no nested-group deadlock).
+
+Behaviour changes versus the old manual path: it now runs CI, Plan and the dedicated Migrate job; a failed Smoke triggers the same conditional recovery to the last known-good Dev deployment (it previously had none); D1 is still never rolled back. Callers that relied on `dev_build_cmd` being empty (one `dev_deploy_cmd` that builds and publishes) must add `dev_build_cmd` and make `dev_deploy_cmd` publish only (see `docs/cf-worker-v2-refactor.md`).

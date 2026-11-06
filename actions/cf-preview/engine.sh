@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CF Worker v2 delivery engine. ONE implementation of
 #   Build -> Config audit -> Migration (optional) -> Publish -> Smoke -> Recovery
-# for every target (prod | preview | dev) and both modes (auto = branch/main push, manual = persistent Dev dispatch).
+# for every target (prod | preview | dev) and every trigger (push or dispatch: the trigger never selects a different pipeline).
 # actions/cf-deploy/action.yml calls one phase per step; every phase reads the workflow inputs from the validated
 # inputs.json written by `init`, so no workflow text is interpolated into a script.
 #
@@ -17,7 +17,7 @@
 # (`deploy` = migrate + publish in ONE job, then `verify` / `rollback`): a caller that must run a cross-service smoke
 # AFTER another Worker's deployment (workflow input pipeline_phase) verifies the published Dev deployment later.
 #
-# State ($STATE_DIR, default $RUNNER_TEMP/cfv2, 0700): inputs.json, target, mode, build.env / smoke.env /
+# State ($STATE_DIR, default $RUNNER_TEMP/cfv2, 0700): inputs.json, target, build.env / smoke.env /
 # preview.env (validated KEY=VALUE data), config.* and artifact.sha (from build.sh), ledger_id, preview_name, ...
 # Application env (build_env_*, smoke_env, preview secrets) is only ever loaded inside the process that needs it and
 # can never set a reserved control variable (parse-env.mjs RESERVED). The target is bound ONCE in `init` (from the
@@ -48,7 +48,7 @@ rd() { [ -f "$S/$1" ] && cat "$S/$1" || true; }
 # Engine-owned context, derived from state and the runner (never from caller env text).
 ctx() {
   [ -s "$S/target" ] || die "delivery engine not initialised"
-  TARGET="$(rd target)"; MODE="$(rd mode)"; KIND="$(rd kind)"
+  TARGET="$(rd target)"; KIND="$(rd kind)"
   if [ -z "$KIND" ]; then case "$TARGET" in prod) KIND=production;; preview) KIND=native-branch;; dev) KIND=persistent-dev;; esac; fi
   APP_NAME="$(inp app_name)"; APP_PATH="$(inp app_path)"; APP_PATH="${APP_PATH:-.}"
   APP_DIR="${APP_DIR_OVERRIDE:-${GITHUB_WORKSPACE:?}/$APP_PATH}"
@@ -63,7 +63,7 @@ ctx() {
   esac
   PREVIEW_NAME="$(rd preview_name)"; ENV_NAME="$(rd ledger_env)"; LEDGER_ID="$(rd ledger_id)"
   [ "$KIND" != native-dev ] || PREVIEW_NAME=dev
-  export KIND TARGET MODE APP_NAME APP_DIR BRANCH_REF BRANCH RUN_SHA DEV_ENV WRANGLER_CONFIG D1_BINDING HOST_WORKER PREVIEW_NAME ENV_NAME STATE_DIR="$S"
+  export KIND TARGET APP_NAME APP_DIR BRANCH_REF BRANCH RUN_SHA DEV_ENV WRANGLER_CONFIG D1_BINDING HOST_WORKER PREVIEW_NAME ENV_NAME STATE_DIR="$S"
 }
 
 # Which commands/env belong to the target. Never falls back across targets (except dev_build_cmd -> build_cmd).
@@ -171,8 +171,8 @@ case "$PHASE" in
       DESC="Native Preview"
     elif [ "$TARGET" = dev ]; then
       printf '%s' "$APP_NAME/dev/shared" > "$S/ledger_env"
-      PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg w "$APP_NAME" --arg d "$HOST_WORKER" --arg r "$GITHUB_REPOSITORY" --arg m "$MODE" '{kind:"persistent-dev",branch_ref:$ref,worker:$w,dev_worker:$d,repo:$r,mode:$m}')"
-      DESC="Shared Dev ($MODE)"
+      PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg w "$APP_NAME" --arg d "$HOST_WORKER" --arg r "$GITHUB_REPOSITORY" '{kind:"persistent-dev",branch_ref:$ref,worker:$w,dev_worker:$d,repo:$r}')"
+      DESC="Shared Dev"
     fi
     # The Migration job runs the identity / preflight checks but opens no ledger entry (the Deploy job owns it).
     if [ "$TARGET" != prod ] && [ "${PREPARE_LEDGER:-true}" = true ]; then

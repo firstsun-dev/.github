@@ -76,7 +76,7 @@ def desc(kind, d1="", owner="", app="app", scope="", phase="all", **over):
     return json.dumps(dict({"v": 1, "kind": kind, "target": TARGET_OF[kind], "environment": f"{app}/{_ENV_OF[kind]}", "deploy_group": g,
                             "rollback_group": g if kind == "persistent-dev" else g + "-rollback", "d1_expected_id": d1, "d1_owner_kind": owner,
                             "owns_migration": bool(d1 and owner == kind), "smoke_mode": "full", "phase": phase}, **over))
-INNER = ("deploy", "smoke", "rollback", "manual")
+INNER = ("deploy", "smoke", "rollback")
 SKIPPED = {"result": "skipped", "outputs": {}}
 
 
@@ -106,8 +106,6 @@ def call_workflow(job, c, ctl):
     w = {k: render(v, c) for k, v in job["with"].items()}
     dinputs = dict(DINPUT_DEFAULTS)
     dinputs.update(w)
-    if "manual" in dinputs:  # type: boolean - GitHub coerces the rendered 'true' / 'false' string
-        dinputs["manual"] = str(dinputs["manual"]).lower() == "true"
     sec = {k: render(v, c) for k, v in job.get("secrets", {}).items()}
     kind = json.loads(w["descriptor"])["kind"]
     dc = Ctx({"github": c["github"], "inputs": dinputs, "needs": {}, "jobs": {}}, sec)
@@ -400,27 +398,14 @@ def advertised(r):
 GD = {"STUB_DEPLOYMENTS": json.dumps([{"id": 7, "sha": GOOD, "payload": {"repo": "o/r", "dev_worker": "app-dev", "worker": "app"}}]), "STUB_STATUS": "success https://dev.example.com Serving good (content)"}
 tamper = 'case "$PWD" in */recover*) sed -i "s/name = \\"app-dev\\"/name = \\"app\\"/" wrangler.toml;; esac; echo "BUILD ver=$VITE_APP_VERSION commit=$PUBLIC_COMMIT_SHA cfenv=$CLOUDFLARE_ENV" >> "$STUB_LOG"'
 
-# Manual persistent-dev: legacy vs engine contract
-PD = dict(DEV_INPUTS, deployment_strategy="hybrid", persistent_dev_ref="refs/heads/dev", dispatch_target="persistent-dev", shared_dev_on_branch_push=False)
+# Manual persistent-dev dispatch: NOT a separate path - the same chain (CI -> Plan -> Migrate -> Deploy -> Smoke -> Rollback) as the automatic push
+PD = dict(DEV_INPUTS, deployment_strategy="hybrid", persistent_dev_ref="refs/heads/dev", dispatch_target="persistent-dev", shared_dev_on_branch_push=False, preview_on_branch_push=False)
 
 
-def manual(inputs=None, env=None, toml=DEV_TOML, gate=True):
-    ws = make_workspace(toml)
-    # the REAL call: delivery_persistent_dev (Plan / Migration skipped for a dispatch) -> the `manual` job of the delivery workflow
-    needs = {"plan": SKIPPED, "migration": SKIPPED}
-    c = ctx("refs/heads/dev", dict(PD, **(inputs or {})), PROD_SECRETS, needs, event="workflow_dispatch")
-    pj = doc["jobs"]["delivery_persistent_dev"]
-    if gate and not ev(pj["if"], c):
-        return {"result": "skipped", "log": "", "summary": "", "ws": ws, "steps": []}
-    dinputs = dict(DINPUT_DEFAULTS, **{k: render(v, c) for k, v in pj["with"].items()})
-    dinputs["manual"] = dinputs["manual"] == "true"
-    dc = Ctx({"github": c["github"], "inputs": dinputs, "needs": {}, "jobs": {}}, {k: render(v, c) for k, v in pj["secrets"].items()})
-    for n in ("deploy", "smoke", "rollback"):
-        assert not ev(ddoc["jobs"][n]["if"], dc), f"{n} must not run for the manual dispatch"
-    assert ev(ddoc["jobs"]["manual"]["if"], dc)
-    r = run_job(ddoc, "manual", dc, ws, dict({"STUB_TIPS": SHA}, **(env or {})))
-    r["ws"] = ws
-    return r
+def manual(inputs=None, env=None, toml=DEV_TOML, ref="refs/heads/dev", needs_over=None, env_by_job=None, **kw):
+    """The protected workflow_dispatch of persistent Dev through the REAL chain (every job's `if` evaluated against the real needs)."""
+    return run_chain(ref, inputs=dict(PD, **(inputs or {})), env=env, toml=toml, event="workflow_dispatch", needs_over=needs_over, env_by_job=env_by_job, **kw)
+
 
 # Every job below ran in its OWN fresh workspace: the hand-off (URL, version ids, Worker identity, ledger id, migration
 # facts, smoke level) travelled through job outputs only.
@@ -949,24 +934,58 @@ def group_shared_dev():
     check(f"commit={GOOD}" in rb["log"], "build env referencing the failed SHA (full) is rebound for the restored commit")
 
 
-    r = manual(inputs={"dev_build_cmd": "", "dev_smoke_cmd": 'echo SMOKE >> "$STUB_LOG"', "dev_deploy_cmd": 'echo "PUBLISH" >> "$STUB_LOG"'})
-    check(r["result"] == "success" and ran(r, "PUBLISH") and ran(r, "SMOKE") and not ran(r, "BUILD") and "-X POST" not in r["log"] and "statuses" not in r["log"], "legacy persistent-dev: unchanged (deploy + optional smoke), never written to the known-good ledger")
-    r = manual()
-    check(r["result"] == "success" and r["log"].index("BUILD") < r["log"].index("PUBLISH") and "state=success" in r["log"], "engine contract: manual run builds first, publishes, smokes and is recorded verified")
-    r = manual(inputs=D1)
-    check(r["result"] == "success" and r["log"].index("BUILD") < r["log"].index("migrations apply") < r["log"].index("PUBLISH") and "SHARED-ID" in mig_file(r, "dev"), "engine contract: manual run migrates the Dev D1 between build and publish")
-    r = manual(inputs={"dev_build_cmd": "false"})
-    check(r["result"] == "failure" and not ran(r, "PUBLISH") and "state=success" not in r["log"], "engine contract: manual build failure publishes nothing and records nothing as good")
-    r = manual(env={"STUB_PROBES": "500 ", **GD})
-    check(r["result"] == "failure" and ran(r, "PUBLISH") and "state=success" not in r["log"] and "state=failure" in r["log"] and r["log"].count("PUBLISH") == 1, "engine contract: a manual deploy whose smoke fails is NEVER recorded as known-good and is not auto-recovered")
+    # ---- the manual dispatch runs the standard pipeline, structurally identical to the automatic Shared Dev push
+    inner_of = lambda x: {k: v["result"] for k, v in x["res"]["delivery_persistent_dev"]["jobs"].items()}
+    auto, man = dev(inputs=D1), manual(inputs=D1)
+    check(man["result"] == "success" and man["res"]["ci"]["result"] == "success" and man["res"]["plan"]["result"] == "success" and man["res"]["migration"]["result"] == "success",
+          "manual dispatch: CI, Plan and the dedicated Migration job all ran (no bypass)")
+    check({k: v["result"] for k, v in man["res"].items()} == {k: v["result"] for k, v in auto["res"].items()} and inner_of(man) == inner_of(auto) == {"deploy": "success", "smoke": "success", "rollback": "skipped"},
+          "manual dispatch vs automatic Shared Dev push: the SAME jobs with the SAME results (CI, Plan, Migrate, persistent-dev Deploy -> Smoke Tests -> Revert skipped); no `manual` job exists")
+    check(json.loads(man["res"]["plan"]["outputs"]["kinds"]) == ["persistent-dev"] and man["res"]["plan"]["outputs"]["descriptors"] == auto["res"]["plan"]["outputs"]["descriptors"],
+          "manual dispatch: the Plan resolves exactly [persistent-dev] with the SAME versioned descriptor as the automatic push")
+    check(man["log"].index("BUILD") < man["log"].index("migrations apply") < man["log"].index("PUBLISH") and "SHARED-ID" in mig_file(man, "dev") and "PROD-ID" not in mig_file(man, "dev") and man["log"].count("migrations apply") == 1,
+          "manual dispatch: ONE migration, in the Migrate job, against the Dev D1 only (never Production), before the publish; none inside the Deploy")
+    check(man["outputs"]["deployed_and_verified"] == "true" and man["outputs"]["verified_url"] == "https://dev.example.com" and "state=success" in man["log"], "manual dispatch: published, smoked at content level and recorded verified through the standard Smoke")
+    r = manual(inputs={"dev_smoke_cmd": 'echo SMOKE >> "$STUB_LOG"'})
+    check(r["result"] == "success" and ran(r, "SMOKE") and not ran(r, "migrations apply"), "manual dispatch: dev_smoke_cmd runs in the standard Smoke")
+    # ---- rejected before any mutation
+    nomut = lambda x: not ran(x, "PUBLISH") and not ran(x, "BUILD") and "migrations apply" not in x["log"] and "-X POST" not in x["log"]
+    for label, kw in (("an unapproved ref", dict(ref="refs/heads/other")), ("a missing persistent_dev_ref", dict(inputs={"persistent_dev_ref": ""})),
+                      ("strategy production-preview", dict(inputs={"deployment_strategy": "production-preview"})), ("an unknown dispatch_target", dict(inputs={"dispatch_target": "production"}))):
+        r = manual(**dict(kw, inputs=dict(D1, **kw.get("inputs", {}))))
+        check(r["result"] == "failure" and r["res"]["plan"]["result"] == "failure" and nomut(r) and all(r["res"][f"delivery_{KEYED[k]}"]["result"] == "skipped" for k in KINDS) and r["res"]["migration"]["result"] == "skipped",
+              f"manual dispatch with {label}: the Plan rejects it - no Migration, no Deploy, nothing built or published")
+    # ---- from the approved main ref: persistent Dev, never Production
+    r = manual(ref=MAIN, inputs=dict(D1, persistent_dev_ref=MAIN, release_cmd="pnpm release", production_rollback_policy="automatic"))
+    check(r["result"] == "success" and json.loads(r["res"]["plan"]["outputs"]["kinds"]) == ["persistent-dev"] and r["res"]["delivery_production"]["result"] == "skipped" and "versions upload" not in r["log"] and "versions deploy" not in r["log"] and r["res"]["delivery_persistent_dev"]["result"] == "success",
+          "manual dispatch from the approved main ref: the Dev target only, Production is never selected or deployed")
+    check(not release_runs(r, {"release_cmd": "pnpm release", "dispatch_target": "persistent-dev"}), "manual dispatch from main: Release never runs")
+    # ---- missing required input / failed gates
     r = manual(inputs={"dev_worker_name": ""})
-    check(r["result"] == "failure" and not ran(r, "PUBLISH"), "engine contract: manual run also requires the Worker identity")
-    r = manual(toml=DEV_TOML.replace('name = "app-dev"', 'name = "app"'))
-    check(r["result"] == "failure" and not ran(r, "PUBLISH"), "engine contract: manual run applies the same config audit")
-    r = manual(inputs={"persistent_dev_ref": "refs/heads/other"})
-    check(r["result"] == "skipped" and not ran(r, "PUBLISH"), "manual dispatch from a ref other than persistent_dev_ref: the delivery call is skipped (nothing runs)")
-    r = manual(inputs={"persistent_dev_ref": "refs/heads/other"}, gate=False)
-    check(r["result"] == "failure" and not ran(r, "PUBLISH"), "engine contract: manual run from a ref other than persistent_dev_ref is refused by the engine too (defence in depth, even if the call gate were bypassed)")
+    check(r["result"] == "failure" and not ran(r, "PUBLISH") and r["res"]["migration"]["result"] in ("failure", "skipped"), "manual dispatch without dev_worker_name: rejected before publish (same validation as the automatic path)")
+    r = manual(inputs=dict(D1, lint_cmd="l"), needs_over={"lint": "failure"})
+    check(r["result"] == "failure" and r["res"]["plan"]["result"] == "skipped" and r["res"]["migration"]["result"] == "skipped" and r["res"]["delivery_persistent_dev"]["result"] == "skipped" and nomut(r), "manual dispatch: a failed CI check stops everything - no Plan, Migration or Deploy")
+    r = manual(inputs=D1, toml=DEV_TOML.replace('name = "app-dev"', 'name = "app"'))
+    check(r["result"] == "failure" and not ran(r, "PUBLISH") and "migrations apply" not in r["log"], "manual dispatch: the same config audit applies (wrong Worker identity: nothing migrated or published)")
+    r = manual(inputs=dict(D1, dev_build_cmd="false"))
+    check(r["result"] == "failure" and not ran(r, "PUBLISH") and "migrations apply" not in r["log"] and r["res"]["delivery_persistent_dev"]["result"] == "skipped", "manual dispatch: a failed build blocks the Migration, so nothing is migrated or deployed")
+    # ---- smoke failure: the SAME conditional recovery as every other persistent-dev deployment
+    r = manual(env=dict(GD, STUB_PROBES="500 ;200 "))
+    check(r["result"] == "failure" and inner_of(r) == {"deploy": "success", "smoke": "failure", "rollback": "success"} and r["log"].count("PUBLISH") == 2 and f"BUILD ver={GOOD} commit={GOOD} cfenv=dev" in r["log"] and "state=success" not in r["log"],
+          "manual dispatch, Smoke failure: the standard Revert redeploys the last known-good Dev SHA; the run stays red and the failed SHA is never recorded verified")
+    r = manual(env={"STUB_PROBES": "500 "})
+    check(r["result"] == "failure" and r["log"].count("PUBLISH") == 1 and "manual recovery required" in r["summary"] and "state=success" not in r["log"], "manual dispatch, Smoke failure without a known-good deployment: fails closed, no recovery attempted")
+    r = manual(env=dict(GD, STUB_PROBES="500 "), env_by_job={"rollback": {"STUB_TIPS": OTHER}})
+    check(r["result"] == "failure" and r["log"].count("PUBLISH") == 1 and "superseded" in r["summary"], "manual dispatch: recovery never replaces a newer deployment of the branch")
+    r = manual(inputs=D1, env={"STUB_PROBES": "500 "})
+    check(r["result"] == "failure" and r["log"].count("migrations apply") == 1 and "d1 migrations" in r["log"] and "schema rollback" not in r["log"] and "migrations revert" not in r["log"], "manual dispatch: a failed Smoke never touches the D1 schema (applied once, never reverted)")
+    # ---- other kinds keep their pipelines
+    r = deploy(MAIN, inputs={"release_cmd": "pnpm release"})
+    check(r["result"] == "success" and r["res"]["delivery_persistent_dev"]["result"] == "skipped" and release_runs(r), "unchanged: a Production push still runs the Production delivery (and Release)")
+    r = deploy(FEAT)
+    check(r["result"] == "success" and r["res"]["delivery_native_branch"]["result"] == "success", "unchanged: a Native Branch push still runs the Native Branch delivery")
+    r = deploy(MAIN, event="workflow_dispatch")
+    check(r["result"] == "success" and json.loads(r["res"]["plan"]["outputs"]["kinds"]) == ["production"], "unchanged: a workflow_dispatch without a target on main keeps the Production behaviour")
 
 
 def group_chain_smoke_rollback():

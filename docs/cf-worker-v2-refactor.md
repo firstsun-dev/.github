@@ -97,9 +97,8 @@ one unspecified leg's output per key, so keeping them apart would need a results
 
 ### Event handlers
 
-`lifecycle` (PR comment of the verified Preview URL; branch-delete ledger retirement, only if this branch still owns the name and the branch does not exist again; the Cloudflare Native Preview is **kept**) and `persistent-dev`
-(Hybrid, protected dispatch of the approved ref, `<app>/dev` Environment; engine in manual mode when `dev_build_cmd` is set, the unchanged legacy two-command contract otherwise) are small reusable workflows. They contain no deployment
-implementation: the persistent-dev engine path is the same `$/actions/cf-deploy`. The legacy path stays because `heaven-monorepo` and `innovation-apps` pass `persistent_dev_ref`; it cannot move into the engine without changing its "one command builds and publishes" contract.
+`lifecycle` (PR comment of the verified Preview URL; branch-delete ledger retirement, only if this branch still owns the name and the branch does not exist again; the Cloudflare Native Preview is **kept**) is a small reusable workflow with no deployment
+implementation. The Hybrid protected dispatch of persistent Dev is not a separate path: it only selects the `persistent-dev` kind in the Plan and then runs the standard pipeline (see `docs/cf-worker-v2-unified-delivery.md`, "Manual dispatch").
 
 ### Concurrency and `phase_state`
 
@@ -209,7 +208,7 @@ No call enables two distinct physical D1s in any modeled event, so the single-D1
 | `<job> / Migration` | `<job> / Migrate` |
 | `<job> / Deploy`, `Smoke Tests`, `Revert on Verify Failure`, `Shared Dev`, `Shared Dev Smoke Tests`, `Shared Dev Revert on Verify Failure` | `<job> / <kind> / Deploy\|Smoke Tests\|Revert on Verify Failure` (`<kind>` = `production\|native-branch\|native-dev\|persistent-dev`) |
 | `<job> / Release` | unchanged |
-| `<job> / Config guard`, `Preview lifecycle`, `Persistent Dev (Hybrid)` | `<job> / Guard`, `<job> / lifecycle / ledger`, `<job> / persistent-dev / manual`; new `<job> / Plan` |
+| `<job> / Config guard`, `Preview lifecycle`, `Persistent Dev (Hybrid)` | `<job> / Guard`, `<job> / lifecycle / ledger`, `<job> / persistent-dev / Deploy` (a manual dispatch of persistent Dev has the same checks as a Shared Dev push); new `<job> / Plan` |
 
 Skipped jobs (unconfigured checks) report as skipped; a required context that is never emitted blocks merging. Nothing was modified in any repository's protection settings.
 
@@ -263,7 +262,7 @@ Detect Changes (monorepo only — the CALLER runs _detect-changes.yml and gates 
 
  outside the core DAG:  lifecycle (same-repo PR comment / branch-delete ledger retire)
                         config-guard (production-only + Shared Dev is rejected)
-                        persistent-dev (Hybrid, protected workflow_dispatch on the approved ref; the same engine, mode=manual)
+                        (a Hybrid workflow_dispatch of the approved ref is NOT a separate path: it selects the persistent-dev kind and runs the same DAG)
 ```
 
 There is **no Prepare, Plan or Test-Gate job**. Migration is its own job again (v1 parity), but it keeps the v2 order *inside* it: the deployable is built and the effective Wrangler config audited and the exact D1 target validated BEFORE the schema is touched, and the migration publishes nothing. Deploy then repeats build + audit from the same SHA and publishes. Smoke and Rollback are separate jobs so the DAG shows whether a deployment was verified or reverted.
@@ -436,7 +435,7 @@ Two independent switches decide what a non-main push deploys. Neither requires t
 | false | false | validation only |
 
 * **Feature Native Preview** — the `Deploy` job with target `preview`: one stable URL per branch.
-* **Shared Dev** — job `dev-deploy` ("Shared Dev"). Every branch targets the **same** Dev Worker and `app_url_dev`; the last verified deployment wins and there is no per-branch Dev. Use `shared_dev_on_branch_push` for this; the manual `persistent-dev` dispatch (Hybrid, approved ref, Cron/Queue checks) is a separate trigger of the **same engine** (`mode: manual`, no automatic recovery) when `dev_build_cmd` is set; without it the legacy two-command contract runs `dev_deploy_cmd` alone.
+* **Shared Dev** — job `dev-deploy` ("Shared Dev"). Every branch targets the **same** Dev Worker and `app_url_dev`; the last verified deployment wins and there is no per-branch Dev. Use `shared_dev_on_branch_push` for this; the manual `persistent-dev` dispatch (Hybrid, approved ref, Cron/Queue checks) is another trigger of the **same pipeline** (same CI, Plan, Migrate, Deploy, Smoke and conditional Revert).
 * `config-guard` fails the run when `deployment_strategy: production-only` is combined with `shared_dev_on_branch_push: true`. `production-only` still silently ignores `preview_on_branch_push` (its default is `true`; failing on it would break existing callers) — open question for review.
 
 ### Shared Dev job order
@@ -493,9 +492,9 @@ Rules: an unknown kind, a malformed entry, a duplicate entry, an entry that matc
 
 ### Manual vs automatic Dev contract
 
-Engine contract (new consumers; opt in by setting `dev_build_cmd`): `dev_build_cmd` builds only, `dev_deploy_cmd` (optional) publishes only, `dev_smoke_cmd` verifies only. Automatic Shared Dev and the manual `persistent-dev` dispatch then both run build → config audit → D1 check → Dev D1 migration (`d1_migrations`) → publish → smoke through the same engine; the manual run also requires `dev_worker_name` and `app_url_dev`, keeps the approved-ref gate and protected `<app>/dev` Environment, and cannot skip the build. A manual run is recorded in the last-good ledger **only after its smoke passes** (failures are recorded as failed); it has no automatic recovery.
+Dev contract (automatic Shared Dev push and manual dispatch alike): `dev_build_cmd` builds only (falls back to `build_cmd`; required with `d1_migrations`), `dev_deploy_cmd` (optional) publishes only, `dev_smoke_cmd` verifies only. Both triggers run CI → Plan → Migrate → Deploy → Smoke → conditional Revert; both require `dev_worker_name` and `app_url_dev`, and a manual dispatch additionally keeps the approved-ref gate and the protected `<app>/dev` Environment.
 
-Legacy contract (`dev_build_cmd` empty, existing hybrid callers): the manual dispatch runs `dev_deploy_cmd` (which must build itself) and the optional `dev_smoke_cmd` exactly as before and is **never** written to the ledger, so automatic recovery can never mistake it for a known-good release. Migration plan: add `dev_build_cmd`, `dev_worker_name`, `app_url_dev` (and an audit-clean Dev config); no caller is forced to.
+The former manual-only "legacy contract" (`dev_build_cmd` empty, `dev_deploy_cmd` builds and publishes in one command) no longer exists: a dispatch cannot select a different implementation than a push. Migration: set `dev_build_cmd`, make `dev_deploy_cmd` publish the audited config only (`wrangler deploy --config "$CF_AUDITED_CONFIG"`), and set `dev_worker_name` / `app_url_dev`.
 
 ### Recovery limits
 

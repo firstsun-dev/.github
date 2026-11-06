@@ -42,8 +42,10 @@ export function resolveSmokeMode(kind, smokeMode = 'full', overridesText = '') {
 
 /**
  * Enabled delivery kinds for one event, in a stable order. Exactly the enabled targets - a disabled channel creates no
- * phantom path. `persistentDevDispatch` = the protected manual dispatch (a separate, non-automatic path).
- * Rejects (throws) the combinations the spec forbids instead of silently dropping them.
+ * phantom path. A protected manual dispatch (`dispatchTarget: persistent-dev`) is NOT a special pipeline: it only SELECTS the
+ * `persistent-dev` kind, and every downstream stage (CI, Plan, Migration, Deploy, Smoke, Rollback) is the standard one.
+ * Rejects (throws, so the Plan fails before any mutation) the combinations the spec forbids instead of silently dropping them:
+ * an unknown dispatch_target, or persistent-dev outside hybrid / without an exact match of the dispatch ref and persistent_dev_ref.
  */
 export function resolveDeliveryTargets({
   event, ref, strategy, previewOnPush = true, sharedDevOnPush = false, sharedDevNativeOnPush = false, dispatchTarget = '', devRef = '',
@@ -55,12 +57,16 @@ export function resolveDeliveryTargets({
   if (sharedDevOnPush && sharedDevNativeOnPush) {
     throw new Error('shared_dev_on_branch_push (separate persistent Dev Worker) and shared_dev_native_preview_on_branch_push (named Native Preview "dev") are conflicting automatic Dev channels; enable only one');
   }
+  if (event === 'workflow_dispatch' && dispatchTarget !== '') {
+    if (dispatchTarget !== 'persistent-dev') throw new Error(`dispatch_target '${dispatchTarget}' is not valid (expected persistent-dev or empty); refusing to fall back to another target`);
+    const r = String(ref).startsWith('refs/heads/') ? classifyEvent({ event, ref, strategy, devRef, dispatchTarget }) : { action: 'skip', reason: 'not a branch ref' };
+    if (r.action !== 'persistent-dev') throw new Error(`manual persistent-dev dispatch rejected: ${r.reason} (requires deployment_strategy hybrid and the dispatch ref equal to persistent_dev_ref; nothing was changed)`);
+    return ['persistent-dev'];
+  }
   if (!String(ref).startsWith('refs/heads/')) return [];
   const r = classifyEvent({ event, ref, strategy, devRef, dispatchTarget });
   if (r.action === 'production') return ['production'];
-  if (r.action === 'persistent-dev') return ['persistent-dev'];
-  const automatic = event === 'push' || (event === 'workflow_dispatch' && dispatchTarget !== 'persistent-dev');
-  if (r.action !== 'preview' || !automatic) return [];
+  if (r.action !== 'preview' || !(event === 'push' || event === 'workflow_dispatch')) return [];
   const kinds = [];
   if (previewOnPush) kinds.push('native-branch');
   if (sharedDevNativeOnPush) kinds.push('native-dev');
@@ -230,7 +236,7 @@ const DESCRIPTOR_KEYS = ['v', 'kind', 'target', 'environment', 'deploy_group', '
 /**
  * Concurrency identity of a kind. Production / Native Branch / Native Dev get uncontended per-run groups (no cross-target
  * waiting). persistent-dev keeps the LEGACY Shared Dev group - keyed by repository and the shared-D1 scope (or the app) - for
- * Deploy AND Rollback, so it serialises with the manual dispatch and with every other app using the same physical D1.
+ * Deploy AND Rollback, so it serialises with the manual persistent-dev dispatch (same kind, same descriptor) and with every other app using the same physical D1.
  */
 export function concurrencyGroups(kind, { runId, repo = '', app, lockScope = '' }) {
   if (assertKind(kind) === 'persistent-dev') {
@@ -386,7 +392,10 @@ export function runLockGroup({ event, ref, inputs, runId }) {
   const on = (k) => inputs?.[k] === true || inputs?.[k] === 'true';
   const branch = String(ref ?? '').startsWith('refs/heads/');
   const scope = s('d1_lock_scope') || s('app_name');
-  if ((event === 'push' || (event === 'workflow_dispatch' && s('dispatch_target') !== 'persistent-dev')) && branch) {
+  if ((event === 'push' || event === 'workflow_dispatch') && branch) {
+    // A manual persistent-dev dispatch mutates the same Dev D1 / Dev Worker as the automatic Shared Dev channel, so it takes the SAME
+    // run-level group (never the Production one, even from main) and serialises with every feature-branch Shared Dev push.
+    if (event === 'workflow_dispatch' && s('dispatch_target') === 'persistent-dev') return on('d1_migrations') ? `cfv2-nonprod-d1-${scope}` : `cfv2-shared-dev-${s('app_name')}`;
     if (ref === 'refs/heads/main') return `cfv2-prod-${scope}`;
     const nonProdOnly = s('deployment_strategy') !== 'production-only';
     const channels = on('preview_on_branch_push') || on('shared_dev_on_branch_push') || on('shared_dev_native_preview_on_branch_push');
@@ -474,7 +483,7 @@ const KIND_OF_TARGET = { prod: 'production', preview: 'native-branch', dev: 'per
 const STAGES = ['all', 'deploy', 'preflight', 'migrate', 'publish', 'verify', 'rollback'];
 const BUILD_ENV_INPUT = { production: 'build_env_prod', 'native-branch': 'build_env_preview', 'native-dev': 'build_env_shared_dev_native_preview', 'persistent-dev': 'build_env_dev' };
 
-export function validateInit({ inputs, target, kind = '', stage = 'all', mode = 'auto', d1Expect = '', descriptor = '', callInputs = '', event, ref, previewSecrets = '' }) {
+export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expect = '', descriptor = '', callInputs = '', event, ref, previewSecrets = '' }) {
   if (inputs === null || typeof inputs !== 'object' || Array.isArray(inputs)) throw new Error('inputs_json is not an object');
   const s = (k) => (inputs[k] == null ? '' : String(inputs[k]));
   const on = (k) => s(k) === 'true';
@@ -493,9 +502,6 @@ export function validateInit({ inputs, target, kind = '', stage = 'all', mode = 
     throw new Error(`${K} must run as split stages (preflight/migrate/publish/verify/rollback), got '${stage}'`);
   }
   if (!/^[A-Za-z0-9_-]*$/.test(d1Expect)) throw new Error('malformed expected D1 id');
-  if (!['auto', 'manual'].includes(mode)) throw new Error(`bad engine mode: ${mode}`);
-  if (mode !== 'auto' && target !== 'dev') throw new Error('manual mode is only for the persistent Dev target');
-  if (mode !== 'auto' && stage !== 'all') throw new Error('manual Dev runs as one job (stage all)');
   if (callInputs) { // deferred verification: the verify call's identity inputs must equal the deploy call's
     let c;
     try { c = JSON.parse(callInputs); } catch { c = null; }
@@ -511,17 +517,12 @@ export function validateInit({ inputs, target, kind = '', stage = 'all', mode = 
     throw new Error('deployment_strategy: production-only cannot be combined with shared_dev_on_branch_push / shared_dev_native_preview_on_branch_push: true; refusing to publish or migrate anything');
   }
   if (on('shared_dev_on_branch_push') && on('shared_dev_native_preview_on_branch_push')) throw new Error('shared_dev_on_branch_push and shared_dev_native_preview_on_branch_push are conflicting automatic Dev channels; enable only one');
-  if (mode === 'manual') {
-    const action = classifyEvent({ event, ref, strategy, devRef: s('persistent_dev_ref'), dispatchTarget: s('dispatch_target') }).action;
-    if (action !== 'persistent-dev') throw new Error(`manual Dev is only allowed from the approved persistent_dev_ref via dispatch (classified '${action}')`);
-  } else {
-    const kinds = resolveDeliveryTargets({
-      event, ref, strategy, previewOnPush: on('preview_on_branch_push'), sharedDevOnPush: on('shared_dev_on_branch_push'),
-      sharedDevNativeOnPush: on('shared_dev_native_preview_on_branch_push'), dispatchTarget: s('dispatch_target'), devRef: s('persistent_dev_ref'),
-    });
-    if (!kinds.includes(K)) throw new Error(`target mismatch (enabled kinds '${kinds.join(',')}', engine '${K}'); refusing to deploy`);
-  }
-  return { kind: K, stage, mode, target, smokeMode, d1Expect, ...validateTargetConfig({ inputs, kind: K, target, previewSecrets }) };
+  const kinds = resolveDeliveryTargets({
+    event, ref, strategy, previewOnPush: on('preview_on_branch_push'), sharedDevOnPush: on('shared_dev_on_branch_push'),
+    sharedDevNativeOnPush: on('shared_dev_native_preview_on_branch_push'), dispatchTarget: s('dispatch_target'), devRef: s('persistent_dev_ref'),
+  });
+  if (!kinds.includes(K)) throw new Error(`target mismatch (enabled kinds '${kinds.join(',')}', engine '${K}'); refusing to deploy`);
+  return { kind: K, stage, target, smokeMode, d1Expect, ...validateTargetConfig({ inputs, kind: K, target, previewSecrets }) };
 }
 
 /** Per-target requirements and the validated KEY=VALUE env data each kind builds/smokes with (a build env never falls back to another kind's). */
