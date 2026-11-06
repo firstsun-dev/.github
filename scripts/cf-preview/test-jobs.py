@@ -979,6 +979,15 @@ def group_shared_dev():
     check(r["result"] == "failure" and r["log"].count("PUBLISH") == 1 and "superseded" in r["summary"], "manual dispatch: recovery never replaces a newer deployment of the branch")
     r = manual(inputs=D1, env={"STUB_PROBES": "500 "})
     check(r["result"] == "failure" and r["log"].count("migrations apply") == 1 and "d1 migrations" in r["log"] and "schema rollback" not in r["log"] and "migrations revert" not in r["log"], "manual dispatch: a failed Smoke never touches the D1 schema (applied once, never reverted)")
+    # ---- failing Migrate / failing publish of a manual dispatch
+    r = manual(inputs=D1, env={"STUB_APPLY_FAIL": "1"})
+    check(r["result"] == "failure" and r["res"]["migration"]["result"] == "failure" and ran(r, "migrations apply") and not ran(r, "PUBLISH") and r["res"]["delivery_persistent_dev"]["result"] == "skipped" and r["outputs"]["migration"] == "failed",
+          "manual dispatch: the migrate step itself fails -> the Migrate job is red and Deploy / Smoke / Revert never run, nothing is published")
+    r = manual(inputs={"dev_deploy_cmd": 'echo "PUBLISH" >> "$STUB_LOG"; exit 1', "release_cmd": "pnpm release"}, env=dict(GD))
+    dres = r["res"]["delivery_persistent_dev"]
+    check(r["result"] == "failure" and inner_of(r)["deploy"] == "failure" and inner_of(r)["rollback"] == "skipped" and dres["outputs"]["smoke_status"] == "none" and r["log"].count("PUBLISH") == 1
+          and r["outputs"]["deployed_and_verified"] == "false" and not ran(r, "SMOKE") and "state=success" not in r["log"] and not release_runs(r, {"release_cmd": "pnpm release", "dispatch_target": "persistent-dev"}),
+          "manual dispatch: a failing publish -> Deploy red, nothing is smoked or verified (smoke_status none), no recovery runs, never recorded known-good, no Release")
     # ---- other kinds keep their pipelines
     r = deploy(MAIN, inputs={"release_cmd": "pnpm release"})
     check(r["result"] == "success" and r["res"]["delivery_persistent_dev"]["result"] == "skipped" and release_runs(r), "unchanged: a Production push still runs the Production delivery (and Release)")

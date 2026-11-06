@@ -358,7 +358,7 @@ detect ─┬─ A (deploy call):   CI ‖ E2E ─► Migration ─► Deploy �
 
 | Concern | prod | preview | dev |
 |---|---|---|---|
-| Trigger | main push / dispatch | non-main push (`preview_on_branch_push`) | non-main push (`shared_dev_on_branch_push`); manual: protected dispatch |
+| Trigger | main push / dispatch | non-main push (`preview_on_branch_push`) | non-main push (`shared_dev_on_branch_push`) or protected dispatch of the approved ref (same pipeline) |
 | Credentials in the job env | `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` | `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` (same account token; + `PREVIEW_SECRETS`) | `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` (same account token as Production) |
 | Environment | `<app>/prod` | `<app>/preview` | `<app>/dev` |
 | Build env / vars | `build_env_prod` | `build_env_preview` | `build_env_dev`, `dev_build_cmd`, `CLOUDFLARE_ENV=dev_wrangler_env` |
@@ -498,7 +498,7 @@ The former manual-only "legacy contract" (`dev_build_cmd` empty, `dev_deploy_cmd
 
 ### Recovery limits
 
-After a failed Shared Dev smoke the job redeploys the last verified SHA (from the Dev ledger, any branch). It rebinds the commit identity: occurrences of the failed run's SHA (full and 7-character) in `build_env_dev` and `app_version` are replaced with the last-good SHA; `app_version` values not derived from the commit SHA are kept and flagged with a warning. It then repeats build, Worker-identity/resource audit, publish and the full smoke. Only with `sha_path` set is the restored **commit identity** verified; without it the summary says "commit identity NOT verified". It never rolls back D1 (a schema newer than the restored code is possible), a caller whose build parameters embed the commit in ways other than the exact SHA cannot be rebound, and a failed recovery is reported as such; the run is always red. Manual runs have no recovery.
+After a failed Shared Dev smoke the job redeploys the last verified SHA (from the Dev ledger, any branch). It rebinds the commit identity: occurrences of the failed run's SHA (full and 7-character) in `build_env_dev` and `app_version` are replaced with the last-good SHA; `app_version` values not derived from the commit SHA are kept and flagged with a warning. It then repeats build, Worker-identity/resource audit, publish and the full smoke. Only with `sha_path` set is the restored **commit identity** verified; without it the summary says "commit identity NOT verified". It never rolls back D1 (a schema newer than the restored code is possible), a caller whose build parameters embed the commit in ways other than the exact SHA cannot be rebound, and a failed recovery is reported as such; the run is always red. A manual persistent-dev dispatch gets the same recovery (it runs the standard pipeline).
 
 ### Required follow-up in Blog #448 (after this PR is approved)
 

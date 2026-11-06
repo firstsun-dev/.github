@@ -5,7 +5,7 @@ It supersedes the job topology in `cf-worker-v2-refactor.md` ("Job DAG", "Shared
 and recovery rules described there still apply. `_cf-worker-v2.yml` remains the only public entrypoint; `_cf-worker-delivery.yml` is an
 **internal** reusable workflow called only by it. v1 / v1.5 and the floating `@v2` tag are untouched by this change.
 
-> **Revised again (PR #89 Phase 1 simplification):** validation lives in `_cf-worker-ci.yml`, the Preview lifecycle in its own workflow, the manual persistent Dev dispatch as the `manual` job of the delivery workflow (one `persistent-dev` delivery job), every shared action/workflow is referenced with `$/` — see [cf-worker-v2-refactor.md](cf-worker-v2-refactor.md#phase-1-simplification-pr-89-refactor--current-structure).
+> **Revised again (PR #89 Phase 1 simplification):** validation lives in `_cf-worker-ci.yml`, the Preview lifecycle in its own workflow, the manual persistent Dev dispatch as just another trigger of the `persistent-dev` kind (no separate job; see "Manual dispatch" below), every shared action/workflow is referenced with `$/` — see [cf-worker-v2-refactor.md](cf-worker-v2-refactor.md#phase-1-simplification-pr-89-refactor--current-structure).
 >
 > **Revised (PR #89 simplification).** No separate Preflight stage. **One Migration job with integrated safety validation; reusable target-driven Delivery.**
 > The earlier Preflight-per-kind / Migration-per-D1-owner topology, and the real-runner tables further down that exercised it, describe the superseded design;
@@ -41,7 +41,7 @@ matrix anywhere in the delivery graph: every `needs.<call>.outputs.*` belongs to
 | --- | --- |
 | trusted push to `main` | `production` |
 | trusted push to another branch | `native-branch` if `preview_on_branch_push`; `native-dev` if `shared_dev_native_preview_on_branch_push`; `persistent-dev` if `shared_dev_on_branch_push` |
-| protected `workflow_dispatch` persistent-dev | the same `persistent-dev` delivery call, `manual: true` (Plan and Migration skipped): its `manual` job runs the engine in manual mode (or the legacy two-command contract), no automatic recovery |
+| protected `workflow_dispatch` persistent-dev | the same standard pipeline and the same `persistent-dev` delivery call as a push (CI, Plan, Migrate, Deploy, Smoke, conditional recovery); the Plan rejects an unapproved dispatch |
 | PR / delete / tag | none (lifecycle handler only) |
 
 Rejected (plan fails closed, `config-guard` also reports): `production-only` with any Dev channel; `shared_dev_on_branch_push` together with
