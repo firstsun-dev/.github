@@ -15,8 +15,8 @@ name: CF Worker Pipeline v2
 #         |
 #   Release                   optional, main only, only after a VERIFIED Production delivery with no rollback
 #
-# Event handlers outside that DAG: `lifecycle` (_cf-worker-lifecycle.yml: PR comment / branch delete), `persistent-dev`
-# (_cf-worker-persistent-dev.yml: Hybrid, protected manual dispatch, same engine in manual mode) and `config-guard`.
+# Event handlers outside that DAG: `lifecycle` (_cf-worker-lifecycle.yml: PR comment / branch delete) and `config-guard`.
+# The Hybrid protected manual dispatch of persistent Dev is NOT a separate job: it is the `manual` entry of `delivery_persistent_dev`.
 # One pipeline migrates at most one physical D1: distinct databases among the enabled targets are rejected by the plan, before any mutation.
 # The run-level concurrency group below spans the whole run. Interface, design record and measurements: docs/cf-worker-v2-refactor.md.
 #
@@ -670,11 +670,14 @@ jobs:
   delivery_persistent_dev:
     name: persistent-dev
     needs: [plan, migration]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_persistent_dev == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
+    # Two entries, one job: the automatic DAG delivery (plan-driven), or the protected manual dispatch of the approved ref (Hybrid only;
+    # Plan and Migration are skipped for a dispatch, so this branch needs no `needs` result and never runs on a push).
+    if: (always() && needs.plan.result == 'success' && needs.plan.outputs.on_persistent_dev == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')) || (!cancelled() && inputs.pipeline_phase != 'verify' && github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref)
     uses: $/.github/workflows/_cf-worker-delivery.yml
     permissions: *delivery_permissions
     with:
-      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
+      descriptor: ${{ needs.plan.outputs.descriptors && toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) || '{}' }}
+      manual: ${{ inputs.pipeline_phase != 'verify' && github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' }}
       runner: ${{ inputs.runner }}
       inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
@@ -730,7 +733,7 @@ jobs:
 
   # -------------------------------------------------------------------------
   # Event handlers outside the delivery DAG, one small reusable workflow each: `lifecycle` (same-repo PR -> comment the verified Preview URL;
-  # branch delete -> retire the ledger, the Preview is KEPT) and `persistent-dev` (Hybrid, explicit dispatch on the approved ref only).
+  # branch delete -> retire the ledger, the Preview is KEPT). The Hybrid manual dispatch of persistent Dev is the `manual` entry of `delivery_persistent_dev`.
   # -------------------------------------------------------------------------
   lifecycle:
     name: lifecycle
@@ -745,25 +748,3 @@ jobs:
       preview_worker_name: ${{ inputs.preview_worker_name }}
       reserve_native_dev: ${{ inputs.shared_dev_native_preview_on_branch_push }}
       runner: ${{ inputs.runner }}
-
-  persistent-dev:
-    name: persistent-dev
-    if: inputs.pipeline_phase != 'verify' && github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref
-    uses: $/.github/workflows/_cf-worker-persistent-dev.yml
-    permissions:
-      contents: read
-      deployments: write
-    with:
-      inputs_json: ${{ toJSON(inputs) }}
-      app_name: ${{ inputs.app_name }}
-      app_path: ${{ inputs.app_path }}
-      d1_lock_scope: ${{ inputs.d1_lock_scope }}
-      dev_build_cmd: ${{ inputs.dev_build_cmd }}
-      dev_deploy_cmd: ${{ inputs.dev_deploy_cmd }}
-      dev_smoke_cmd: ${{ inputs.dev_smoke_cmd }}
-      runner: ${{ inputs.runner }}
-    secrets:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
-      SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}

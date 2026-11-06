@@ -11,6 +11,12 @@ name: CF Worker delivery (one target)
 #   deploy -> smoke -> conditional rollback of THIS kind, independent of every other kind
 #   (pipeline_phase deploy = deploy only; verify = smoke + rollback from the handed-over deploy result)
 #
+# `manual: true` (kind persistent-dev only; the public workflow sets it for the protected workflow_dispatch of the approved ref) runs the
+# single `manual` job INSTEAD of deploy / smoke / rollback: the same engine in manual mode (stage all: build -> audit -> migration -> publish
+# -> smoke -> ledger; NO automatic recovery) or, when dev_build_cmd is empty, the legacy two-command contract (never recorded in the
+# last-good ledger). Plan and Migration do not run for a dispatch, so there is no descriptor and no migration hand-over; the job reads its
+# settings from inputs_json. Its Environment `<app>/dev`, narrower permissions and concurrency group are properties of the job itself.
+#
 # Pre-mutation validation and the D1 migration are NOT here: the public workflow runs them once, in its single Migration job, and
 # passes the result in (`migration_result` / `migration_json`).
 #
@@ -62,9 +68,13 @@ on:
         type: string
         default: ''
       descriptor:
-        description: toJSON of THIS kind's target descriptor (versioned, validated by the Plan job and re-validated by the engine). Carries the engine target, GitHub Environment, concurrency groups, expected physical D1, migration owner and smoke mode; never a secret.
+        description: toJSON of THIS kind's target descriptor (versioned, validated by the Plan job and re-validated by the engine). Carries the engine target, GitHub Environment, concurrency groups, expected physical D1, migration owner and smoke mode; never a secret. `{}` with manual (no Plan runs for the dispatch; unused).
         type: string
         required: true
+      manual:
+        description: persistent-dev only - the protected manual dispatch of the approved ref; runs the `manual` job instead of deploy / smoke / rollback
+        type: boolean
+        default: false
     outputs:
       handoff:
         description: the validated deploy result of THIS kind (own publish in the deploy phase, the handed-over one in the verify phase)
@@ -108,7 +118,7 @@ jobs:
   # -------------------------------------------------------------------------
   deploy:
     name: Deploy
-    if: inputs.phase != 'verify'
+    if: inputs.phase != 'verify' && !inputs.manual
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     concurrency:
@@ -155,7 +165,7 @@ jobs:
   smoke:
     name: Smoke Tests
     needs: [deploy]
-    if: always() && inputs.phase != 'deploy'
+    if: always() && inputs.phase != 'deploy' && !inputs.manual
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     permissions:
@@ -241,7 +251,7 @@ jobs:
   rollback:
     name: Revert on Verify Failure
     needs: [deploy, smoke]
-    if: always() && inputs.phase != 'deploy' && needs.smoke.outputs.smoke_status == 'failure' && (fromJSON(inputs.descriptor).kind != 'production' || fromJSON(inputs.inputs_json).production_rollback_policy == 'automatic') && fromJSON(needs.smoke.outputs.smoke_json || '{}').gate_blocked != 'true'
+    if: always() && inputs.phase != 'deploy' && !inputs.manual && needs.smoke.outputs.smoke_status == 'failure' && (fromJSON(inputs.descriptor).kind != 'production' || fromJSON(inputs.inputs_json).production_rollback_policy == 'automatic') && fromJSON(needs.smoke.outputs.smoke_json || '{}').gate_blocked != 'true'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     concurrency:
@@ -295,3 +305,64 @@ jobs:
           deploy_outputs: ${{ env.HANDOFF }}
           migration_outputs: ${{ env.MIGJSON }}
           smoke_outputs: ${{ env.SMOKEJSON }}
+
+  # -------------------------------------------------------------------------
+  # Manual persistent Dev (Hybrid) — explicit dispatch of the approved ref only (the caller's `if` checks dispatch_target, strategy hybrid and
+  # persistent_dev_ref; the engine re-checks the ref). Never a side effect of a feature-branch push. Runs INSTEAD of deploy / smoke / rollback.
+  #   dev_build_cmd set   : the SAME delivery engine in manual mode, ONE job (build -> audit -> migration -> publish -> smoke -> ledger,
+  #                         recorded verified ONLY after the smoke passes; no automatic recovery)
+  #   dev_build_cmd empty : the legacy two-command contract, unchanged (dev_deploy_cmd builds AND publishes, dev_smoke_cmd checks). It is never
+  #                         recorded in the Shared Dev last-good ledger, so automatic recovery can never treat it as known-good.
+  # The Environment `<app>/dev` is a property of this job, so its protection rules and approvals apply exactly as for the automatic kind.
+  # -------------------------------------------------------------------------
+  manual:
+    name: manual
+    if: inputs.manual
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    environment: ${{ fromJSON(inputs.inputs_json).app_name }}/dev
+    concurrency:
+      group: cfv2-dev-${{ github.repository }}-${{ fromJSON(inputs.inputs_json).d1_lock_scope != '' && fromJSON(inputs.inputs_json).d1_lock_scope || fromJSON(inputs.inputs_json).app_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      deployments: write # engine mode only: Dev ledger entry, recorded verified ONLY after the smoke passes
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # ---- Engine contract (dev_build_cmd set)
+      - id: engine
+        if: fromJSON(inputs.inputs_json).dev_build_cmd != ''
+        uses: $/actions/cf-deploy
+        with:
+          target: dev
+          mode: manual
+          inputs_json: ${{ inputs.inputs_json }}
+          smoke_username: ${{ secrets.SMOKE_USERNAME }}
+          smoke_password: ${{ secrets.SMOKE_PASSWORD }}
+      # ---- Legacy contract (dev_build_cmd empty)
+      - uses: $/actions/setup
+        if: fromJSON(inputs.inputs_json).dev_build_cmd == ''
+        with:
+          setup-node: 'false'
+          setup-pnpm: 'false'
+      - name: Deploy persistent Dev
+        if: fromJSON(inputs.inputs_json).dev_build_cmd == ''
+        working-directory: ${{ fromJSON(inputs.inputs_json).app_path }}
+        env:
+          CMD: ${{ fromJSON(inputs.inputs_json).dev_deploy_cmd }}
+        run: |
+          [ -n "$CMD" ] || { echo "::error::dev_deploy_cmd required"; exit 1; }
+          bash -c "$CMD"
+      - name: Dev smoke (Cron/Queue-adjacent checks)
+        if: fromJSON(inputs.inputs_json).dev_build_cmd == '' && fromJSON(inputs.inputs_json).dev_smoke_cmd != ''
+        working-directory: ${{ fromJSON(inputs.inputs_json).app_path }}
+        env:
+          CMD: ${{ fromJSON(inputs.inputs_json).dev_smoke_cmd }}
+        run: bash -c "$CMD"
