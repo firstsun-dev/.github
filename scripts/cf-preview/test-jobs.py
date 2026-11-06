@@ -4,7 +4,7 @@ run-job-groups.py runs each group in its own process, in parallel, against the m
 
 Executes the REAL steps of the ONE Migrate job (pre-mutation validation of every enabled target, then the single
 migration), the per-kind Delivery calls (the internal reusable workflow _cf-worker-delivery.yml: deploy -> smoke -> rollback), the
-Plan, and the persistent-Dev job - including the
+Plan, and the manual persistent-Dev dispatch (the `manual` job of the delivery workflow) - including the
 composite delivery engine (actions/cf-deploy -> actions/cf-preview/engine.sh) - against stub gh/pnpm/curl, and feeds each job's
 result into the next job's `if:` and `needs.*.outputs`. EVERY job runs in a FRESH workspace (a different runner): anything the
 chain needs must travel through job outputs, never through local files. A reusable-workflow CALL is emulated like GitHub does:
@@ -30,7 +30,6 @@ doc = yaml.safe_load(open(WF))
 ddoc = yaml.safe_load(open(DWF))
 cdoc = yaml.safe_load(open(".github/workflows/_cf-worker-ci.yml"))
 ldoc = yaml.safe_load(open(".github/workflows/_cf-worker-lifecycle.yml"))
-pdoc = yaml.safe_load(open(".github/workflows/_cf-worker-persistent-dev.yml"))
 INPUT_DEFAULTS = {k: v.get("default", "") for k, v in doc[True]["workflow_call"]["inputs"].items()}
 DINPUT_DEFAULTS = {k: v.get("default", "") for k, v in ddoc[True]["workflow_call"]["inputs"].items()}
 SHA, OTHER = "abcdef1234567890", "ffffffffffffffff"
@@ -77,7 +76,7 @@ def desc(kind, d1="", owner="", app="app", scope="", phase="all", **over):
     return json.dumps(dict({"v": 1, "kind": kind, "target": TARGET_OF[kind], "environment": f"{app}/{_ENV_OF[kind]}", "deploy_group": g,
                             "rollback_group": g if kind == "persistent-dev" else g + "-rollback", "d1_expected_id": d1, "d1_owner_kind": owner,
                             "owns_migration": bool(d1 and owner == kind), "smoke_mode": "full", "phase": phase}, **over))
-INNER = ("deploy", "smoke", "rollback")
+INNER = ("deploy", "smoke", "rollback", "manual")
 SKIPPED = {"result": "skipped", "outputs": {}}
 
 
@@ -107,6 +106,8 @@ def call_workflow(job, c, ctl):
     w = {k: render(v, c) for k, v in job["with"].items()}
     dinputs = dict(DINPUT_DEFAULTS)
     dinputs.update(w)
+    if "manual" in dinputs:  # type: boolean - GitHub coerces the rendered 'true' / 'false' string
+        dinputs["manual"] = str(dinputs["manual"]).lower() == "true"
     sec = {k: render(v, c) for k, v in job.get("secrets", {}).items()}
     kind = json.loads(w["descriptor"])["kind"]
     dc = Ctx({"github": c["github"], "inputs": dinputs, "needs": {}, "jobs": {}}, sec)
@@ -403,9 +404,21 @@ tamper = 'case "$PWD" in */recover*) sed -i "s/name = \\"app-dev\\"/name = \\"ap
 PD = dict(DEV_INPUTS, deployment_strategy="hybrid", persistent_dev_ref="refs/heads/dev", dispatch_target="persistent-dev", shared_dev_on_branch_push=False)
 
 
-def manual(inputs=None, env=None, toml=DEV_TOML):
+def manual(inputs=None, env=None, toml=DEV_TOML, gate=True):
     ws = make_workspace(toml)
-    r = called(pdoc, "persistent-dev", "persistent-dev", ctx("refs/heads/dev", dict(PD, **(inputs or {})), PROD_SECRETS, event="workflow_dispatch"), ws, dict({"STUB_TIPS": SHA}, **(env or {})))
+    # the REAL call: delivery_persistent_dev (Plan / Migration skipped for a dispatch) -> the `manual` job of the delivery workflow
+    needs = {"plan": SKIPPED, "migration": SKIPPED}
+    c = ctx("refs/heads/dev", dict(PD, **(inputs or {})), PROD_SECRETS, needs, event="workflow_dispatch")
+    pj = doc["jobs"]["delivery_persistent_dev"]
+    if gate and not ev(pj["if"], c):
+        return {"result": "skipped", "log": "", "summary": "", "ws": ws, "steps": []}
+    dinputs = dict(DINPUT_DEFAULTS, **{k: render(v, c) for k, v in pj["with"].items()})
+    dinputs["manual"] = dinputs["manual"] == "true"
+    dc = Ctx({"github": c["github"], "inputs": dinputs, "needs": {}, "jobs": {}}, {k: render(v, c) for k, v in pj["secrets"].items()})
+    for n in ("deploy", "smoke", "rollback"):
+        assert not ev(ddoc["jobs"][n]["if"], dc), f"{n} must not run for the manual dispatch"
+    assert ev(ddoc["jobs"]["manual"]["if"], dc)
+    r = run_job(ddoc, "manual", dc, ws, dict({"STUB_TIPS": SHA}, **(env or {})))
     r["ws"] = ws
     return r
 
@@ -951,7 +964,9 @@ def group_shared_dev():
     r = manual(toml=DEV_TOML.replace('name = "app-dev"', 'name = "app"'))
     check(r["result"] == "failure" and not ran(r, "PUBLISH"), "engine contract: manual run applies the same config audit")
     r = manual(inputs={"persistent_dev_ref": "refs/heads/other"})
-    check(r["result"] == "failure" and not ran(r, "PUBLISH"), "engine contract: manual run from a ref other than persistent_dev_ref is refused by the engine too")
+    check(r["result"] == "skipped" and not ran(r, "PUBLISH"), "manual dispatch from a ref other than persistent_dev_ref: the delivery call is skipped (nothing runs)")
+    r = manual(inputs={"persistent_dev_ref": "refs/heads/other"}, gate=False)
+    check(r["result"] == "failure" and not ran(r, "PUBLISH"), "engine contract: manual run from a ref other than persistent_dev_ref is refused by the engine too (defence in depth, even if the call gate were bypassed)")
 
 
 def group_chain_smoke_rollback():
