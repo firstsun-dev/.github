@@ -78,6 +78,7 @@ case "$3 $4 $5" in
                if [ -n "${STUB_PREVIEW_RAW+x}" ]; then printf '%s' "$STUB_PREVIEW_RAW"; else echo '{"preview":{"urls":["https://'"$5"'-app.example.workers.dev"]}}'; fi;;
   "deployments list"*) [ "${STUB_NO_PREV:-}" = 1 ] && { echo '[]'; exit 0; }
                echo '[{"created_on":"2024-01-01","versions":[{"version_id":"'"${STUB_ACTIVE:-prev-1}"'","percentage":100}]}]';;
+  "deploy "*) echo "PUBLISH $*" >> "$STUB_LOG"; [ "${STUB_DEPLOY_FAIL:-}" = 1 ] && exit 5;;
   "versions view"*) [ -n "${STUB_PREV_MESSAGE:-}" ] && echo '{"annotations":{"workers/message":"'"$STUB_PREV_MESSAGE"'"}}';;
   "versions upload"*) [ "${STUB_UPLOAD_FAIL:-}" = 1 ] && exit 6; echo "Worker Version ID: new-2";;
   "versions deploy prev-1@100") [ "${STUB_ROLLBACK_FAIL:-}" = 1 ] && exit 8;;

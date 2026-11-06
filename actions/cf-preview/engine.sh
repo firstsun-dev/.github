@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CF Worker v2 delivery engine. ONE implementation of
 #   Build -> Config audit -> Migration (optional) -> Publish -> Smoke -> Recovery
-# for every target (prod | preview | dev) and both modes (auto = branch/main push, manual = persistent Dev dispatch).
+# for every target (prod | preview | dev) and every trigger (push or dispatch: the trigger never selects a different pipeline).
 # actions/cf-deploy/action.yml calls one phase per step; every phase reads the workflow inputs from the validated
 # inputs.json written by `init`, so no workflow text is interpolated into a script.
 #
@@ -17,7 +17,7 @@
 # (`deploy` = migrate + publish in ONE job, then `verify` / `rollback`): a caller that must run a cross-service smoke
 # AFTER another Worker's deployment (workflow input pipeline_phase) verifies the published Dev deployment later.
 #
-# State ($STATE_DIR, default $RUNNER_TEMP/cfv2, 0700): inputs.json, target, mode, build.env / smoke.env /
+# State ($STATE_DIR, default $RUNNER_TEMP/cfv2, 0700): inputs.json, target, build.env / smoke.env /
 # preview.env (validated KEY=VALUE data), config.* and artifact.sha (from build.sh), ledger_id, preview_name, ...
 # Application env (build_env_*, smoke_env, preview secrets) is only ever loaded inside the process that needs it and
 # can never set a reserved control variable (parse-env.mjs RESERVED). The target is bound ONCE in `init` (from the
@@ -48,7 +48,7 @@ rd() { [ -f "$S/$1" ] && cat "$S/$1" || true; }
 # Engine-owned context, derived from state and the runner (never from caller env text).
 ctx() {
   [ -s "$S/target" ] || die "delivery engine not initialised"
-  TARGET="$(rd target)"; MODE="$(rd mode)"; KIND="$(rd kind)"
+  TARGET="$(rd target)"; KIND="$(rd kind)"
   if [ -z "$KIND" ]; then case "$TARGET" in prod) KIND=production;; preview) KIND=native-branch;; dev) KIND=persistent-dev;; esac; fi
   APP_NAME="$(inp app_name)"; APP_PATH="$(inp app_path)"; APP_PATH="${APP_PATH:-.}"
   APP_DIR="${APP_DIR_OVERRIDE:-${GITHUB_WORKSPACE:?}/$APP_PATH}"
@@ -63,7 +63,7 @@ ctx() {
   esac
   PREVIEW_NAME="$(rd preview_name)"; ENV_NAME="$(rd ledger_env)"; LEDGER_ID="$(rd ledger_id)"
   [ "$KIND" != native-dev ] || PREVIEW_NAME=dev
-  export KIND TARGET MODE APP_NAME APP_DIR BRANCH_REF BRANCH RUN_SHA DEV_ENV WRANGLER_CONFIG D1_BINDING HOST_WORKER PREVIEW_NAME ENV_NAME STATE_DIR="$S"
+  export KIND TARGET APP_NAME APP_DIR BRANCH_REF BRANCH RUN_SHA DEV_ENV WRANGLER_CONFIG D1_BINDING HOST_WORKER PREVIEW_NAME ENV_NAME STATE_DIR="$S"
 }
 
 # Which commands/env belong to the target. Never falls back across targets (except dev_build_cmd -> build_cmd).
@@ -103,7 +103,7 @@ run_build() { # <state dir> <build env file> <app version> <preview host check>
 }
 run_publish() { # <state dir> <out file> <app version> <commit message>
   STATE_DIR="$1" APP_URL="$(target_url)" OUT_FILE="$2" APP_VERSION="$3" COMMIT_MSG="$4" \
-    WORKER_NAME="$(inp preview_worker_name)" PUBLISH_CMD="$([ "$TARGET" = dev ] && inp dev_deploy_cmd || true)" \
+    WORKER_NAME="$(inp preview_worker_name)" \
     PREVIEW_NAME="$PREVIEW_NAME" EXPECTED_URL="$([ "$TARGET" = preview ] && target_url || true)" "$TOOLS_DIR/publish.sh"
 }
 
@@ -171,8 +171,8 @@ case "$PHASE" in
       DESC="Native Preview"
     elif [ "$TARGET" = dev ]; then
       printf '%s' "$APP_NAME/dev/shared" > "$S/ledger_env"
-      PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg w "$APP_NAME" --arg d "$HOST_WORKER" --arg r "$GITHUB_REPOSITORY" --arg m "$MODE" '{kind:"persistent-dev",branch_ref:$ref,worker:$w,dev_worker:$d,repo:$r,mode:$m}')"
-      DESC="Shared Dev ($MODE)"
+      PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg w "$APP_NAME" --arg d "$HOST_WORKER" --arg r "$GITHUB_REPOSITORY" '{kind:"persistent-dev",branch_ref:$ref,worker:$w,dev_worker:$d,repo:$r}')"
+      DESC="Shared Dev"
     fi
     # The Migration job runs the identity / preflight checks but opens no ledger entry (the Deploy job owns it).
     if [ "$TARGET" != prod ] && [ "${PREPARE_LEDGER:-true}" = true ]; then
@@ -213,7 +213,9 @@ case "$PHASE" in
     printf '%s' "$PENDING" > "$S/migration"
     echo "schema_changed=$PENDING"
     echo "kind=$KIND"; echo "d1_id=$(rd d1_id)"
-    echo "migration=applied";;
+    echo "migration=applied"
+    SCAN_L="$(printf '%s\n' "$OUT" | sed -n 's/^d1_scan=//p' | head -1)"
+    jq -cn --arg c "$PENDING" --arg s "$SCAN_L" --arg k "$KIND" --arg i "$(rd d1_id)" '{migration:"applied",schema_changed:$c,d1_scan:$s,kind:$k,d1_id:$i}' > "$S/migration.json";;
 
   report) # final, always-run state report of a stage (data only)
     ctx
@@ -271,6 +273,8 @@ case "$PHASE" in
     fi
     [ -z "$H_PUBSHA" ] || [ "$H_PUBSHA" = "$RUN_SHA" ] || die "hand-off was published from $H_PUBSHA, this run is $RUN_SHA; refusing to act on another deployment"
     [ "$TARGET" = prod ] || [ -n "$H_URL" ] || die "$TARGET hand-off has no published URL"
+    # The Migration job's validated result, kept for the non-Production recovery guard (recover-find). Absent when none was handed over.
+    if [ -n "${HANDOFF_MIGRATION:-}" ] && [ "$HANDOFF_MIGRATION" != '{}' ]; then printf '%s' "$M" > "$S/migration.json"; else rm -f "$S/migration.json"; fi
     printf '%s' "$H_LEDGER" > "$S/ledger_id"; printf '%s' "$H_PNAME" > "$S/preview_name"
     case "$KIND" in native-branch) printf '%s' "$APP_NAME/preview/$H_PNAME" > "$S/ledger_env";; native-dev) printf '%s' "$APP_NAME/native-dev/dev" > "$S/ledger_env";; persistent-dev) printf '%s' "$APP_NAME/dev/shared" > "$S/ledger_env";; esac
     [ "$TARGET" != preview ] || [ -n "$H_PNAME" ] || die "preview hand-off has no Preview identity"
@@ -391,6 +395,22 @@ case "$PHASE" in
   recover-find)
     ctx
     ROW=""
+    # D1 compatibility guard (before anything is looked up or published): older code is only redeployed when the D1 state of
+    # THIS pipeline is known and the code is proven to cope. D1 is never reverted. Decision: delivery.mjs nonProdRecoveryBlock.
+    G="$(env D1_MIGRATIONS="$(inp d1_migrations)" MIGRATION_JSON="$([ -s "$S/migration.json" ] && cat "$S/migration.json" || echo null)" D1_EXPECT="$(rd d1_expect)" D1_COMPAT="$(inp d1_rollback_compat)" \
+      node "$TOOLS_DIR/cli.mjs" recovery-guard)"
+    BC="$(printf '%s\n' "$G" | sed -n 's/^block_code=//p')"
+    if [ -n "$BC" ]; then
+      BW="$(printf '%s\n' "$G" | sed -n 's/^block_why=//p')"
+      echo "::error::Automatic recovery of $TARGET is BLOCKED ($BC): $BW" >&2
+      summary "### 🛑 Automatic recovery of $TARGET **blocked** (\`$BC\`) — $TARGET serves \`$RUN_SHA\`, which FAILED its smoke, and is **UNVERIFIED**."
+      summary "- Why: $BW"
+      summary "- Nothing was redeployed and the D1 schema was NOT reverted. Required manual recovery: push a forward fix (preferred); or restore the last verified commit only after confirming it runs on the CURRENT D1 schema."
+      [ -z "$LEDGER_ID" ] || "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" failure "" "Smoke failed for $RUN_SHA; recovery blocked ($BC) — $TARGET UNVERIFIED" || true
+      "$TOOLS_DIR/gh.sh" mark-env-deployment "$(gh_env)" "$RUN_SHA" failure "Smoke failed, recovery blocked ($BC) — UNVERIFIED (served $RUN_SHA)" || echo "::warning::could not annotate the Environment deployment as unverified" >&2
+      echo "sha="; echo "url="; echo "blocked=true"; echo "block_code=$BC"
+      exit 0
+    fi
     case "$KIND" in
       native-branch) ROW="$("$TOOLS_DIR/gh.sh" last-good-preview "$(rd ledger_env)" "$LEDGER_ID" "$BRANCH_REF" "$HOST_WORKER" "$APP_NAME" || true)";;
       native-dev) ROW="$("$TOOLS_DIR/gh.sh" last-good-native-dev "$(rd ledger_env)" "$LEDGER_ID" "$HOST_WORKER" "$APP_NAME" || true)";;

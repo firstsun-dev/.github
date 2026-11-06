@@ -97,9 +97,8 @@ one unspecified leg's output per key, so keeping them apart would need a results
 
 ### Event handlers
 
-`lifecycle` (PR comment of the verified Preview URL; branch-delete ledger retirement, only if this branch still owns the name and the branch does not exist again; the Cloudflare Native Preview is **kept**) and `persistent-dev`
-(Hybrid, protected dispatch of the approved ref, `<app>/dev` Environment; engine in manual mode when `dev_build_cmd` is set, the unchanged legacy two-command contract otherwise) are small reusable workflows. They contain no deployment
-implementation: the persistent-dev engine path is the same `$/actions/cf-deploy`. The legacy path stays because `heaven-monorepo` and `innovation-apps` pass `persistent_dev_ref`; it cannot move into the engine without changing its "one command builds and publishes" contract.
+`lifecycle` (PR comment of the verified Preview URL; branch-delete ledger retirement, only if this branch still owns the name and the branch does not exist again; the Cloudflare Native Preview is **kept**) is a small reusable workflow with no deployment
+implementation. The Hybrid protected dispatch of persistent Dev is not a separate path: it only selects the `persistent-dev` kind in the Plan and then runs the standard pipeline (see `docs/cf-worker-v2-unified-delivery.md`, "Manual dispatch").
 
 ### Concurrency and `phase_state`
 
@@ -209,7 +208,7 @@ No call enables two distinct physical D1s in any modeled event, so the single-D1
 | `<job> / Migration` | `<job> / Migrate` |
 | `<job> / Deploy`, `Smoke Tests`, `Revert on Verify Failure`, `Shared Dev`, `Shared Dev Smoke Tests`, `Shared Dev Revert on Verify Failure` | `<job> / <kind> / Deploy\|Smoke Tests\|Revert on Verify Failure` (`<kind>` = `production\|native-branch\|native-dev\|persistent-dev`) |
 | `<job> / Release` | unchanged |
-| `<job> / Config guard`, `Preview lifecycle`, `Persistent Dev (Hybrid)` | `<job> / Guard`, `<job> / lifecycle / ledger`, `<job> / persistent-dev / manual`; new `<job> / Plan` |
+| `<job> / Config guard`, `Preview lifecycle`, `Persistent Dev (Hybrid)` | `<job> / Guard`, `<job> / lifecycle / ledger`, `<job> / persistent-dev / Deploy` (a manual dispatch of persistent Dev has the same checks as a Shared Dev push); new `<job> / Plan` |
 
 Skipped jobs (unconfigured checks) report as skipped; a required context that is never emitted blocks merging. Nothing was modified in any repository's protection settings.
 
@@ -263,7 +262,7 @@ Detect Changes (monorepo only — the CALLER runs _detect-changes.yml and gates 
 
  outside the core DAG:  lifecycle (same-repo PR comment / branch-delete ledger retire)
                         config-guard (production-only + Shared Dev is rejected)
-                        persistent-dev (Hybrid, protected workflow_dispatch on the approved ref; the same engine, mode=manual)
+                        (a Hybrid workflow_dispatch of the approved ref is NOT a separate path: it selects the persistent-dev kind and runs the same DAG)
 ```
 
 There is **no Prepare, Plan or Test-Gate job**. Migration is its own job again (v1 parity), but it keeps the v2 order *inside* it: the deployable is built and the effective Wrangler config audited and the exact D1 target validated BEFORE the schema is touched, and the migration publishes nothing. Deploy then repeats build + audit from the same SHA and publishes. Smoke and Rollback are separate jobs so the DAG shows whether a deployment was verified or reverted.
@@ -359,13 +358,13 @@ detect ─┬─ A (deploy call):   CI ‖ E2E ─► Migration ─► Deploy �
 
 | Concern | prod | preview | dev |
 |---|---|---|---|
-| Trigger | main push / dispatch | non-main push (`preview_on_branch_push`) | non-main push (`shared_dev_on_branch_push`); manual: protected dispatch |
+| Trigger | main push / dispatch | non-main push (`preview_on_branch_push`) | non-main push (`shared_dev_on_branch_push`) or protected dispatch of the approved ref (same pipeline) |
 | Credentials in the job env | `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` | `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` (same account token; + `PREVIEW_SECRETS`) | `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` (same account token as Production) |
 | Environment | `<app>/prod` | `<app>/preview` | `<app>/dev` |
 | Build env / vars | `build_env_prod` | `build_env_preview` | `build_env_dev`, `dev_build_cmd`, `CLOUDFLARE_ENV=dev_wrangler_env` |
 | D1 (same project SQL) | top-level `d1_databases` | `previews.d1_databases` | `env.<dev_wrangler_env>.d1_databases` |
 | Config audit on the published config | Preview-resource ban | Preview binding / auth isolation | Dev Worker identity + resource policy |
-| Publish | `versions upload` + `versions deploy @100` | `wrangler preview --name <slug>` | `wrangler deploy --config <audited> --env <dev env>` or the caller's `dev_deploy_cmd` |
+| Publish | `versions upload` + `versions deploy @100` | `wrangler preview --name <slug>` | `wrangler deploy --config <audited> [--env <dev env> for a source config]` (engine-owned) |
 | Smoke URL | `app_url_prod` | discovered Preview URL | `app_url_dev` |
 | Recovery | policy-driven rollback to the previous version | redeploy last-good of THIS branch + host Worker | redeploy last verified Dev SHA (any branch) |
 
@@ -403,8 +402,8 @@ detect ─┬─ A (deploy call):   CI ‖ E2E ─► Migration ─► Deploy �
 | Deploy | `build_env_prod`, `build_env_preview`, `smoke_cmd`, `smoke_env`, `probe_path`, `probe_expect_status`, `sha_path`, `app_url_prod`, `access_protected_targets`, `production_rollback_policy`, `preview_binding_allow`, `preview_deny_resources` |
 | Migration | `d1_migrations`, `d1_binding`, `d1_lock_scope` (names the shared-D1 concurrency group; no command override) |
 | Release | `release_cmd` (+ secret `RELEASE_TOKEN`) |
-| Hybrid | `persistent_dev_ref`, `dev_deploy_cmd`, `dev_smoke_cmd`, `dispatch_target` |
-| Shared Dev | `shared_dev_on_branch_push`, `app_url_dev`, `dev_deploy_cmd`, `dev_smoke_cmd`, `build_env_dev`, `dev_build_cmd`, `dev_wrangler_env` (default `dev`), `dev_worker_name`, `dev_binding_allow`, `dev_deny_resources`; reuses `d1_migrations`, `d1_binding`, `sha_path`, `smoke_env`, `access_protected_targets`, `preview_deny_resources` |
+| Hybrid | `persistent_dev_ref`, `dev_smoke_cmd`, `dispatch_target` |
+| Shared Dev | `shared_dev_on_branch_push`, `app_url_dev`, `dev_smoke_cmd`, `build_env_dev`, `dev_build_cmd`, `dev_wrangler_env` (default `dev`), `dev_worker_name`, `dev_binding_allow`, `dev_deny_resources`; reuses `d1_migrations`, `d1_binding`, `sha_path`, `smoke_env`, `access_protected_targets`, `preview_deny_resources` |
 
 Outputs: `deploy_url`, `deploy_target`, `version_id` (prod only), `dev_url` (Shared Dev). The internal `deployed_and_verified` Deploy output is what gates Release. Secrets: `CLOUDFLARE_API_TOKEN/ACCOUNT_ID` (prod), `PREVIEW_SECRETS`, `SMOKE_USERNAME/PASSWORD`, `RELEASE_TOKEN`.
 
@@ -436,7 +435,7 @@ Two independent switches decide what a non-main push deploys. Neither requires t
 | false | false | validation only |
 
 * **Feature Native Preview** — the `Deploy` job with target `preview`: one stable URL per branch.
-* **Shared Dev** — job `dev-deploy` ("Shared Dev"). Every branch targets the **same** Dev Worker and `app_url_dev`; the last verified deployment wins and there is no per-branch Dev. Use `shared_dev_on_branch_push` for this; the manual `persistent-dev` dispatch (Hybrid, approved ref, Cron/Queue checks) is a separate trigger of the **same engine** (`mode: manual`, no automatic recovery) when `dev_build_cmd` is set; without it the legacy two-command contract runs `dev_deploy_cmd` alone.
+* **Shared Dev** — job `dev-deploy` ("Shared Dev"). Every branch targets the **same** Dev Worker and `app_url_dev`; the last verified deployment wins and there is no per-branch Dev. Use `shared_dev_on_branch_push` for this; the manual `persistent-dev` dispatch (Hybrid, approved ref, Cron/Queue checks) is another trigger of the **same pipeline** (same CI, Plan, Migrate, Deploy, Smoke and conditional Revert).
 * `config-guard` fails the run when `deployment_strategy: production-only` is combined with `shared_dev_on_branch_push: true`. `production-only` still silently ignores `preview_on_branch_push` (its default is `true`; failing on it would break existing callers) — open question for review.
 
 ### Shared Dev job order
@@ -446,7 +445,7 @@ Two independent switches decide what a non-main push deploys. Neither requires t
 * A failed build, audit or stale run never changes the running Dev Worker or its D1. Production, Preview and Dev all build **before** they migrate.
 * Migration reuses `migrate.sh` with the engine-bound target `dev`: D1 = `env.<dev_wrangler_env>.d1_databases`, never top-level (Production); no fallback. The Preview D1 and the Dev D1 **may** be the same physical database (Blog); Production's may not. `migrations apply` is pending-only. Shared Dev has `needs: deploy` purely for ordering, so the two channels never migrate one shared D1 concurrently, plus the shared concurrency group below.
 * `dev_worker_name` is **required** and the audit runs on every Shared Dev run (automatic and manual): the adapter-generated effective config (`.wrangler/deploy/config.json`), or if none was generated the source `env.<dev_wrangler_env>` block, must have `name == dev_worker_name` and pass the resource policy below.
-* **Same artifact.** `build.sh` records the path, SHA-256 and a content fingerprint (`artifact-digest`: config + Worker entry directory + assets directory) of the audited config. `publish.sh` refuses to run without that record, refuses a config that changed in between, always passes `--config <audited config>` (and `--env <dev env>` only for an un-flattened source config) and clears `CLOUDFLARE_ENV`. A caller-supplied `dev_deploy_cmd` is **publish-only**: it runs with `CF_AUDITED_CONFIG` exported and must `wrangler deploy --config "$CF_AUDITED_CONFIG"`; a changed config or deployable afterwards fails the run and the deployment is reported unverified. (A command that ignores the variable and deploys something else cannot be proven wrong by static means; keep `dev_deploy_cmd` empty to use the default.)
+* **Same artifact.** `build.sh` records the path, SHA-256 and a content fingerprint (`artifact-digest`: config + Worker entry directory + assets directory) of the audited config. `publish.sh` refuses to run without that record, refuses a config that changed in between, always passes `--config <audited config>` (and `--env <dev env>` only for an un-flattened source config) and clears `CLOUDFLARE_ENV`. There is no caller-supplied publish command: the engine is the only publisher (`dev_deploy_cmd` is retired and fails the Plan when set).
 * **Same D1.** `cli.mjs d1-consistency` requires the D1 binding of the config that will be published (effective config, or the source for an un-flattened config) to have the same physical `database_id` as the validated migration target. A mismatch fails before the migration and the publish: DB-A is never migrated while a Worker bound to DB-B is deployed.
 * With `d1_migrations`, `dev_build_cmd` is **required**, so the Dev build always succeeds before the Dev D1 is migrated.
 * **Shared-D1 guard:** if the Preview and Dev D1 are the same physical database and the Preview Deploy job reported its migration `failed` (or was cancelled), Shared Dev stops before touching anything (D1 state unknown). With distinct D1s, Preview off, or a Preview failure after a successful migration (e.g. a failed smoke), Dev still deploys; a Preview failure never blocks Dev otherwise.
@@ -493,13 +492,13 @@ Rules: an unknown kind, a malformed entry, a duplicate entry, an entry that matc
 
 ### Manual vs automatic Dev contract
 
-Engine contract (new consumers; opt in by setting `dev_build_cmd`): `dev_build_cmd` builds only, `dev_deploy_cmd` (optional) publishes only, `dev_smoke_cmd` verifies only. Automatic Shared Dev and the manual `persistent-dev` dispatch then both run build → config audit → D1 check → Dev D1 migration (`d1_migrations`) → publish → smoke through the same engine; the manual run also requires `dev_worker_name` and `app_url_dev`, keeps the approved-ref gate and protected `<app>/dev` Environment, and cannot skip the build. A manual run is recorded in the last-good ledger **only after its smoke passes** (failures are recorded as failed); it has no automatic recovery.
+Dev contract (automatic Shared Dev push and manual dispatch alike): `dev_build_cmd` builds only (falls back to `build_cmd`; required with `d1_migrations`), the engine alone publishes the audited Dev config (no caller publish command), `dev_smoke_cmd` verifies only. Both triggers run CI → Plan → Migrate → Deploy → Smoke → conditional Revert; both require `dev_worker_name` and `app_url_dev`, and a manual dispatch additionally keeps the approved-ref gate and the protected `<app>/dev` Environment.
 
-Legacy contract (`dev_build_cmd` empty, existing hybrid callers): the manual dispatch runs `dev_deploy_cmd` (which must build itself) and the optional `dev_smoke_cmd` exactly as before and is **never** written to the ledger, so automatic recovery can never mistake it for a known-good release. Migration plan: add `dev_build_cmd`, `dev_worker_name`, `app_url_dev` (and an audit-clean Dev config); no caller is forced to.
+The former "legacy contract" (`dev_deploy_cmd` builds and publishes in one command) no longer exists. `dev_deploy_cmd` is a retired input: a non-empty value fails the Plan before anything is built, migrated or published. Migration: build in `dev_build_cmd` (or `build_cmd`), delete `dev_deploy_cmd`, set `dev_worker_name` / `app_url_dev`, or move the app to Native Dev.
 
 ### Recovery limits
 
-After a failed Shared Dev smoke the job redeploys the last verified SHA (from the Dev ledger, any branch). It rebinds the commit identity: occurrences of the failed run's SHA (full and 7-character) in `build_env_dev` and `app_version` are replaced with the last-good SHA; `app_version` values not derived from the commit SHA are kept and flagged with a warning. It then repeats build, Worker-identity/resource audit, publish and the full smoke. Only with `sha_path` set is the restored **commit identity** verified; without it the summary says "commit identity NOT verified". It never rolls back D1 (a schema newer than the restored code is possible), a caller whose build parameters embed the commit in ways other than the exact SHA cannot be rebound, and a failed recovery is reported as such; the run is always red. Manual runs have no recovery.
+After a failed Shared Dev smoke the job redeploys the last verified SHA (from the Dev ledger, any branch). It rebinds the commit identity: occurrences of the failed run's SHA (full and 7-character) in `build_env_dev` and `app_version` are replaced with the last-good SHA; `app_version` values not derived from the commit SHA are kept and flagged with a warning. It then repeats build, Worker-identity/resource audit, publish and the full smoke. Only with `sha_path` set is the restored **commit identity** verified; without it the summary says "commit identity NOT verified". It never rolls back D1 (a schema newer than the restored code is possible), a caller whose build parameters embed the commit in ways other than the exact SHA cannot be rebound, and a failed recovery is reported as such; the run is always red. A manual persistent-dev dispatch gets the same recovery (it runs the standard pipeline).
 
 ### Required follow-up in Blog #448 (after this PR is approved)
 

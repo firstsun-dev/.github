@@ -28,9 +28,6 @@ inputs:
   stage:
     description: all | deploy | preflight | migrate | publish | verify | rollback (see description). dev supports all, deploy, preflight, migrate, publish, verify, rollback; prod and preview support preflight, migrate, publish, verify, rollback.
     default: all
-  mode:
-    description: auto (branch / main push, with automatic recovery) | manual (persistent Dev dispatch, no recovery)
-    default: auto
   inputs_json:
     description: toJSON(inputs) of the calling workflow (data only; never interpolated into a script)
     required: true
@@ -159,7 +156,6 @@ runs:
         ENGINE_TARGET: ${{ inputs.target }}
         ENGINE_KIND: ${{ inputs.kind }}
         ENGINE_STAGE: ${{ inputs.stage }}
-        ENGINE_MODE: ${{ inputs.mode }}
         ENGINE_D1_EXPECT: ${{ inputs.d1_expected_id }}
         ENGINE_DESCRIPTOR: ${{ inputs.descriptor }}
         INPUTS_JSON: ${{ inputs.inputs_json }}
@@ -300,7 +296,7 @@ runs:
     # Production version). stage all (Shared Dev): runs inside the failed job; stage rollback (Preview): its own job.
     - name: Recovery - find the last known-good deployment of this target
       id: good
-      if: (failure() && inputs.stage == 'all' && inputs.mode == 'auto' && inputs.target != 'prod' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure') || (success() && inputs.stage == 'rollback' && inputs.target != 'prod')
+      if: (failure() && inputs.stage == 'all' && inputs.target != 'prod' && steps.publish.outcome == 'success' && steps.smoke.outcome == 'failure') || (success() && inputs.stage == 'rollback' && inputs.target != 'prod')
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" recover-find | tee -a "$GITHUB_OUTPUT"'
     - name: Recovery - checkout last good
@@ -362,7 +358,7 @@ runs:
       if: '!cancelled() && inputs.stage == ''rollback'''
       shell: bash
       env:
-        RB_RESULT: ${{ steps.prodrb.outputs.rollback_result }}
+        RB_RESULT: ${{ steps.prodrb.outputs.rollback_result || (steps.good.outputs.blocked == 'true' && 'blocked' || '') }}
         RB_VERIFY: ${{ steps.prodverify.outcome }}
         RB_LEVEL: ${{ steps.prodverify.outputs.smoke_level }}
         GOOD_SHA: ${{ steps.good.outputs.sha }}

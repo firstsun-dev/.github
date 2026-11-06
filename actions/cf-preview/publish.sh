@@ -3,10 +3,10 @@
 # explicit); it never builds. Prints key=value lines on stdout (progress goes to stderr).
 #   TARGET=preview -> `wrangler preview --name <slug> --json`              -> url=<stable Preview URL>
 #   TARGET=prod    -> `wrangler versions upload` + `versions deploy @100`   -> url=<APP_URL> version_id= previous_version_id=
-#   TARGET=dev     -> `wrangler deploy` (built in) or the caller's PUBLISH_CMD -> url=<APP_URL>
+#   TARGET=dev     -> `wrangler deploy` of the audited config (the engine is the only publisher) -> url=<APP_URL>
 #   ROLLBACK_TO=<version id> (prod only): `wrangler versions deploy <id>@100` with the same audited config.
 # Env: TARGET APP_DIR TOOLS_DIR STATE_DIR [OUT_FILE] [WRANGLER_CONFIG] [APP_URL] [APP_VERSION] [COMMIT_MSG]
-#      preview: PREVIEW_NAME [WORKER_NAME]   dev: [PUBLISH_CMD] [DEV_ENV]
+#      preview: PREVIEW_NAME [WORKER_NAME]   dev: [DEV_ENV]
 set -euo pipefail
 : "${TARGET:?}" "${APP_DIR:?}" "${TOOLS_DIR:?}" "${STATE_DIR:?}"
 case "$TARGET" in prod|preview|dev) ;; *) echo "::error::bad TARGET: $TARGET" >&2; exit 1;; esac
@@ -67,16 +67,7 @@ fi
 
 if [ "$TARGET" = dev ]; then
   echo "publish_started=true"
-  if [ -z "${PUBLISH_CMD:-}" ]; then
-    pnpm exec wrangler deploy "${CFG_ARGS[@]}" --message "$MSG" >&2
-  else
-    # Caller customization: runs with the audited config exported. It must only publish; any change to the audited
-    # config or deployable is detected below and fails the run (the Dev deployment is then reported unverified).
-    CF_AUDITED_CONFIG="$CONFIG_PATH" CLOUDFLARE_ENV="$DEV_ENV" bash -eo pipefail -c "$PUBLISH_CMD" >&2
-    [ "$(sha256sum "$CONFIG_PATH" | cut -d' ' -f1)" = "$(cat "$STATE_DIR/config.sha")" ] || { echo "::error::the publish command modified the audited Wrangler config" >&2; exit 1; }
-    NOW="$(node "$TOOLS_DIR/cli.mjs" artifact-digest --config "$CONFIG_PATH" | sed -n 's/^artifact_digest=//p')"
-    [ "$NOW" = "$(cat "$STATE_DIR/artifact.sha")" ] || { echo "::error::the publish command rebuilt or replaced the audited artifact; Dev may serve an unaudited build" >&2; exit 1; }
-  fi
+  pnpm exec wrangler deploy "${CFG_ARGS[@]}" --message "$MSG" >&2
   echo "url=${APP_URL:-}"
   exit 0
 fi

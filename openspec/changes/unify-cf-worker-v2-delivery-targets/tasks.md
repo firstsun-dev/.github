@@ -51,7 +51,7 @@
 - [x] `$/` self-repository references replace every `.cf-tools` checkout; `tools_ref` stays accepted (optional, ignored); runner floor 2.336.0 documented.
 - [x] `_cf-worker-ci.yml`: six parallel checks + fail-closed Validation Gate with a `validation=passed` verdict; one CI call; no duplicate CI between push and same-repo PR.
 - [x] ONE Migration job unchanged; Migration and Delivery depend on the plan only (the plan requires a passed CI).
-- [x] Preview lifecycle and manual persistent Dev extracted (`_cf-worker-lifecycle.yml`, `_cf-worker-persistent-dev.yml`); one shared Delivery engine kept; four thin calls kept (no matrix, rationale in docs).
+- [x] Preview lifecycle and manual persistent Dev extracted (`_cf-worker-lifecycle.yml`, `_cf-worker-persistent-dev.yml`); one shared Delivery engine kept; four thin calls kept (no matrix, rationale in docs). (Superseded: `_cf-worker-persistent-dev.yml` and the later `manual` delivery job were removed; a manual dispatch now runs the standard pipeline, see docs/cf-worker-v2-unified-delivery.md.)
 - [x] One scheduling-time `concurrency.group` expression; canonical `runLockGroup()` emitted by the Plan; `phase_state` without the redundant `d1` map.
 - [x] P1 review fix: `resolveMigrationUsed` rejects `stale` migration results (no stale-skipped migration authorizes a publish); regression tests incl. A→B→A.
 - [x] Contract + chain tests ported; cross-repository real-runner scenarios r1–r11 recorded in `docs/cf-worker-v2-refactor.md`.

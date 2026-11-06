@@ -191,7 +191,7 @@ TARGET=prod ROLLBACK_TO=prev-1 "$P" >/dev/null 2>&1 && grep -Eq 'versions deploy
 TARGET=prod ROLLBACK_TO='x;rm -rf /' "$P" >/dev/null 2>&1 && bad "unsafe rollback id accepted" || ok "unsafe rollback version id rejected"
 TARGET=preview PREVIEW_NAME=feat-a ROLLBACK_TO=prev-1 "$P" >/dev/null 2>&1 && bad "ROLLBACK_TO accepted for preview" || ok "ROLLBACK_TO is Production only"
 
-# ---- Shared Dev (target=dev): identity audit in build.sh; publish-only default; caller publish command is held to the contract ----
+# ---- Shared Dev (target=dev): identity audit in build.sh; the engine is the only publisher ----
 cat > "$T/app/wrangler.toml" <<'TOML'
 name = "x"
 [[queues.producers]]
@@ -213,10 +213,5 @@ grep -q 'deploy' "$T/log" && bad "published with a Production queue" || ok "dev:
 python3 - "$T/app/wrangler.toml" <<'PY'
 import sys; p = sys.argv[1]; s = open(p).read(); i = s.index("[env.dev]"); open(p, "w").write(s[:i] + s[i:].replace("prod-queue", "dev-queue"))
 PY
-: > "$T/log"; env "${DEVV[@]}" BUILD_CMD=true PUBLISH_CMD='echo "custom publish $CF_AUDITED_CONFIG" >> "$STUB_LOG"' bash -c "$(declare -f D); D" >/dev/null 2>&1 && grep -q 'custom publish .*wrangler.toml' "$T/log" && ok "dev: the caller's publish command runs with CF_AUDITED_CONFIG" || bad "dev custom publish"
-: > "$T/log"; env "${DEVV[@]}" BUILD_CMD=true PUBLISH_CMD='sed -i "s/x-dev/x-evil/" "$CF_AUDITED_CONFIG"' bash -c "$(declare -f D); D" >/dev/null 2>&1 && bad "publish command modifying the audited config accepted" || ok "dev: a publish command that modifies the audited config fails the run"
-sed -i 's/x-evil/x-dev/' "$T/app/wrangler.toml"
-mkdir -p "$T/app/dist"; echo orig > "$T/app/dist/index.js"
-sed -i 's/^name = "x"$/name = "x"\nmain = "dist\/index.js"/' "$T/app/wrangler.toml"
-: > "$T/log"; env "${DEVV[@]}" BUILD_CMD=true PUBLISH_CMD='echo rebuilt > dist/index.js' bash -c "$(declare -f D); D" >/dev/null 2>&1 && bad "publish command replacing the artifact accepted" || ok "dev: a publish command that rebuilds/replaces the audited artifact fails the run"
+: > "$T/log"; env "${DEVV[@]}" BUILD_CMD=true PUBLISH_CMD='echo "evil custom publish" >> "$STUB_LOG"' bash -c "$(declare -f D); D" >/dev/null 2>&1 && ! grep -q "evil custom publish" "$T/log" && grep -Eq "deploy --config [^ ]+wrangler.toml --env dev" "$T/log" && ok "dev: the engine is the only publisher (a PUBLISH_CMD in the environment is never executed)" || bad "dev: engine-only publish"
 exit $fail

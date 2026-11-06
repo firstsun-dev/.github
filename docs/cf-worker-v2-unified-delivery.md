@@ -5,7 +5,7 @@ It supersedes the job topology in `cf-worker-v2-refactor.md` ("Job DAG", "Shared
 and recovery rules described there still apply. `_cf-worker-v2.yml` remains the only public entrypoint; `_cf-worker-delivery.yml` is an
 **internal** reusable workflow called only by it. v1 / v1.5 and the floating `@v2` tag are untouched by this change.
 
-> **Revised again (PR #89 Phase 1 simplification):** validation lives in `_cf-worker-ci.yml`, the Preview lifecycle in its own workflow, the manual persistent Dev dispatch as the `manual` job of the delivery workflow (one `persistent-dev` delivery job), every shared action/workflow is referenced with `$/` — see [cf-worker-v2-refactor.md](cf-worker-v2-refactor.md#phase-1-simplification-pr-89-refactor--current-structure).
+> **Revised again (PR #89 Phase 1 simplification):** validation lives in `_cf-worker-ci.yml`, the Preview lifecycle in its own workflow, the manual persistent Dev dispatch as just another trigger of the `persistent-dev` kind (no separate job; see "Manual dispatch" below), every shared action/workflow is referenced with `$/` — see [cf-worker-v2-refactor.md](cf-worker-v2-refactor.md#phase-1-simplification-pr-89-refactor--current-structure).
 >
 > **Revised (PR #89 simplification).** No separate Preflight stage. **One Migration job with integrated safety validation; reusable target-driven Delivery.**
 > The earlier Preflight-per-kind / Migration-per-D1-owner topology, and the real-runner tables further down that exercised it, describe the superseded design;
@@ -41,7 +41,7 @@ matrix anywhere in the delivery graph: every `needs.<call>.outputs.*` belongs to
 | --- | --- |
 | trusted push to `main` | `production` |
 | trusted push to another branch | `native-branch` if `preview_on_branch_push`; `native-dev` if `shared_dev_native_preview_on_branch_push`; `persistent-dev` if `shared_dev_on_branch_push` |
-| protected `workflow_dispatch` persistent-dev | the same `persistent-dev` delivery call, `manual: true` (Plan and Migration skipped): its `manual` job runs the engine in manual mode (or the legacy two-command contract), no automatic recovery |
+| protected `workflow_dispatch` persistent-dev | the same standard pipeline and the same `persistent-dev` delivery call as a push (CI, Plan, Migrate, Deploy, Smoke, conditional recovery); the Plan rejects an unapproved dispatch |
 | PR / delete / tag | none (lifecycle handler only) |
 
 Rejected (plan fails closed, `config-guard` also reports): `production-only` with any Dev channel; `shared_dev_on_branch_push` together with
@@ -356,3 +356,31 @@ YAML anchors (`&delivery_permissions`, `&delivery_secrets`, `&fetch_ci_tools`) w
   with a message naming both databases. Nothing is changed before it fails. The consumer plan (blog, innovation-apps, heaven-monorepo, anas-mcp, heaven-www) does not
   need this, but each caller must be confirmed before the `@v2` move; the rollout stays blocked on that confirmation.
 * The Migration job runs in the owner's Environment, so on main the `<app>/prod` approval is requested **before** the read-only validation steps as well as before the migration.
+
+## Manual dispatch (persistent-dev) — one pipeline, trigger-independent
+
+Deployment **targets** decide what is deployed; **triggers** decide when. A `workflow_dispatch` with `dispatch_target: persistent-dev` therefore is not a delivery kind or a job of its own. It only makes `resolveDeliveryTargets()` return `["persistent-dev"]`, and the run is the standard
+
+`CI → Validation Gate → Plan → Migrate → persistent-dev / Deploy → Smoke Tests → Revert on Verify Failure`
+
+identical to a feature-branch Shared Dev push. The delivery workflow has exactly `deploy`, `smoke`, `rollback`; the `manual` job, its `manual` input and the engine's `mode` input are gone.
+
+| Event | Ref | Requested target | Resolved delivery |
+| --- | --- | --- | --- |
+| push | main | – | production |
+| push | feature | enabled channels | native-branch / native-dev / persistent-dev (as before) |
+| workflow_dispatch | = `persistent_dev_ref` (hybrid) | `persistent-dev` | persistent-dev only (also from `main`; never Production, never Release) |
+| workflow_dispatch | any other ref, non-hybrid, empty `persistent_dev_ref`, unknown target | `persistent-dev` / other | Plan **fails** before any mutation |
+| workflow_dispatch | main / feature | empty | unchanged (production / enabled previews) |
+| pull_request, delete | – | – | CI only / lifecycle only |
+
+Concurrency: the run-level group of a persistent-dev dispatch is the same as for the automatic Shared Dev push (`cfv2-nonprod-d1-<scope>` with `d1_migrations`, else `cfv2-shared-dev-<app>`; never the Production group, even from `main`), so the Migrate job cannot race a feature-branch Dev push. Deploy and Revert keep the descriptor's job-level group `cfv2-dev-<repo>-<scope|app>` (a different name, so no nested-group deadlock).
+
+Behaviour changes versus the old manual path: it now runs CI, Plan and the dedicated Migrate job; a failed Smoke triggers the same conditional recovery to the last known-good Dev deployment (it previously had none); D1 is still never rolled back. `dev_deploy_cmd` is retired (non-empty fails the Plan): the engine is the only publisher, callers build in `dev_build_cmd` (see `docs/cf-worker-v2-refactor.md`).
+
+## Final rules (PR #93)
+
+- **One audited publisher.** The engine alone publishes: build (`dev_build_cmd` or `build_cmd`) -> audit the effective Wrangler config -> publish that config (`wrangler deploy --config <audited>`, plus `--env <dev env>` only for an audited *source* config) -> Smoke. There is no caller-supplied publish command: `dev_deploy_cmd` is a retired input and a non-empty value fails the Plan (explicit error instead of a workflow-syntax failure for stale callers).
+- **CI environment follows the intended target** (`ci_target_env`, JS twin `ciTargetEnv`): `dev` when the run's only target is Persistent Dev (manual dispatch from any ref, `main` included, or an automatic push where Shared Dev is the only enabled channel); `prod` for `main`; `preview` otherwise (Native Branch, Native Dev, several kinds at once, PRs). With several kinds the shared validation keeps the Preview contract and each kind's own build and audit still validate its actual configuration. Exactly one build env is imported; `ci_env` applies afterwards; no Cloudflare credentials in CI.
+- **`dispatch_target` fails closed**: valid only for `workflow_dispatch` and only as exactly `persistent-dev`; unapproved ref, tag, missing `persistent_dev_ref`, non-hybrid strategy or any other value fails the Plan, including for tag / PR / push / delete events (the Plan `if:` runs for an explicit target so the run is red, never green without deploying).
+- **Non-Production recovery D1 guard** (`nonProdRecoveryBlock`, same rule as Production via `d1SchemaBlock`): last-known-good code is redeployed only when this pipeline's migration result is present, for this target's D1, and either unchanged or additive with `d1_rollback_compat: expand-contract`; otherwise recovery is blocked, the deployment is UNVERIFIED and the summary gives the reason and manual steps. D1 is never reverted.

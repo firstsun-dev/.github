@@ -16,7 +16,7 @@ name: CF Worker Pipeline v2
 #   Release                   optional, main only, only after a VERIFIED Production delivery with no rollback
 #
 # Event handlers outside that DAG: `lifecycle` (_cf-worker-lifecycle.yml: PR comment / branch delete) and `config-guard`.
-# The Hybrid protected manual dispatch of persistent Dev is NOT a separate job: it is the `manual` entry of `delivery_persistent_dev`.
+# The Hybrid protected manual dispatch of persistent Dev is NOT a separate path: it only selects the `persistent-dev` kind in the Plan, then runs this same DAG.
 # One pipeline migrates at most one physical D1: distinct databases among the enabled targets are rejected by the plan, before any mutation.
 # The run-level concurrency group below spans the whole run. Interface, design record and measurements: docs/cf-worker-v2-refactor.md.
 #
@@ -332,11 +332,9 @@ on:
         default: ''
       dev_deploy_cmd:
         description: >
-          OPTIONAL publish-only command for the Dev Worker (default: `wrangler deploy --config <audited config>`).
-          The engine builds with dev_build_cmd (or build_cmd) and audits the effective config FIRST; this command runs
-          afterwards with CF_AUDITED_CONFIG exported, must publish THAT config (`wrangler deploy --config
-          "$CF_AUDITED_CONFIG"`) and must not rebuild: a changed config or deployable fails the run. Legacy manual
-          dispatch (dev_build_cmd empty): dev_deploy_cmd builds and publishes exactly as before.
+          RETIRED - must be empty. The engine is the only publisher (it publishes the audited Dev Wrangler config itself); a non-empty
+          value fails the Plan before anything is built, migrated or published. Build in dev_build_cmd (or build_cmd). The input is kept
+          declared only so a stale caller gets this explicit error instead of a workflow-syntax failure.
         type: string
         default: ''
       dev_smoke_cmd:
@@ -348,7 +346,7 @@ on:
         type: string
         default: ''
       dev_build_cmd:
-        description: Dev build from app_path (with build_env_dev), build only; falls back to build_cmd when empty. REQUIRED with d1_migrations (the Dev build must succeed before the Dev D1 is migrated). Setting it also opts the manual persistent-dev dispatch into the engine. Leave empty only for a legacy persistent-dev caller whose dev_deploy_cmd builds itself.
+        description: Dev build from app_path (with build_env_dev), build only; falls back to build_cmd when empty. REQUIRED with d1_migrations (the Dev build must succeed before the Dev D1 is migrated). Required by the persistent-dev kind (automatic and manual dispatch alike).
         type: string
         default: ''
       dev_wrangler_env:
@@ -373,7 +371,7 @@ on:
         type: string
         default: ''
       dispatch_target:
-        description: Pass github.event.inputs.target from the caller; "persistent-dev" triggers the protected Dev path
+        description: Pass github.event.inputs.target from the caller; empty (default) or "persistent-dev". "persistent-dev" only SELECTS the persistent-dev delivery kind for a workflow_dispatch of the approved persistent_dev_ref (hybrid); the run is the standard CI -> Plan -> Migrate -> Deploy -> Smoke -> Rollback pipeline. Any other value, or an unapproved ref, fails the Plan before any mutation.
         type: string
         default: ''
       pipeline_phase:
@@ -422,7 +420,9 @@ on:
 #                                      -> cfv2-nonprod-d1-<d1_lock_scope|app_name>   (Preview AND Shared Dev D1)
 #   branch, Shared Dev on, no D1 lock  -> cfv2-shared-dev-<app_name>                  (the ONE Dev Worker)
 #   branch, both channels off          -> cfv2-<app_name>-preview-<branch>            (CI-only: no shared D1 serialization)
-#   PR / delete / persistent-dev / any other event -> a private group (never queues behind a deploy)
+#   workflow_dispatch target=persistent-dev (any approved ref, main included) -> the SAME group as the automatic Shared Dev push
+#                                      (cfv2-nonprod-d1-<scope> with d1_migrations, else cfv2-shared-dev-<app>): never the Production group
+#   PR / delete / any other event      -> a private group (never queues behind a deploy)
 # The `cfv2-` prefix is static on purpose: never reuse it (or ${{ github.workflow }}) in a CALLER group, or caller and callee deadlock.
 # A repo-local group does NOT protect a D1 shared with another repository. `queue` is unknown to actionlint 1.7.12: .github/actionlint.yaml.
 #
@@ -432,7 +432,7 @@ on:
 # phase_state; the Plan job then proves, before any mutation, that it equals runLockGroup() of the deploy call's own inputs - a wrong or
 # forged value fails the run there, it can never mutate under another lock.
 concurrency:
-  group: ${{ inputs.pipeline_phase == 'verify' && (fromJSON(inputs.phase_state).group || format('cfv2-run-{0}', github.run_id)) || ((github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target != 'persistent-dev')) && github.ref_type == 'branch') && (github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.preview_on_branch_push || inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id) }}
+  group: ${{ inputs.pipeline_phase == 'verify' && (fromJSON(inputs.phase_state).group || format('cfv2-run-{0}', github.run_id)) || ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref_type == 'branch') && ((github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev') && (inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || format('cfv2-shared-dev-{0}', inputs.app_name)) || github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.preview_on_branch_push || inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id) }}
   queue: max
 
 permissions:
@@ -459,7 +459,7 @@ jobs:
   # -------------------------------------------------------------------------
   ci:
     name: CI
-    if: github.event_name != 'delete' && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
+    if: github.event_name != 'delete' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     uses: $/.github/workflows/_cf-worker-ci.yml
     with:
       app_name: ${{ inputs.app_name }}
@@ -475,6 +475,12 @@ jobs:
       use_mailpit: ${{ inputs.use_mailpit }}
       build_env_prod: ${{ inputs.build_env_prod }}
       build_env_preview: ${{ inputs.build_env_preview }}
+      build_env_dev: ${{ inputs.build_env_dev }}
+      # The CI environment follows the INTENDED deployment target, not only the ref: a persistent-dev dispatch (even from `main`) and an
+      # automatic push whose ONLY target is Shared Dev are validated against the Dev build env (never Production env vars); several kinds
+      # at once keep the Preview contract. Pure event/input resolution (CI runs before the Plan; the Plan stays
+      # the authorization gate). JS twin: delivery.mjs ciTargetEnv.
+      ci_target_env: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && 'dev' || (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main' && inputs.dispatch_target == '' && inputs.deployment_strategy != 'production-only' && inputs.shared_dev_on_branch_push && !inputs.preview_on_branch_push && !inputs.shared_dev_native_preview_on_branch_push && 'dev' || github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
       test_e2e_cmd: ${{ inputs.test_e2e_cmd }}
       test_e2e_setup_cmd: ${{ inputs.test_e2e_setup_cmd }}
       test_e2e_build_cmd: ${{ inputs.test_e2e_build_cmd }}
@@ -489,7 +495,10 @@ jobs:
   plan:
     name: Plan
     needs: [ci]
-    if: always() && (inputs.pipeline_phase == 'verify' || (needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed' && github.ref_type == 'branch' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')))
+    # The last clause makes an explicit but unservable request (a dispatch_target on a tag / PR / push / delete event) reach the Plan even
+    # without a passed CI: the Plan then ALWAYS fails (resolveDeliveryTargets), so such a run is red instead of silently green, and it
+    # can never emit a target (no downstream job runs).
+    if: always() && (inputs.pipeline_phase == 'verify' || (needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed' && github.ref_type == 'branch' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) || (inputs.dispatch_target != '' && (github.event_name != 'workflow_dispatch' || github.ref_type != 'branch')))
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     outputs:
@@ -670,14 +679,11 @@ jobs:
   delivery_persistent_dev:
     name: persistent-dev
     needs: [plan, migration]
-    # Two entries, one job: the automatic DAG delivery (plan-driven), or the protected manual dispatch of the approved ref (Hybrid only;
-    # Plan and Migration are skipped for a dispatch, so this branch needs no `needs` result and never runs on a push).
-    if: (always() && needs.plan.result == 'success' && needs.plan.outputs.on_persistent_dev == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')) || (!cancelled() && inputs.pipeline_phase != 'verify' && github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && inputs.deployment_strategy == 'hybrid' && inputs.persistent_dev_ref != '' && github.ref == inputs.persistent_dev_ref)
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_persistent_dev == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
     uses: $/.github/workflows/_cf-worker-delivery.yml
     permissions: *delivery_permissions
     with:
-      descriptor: ${{ needs.plan.outputs.descriptors && toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) || '{}' }}
-      manual: ${{ inputs.pipeline_phase != 'verify' && github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' }}
+      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
       runner: ${{ inputs.runner }}
       inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
@@ -733,7 +739,7 @@ jobs:
 
   # -------------------------------------------------------------------------
   # Event handlers outside the delivery DAG, one small reusable workflow each: `lifecycle` (same-repo PR -> comment the verified Preview URL;
-  # branch delete -> retire the ledger, the Preview is KEPT). The Hybrid manual dispatch of persistent Dev is the `manual` entry of `delivery_persistent_dev`.
+  # branch delete -> retire the ledger, the Preview is KEPT).
   # -------------------------------------------------------------------------
   lifecycle:
     name: lifecycle
