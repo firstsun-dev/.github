@@ -54,6 +54,13 @@ on:
       build_env_preview:
         type: string
         default: ''
+      build_env_dev:
+        type: string
+        default: ''
+      ci_target_env:
+        description: prod | dev | preview - which build env the validation commands import (resolved by the caller from event/ref/dispatch_target)
+        type: string
+        default: ''
       test_e2e_cmd:
         type: string
         default: ''
@@ -99,6 +106,8 @@ jobs:
           app_path: ${{ inputs.app_path }}
           build_env_prod: ${{ inputs.build_env_prod }}
           build_env_preview: ${{ inputs.build_env_preview }}
+          build_env_dev: ${{ inputs.build_env_dev }}
+          target_env: ${{ inputs.ci_target_env }}
           ci_env: ${{ inputs.ci_env }}
           app_version: ${{ inputs.app_version }}
   typecheck:
@@ -115,6 +124,8 @@ jobs:
           app_path: ${{ inputs.app_path }}
           build_env_prod: ${{ inputs.build_env_prod }}
           build_env_preview: ${{ inputs.build_env_preview }}
+          build_env_dev: ${{ inputs.build_env_dev }}
+          target_env: ${{ inputs.ci_target_env }}
           ci_env: ${{ inputs.ci_env }}
           app_version: ${{ inputs.app_version }}
   unit:
@@ -131,6 +142,8 @@ jobs:
           app_path: ${{ inputs.app_path }}
           build_env_prod: ${{ inputs.build_env_prod }}
           build_env_preview: ${{ inputs.build_env_preview }}
+          build_env_dev: ${{ inputs.build_env_dev }}
+          target_env: ${{ inputs.ci_target_env }}
           ci_env: ${{ inputs.ci_env }}
           app_version: ${{ inputs.app_version }}
           use_mailpit: ${{ inputs.use_mailpit }}
@@ -148,6 +161,8 @@ jobs:
           app_path: ${{ inputs.app_path }}
           build_env_prod: ${{ inputs.build_env_prod }}
           build_env_preview: ${{ inputs.build_env_preview }}
+          build_env_dev: ${{ inputs.build_env_dev }}
+          target_env: ${{ inputs.ci_target_env }}
           ci_env: ${{ inputs.ci_env }}
           app_version: ${{ inputs.app_version }}
           use_mailpit: ${{ inputs.use_mailpit }}
@@ -164,6 +179,8 @@ jobs:
           app_path: ${{ inputs.app_path }}
           build_env_prod: ${{ inputs.build_env_prod }}
           build_env_preview: ${{ inputs.build_env_preview }}
+          build_env_dev: ${{ inputs.build_env_dev }}
+          target_env: ${{ inputs.ci_target_env }}
           ci_env: ${{ inputs.ci_env }}
           app_version: ${{ inputs.app_version }}
 

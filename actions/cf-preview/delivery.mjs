@@ -42,8 +42,10 @@ export function resolveSmokeMode(kind, smokeMode = 'full', overridesText = '') {
 
 /**
  * Enabled delivery kinds for one event, in a stable order. Exactly the enabled targets - a disabled channel creates no
- * phantom path. `persistentDevDispatch` = the protected manual dispatch (a separate, non-automatic path).
- * Rejects (throws) the combinations the spec forbids instead of silently dropping them.
+ * phantom path. A protected manual dispatch (`dispatchTarget: persistent-dev`) is NOT a special pipeline: it only SELECTS the
+ * `persistent-dev` kind, and every downstream stage (CI, Plan, Migration, Deploy, Smoke, Rollback) is the standard one.
+ * Rejects (throws, so the Plan fails before any mutation) the combinations the spec forbids instead of silently dropping them:
+ * an unknown dispatch_target, or persistent-dev outside hybrid / without an exact match of the dispatch ref and persistent_dev_ref.
  */
 export function resolveDeliveryTargets({
   event, ref, strategy, previewOnPush = true, sharedDevOnPush = false, sharedDevNativeOnPush = false, dispatchTarget = '', devRef = '',
@@ -55,12 +57,19 @@ export function resolveDeliveryTargets({
   if (sharedDevOnPush && sharedDevNativeOnPush) {
     throw new Error('shared_dev_on_branch_push (separate persistent Dev Worker) and shared_dev_native_preview_on_branch_push (named Native Preview "dev") are conflicting automatic Dev channels; enable only one');
   }
+  // Fail closed: an explicit deployment request is honoured exactly or refused - never ignored. A non-empty dispatch_target is only
+  // meaningful for a workflow_dispatch (push / pull_request / delete / anything else with a target is a conflicting request).
+  if (dispatchTarget !== '' && event !== 'workflow_dispatch') throw new Error(`dispatch_target '${dispatchTarget}' is only valid for a workflow_dispatch (event: ${event || 'unknown'}); refusing to ignore it or fall back to another target (nothing was changed)`);
+  if (event === 'workflow_dispatch' && dispatchTarget !== '') {
+    if (dispatchTarget !== 'persistent-dev') throw new Error(`dispatch_target '${dispatchTarget}' is not valid (expected persistent-dev or empty); refusing to fall back to another target`);
+    const r = String(ref).startsWith('refs/heads/') ? classifyEvent({ event, ref, strategy, devRef, dispatchTarget }) : { action: 'skip', reason: 'not a branch ref' };
+    if (r.action !== 'persistent-dev') throw new Error(`manual persistent-dev dispatch rejected: ${r.reason} (requires deployment_strategy hybrid and the dispatch ref equal to persistent_dev_ref; nothing was changed)`);
+    return ['persistent-dev'];
+  }
   if (!String(ref).startsWith('refs/heads/')) return [];
   const r = classifyEvent({ event, ref, strategy, devRef, dispatchTarget });
   if (r.action === 'production') return ['production'];
-  if (r.action === 'persistent-dev') return ['persistent-dev'];
-  const automatic = event === 'push' || (event === 'workflow_dispatch' && dispatchTarget !== 'persistent-dev');
-  if (r.action !== 'preview' || !automatic) return [];
+  if (r.action !== 'preview' || !(event === 'push' || event === 'workflow_dispatch')) return [];
   const kinds = [];
   if (previewOnPush) kinds.push('native-branch');
   if (sharedDevNativeOnPush) kinds.push('native-dev');
@@ -230,7 +239,7 @@ const DESCRIPTOR_KEYS = ['v', 'kind', 'target', 'environment', 'deploy_group', '
 /**
  * Concurrency identity of a kind. Production / Native Branch / Native Dev get uncontended per-run groups (no cross-target
  * waiting). persistent-dev keeps the LEGACY Shared Dev group - keyed by repository and the shared-D1 scope (or the app) - for
- * Deploy AND Rollback, so it serialises with the manual dispatch and with every other app using the same physical D1.
+ * Deploy AND Rollback, so it serialises with the manual persistent-dev dispatch (same kind, same descriptor) and with every other app using the same physical D1.
  */
 export function concurrencyGroups(kind, { runId, repo = '', app, lockScope = '' }) {
   if (assertKind(kind) === 'persistent-dev') {
@@ -340,6 +349,57 @@ export function verificationOutcome(level) {
 }
 
 /**
+ * Which build env the CI validation commands import (and the value of VITE_APP_ENV): the env of the INTENDED deployment, resolved from
+ * pure event/input data because CI runs before the Plan (the Plan stays the authorization gate). JS twin of the `ci_target_env`
+ * expression of _cf-worker-v2.yml (the contract test compares them and checks `dev` against resolveDeliveryTargets).
+ *   dev     : the run's only automatic target is persistent-dev - a manual dispatch with dispatch_target persistent-dev (any ref, `main`
+ *             included), or a push / dispatch to a non-main branch where Shared Dev is the only enabled channel
+ *   prod    : refs/heads/main otherwise
+ *   preview : everything else - Native Branch, Native Dev, several kinds at once (their shared validation keeps the Preview contract;
+ *             each kind's own build and audit still validate its actual deployment configuration downstream), PRs, tags
+ */
+export function ciTargetEnv({ event = '', ref = '', dispatchTarget = '', strategy = '', previewOnPush = true, sharedDevOnPush = false, sharedDevNativeOnPush = false }) {
+  if (event === 'workflow_dispatch' && dispatchTarget === 'persistent-dev') return 'dev';
+  if ((event === 'push' || event === 'workflow_dispatch') && String(ref).startsWith('refs/heads/') && ref !== 'refs/heads/main' && dispatchTarget === ''
+      && strategy !== 'production-only' && sharedDevOnPush && !previewOnPush && !sharedDevNativeOnPush) return 'dev';
+  return ref === 'refs/heads/main' ? 'prod' : 'preview';
+}
+
+/**
+ * The ONE D1 compatibility rule for restoring older Worker code (Production rollback and non-Production recovery alike):
+ * after an applied schema change the older code must be attested (d1_rollback_compat) AND the applied migrations provably
+ * additive. D1 itself is never reverted. null = allowed.
+ */
+export function d1SchemaBlock({ d1Pending = false, d1Compat = '', d1Scan = '' }) {
+  if (!d1Pending) return null;
+  if (d1Compat !== 'expand-contract') return { code: 'd1_unattested', why: "This run applied D1 migrations and d1_rollback_compat is not 'expand-contract': compatibility of the previous Worker version with the new schema is unproven." };
+  if (d1Scan !== 'additive') return { code: 'd1_not_additive', why: `This run applied D1 migrations that are not provably additive (scan: ${d1Scan || 'unknown'}); the previous Worker version may not work on the new schema.` };
+  return null;
+}
+
+/**
+ * Non-Production recovery (Native Branch / Native Dev / Persistent Dev): may the last known-good code be redeployed?
+ * Fails closed on everything it cannot prove, using the migration result of THIS pipeline.
+ *   d1Migrations false            -> allowed (no D1 involved)
+ *   migration result missing/bad  -> blocked (state of D1 unknown)
+ *   result for another D1         -> blocked
+ *   schema_changed not true/false -> blocked; false -> allowed; true -> d1SchemaBlock
+ * `migration` = the parsed hand-off of the Migration job (or null). null = allowed.
+ */
+export function nonProdRecoveryBlock({ d1Migrations = false, migration = null, expectedId = '', d1Compat = '' }) {
+  if (!d1Migrations) return null;
+  if (migration === null || typeof migration !== 'object' || Array.isArray(migration) || migration.migration !== 'applied') {
+    return { code: 'migration_result_missing', why: 'D1 migrations are enabled but this pipeline handed over no valid applied-migration result: the D1 schema state is unknown, so older code cannot be proven compatible.' };
+  }
+  if (!expectedId || migration.d1_id !== expectedId) {
+    return { code: 'd1_identity_mismatch', why: `The migration result is for D1 '${migration.d1_id || 'unknown'}', not this target's D1 '${expectedId || 'unknown'}'.` };
+  }
+  const changed = String(migration.schema_changed ?? '');
+  if (changed !== 'true' && changed !== 'false') return { code: 'migration_result_invalid', why: `The migration result has no valid schema_changed value ('${changed || 'missing'}').` };
+  return d1SchemaBlock({ d1Pending: changed === 'true', d1Compat, d1Scan: String(migration.d1_scan ?? '') });
+}
+
+/**
  * Production automatic rollback: why it must NOT happen (null = allowed so far). Checked in this order, fail closed.
  * `live` = the version Cloudflare reports as live; pass undefined to skip that last, observation-based check.
  * A Worker rollback never reverts D1: after an applied migration the previous version must be PROVEN to cope.
@@ -349,10 +409,8 @@ export function prodRollbackBlock({ policy, previous = '', current = '', worker 
   if (!previous) return { code: 'no_previous_version', why: 'No previous Worker version id was recorded (first deployment, or the deployment list was unreadable); there is nothing safe to roll back to.' };
   if (!current || !worker) return { code: 'no_identity', why: 'The deployed version id or Worker name was not handed over.' };
   if (previous === current) return { code: 'same_version', why: 'The previous and the new version id are identical.' };
-  if (d1Pending) {
-    if (d1Compat !== 'expand-contract') return { code: 'd1_unattested', why: "This run applied D1 migrations and d1_rollback_compat is not 'expand-contract': compatibility of the previous Worker version with the new schema is unproven." };
-    if (d1Scan !== 'additive') return { code: 'd1_not_additive', why: `This run applied D1 migrations that are not provably additive (scan: ${d1Scan || 'unknown'}); the previous Worker version may not work on the new schema.` };
-  }
+  const d1 = d1SchemaBlock({ d1Pending, d1Compat, d1Scan });
+  if (d1) return d1;
   if (live !== undefined && live !== current) {
     return { code: 'live_version_changed', why: `The live version is '${live || 'unknown'}', not the version \`${current}\` this run deployed; refusing to replace someone else's deployment.` };
   }
@@ -370,7 +428,8 @@ export function rollbackVerdict({ target, rbResult = '', rbVerify = '', rbLevel 
     if (rbResult === 'rolled_back') {
       if (rbVerify === 'success') { result = isContentLevel(rbLevel) ? 'restored_verified' : 'restored_unverified'; level = rbLevel; } else result = 'restored_unhealthy';
     } else result = rbResult === 'blocked' ? 'blocked' : 'failed';
-  } else if (!goodSha) result = 'no_known_good';
+  } else if (rbResult === 'blocked') result = 'blocked';
+  else if (!goodSha) result = 'no_known_good';
   else if (recovered === 'success' && verified === 'success') { result = isContentLevel(smokeLevel) ? 'restored_verified' : 'restored_unverified'; level = smokeLevel; } else result = 'failed';
   return { result, level, ok: result === 'restored_verified' };
 }
@@ -386,7 +445,10 @@ export function runLockGroup({ event, ref, inputs, runId }) {
   const on = (k) => inputs?.[k] === true || inputs?.[k] === 'true';
   const branch = String(ref ?? '').startsWith('refs/heads/');
   const scope = s('d1_lock_scope') || s('app_name');
-  if ((event === 'push' || (event === 'workflow_dispatch' && s('dispatch_target') !== 'persistent-dev')) && branch) {
+  if ((event === 'push' || event === 'workflow_dispatch') && branch) {
+    // A manual persistent-dev dispatch mutates the same Dev D1 / Dev Worker as the automatic Shared Dev channel, so it takes the SAME
+    // run-level group (never the Production one, even from main) and serialises with every feature-branch Shared Dev push.
+    if (event === 'workflow_dispatch' && s('dispatch_target') === 'persistent-dev') return on('d1_migrations') ? `cfv2-nonprod-d1-${scope}` : `cfv2-shared-dev-${s('app_name')}`;
     if (ref === 'refs/heads/main') return `cfv2-prod-${scope}`;
     const nonProdOnly = s('deployment_strategy') !== 'production-only';
     const channels = on('preview_on_branch_push') || on('shared_dev_on_branch_push') || on('shared_dev_native_preview_on_branch_push');
@@ -474,7 +536,7 @@ const KIND_OF_TARGET = { prod: 'production', preview: 'native-branch', dev: 'per
 const STAGES = ['all', 'deploy', 'preflight', 'migrate', 'publish', 'verify', 'rollback'];
 const BUILD_ENV_INPUT = { production: 'build_env_prod', 'native-branch': 'build_env_preview', 'native-dev': 'build_env_shared_dev_native_preview', 'persistent-dev': 'build_env_dev' };
 
-export function validateInit({ inputs, target, kind = '', stage = 'all', mode = 'auto', d1Expect = '', descriptor = '', callInputs = '', event, ref, previewSecrets = '' }) {
+export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expect = '', descriptor = '', callInputs = '', event, ref, previewSecrets = '' }) {
   if (inputs === null || typeof inputs !== 'object' || Array.isArray(inputs)) throw new Error('inputs_json is not an object');
   const s = (k) => (inputs[k] == null ? '' : String(inputs[k]));
   const on = (k) => s(k) === 'true';
@@ -493,9 +555,6 @@ export function validateInit({ inputs, target, kind = '', stage = 'all', mode = 
     throw new Error(`${K} must run as split stages (preflight/migrate/publish/verify/rollback), got '${stage}'`);
   }
   if (!/^[A-Za-z0-9_-]*$/.test(d1Expect)) throw new Error('malformed expected D1 id');
-  if (!['auto', 'manual'].includes(mode)) throw new Error(`bad engine mode: ${mode}`);
-  if (mode !== 'auto' && target !== 'dev') throw new Error('manual mode is only for the persistent Dev target');
-  if (mode !== 'auto' && stage !== 'all') throw new Error('manual Dev runs as one job (stage all)');
   if (callInputs) { // deferred verification: the verify call's identity inputs must equal the deploy call's
     let c;
     try { c = JSON.parse(callInputs); } catch { c = null; }
@@ -511,17 +570,12 @@ export function validateInit({ inputs, target, kind = '', stage = 'all', mode = 
     throw new Error('deployment_strategy: production-only cannot be combined with shared_dev_on_branch_push / shared_dev_native_preview_on_branch_push: true; refusing to publish or migrate anything');
   }
   if (on('shared_dev_on_branch_push') && on('shared_dev_native_preview_on_branch_push')) throw new Error('shared_dev_on_branch_push and shared_dev_native_preview_on_branch_push are conflicting automatic Dev channels; enable only one');
-  if (mode === 'manual') {
-    const action = classifyEvent({ event, ref, strategy, devRef: s('persistent_dev_ref'), dispatchTarget: s('dispatch_target') }).action;
-    if (action !== 'persistent-dev') throw new Error(`manual Dev is only allowed from the approved persistent_dev_ref via dispatch (classified '${action}')`);
-  } else {
-    const kinds = resolveDeliveryTargets({
-      event, ref, strategy, previewOnPush: on('preview_on_branch_push'), sharedDevOnPush: on('shared_dev_on_branch_push'),
-      sharedDevNativeOnPush: on('shared_dev_native_preview_on_branch_push'), dispatchTarget: s('dispatch_target'), devRef: s('persistent_dev_ref'),
-    });
-    if (!kinds.includes(K)) throw new Error(`target mismatch (enabled kinds '${kinds.join(',')}', engine '${K}'); refusing to deploy`);
-  }
-  return { kind: K, stage, mode, target, smokeMode, d1Expect, ...validateTargetConfig({ inputs, kind: K, target, previewSecrets }) };
+  const kinds = resolveDeliveryTargets({
+    event, ref, strategy, previewOnPush: on('preview_on_branch_push'), sharedDevOnPush: on('shared_dev_on_branch_push'),
+    sharedDevNativeOnPush: on('shared_dev_native_preview_on_branch_push'), dispatchTarget: s('dispatch_target'), devRef: s('persistent_dev_ref'),
+  });
+  if (!kinds.includes(K)) throw new Error(`target mismatch (enabled kinds '${kinds.join(',')}', engine '${K}'); refusing to deploy`);
+  return { kind: K, stage, target, smokeMode, d1Expect, ...validateTargetConfig({ inputs, kind: K, target, previewSecrets }) };
 }
 
 /** Per-target requirements and the validated KEY=VALUE env data each kind builds/smokes with (a build env never falls back to another kind's). */

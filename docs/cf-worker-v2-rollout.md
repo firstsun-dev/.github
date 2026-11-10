@@ -41,7 +41,7 @@ Status at the time of writing (2026-11-03): **PR #89 is ready to merge; the floa
 | `<job> / Migration` | `<job> / Migrate` |
 | `<job> / Deploy`, `Smoke Tests`, `Revert on Verify Failure`, `Shared Dev`, `Shared Dev Smoke Tests`, `Shared Dev Revert on Verify Failure` | `<job> / <kind> / Deploy\|Smoke Tests\|Revert on Verify Failure` (`<kind>` = `production\|native-branch\|native-dev\|persistent-dev`) |
 | `Release` | unchanged |
-| `Config guard`, `Preview lifecycle`, `Persistent Dev (Hybrid)` | `Guard`, `lifecycle / ledger`, `persistent-dev / manual` |
+| `Config guard`, `Preview lifecycle`, `Persistent Dev (Hybrid)` | `Guard`, `lifecycle / ledger`; the manual dispatch of Persistent Dev is now `persistent-dev / Deploy` (the same checks as a Shared Dev push). A repository that lists `persistent-dev / manual` as a required check must replace it with `persistent-dev / Deploy` |
 
 ## Procedure
 

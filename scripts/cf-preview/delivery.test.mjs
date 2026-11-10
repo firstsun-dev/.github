@@ -4,7 +4,7 @@ import {
   DELIVERY_KINDS, resolveDeliveryTargets, resolveSmokeMode, parseSmokeOverrides, planMigrations, branchPreviewIdentity, ENGINE_TARGET,
   canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins,
   targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor, resolveMigrationUsed,
-  isContentLevel, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
+  isContentLevel, verificationOutcome, prodRollbackBlock, nonProdRecoveryBlock, ciTargetEnv, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
 } from '../../actions/cf-preview/delivery.mjs';
 
 const base = { event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-preview', previewOnPush: true };
@@ -26,11 +26,49 @@ test('non-deploy events and refs never produce a target', () => {
   assert.deepEqual(T({ ref: 'refs/tags/v1', sharedDevNativeOnPush: true }), []);
   assert.deepEqual(T({ ref: 'refs/pull/1/merge' }), []);
 });
-test('manual persistent-dev dispatch is its own path, only from the approved ref on hybrid', () => {
+test('manual persistent-dev dispatch only SELECTS the persistent-dev kind (approved ref, hybrid); everything else rejects', () => {
   const d = { event: 'workflow_dispatch', strategy: 'hybrid', dispatchTarget: 'persistent-dev', devRef: 'refs/heads/dev-ref', ref: 'refs/heads/dev-ref' };
   assert.deepEqual(T(d), ['persistent-dev']);
-  assert.deepEqual(T({ ...d, ref: 'refs/heads/other' }), []);
-  assert.deepEqual(T({ ...d, strategy: 'production-preview' }), []);
+  assert.throws(() => T({ ...d, ref: 'refs/heads/other' }), /rejected.*approved persistent_dev_ref/);
+  assert.throws(() => T({ ...d, strategy: 'production-preview' }), /rejected.*requires hybrid/);
+  assert.throws(() => T({ ...d, devRef: '' }), /rejected/);
+  assert.throws(() => T({ ...d, ref: 'refs/tags/v1', devRef: 'refs/tags/v1' }), /rejected/);
+  assert.throws(() => T({ ...d, dispatchTarget: 'production' }), /dispatch_target 'production' is not valid/);
+  // approved ref = main: still ONLY persistent-dev, never production, and no automatic Preview target alongside it
+  assert.deepEqual(T({ ...d, ref: 'refs/heads/main', devRef: 'refs/heads/main', sharedDevOnPush: true }), ['persistent-dev']);
+  // dispatch without a target keeps the existing behaviour (main -> production, branch -> the enabled automatic previews)
+  assert.deepEqual(T({ event: 'workflow_dispatch', strategy: 'hybrid', ref: 'refs/heads/main', devRef: 'refs/heads/main' }), ['production']);
+  assert.deepEqual(T({ event: 'workflow_dispatch', strategy: 'hybrid', ref: 'refs/heads/x', sharedDevOnPush: true }), ['native-branch', 'persistent-dev']);
+});
+test('dispatch_target fails closed: the full event / ref / target matrix', () => {
+  const H = { strategy: 'hybrid', devRef: 'refs/heads/dev-ref', sharedDevOnPush: true };
+  const rej = /only valid for a workflow_dispatch|rejected|not valid/;
+  // push / PR / delete: a non-empty target is a conflicting request - never ignored, never a Production fallback
+  assert.deepEqual(T({ ...H, event: 'push', ref: 'refs/heads/main' }), ['production'], 'push main, no target');
+  assert.throws(() => T({ ...H, event: 'push', ref: 'refs/heads/main', dispatchTarget: 'persistent-dev' }), /only valid for a workflow_dispatch/);
+  assert.deepEqual(T({ ...H, event: 'push', ref: 'refs/heads/feat' }), ['native-branch', 'persistent-dev'], 'push feature, no target: the existing enabled targets');
+  assert.throws(() => T({ ...H, event: 'push', ref: 'refs/heads/feat', dispatchTarget: 'persistent-dev' }), /only valid for a workflow_dispatch/);
+  assert.throws(() => T({ ...H, event: 'pull_request', ref: 'refs/pull/1/merge', dispatchTarget: 'persistent-dev' }), /only valid for a workflow_dispatch/);
+  assert.throws(() => T({ ...H, event: 'delete', ref: 'refs/heads/feat', dispatchTarget: 'persistent-dev' }), /only valid for a workflow_dispatch/);
+  assert.throws(() => T({ ...H, event: 'push', ref: 'refs/tags/v1', dispatchTarget: 'persistent-dev' }), /only valid for a workflow_dispatch/);
+  for (const ev of ['push', 'pull_request', 'delete', 'schedule', '']) assert.throws(() => T({ ...H, event: ev, ref: 'refs/heads/main', dispatchTarget: 'production' }), /only valid for a workflow_dispatch/);
+  // dispatch
+  assert.deepEqual(T({ ...H, event: 'workflow_dispatch', ref: 'refs/heads/dev-ref', dispatchTarget: 'persistent-dev' }), ['persistent-dev'], 'approved feature');
+  assert.deepEqual(T({ ...H, event: 'workflow_dispatch', ref: 'refs/heads/main', devRef: 'refs/heads/main', dispatchTarget: 'persistent-dev' }), ['persistent-dev'], 'approved main');
+  assert.throws(() => T({ ...H, event: 'workflow_dispatch', ref: 'refs/heads/other', dispatchTarget: 'persistent-dev' }), rej, 'unapproved ref');
+  assert.throws(() => T({ ...H, event: 'workflow_dispatch', ref: 'refs/heads/main', dispatchTarget: 'persistent-dev' }), rej, 'main is not the approved ref');
+  assert.throws(() => T({ ...H, event: 'workflow_dispatch', ref: 'refs/tags/v1', devRef: 'refs/tags/v1', dispatchTarget: 'persistent-dev' }), rej, 'tag');
+  assert.throws(() => T({ ...H, event: 'workflow_dispatch', ref: 'refs/heads/dev-ref', devRef: '', dispatchTarget: 'persistent-dev' }), rej, 'missing persistent_dev_ref');
+  for (const strategy of ['production-only', 'production-preview']) assert.throws(() => T({ event: 'workflow_dispatch', strategy, ref: 'refs/heads/dev-ref', devRef: 'refs/heads/dev-ref', dispatchTarget: 'persistent-dev' }), rej, `strategy ${strategy}`);
+  for (const bad of ['production', 'native-dev', 'Persistent-Dev', ' persistent-dev', 'persistent-dev ', 'unknown']) {
+    for (const ref of ['refs/heads/main', 'refs/heads/dev-ref', 'refs/heads/x']) assert.throws(() => T({ ...H, event: 'workflow_dispatch', ref, dispatchTarget: bad }), /not valid/, `${bad} on ${ref}`);
+  }
+  assert.deepEqual(T({ ...H, event: 'workflow_dispatch', ref: 'refs/heads/main', devRef: 'refs/heads/main' }), ['production'], 'dispatch main, no target: existing default');
+  // no combination ever falls back to Production
+  for (const ev of ['push', 'workflow_dispatch', 'pull_request', 'delete']) for (const ref of ['refs/heads/main', 'refs/heads/x', 'refs/tags/v1']) for (const t of ['persistent-dev', 'x']) {
+    let r; try { r = T({ ...H, event: ev, ref, dispatchTarget: t }); } catch { r = 'throws'; }
+    assert.ok(r === 'throws' || (Array.isArray(r) && r.length === 1 && r[0] === 'persistent-dev' && ev === 'workflow_dispatch'), `${ev} ${ref} ${t} -> ${JSON.stringify(r)}`);
+  }
 });
 test('production-only rejects every Dev channel; conflicting automatic Dev channels are rejected', () => {
   assert.throws(() => T({ strategy: 'production-only', sharedDevNativeOnPush: true }), /production-only/);
@@ -482,21 +520,18 @@ const IN0 = {
 const INIT = (o = {}, i = {}) => validateInit({ inputs: { ...IN0, ...i }, target: 'preview', stage: 'migrate', event: 'push', ref: 'refs/heads/feat/x', ...o });
 const initFails = (re, o, i) => assert.throws(() => INIT(o, i), re);
 
-test('init: a valid Native Branch push binds kind, stage, mode and the smoke policy', () => {
+test('init: a valid Native Branch push binds kind, stage and the smoke policy', () => {
   const r = INIT();
-  assert.deepEqual([r.kind, r.target, r.stage, r.mode, r.smokeMode], ['native-branch', 'preview', 'migrate', 'auto', 'full']);
+  assert.deepEqual([r.kind, r.target, r.stage, r.smokeMode], ['native-branch', 'preview', 'migrate', 'full']);
   assert.equal(INIT({ target: 'prod', stage: 'publish', ref: 'refs/heads/main' }).kind, 'production');
 });
 
-test('init: target, kind, stage and mode binding refuse everything unknown or cross-target', () => {
+test('init: target, kind, and stage binding refuse everything unknown or cross-target', () => {
   initFails(/bad engine target/, { target: 'staging' });
   initFails(/does not belong to engine target/, { kind: 'production' });
   initFails(/must run as split stages/, { stage: 'all' });
   initFails(/bad engine stage/, { stage: 'nope' });
   initFails(/malformed expected D1 id/, { d1Expect: 'a b' });
-  initFails(/bad engine mode/, { mode: 'weird' });
-  initFails(/manual mode is only for the persistent Dev target/, { mode: 'manual' });
-  assert.throws(() => INIT({ target: 'dev', kind: 'persistent-dev', mode: 'manual', stage: 'migrate' }, { dev_build_cmd: 'x' }), /manual Dev runs as one job/);
   assert.throws(() => validateInit({ inputs: [], target: 'preview', event: 'push', ref: 'refs/heads/x' }), /inputs_json is not an object/);
 });
 
@@ -514,11 +549,17 @@ test('init: the engine kind must be among the kinds this event enables (no phant
   assert.equal(INIT({ kind: 'native-dev' }, { shared_dev_native_preview_on_branch_push: true }).kind, 'native-dev');
 });
 
-test('init: manual persistent Dev only from the approved ref via dispatch', () => {
-  const M = (o = {}, i = {}) => validateInit({ inputs: { ...IN0, deployment_strategy: 'hybrid', dev_build_cmd: 'x', persistent_dev_ref: 'refs/heads/dev', dispatch_target: 'persistent-dev', ...i }, target: 'dev', kind: 'persistent-dev', stage: 'all', mode: 'manual', event: 'workflow_dispatch', ref: 'refs/heads/dev', ...o });
+test('init: a manual persistent Dev dispatch is validated by the same rule as every other event (approved ref via dispatch only)', () => {
+  const M = (o = {}, i = {}) => validateInit({ inputs: { ...IN0, deployment_strategy: 'hybrid', dev_build_cmd: 'x', persistent_dev_ref: 'refs/heads/dev', dispatch_target: 'persistent-dev', ...i }, target: 'dev', kind: 'persistent-dev', stage: 'publish', event: 'workflow_dispatch', ref: 'refs/heads/dev', ...o });
   assert.equal(M().kind, 'persistent-dev');
-  assert.throws(() => M({ ref: 'refs/heads/other' }), /manual Dev is only allowed from the approved persistent_dev_ref/);
-  assert.throws(() => M({ event: 'push' }), /manual Dev is only allowed/);
+  assert.throws(() => M({ ref: 'refs/heads/other' }), /manual persistent-dev dispatch rejected/);
+  assert.throws(() => M({}, { deployment_strategy: 'production-preview' }), /rejected/);
+  assert.throws(() => M({}, { persistent_dev_ref: '' }), /rejected/);
+  assert.throws(() => M({}, { dispatch_target: 'production' }), /dispatch_target 'production' is not valid/);
+  assert.throws(() => M({ kind: 'production', target: 'prod' }), /target mismatch|does not belong/, 'a dispatch from the approved main ref never validates as Production');
+  const onMain = (o = {}) => M({ ref: 'refs/heads/main', ...o }, { persistent_dev_ref: 'refs/heads/main' });
+  assert.equal(onMain().kind, 'persistent-dev');
+  assert.throws(() => onMain({ kind: 'production', target: 'prod' }), /target mismatch/);
 });
 
 test('init: per-target requirements (Native Dev flag, Dev identity/URL/build, build command)', () => {
@@ -568,7 +609,12 @@ test('lock identity: run-level group follows the same rule as the workflow (scop
   assert.equal(runLockGroup({ event: 'push', ref: 'refs/heads/x', inputs: { ...I, d1_migrations: false }, runId: 1 }), 'cfv2-blog-preview-x');
   assert.equal(runLockGroup({ event: 'pull_request', ref: 'refs/pull/1/merge', inputs: I, runId: 7 }), 'cfv2-run-7');
   assert.equal(runLockGroup({ event: 'push', ref: 'refs/tags/v1', inputs: I, runId: 7 }), 'cfv2-run-7');
-  assert.equal(runLockGroup({ event: 'workflow_dispatch', ref: 'refs/heads/dev', inputs: { ...I, dispatch_target: 'persistent-dev' }, runId: 7 }), 'cfv2-run-7');
+  // a manual persistent-dev dispatch takes the SAME group as the automatic Shared Dev push (never the Production group, even from main)
+  const M = { ...I, dispatch_target: 'persistent-dev', d1_lock_scope: 'shared-db' };
+  assert.equal(runLockGroup({ event: 'workflow_dispatch', ref: 'refs/heads/dev', inputs: M, runId: 7 }), 'cfv2-nonprod-d1-shared-db');
+  assert.equal(runLockGroup({ event: 'workflow_dispatch', ref: 'refs/heads/main', inputs: M, runId: 7 }), 'cfv2-nonprod-d1-shared-db');
+  assert.equal(runLockGroup({ event: 'workflow_dispatch', ref: 'refs/heads/main', inputs: { ...M, d1_migrations: false }, runId: 7 }), 'cfv2-shared-dev-blog');
+  assert.equal(runLockGroup({ event: 'workflow_dispatch', ref: 'refs/heads/main', inputs: I, runId: 7 }), 'cfv2-prod-blog', 'a dispatch without a target keeps the Production group on main');
 });
 
 test('lock identity: same Deploy/Verify d1_lock_scope -> same effective lock; a verify default never selects another', () => {
@@ -663,4 +709,38 @@ test('legacy migration ownership: D1 identity mismatch is rejected; the descript
   assert.throws(() => R({ ...base, d1: { native_branch: 'DB1', native_dev: 'DB2' } }), /conflicting migration owners|for D1/);
   const withDesc = deployState();
   assert.deepEqual(R(withDesc)['native-dev'], { ...withDesc.descriptors['native-dev'], phase: 'verify' });
+});
+
+test('nonProdRecoveryBlock: non-Production recovery is fail-closed against the migration result of the same pipeline', () => {
+  const M = { migration: 'applied', schema_changed: 'true', d1_scan: 'additive', kind: 'persistent-dev', d1_id: 'D1' };
+  const b = (o) => nonProdRecoveryBlock({ d1Migrations: true, migration: M, expectedId: 'D1', d1Compat: 'expand-contract', ...o });
+  assert.equal(nonProdRecoveryBlock({ d1Migrations: false, migration: null }), null, 'no D1 migrations: allowed');
+  assert.equal(b({ migration: { ...M, schema_changed: 'false', d1_scan: 'none' }, d1Compat: '' }), null, 'no schema change: allowed without attestation');
+  assert.equal(b({}), null, 'additive + attested: allowed');
+  assert.equal(b({ d1Compat: '' }).code, 'd1_unattested');
+  assert.equal(b({ d1Compat: 'none' }).code, 'd1_unattested');
+  for (const scan of ['non-additive', 'unknown', '', 'none']) assert.equal(b({ migration: { ...M, d1_scan: scan } }).code, 'd1_not_additive', `scan ${scan}`);
+  for (const bad of [null, {}, [], 'x', { ...M, migration: 'failed' }, { ...M, migration: 'none' }]) assert.equal(b({ migration: bad }).code, 'migration_result_missing');
+  assert.equal(b({ migration: { ...M, d1_id: 'OTHER' } }).code, 'd1_identity_mismatch');
+  assert.equal(b({ expectedId: '' }).code, 'd1_identity_mismatch');
+  for (const v of ['', undefined, 'maybe', 'TRUE']) assert.equal(b({ migration: { ...M, schema_changed: v } }).code, 'migration_result_invalid');
+  // identical D1 rule as Production
+  assert.equal(prodRollbackBlock({ policy: 'automatic', previous: 'a', current: 'b', worker: 'w', d1Pending: true, d1Compat: '', d1Scan: 'additive' }).code, 'd1_unattested');
+  assert.equal(rollbackVerdict({ target: 'dev', rbResult: 'blocked', goodSha: 'abc' }).result, 'blocked');
+  assert.equal(rollbackVerdict({ target: 'dev', rbResult: 'blocked', goodSha: '' }).ok, false);
+});
+
+test('ciTargetEnv: the CI environment follows the intended target (automatic and manual Persistent Dev alike)', () => {
+  const E = (o) => ciTargetEnv({ strategy: 'hybrid', previewOnPush: true, ...o });
+  assert.equal(E({ event: 'push', ref: 'refs/heads/main' }), 'prod');
+  assert.equal(E({ event: 'push', ref: 'refs/heads/feat' }), 'preview', 'Native Branch');
+  assert.equal(E({ event: 'push', ref: 'refs/heads/feat', previewOnPush: false, sharedDevNativeOnPush: true }), 'preview', 'Native Dev only: existing contract');
+  assert.equal(E({ event: 'push', ref: 'refs/heads/feat', previewOnPush: false, sharedDevOnPush: true }), 'dev', 'automatic Persistent Dev only');
+  assert.equal(E({ event: 'push', ref: 'refs/heads/feat', sharedDevOnPush: true }), 'preview', 'several kinds: shared Preview contract');
+  assert.equal(E({ event: 'workflow_dispatch', ref: 'refs/heads/dev', dispatchTarget: 'persistent-dev' }), 'dev');
+  assert.equal(E({ event: 'workflow_dispatch', ref: 'refs/heads/main', dispatchTarget: 'persistent-dev' }), 'dev');
+  assert.equal(E({ event: 'workflow_dispatch', ref: 'refs/heads/main' }), 'prod');
+  assert.equal(E({ event: 'pull_request', ref: 'refs/pull/1/merge', previewOnPush: false, sharedDevOnPush: true }), 'preview');
+  assert.equal(E({ event: 'push', ref: 'refs/heads/main', dispatchTarget: 'persistent-dev' }), 'prod');
+  assert.equal(E({ event: 'workflow_dispatch', ref: 'refs/heads/main', dispatchTarget: 'Persistent-Dev' }), 'prod');
 });

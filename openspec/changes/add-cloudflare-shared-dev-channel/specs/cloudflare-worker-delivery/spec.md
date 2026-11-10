@@ -30,9 +30,9 @@ All eligible branches SHALL target the same configured Dev Worker and `app_url_d
 
 Shared Dev SHALL use the existing `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID` pair in the `<app>/dev` Environment by the 2026-10-28 owner decision; no dedicated Dev token is required. It SHALL keep the Dev build environment, named Wrangler environment, and `env.<name>.d1_databases` for migrations (no fallback to top-level/Production D1). Its effective Wrangler config SHALL name the expected Dev Worker and bind no Production resource. Dev and Native Preview MAY share one non-Production D1; Production SHALL NOT.
 
-### Requirement: Manual Persistent Dev dispatch SHALL remain available and distinct
+### Requirement: Manual Persistent Dev dispatch SHALL remain available through the standard pipeline
 
-The `persistent-dev` workflow_dispatch path SHALL keep its approved-ref gate, Environment, concurrency group and behaviour, and SHALL NOT be triggered by the automatic Shared Dev switch.
+The `persistent-dev` workflow_dispatch SHALL keep its approved-ref gate and `<app>/dev` Environment, SHALL NOT be triggered by the automatic Shared Dev switch, and SHALL run the same CI, Plan, Migration, Deploy, Smoke and conditional recovery as an automatic Shared Dev push (no separate job or mode); an unapproved or invalid dispatch SHALL fail the Plan before any mutation.
 
 ### Requirement: Shared Dev resource sharing SHALL be exact, explicit and independent of Preview policy
 
@@ -48,7 +48,7 @@ Queue producers, consumers and dead-letter queues, Service Bindings, routes/cust
 
 ### Requirement: Manual and automatic Dev deployments SHALL share one command contract and one verification rule
 
-With `dev_build_cmd` set, build, publish and smoke SHALL be separate commands and both paths SHALL run them with the same audit. A deployment SHALL enter the known-good ledger only after its smoke passes; legacy manual runs SHALL never enter it.
+With `dev_build_cmd` set, build, publish and smoke SHALL be separate commands and both triggers SHALL run them with the same audit. A deployment SHALL enter the known-good ledger only after its smoke passes. (The former legacy manual contract, `dev_build_cmd` empty, was removed.)
 
 ### Requirement: Dev recovery SHALL rebuild the last-good commit with that commit's identity
 
@@ -80,7 +80,7 @@ A D1-capable Worker SHALL apply remote migrations from one explicit step of the 
 
 ### Requirement: Production, Native Preview and Shared Dev SHALL use one delivery implementation
 
-The workflow SHALL contain a single Deploy job for `target = prod | preview` and SHALL call the same composite delivery engine from the Shared Dev job (`target = dev`) and the manual persistent-Dev job (`mode = manual`). Build, audit, migration, publish, smoke and recovery logic SHALL NOT be duplicated per target; target differences SHALL be explicit, validated parameters. Complex logic SHALL live in tested scripts, not inline workflow YAML.
+The workflow SHALL contain a single Deploy job for `target = prod | preview` and SHALL call the same composite delivery engine from the Shared Dev job (`target = dev`); a manual persistent-Dev dispatch is the same Shared Dev delivery (no separate job). Build, audit, migration, publish, smoke and recovery logic SHALL NOT be duplicated per target; target differences SHALL be explicit, validated parameters. Complex logic SHALL live in tested scripts, not inline workflow YAML.
 
 #### Scenario: Cross-repository reusable workflow
 - **WHEN** the workflow is called from another repository

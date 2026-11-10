@@ -9,7 +9,7 @@ import {
 } from './lib.mjs';
 import {
   DELIVERY_KINDS, ENGINE_TARGET, assertKind, branchPreviewIdentity, canonicalOrigin, checkBuildEnvOrigins, environmentName, foreignUrlsInBuildEnv, planMigrations, resolveCanonicalUrl, resolveDeliveryTargets, resolveSmokeMode,
-  buildDescriptors, parseDescriptor, resolveMigrationUsed, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
+  buildDescriptors, parseDescriptor, resolveMigrationUsed, verificationOutcome, prodRollbackBlock, nonProdRecoveryBlock, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
 } from './delivery.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -222,6 +222,9 @@ try {
       const i = JSON.parse(process.env.INPUTS_JSON ?? '{}');
       const str = (k) => (i[k] == null ? '' : String(i[k]));
       const bool = (k) => i[k] === true || i[k] === 'true';
+      // The engine is the ONLY publisher of a Worker. The former caller-supplied publish command is retired: refuse it before anything runs
+      // (an explicit, actionable error instead of a silently different deployment).
+      if (str('dev_deploy_cmd').trim() !== '') throw new Error('dev_deploy_cmd is no longer supported: the shared engine publishes the audited Wrangler config itself. Remove the input and build in dev_build_cmd (or build_cmd); nothing was built, migrated or published.');
       let kinds;
       let restored = null; // verify: the DEPLOY call's own descriptors (validated); nothing is re-derived from this call's inputs
       if (opt('phase') === 'verify') {
@@ -291,6 +294,14 @@ try {
       out({ block_code: b ? b.code : '', block_why: b ? b.why : '' });
       break;
     }
+    case 'recovery-guard': { // non-Production recovery; env: D1_MIGRATIONS MIGRATION_JSON D1_EXPECT D1_COMPAT
+      const e = process.env;
+      let migration = null;
+      try { migration = JSON.parse(e.MIGRATION_JSON || 'null'); } catch { migration = null; }
+      const b = nonProdRecoveryBlock({ d1Migrations: e.D1_MIGRATIONS === 'true', migration, expectedId: e.D1_EXPECT ?? '', d1Compat: e.D1_COMPAT ?? '' });
+      out({ block_code: b ? b.code : '', block_why: b ? b.why : '' });
+      break;
+    }
     case 'rollback-verdict': { // env: TARGET RB_RESULT RB_VERIFY RB_LEVEL GOOD_SHA RECOVERED VERIFIED SMOKE_LEVEL
       const e = process.env;
       const v = rollbackVerdict({
@@ -303,14 +314,14 @@ try {
     case 'init-checks': { // --state DIR --inputs FILE; env ENGINE_* GITHUB_EVENT_NAME GITHUB_REF CALL_INPUTS_JSON PREVIEW_SECRETS. ONE process for every init check.
       const e = process.env;
       const r = validateInit({
-        inputs: JSON.parse(readFileSync(opt('inputs'), 'utf8')), target: e.ENGINE_TARGET, kind: e.ENGINE_KIND ?? '', stage: e.ENGINE_STAGE || 'all', mode: e.ENGINE_MODE || 'auto',
+        inputs: JSON.parse(readFileSync(opt('inputs'), 'utf8')), target: e.ENGINE_TARGET, kind: e.ENGINE_KIND ?? '', stage: e.ENGINE_STAGE || 'all',
         d1Expect: e.ENGINE_D1_EXPECT ?? '', descriptor: e.ENGINE_DESCRIPTOR ?? '', callInputs: e.CALL_INPUTS_JSON ?? '', event: e.GITHUB_EVENT_NAME, ref: e.GITHUB_REF,
         previewSecrets: e.PREVIEW_SECRETS ?? '',
       });
       const dir = opt('state');
       const put = (name, text) => writeFileSync(resolve(dir, name), text, { mode: 0o600 });
       const env = (name, pairs) => { if (pairs?.length) appendFileSync(resolve(dir, name), pairs.map(([k, v]) => `${k}=${v}`).join('\n') + '\n', { mode: 0o600 }); };
-      put('kind', r.kind); put('smoke_mode', r.smokeMode); put('stage', r.stage); put('d1_expect', r.d1Expect); put('target', r.target); put('mode', r.mode);
+      put('kind', r.kind); put('smoke_mode', r.smokeMode); put('stage', r.stage); put('d1_expect', r.d1Expect); put('target', r.target);
       env('build.env', r.buildEnv); env('smoke.env', r.smokeEnv); env('preview.env', r.previewEnv);
       for (const [, v] of r.previewEnv ?? []) if (v) console.error(`::add-mask::${v}`);
       out({ kind: r.kind, smoke_mode: r.smokeMode });
