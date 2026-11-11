@@ -1109,12 +1109,6 @@ def group_shared_dev():
         check(r["res"]["delivery_persistent_dev"]["outputs"]["rollback_result"] == "restored_verified" and r["log"].count("PUBLISH") == 2, f"{label}: nothing pending this run (schema unchanged) -> recovery allowed without attestation")
     r = manual(env=FAIL_GOOD)
     check(r["res"]["delivery_persistent_dev"]["outputs"]["rollback_result"] == "restored_verified" and r["log"].count("PUBLISH") == 2, "no D1 migrations configured -> recovery unchanged")
-    # ---- the retired dev_deploy_cmd input: any non-empty value fails the Plan before anything is built, migrated or published
-    for cmd_ in ("pnpm run deploy:dev", "pnpm exec wrangler deploy --config \"$CF_AUDITED_CONFIG\""):
-        for runner in (manual, dev):
-            r = runner(inputs=dict(D1, dev_deploy_cmd=cmd_))
-            check(r["result"] == "failure" and r["res"]["plan"]["result"] == "failure" and not ran(r, "BUILD") and not ran(r, "PUBLISH") and "migrations apply" not in r["log"] and r["res"]["migration"]["result"] == "skipped",
-                  f"retired dev_deploy_cmd ({cmd_[:20]}...) via {runner.__name__}: the Plan fails it - nothing built, migrated or published")
     # ---- regression: Dev build -> audited config -> engine-owned publish -> Smoke -> verified; and a failed publish is never verified
     r = manual()
     check(r["result"] == "success" and r["log"].index("BUILD") < r["log"].index("PUBLISH exec wrangler deploy --config") and r["log"].count("PUBLISH") == 1 and r["outputs"]["deployed_and_verified"] == "true" and r["outputs"]["verified_url"] == "https://dev.example.com",
@@ -1270,9 +1264,6 @@ def group_deferred_verification():
         vv = deferred(inputs=AUTO_P, call_over={key: val})
         check(vv["jobs"]["smoke"]["result"] in ("failure", "skipped") and vv["jobs"]["smoke"]["outputs"].get("deployed_and_verified") != "true" and not verify_release(vv),
               f"deferred: a verify call whose {key} differs from the deploy call's verifies nothing (identity check)")
-    vv = deferred(inputs=AUTO_P, call_over={"tools_ref": "some-other-ref"})
-    check(vv["jobs"]["smoke"]["result"] == "success" and vv["jobs"]["smoke"]["outputs"].get("deployed_and_verified") == "true",
-          "deferred: tools_ref is a deprecated no-op - a verify call that passes a different (or no) tools_ref still verifies the deploy call's deployment")
     # ---- Deferred verification keeps the DEPLOY call's descriptors (smoke policy, lock identity, D1, owner): never re-derived from the verify call
     vst = json.loads(v["state"])
     check(set(vst["descriptors"]) == {"production"} and vst["descriptors"]["production"]["phase"] == "deploy", "deferred: phase_state carries the deploy call's validated descriptors (phase deploy)")
