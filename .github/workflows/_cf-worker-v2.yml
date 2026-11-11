@@ -9,8 +9,8 @@ name: CF Worker Pipeline v2
 #         |
 #   Plan                      enabled targets, ONE physical D1, the migration owner (pure data; runs only when CI passed)
 #         |
-#   Migrate                  ONE job: read-only safety checks first (target build, effective-config audit, exact D1 binding), then
-#         |                   the migration is applied ONCE. No separate Preflight stage.
+#   Migrate                  ONE job: a READ-ONLY D1 precheck first. Nothing pending -> a verified no-op, NO build here. Pending -> read-only
+#         |                   safety checks (target build, effective-config audit, exact D1 binding), then the migration is applied ONCE.
 #   Delivery x enabled kinds  _cf-worker-delivery.yml, one call per kind: Deploy -> Smoke -> conditional Rollback, independent per kind
 #         |
 #   Release                   optional, main only, only after a VERIFIED Production delivery with no rollback
@@ -57,7 +57,7 @@ on:
         description: Production Worker version that was live before this run's publish (prod only; the rollback target)
         value: ${{ fromJSON((jobs.plan.outputs.on_production == 'true' && jobs.delivery_production.outputs.handoff) || (jobs.plan.outputs.on_native_branch == 'true' && jobs.delivery_native_branch.outputs.handoff) || '{}').previous_version_id }}
       migration_status:
-        description: applied | failed | none - the result of the single Migration job (none when d1_migrations is false, nothing needed migrating, or on a pipeline_phase verify call)
+        description: applied | failed | none - the result of the single Migration job (none when d1_migrations is false, a read-only precheck verified nothing pending, or on a pipeline_phase verify call)
         value: ${{ jobs.migration.outputs.migration_status || 'none' }}
       rollback_result:
         description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed | no_known_good; empty when no rollback ran. Anything but empty is a FAILED run (first kind of the run that rolled back)
@@ -536,6 +536,10 @@ jobs:
   # =========================================================================
   # Migration — the ONE job that mutates a database; there is no separate Preflight stage. Its steps run in this order and a failing step
   # stops the job, so every read-only check precedes the single remote mutation:
+  #   0. precheck (stage precheck): two read-only SELECTs on the owner's exact physical D1 (identity checked against the plan first). NOTHING
+  #      pending -> steps 1-2 are skipped, no target is built here, and the result carries `precheck: verified_no_pending` bound to the owner,
+  #      the D1 id and this commit (the Delivery gate accepts it like an applied migration; a skipped / failed / stale job never carries it).
+  #      A failing or unreadable query fails the job (never read as "nothing pending"). Pending, or anything it cannot prove -> steps 1-2.
   #   1. each enabled target that is not the owner: target build, effective-config audit, exact D1 binding (stage preflight)
   #   2. the owner: target build, audit, exact D1 binding, stale-SHA guard, then the migration (stage migrate)
   # The plan picked the owner and its Environment (main -> <app>/prod with its approvals; else the shared Preview/Dev D1). Skipped (Delivery
@@ -553,7 +557,7 @@ jobs:
       contents: read
       deployments: read # Preview identity guard reads the ledger owner (no ledger entry is written here)
     outputs:
-      migration_json: ${{ toJSON(steps.migrate.outputs) }}
+      migration_json: ${{ steps.precheck.outputs.precheck == 'pending' && toJSON(steps.migrate.outputs) || toJSON(steps.precheck.outputs) }}
       migration_status: ${{ steps.result.outputs.status }}
     env:
       GH_TOKEN: ${{ github.token }}
@@ -565,8 +569,20 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      # Read-only first: when the owner's physical D1 has NOTHING pending, no target is built here (each Deploy still builds, audits and checks
+      # its D1 binding before it publishes, and its gate requires this verified result). Pending -> the full path below, unchanged.
+      - id: precheck
+        name: Check pending D1 migrations (read-only, no build)
+        uses: $/actions/cf-deploy
+        with:
+          target: ${{ fromJSON(needs.plan.outputs.descriptors)[fromJSON(needs.plan.outputs.migration).kind].target }}
+          descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)[fromJSON(needs.plan.outputs.migration).kind]) }}
+          kind: ${{ fromJSON(needs.plan.outputs.migration).kind }}
+          stage: precheck
+          inputs_json: ${{ toJSON(inputs) }}
+          d1_expected_id: ${{ fromJSON(needs.plan.outputs.migration).d1_id }}
       - name: Verify native-dev build and D1 binding
-        if: needs.plan.outputs.on_native_dev == 'true' && fromJSON(needs.plan.outputs.migration).kind != 'native-dev'
+        if: steps.precheck.outputs.precheck == 'pending' && needs.plan.outputs.on_native_dev == 'true' && fromJSON(needs.plan.outputs.migration).kind != 'native-dev'
         uses: $/actions/cf-deploy
         with:
           target: ${{ fromJSON(needs.plan.outputs.descriptors)['native-dev'].target }}
@@ -577,7 +593,7 @@ jobs:
           d1_expected_id: ${{ fromJSON(needs.plan.outputs.descriptors)['native-dev'].d1_expected_id }}
           preview_secrets: ${{ fromJSON(needs.plan.outputs.descriptors)['native-dev'].target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
       - name: Verify persistent-dev build and D1 binding
-        if: needs.plan.outputs.on_persistent_dev == 'true' && fromJSON(needs.plan.outputs.migration).kind != 'persistent-dev'
+        if: steps.precheck.outputs.precheck == 'pending' && needs.plan.outputs.on_persistent_dev == 'true' && fromJSON(needs.plan.outputs.migration).kind != 'persistent-dev'
         uses: $/actions/cf-deploy
         with:
           target: ${{ fromJSON(needs.plan.outputs.descriptors)['persistent-dev'].target }}
@@ -589,6 +605,7 @@ jobs:
           preview_secrets: ${{ fromJSON(needs.plan.outputs.descriptors)['persistent-dev'].target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
       - id: migrate
         name: Apply pending D1 migrations (once)
+        if: steps.precheck.outputs.precheck == 'pending'
         uses: $/actions/cf-deploy
         with:
           target: ${{ fromJSON(needs.plan.outputs.descriptors)[fromJSON(needs.plan.outputs.migration).kind].target }}

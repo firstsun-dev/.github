@@ -314,14 +314,46 @@ export function parseDescriptor(text, expectKind = '') {
 // pre-mutation validation of every target lives in the single Migration job: its steps run in order, so a failed target
 // check stops the job before the migrate step - no peer-result bookkeeping.)
 // ---------------------------------------------------------------------------------------------------------------------
+/** Marker of the Migration job's read-only precheck proving that the planned D1 has NOTHING pending (see migrationPrecheck below). */
+export const VERIFIED_NO_PENDING = 'verified_no_pending';
+
+/** Strict parse of `wrangler d1 execute --json` output (a JSON array with one `{success, results}` entry per statement). Throws on anything else. */
+export function parseD1Rows(text) {
+  let j;
+  try { j = JSON.parse(String(text)); } catch { throw new Error('the D1 query did not return JSON'); }
+  if (!Array.isArray(j) || j.length !== 1 || j[0] === null || typeof j[0] !== 'object' || j[0].success !== true || !Array.isArray(j[0].results)) {
+    throw new Error('the D1 query result is not a single successful statement result');
+  }
+  return j[0].results;
+}
+
+/**
+ * Read-only migration precheck decision (pure). `files` = the .sql names of the migrations directory, `tableExists` = the migrations table
+ * exists on the remote D1, `applied` = its `name` column. A migration is pending when its file is not recorded as applied; a missing table
+ * means everything is pending. This is the same rule `wrangler d1 migrations apply` uses (file name vs. recorded name). Throws on malformed rows
+ * (fail closed - never read as "nothing pending").
+ */
+export function pendingMigrations({ files, tableExists, applied = [] }) {
+  if (!Array.isArray(files) || !files.length) throw new Error('the migrations directory has no .sql files');
+  if (!tableExists) return [...files].sort();
+  const done = new Set();
+  for (const r of applied) {
+    if (r === null || typeof r !== 'object' || typeof r.name !== 'string' || !r.name) throw new Error('the migrations table holds a row without a name');
+    done.add(r.name);
+  }
+  return files.filter((f) => !done.has(f)).sort();
+}
+
 /**
  * Publish stage: the result of THE Migration job this kind's deployment depends on. Fails closed unless that job succeeded and
- * reports an APPLIED migration of the planned owner on exactly this kind's D1. A stale-skipped migration (`stale` true) is NEVER
+ * reports EITHER an APPLIED migration of the planned owner on exactly this kind's D1, OR a read-only precheck that VERIFIED nothing was
+ * pending on that D1 for exactly this commit (`precheck: verified_no_pending`, bound to owner, D1 id and `runSha`). A skipped, failed or
+ * stale-skipped Migration job never carries either. A stale-skipped migration (`stale` true) is NEVER
  * authorization: nothing was applied, and the branch may point at this commit again by the time the Delivery runs (A -> B -> A), so
  * the later branch-tip check cannot prove the migration happened. Returns the validated migration result, or {} when the app has no
- * D1 migrations.
+ * D1 migrations. A verified no-pending result is normalised to `migration: none, schema_changed: false, d1_scan: none`.
  */
-export function resolveMigrationUsed({ d1Migrations, kind, ownerKind = '', expectedId = '', result = '', json = '' }) {
+export function resolveMigrationUsed({ d1Migrations, kind, ownerKind = '', expectedId = '', result = '', json = '', runSha = '' }) {
   if (!d1Migrations) return {};
   assertKind(kind);
   if (!ownerKind) throw new Error(`no migration owner is planned for ${kind}; nothing is published`);
@@ -330,10 +362,14 @@ export function resolveMigrationUsed({ d1Migrations, kind, ownerKind = '', expec
   try { m = JSON.parse(json); } catch { throw new Error(`the migration result for ${kind} is missing or not valid JSON; nothing is published`); }
   if (m === null || typeof m !== 'object' || Array.isArray(m)) throw new Error(`the migration result for ${kind} is malformed; nothing is published`);
   if (m.stale === true || m.stale === 'true') throw new Error(`the migration for ${kind} was skipped because its run became stale; it does not authorize a publish (nothing is published)`);
-  if (m.migration !== 'applied') throw new Error(`the migration result for ${kind} reports no applied migration; nothing is published`);
+  const noPending = m.precheck === VERIFIED_NO_PENDING;
+  if (m.migration !== 'applied' && !noPending) throw new Error(`the migration result for ${kind} reports no applied migration and no verified-empty precheck; nothing is published`);
   if (m.kind !== ownerKind) throw new Error(`the migration result belongs to another kind than the planned owner ${ownerKind}; refusing`);
   if (m.d1_id !== expectedId) throw new Error(`the migration result is for another D1 than ${kind}'s (${expectedId}); refusing`);
-  return m;
+  if (!noPending) return m;
+  if (m.migration === 'applied') throw new Error(`the migration result for ${kind} claims both an applied migration and a verified-empty precheck; refusing`);
+  if (!runSha || m.precheck_sha !== runSha) throw new Error(`the verified-empty precheck for ${kind} belongs to commit '${m.precheck_sha || 'unknown'}', not this run's ${runSha || 'unknown'}; nothing is published`);
+  return { ...m, migration: 'none', schema_changed: 'false', d1_scan: 'none' };
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -388,7 +424,8 @@ export function d1SchemaBlock({ d1Pending = false, d1Compat = '', d1Scan = '' })
  */
 export function nonProdRecoveryBlock({ d1Migrations = false, migration = null, expectedId = '', d1Compat = '' }) {
   if (!d1Migrations) return null;
-  if (migration === null || typeof migration !== 'object' || Array.isArray(migration) || migration.migration !== 'applied') {
+  const verifiedEmpty = migration !== null && typeof migration === 'object' && migration.precheck === VERIFIED_NO_PENDING && migration.migration === 'none';
+  if (migration === null || typeof migration !== 'object' || Array.isArray(migration) || (migration.migration !== 'applied' && !verifiedEmpty)) {
     return { code: 'migration_result_missing', why: 'D1 migrations are enabled but this pipeline handed over no valid applied-migration result: the D1 schema state is unknown, so older code cannot be proven compatible.' };
   }
   if (!expectedId || migration.d1_id !== expectedId) {
@@ -533,7 +570,7 @@ export function restoreDescriptors(state, { repo, runId = '0', event = '', ref =
 // validated inputs. Throws (fail closed, BEFORE any mutation) with the message the operator sees. Credentials stay a shell check.
 // ---------------------------------------------------------------------------------------------------------------------
 const KIND_OF_TARGET = { prod: 'production', preview: 'native-branch', dev: 'persistent-dev' };
-const STAGES = ['all', 'deploy', 'preflight', 'migrate', 'publish', 'verify', 'rollback'];
+const STAGES = ['all', 'deploy', 'precheck', 'preflight', 'migrate', 'publish', 'verify', 'rollback'];
 const BUILD_ENV_INPUT = { production: 'build_env_prod', 'native-branch': 'build_env_preview', 'native-dev': 'build_env_shared_dev_native_preview', 'persistent-dev': 'build_env_dev' };
 
 export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expect = '', descriptor = '', callInputs = '', event, ref, previewSecrets = '' }) {
@@ -551,8 +588,8 @@ export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expec
     smokeMode = d.smoke_mode;
   } else smokeMode = resolveSmokeMode(K, s('smoke_mode'), s('smoke_mode_overrides'));
   if (!STAGES.includes(stage)) throw new Error(`bad engine stage: ${stage}`);
-  if (target === 'dev') { /* every stage is allowed for persistent Dev */ } else if (!['preflight', 'migrate', 'publish', 'verify', 'rollback'].includes(stage)) {
-    throw new Error(`${K} must run as split stages (preflight/migrate/publish/verify/rollback), got '${stage}'`);
+  if (target === 'dev') { /* every stage is allowed for persistent Dev */ } else if (!['precheck', 'preflight', 'migrate', 'publish', 'verify', 'rollback'].includes(stage)) {
+    throw new Error(`${K} must run as split stages (precheck/preflight/migrate/publish/verify/rollback), got '${stage}'`);
   }
   if (!/^[A-Za-z0-9_-]*$/.test(d1Expect)) throw new Error('malformed expected D1 id');
   if (callInputs) { // deferred verification: the verify call's identity inputs must equal the deploy call's

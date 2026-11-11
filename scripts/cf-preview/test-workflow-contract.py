@@ -175,14 +175,16 @@ check(len(text_all.splitlines()) <= 780, f"the public workflow stays thin ({len(
 # ---------------------------------------------------------------- 2. one deployment implementation
 ENGINE_USE = "$/actions/cf-deploy"
 engine_jobs = {n: [s for s in j.get("steps", []) if s.get("uses") == ENGINE_USE] for n, j in {**{f"d.{k}": v for k, v in djobs.items()}, **jobs}.items()}
-check({n for n, s in engine_jobs.items() if s} == {"d.deploy", "d.smoke", "d.rollback", "migration"} and all(len(s) == 1 for n, s in engine_jobs.items() if s and n != "migration") and len(engine_jobs["migration"]) == 3,
-      "the three delivery-workflow jobs (deploy, smoke, rollback) each call the SAME delivery engine action exactly once; the Migration job calls it for the owner's migration and for each non-owner target's validation (no second deployment implementation)")
+check({n for n, s in engine_jobs.items() if s} == {"d.deploy", "d.smoke", "d.rollback", "migration"} and all(len(s) == 1 for n, s in engine_jobs.items() if s and n != "migration") and len(engine_jobs["migration"]) == 4,
+      "the three delivery-workflow jobs (deploy, smoke, rollback) each call the SAME delivery engine action exactly once; the Migration job calls it for the read-only precheck, the owner's migration and each non-owner target's validation (no second deployment implementation)")
 eng = {n.replace("d.", ""): s[0] for n, s in engine_jobs.items() if s and n != "migration"}
 AUTO_JOBS = ("deploy", "smoke", "rollback")
 check({n: eng[n]["with"]["stage"] for n in AUTO_JOBS} == {"deploy": "publish", "smoke": "verify", "rollback": "rollback"}, "each delivery job selects its engine stage (publish / verify / rollback), for every kind and every trigger")
 MIG_STEPS = engine_jobs["migration"]
-check([s["with"]["stage"] for s in MIG_STEPS] == ["preflight", "preflight", "migrate"] and MIG_STEPS[-1].get("id") == "migrate",
-      "the Migration job validates every non-owner target first (stage preflight: build + effective-config audit + exact D1 binding), then migrates ONCE as its LAST engine step (stage migrate)")
+check([s["with"]["stage"] for s in MIG_STEPS] == ["precheck", "preflight", "preflight", "migrate"] and MIG_STEPS[0].get("id") == "precheck" and MIG_STEPS[-1].get("id") == "migrate",
+      "the Migration job first runs the read-only D1 precheck (stage precheck, no build), then validates every non-owner target (stage preflight: build + effective-config audit + exact D1 binding), then migrates ONCE as its LAST engine step (stage migrate)")
+check(all("steps.precheck.outputs.precheck == 'pending'" in s["if"] for s in MIG_STEPS[1:]) and "if" not in MIG_STEPS[0] and MIG_STEPS[0]["with"]["d1_expected_id"] == "${{ fromJSON(needs.plan.outputs.migration).d1_id }}" and "preview_secrets" not in MIG_STEPS[0]["with"],
+      "Migration: every build-bearing step (non-owner preflight, owner migrate) runs ONLY when the precheck said `pending`; the precheck always runs, is bound to the plan's D1 id and receives no application secrets")
 check(not any(s["with"].get("kinds") or s["with"].get("peers") for s in MIG_STEPS), "the Migration job has no peer-result bookkeeping: step order is the guarantee")
 check(all(eng[n]["with"]["target"] == "${{ fromJSON(inputs.descriptor).target }}" and eng[n]["with"]["kind"] == "${{ fromJSON(inputs.descriptor).kind }}" and eng[n]["with"]["descriptor"] == "${{ inputs.descriptor }}" for n in AUTO_JOBS), "the engine target comes from the call's validated descriptor, kind from the static input; the engine re-validates the descriptor")
 check(all(re.fullmatch(r"\$\{\{ fromJSON\(needs\.plan\.outputs\.descriptors\)\[(fromJSON\(needs\.plan\.outputs\.migration\)\.kind|'[a-z-]+')\]\.target \}\}", s["with"]["target"]) and "toJSON(fromJSON(needs.plan.outputs.descriptors)[" in s["with"]["descriptor"] for s in MIG_STEPS),
@@ -290,7 +292,7 @@ check(render(env_expr, scenario("push", MAIN, {"d1_migrations": True}, {"plan": 
       and render(env_expr, scenario("push", FEAT, {"d1_migrations": True}, {"plan": pl(("native_dev",), True)})) == "app/native-dev",
       "Migration: runs in the GitHub Environment of the plan's migration owner (<app>/prod keeps its approval protection; Production approval cannot be bypassed)")
 check(mj["permissions"] == {"contents": "read", "deployments": "read"}, "Migration: read-only token (deployments read for the Preview identity guard)")
-check(mj["outputs"]["migration_json"] == "${{ toJSON(steps.migrate.outputs) }}" and [x.get("id") for x in mj["steps"] if x.get("id") in ("migrate", "result")] == ["migrate", "result"] and mj["outputs"]["migration_status"] == "${{ steps.result.outputs.status }}", "Migration: ONE deterministic result - the outputs of its single `migrate` step, and an always-run status step (applied | none | failed)")
+check(mj["outputs"]["migration_json"] == "${{ steps.precheck.outputs.precheck == 'pending' && toJSON(steps.migrate.outputs) || toJSON(steps.precheck.outputs) }}" and [x.get("id") for x in mj["steps"] if x.get("id") in ("precheck", "migrate", "result")] == ["precheck", "migrate", "result"] and mj["outputs"]["migration_status"] == "${{ steps.result.outputs.status }}", "Migration: ONE deterministic result - the outputs of its single `migrate` step (pending) or of the read-only `precheck` step (verified no-pending), and an always-run status step (applied | none | failed)")
 MS = mj["steps"]
 vsteps = [x for x in MS if x.get("with", {}).get("stage") == "preflight"]
 check(all("fromJSON(needs.plan.outputs.migration).kind != '" in x["if"] for x in vsteps) and {x["with"]["kind"] for x in vsteps} == {"native-dev", "persistent-dev"} and MS.index(vsteps[-1]) < MS.index(MS[-1]),
@@ -538,6 +540,9 @@ check("node_modules/smol-toml" in astep("Install tooling deps")["run"] and "env.
       "engine: several engine calls in ONE job (the Migration job) install the tooling and the application dependencies once")
 check(aidx("Build and audit") < aidx("Apply pending D1 migrations"), "no schema migration runs before the deployable build and the target config were validated")
 check(aidx("Validate the exact migration target") < aidx("Apply pending D1 migrations") < aidx("Publish the audited artifact"), "the exact D1 target is validated before the migration, which precedes the publish")
+pre = astep("Read-only D1 migration precheck")
+check("inputs.stage == 'precheck'" in pre["if"] and pre["run"].endswith("| tee -a \"$GITHUB_OUTPUT\"") and all("inputs.stage != 'precheck'" in astep(n)["if"] for n in ("Prepare", "Build and audit", "Validate the exact migration target")) and aidx("Read-only D1 migration precheck") < aidx("Prepare"),
+      "engine: the precheck stage is read-only and runs BEFORE any build - Prepare, Build+audit and the D1 target step are excluded from it, and it is not a migrate / publish stage")
 mig = astep("Apply pending D1 migrations")
 check("engine.sh\" migrate" in mig["run"] and mig["env"]["ENGINE_TARGET"] == "${{ inputs.target }}", "Migration is ONE explicit engine step, bound to the composite target input (not to application env)")
 check(sum(1 for s in ASTEPS if 'engine.sh" migrate' in s.get("run", "")) == 1, "the migration is invoked from exactly one step of the engine")

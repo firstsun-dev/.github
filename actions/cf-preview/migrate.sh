@@ -7,7 +7,11 @@
 # (explicit ids, Preview != Production, migrations dir with .sql files) before anything remote runs.
 # Correctness never depends on parsing human-readable output: `list` must exit 0 (state readable, target
 # reachable) and `apply` is itself pending-only; the "No migrations to apply" text only skips a no-op apply.
-# Env: TARGET(prod|preview|dev) APP_DIR TOOLS_DIR [WRANGLER_CONFIG=wrangler.toml] [D1_BINDING] [DEV_ENV=dev]
+# MIGRATE_MODE=precheck: READ-ONLY (two SELECTs through `wrangler d1 execute --remote --json`, parsed as JSON - never the
+# human-readable `migrations list` text, which also creates the migrations table). Prints pending=true|false, d1_name, d1_id and
+# changes nothing. Anything it cannot prove (unsupported migration settings, unreadable state) is never "nothing pending":
+# unsupported settings print pending=true (the caller then runs the full path), a failing query exits non-zero.
+# Env: TARGET(prod|preview|dev) APP_DIR TOOLS_DIR [WRANGLER_CONFIG=wrangler.toml] [D1_BINDING] [DEV_ENV=dev] [MIGRATE_MODE=apply|precheck]
 set -euo pipefail
 : "${TARGET:?}" "${APP_DIR:?}" "${TOOLS_DIR:?}"
 case "$TARGET" in prod|preview|dev) ;; *) echo "::error::bad TARGET: $TARGET" >&2; exit 1;; esac
@@ -23,7 +27,30 @@ OUT="$(node "$TOOLS_DIR/cli.mjs" migration-config --config "${WRANGLER_CONFIG:-w
 BINDING="$(printf '%s\n' "$OUT" | sed -n 's/^d1_binding=//p')"
 NAME="$(printf '%s\n' "$OUT" | sed -n 's/^d1_name=//p')"
 CONF="$(printf '%s\n' "$OUT" | sed -n 's/^migrate_config=//p')"
+ID="$(printf '%s\n' "$OUT" | sed -n 's/^d1_id=//p')"
 echo "Target $TARGET -> D1 $NAME (binding $BINDING)" >&2
+
+if [ "${MIGRATE_MODE:-apply}" = precheck ]; then
+  TABLE="$(jq -r '.d1_databases[0].migrations_table // "d1_migrations"' "$CONF")"
+  if jq -e '.d1_databases[0] | has("migrations_pattern")' "$CONF" >/dev/null || ! [[ "$TABLE" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "::notice::migration settings of $NAME are not covered by the read-only precheck; running the full path." >&2
+    echo "pending=true"; echo "d1_name=$NAME"; echo "d1_id=$ID"; exit 0
+  fi
+  # Exact physical identity BEFORE the first remote read: the database the source config names must be the one the plan expects.
+  [ -z "${D1_EXPECT:-}" ] || [ "$ID" = "$D1_EXPECT" ] || { echo "::error::the source config binds D1 '$ID' for target $TARGET but the plan expects '$D1_EXPECT'; refusing (nothing was read or changed)" >&2; exit 1; }
+  Q="$(mktemp -d)"; trap 'rm -rf "$Q"' EXIT
+  query() { pnpm exec wrangler d1 execute "$BINDING" --remote --config "$CONF" --json --yes --command "$1" > "$2" || { echo "::error::cannot read the migration state of $NAME (query failed); failing closed" >&2; exit 1; }; }
+  query "SELECT name FROM sqlite_master WHERE type='table' AND name='$TABLE'" "$Q/exists.json"
+  APPLIED=()
+  if [ "$(jq 'if type == "array" and length == 1 then .[0].results | length else -1 end' "$Q/exists.json" 2>/dev/null)" = 1 ]; then
+    query "SELECT name FROM \"$TABLE\"" "$Q/applied.json"; APPLIED=(--applied "$Q/applied.json")
+  fi
+  R="$(node "$TOOLS_DIR/cli.mjs" migration-pending --dir "$(jq -r '.d1_databases[0].migrations_dir' "$CONF")" --exists "$Q/exists.json" "${APPLIED[@]}")" \
+    || { echo "::error::the migration state of $NAME is unreadable or malformed; failing closed" >&2; exit 1; }
+  printf '%s\n' "$R" | sed 's/^/::notice::precheck /' >&2
+  printf '%s\n' "$R" | grep -E '^pending='; echo "d1_name=$NAME"; echo "d1_id=$ID"
+  exit 0
+fi
 
 LIST="$(pnpm exec wrangler d1 migrations list "$BINDING" --remote --config "$CONF" 2>&1)" || { printf '%s\n' "$LIST" >&2; echo "::error::cannot list migrations on $NAME" >&2; exit 1; }
 printf '%s\n' "$LIST" >&2

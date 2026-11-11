@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   DELIVERY_KINDS, resolveDeliveryTargets, resolveSmokeMode, parseSmokeOverrides, planMigrations, branchPreviewIdentity, ENGINE_TARGET,
   canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins,
-  targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor, resolveMigrationUsed,
+  targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor, resolveMigrationUsed, parseD1Rows, pendingMigrations, VERIFIED_NO_PENDING,
   isContentLevel, verificationOutcome, prodRollbackBlock, nonProdRecoveryBlock, ciTargetEnv, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
 } from '../../actions/cf-preview/delivery.mjs';
 
@@ -743,4 +743,47 @@ test('ciTargetEnv: the CI environment follows the intended target (automatic and
   assert.equal(E({ event: 'pull_request', ref: 'refs/pull/1/merge', previewOnPush: false, sharedDevOnPush: true }), 'preview');
   assert.equal(E({ event: 'push', ref: 'refs/heads/main', dispatchTarget: 'persistent-dev' }), 'prod');
   assert.equal(E({ event: 'workflow_dispatch', ref: 'refs/heads/main', dispatchTarget: 'Persistent-Dev' }), 'prod');
+});
+
+// ---- read-only D1 migration precheck: pure decision + the verified no-pending evidence
+const rows = (results, success = true) => JSON.stringify([{ results, success, meta: {} }]);
+test('parseD1Rows: only a single successful statement result is data; everything else throws (fail closed)', () => {
+  assert.deepEqual(parseD1Rows(rows([{ name: 'a.sql' }])), [{ name: 'a.sql' }]);
+  assert.deepEqual(parseD1Rows(rows([])), []);
+  for (const bad of ['', 'not json', '{}', '[]', rows([], false), '[{"success":true}]', JSON.stringify([{ results: [], success: true }, { results: [], success: true }]), '{"error":{"text":"auth"}}']) {
+    assert.throws(() => parseD1Rows(bad), /D1 query/, `rejected: ${bad.slice(0, 30)}`);
+  }
+});
+test('pendingMigrations: unrecorded files are pending; a missing table means everything; malformed rows throw', () => {
+  const files = ['0002.sql', '0001.sql'];
+  assert.deepEqual(pendingMigrations({ files, tableExists: true, applied: [{ name: '0001.sql' }, { name: '0002.sql' }] }), []);
+  assert.deepEqual(pendingMigrations({ files, tableExists: true, applied: [{ name: '0001.sql' }] }), ['0002.sql'], 'a file left unapplied by an earlier failed run is pending');
+  assert.deepEqual(pendingMigrations({ files, tableExists: true, applied: [{ name: '0001.sql' }, { name: '0009-from-a-newer-branch.sql' }] }), ['0002.sql'], 'extra remote rows never hide a pending file');
+  assert.deepEqual(pendingMigrations({ files, tableExists: false }), ['0001.sql', '0002.sql'], 'no migrations table: everything is pending');
+  assert.throws(() => pendingMigrations({ files, tableExists: true, applied: [{ id: 1 }] }), /without a name/);
+  assert.throws(() => pendingMigrations({ files: [], tableExists: true, applied: [] }), /no \.sql files/);
+});
+const VNP = (o = {}) => JSON.stringify({ precheck: VERIFIED_NO_PENDING, kind: 'native-branch', d1_id: 'DB1', precheck_sha: 'abc1234', ...o });
+test('resolveMigrationUsed: a verified no-pending precheck authorizes only for the exact owner, D1 and commit', () => {
+  const R = (o) => resolveMigrationUsed({ d1Migrations: true, kind: 'native-dev', ownerKind: 'native-branch', expectedId: 'DB1', result: 'success', json: VNP(), runSha: 'abc1234', ...o });
+  const ok = R({});
+  assert.equal(ok.migration, 'none'); assert.equal(ok.schema_changed, 'false'); assert.equal(ok.d1_scan, 'none'); assert.equal(ok.precheck, VERIFIED_NO_PENDING);
+  assert.throws(() => R({ result: 'skipped' }), /finished 'skipped'/);
+  assert.throws(() => R({ result: 'failure' }), /finished 'failure'/);
+  assert.throws(() => R({ runSha: 'def5678' }), /belongs to commit/);
+  assert.throws(() => R({ runSha: '' }), /belongs to commit/);
+  assert.throws(() => R({ json: VNP({ precheck_sha: undefined }) }), /belongs to commit/);
+  assert.throws(() => R({ json: VNP({ d1_id: 'PROD' }) }), /another D1/);
+  assert.throws(() => R({ json: VNP({ kind: 'native-dev' }) }), /another kind/);
+  assert.throws(() => R({ json: VNP({ stale: 'true' }) }), /stale/);
+  assert.throws(() => R({ json: VNP({ migration: 'applied' }) }), /both an applied migration/);
+  assert.throws(() => R({ json: JSON.stringify({ migration: 'none', kind: 'native-branch', d1_id: 'DB1', precheck_sha: 'abc1234' }) }), /no verified-empty precheck/);
+  assert.throws(() => R({ json: JSON.stringify({ precheck: 'pending', kind: 'native-branch', d1_id: 'DB1' }) }), /no verified-empty precheck/);
+  assert.deepEqual(resolveMigrationUsed({ d1Migrations: false, kind: 'production', result: 'skipped', json: VNP() }), {}, 'without d1_migrations nothing is required');
+});
+test('nonProdRecoveryBlock: a verified no-pending result is a known D1 state (schema unchanged); an unmarked none is not', () => {
+  const g = (m) => nonProdRecoveryBlock({ d1Migrations: true, migration: m, expectedId: 'DB1', d1Compat: '' });
+  assert.equal(g({ migration: 'none', precheck: VERIFIED_NO_PENDING, kind: 'native-branch', d1_id: 'DB1', schema_changed: 'false', d1_scan: 'none' }), null);
+  assert.equal(g({ migration: 'none', kind: 'native-branch', d1_id: 'DB1', schema_changed: 'false' }).code, 'migration_result_missing');
+  assert.equal(g({ migration: 'none', precheck: VERIFIED_NO_PENDING, kind: 'native-branch', d1_id: 'OTHER', schema_changed: 'false' }).code, 'd1_identity_mismatch');
 });

@@ -11,6 +11,10 @@ echo "$*" >> "$STUB_LOG"
 for i in "$@"; do [ -f "$i" ] && grep -o '"database_id": "[^"]*"' "$i" >> "$STUB_LOG"; done
 [ "$3" = "--version" ] && { echo "${STUB_WRANGLER_VERSION:-4.140.0}"; exit 0; }
 [ "$3 $4 $5" = "d1 migrations list" ] && { [ "${STUB_PENDING:-1}" = 1 ] && echo "Migrations to be applied: 0002.sql" || echo "No migrations to apply!"; [ "${STUB_LIST_FAIL:-}" = 1 ] && exit 3; }
+[ "$3 $4" = "d1 execute" ] && {
+  [ "${STUB_PRECHECK_FAIL:-}" = 1 ] && exit 4
+  case "$*" in *sqlite_master*) [ "${STUB_NO_TABLE:-}" = 1 ] && echo '[{"results":[],"success":true}]' || echo '[{"results":[{"name":"d1_migrations"}],"success":true}]';;
+    *) echo "[{\"results\":[${STUB_ROWS-{\"name\":\"0001.sql\"\}}],\"success\":true}]";; esac; exit 0; }
 [ "$3 $4 $5" = "d1 migrations apply" ] && [ "${STUB_APPLY_FAIL:-}" = 1 ] && exit 7
 exit 0
 STUB
@@ -81,6 +85,19 @@ grep -q 'migrations apply' "$T/log" && bad "apply ran with nothing pending" || o
 STUB_APPLY_FAIL=1 TARGET=prod "$M" >/dev/null 2>&1 && bad "failed apply must fail the job" || ok "apply failure fails Migration (blocks Deploy)"
 STUB_LIST_FAIL=1 STUB_PENDING=0 TARGET=prod "$M" >/dev/null 2>&1 && bad "failed list must fail" || ok "cannot read migration state: fails closed"
 
+# ---- MIGRATE_MODE=precheck: read-only (SELECT only, JSON parsed), never `list` / `apply`
+: > "$T/log"; OUT="$(MIGRATE_MODE=precheck TARGET=preview D1_EXPECT=PREV-ID "$M" 2>/dev/null)"
+echo "$OUT" | grep -qx 'pending=false' && echo "$OUT" | grep -qx 'd1_id=PREV-ID' && ok "precheck: every migration file recorded -> pending=false, bound to the Preview D1 id" || bad "precheck none ($OUT)"
+grep -q 'migrations apply\|migrations list' "$T/log" && bad "precheck ran list/apply" || ok "precheck never runs migrations list (it creates the table) or apply"
+[ "$(grep -c 'd1 execute' "$T/log")" = 2 ] && ! grep 'd1 execute' "$T/log" | grep -qi 'insert\|update\|create\|delete\|drop\|alter' && ok "precheck: exactly two read-only SELECTs" || bad "precheck queries"
+grep -q '"database_id": "PREV-ID"' "$T/log" && ! grep -q 'PROD-ID\|DEV-ID' "$T/log" && ok "precheck: reads ONLY the target's D1" || bad "precheck D1 isolation"
+echo "select 1;" > "$T/app/db/migrations/0002.sql"
+OUT="$(MIGRATE_MODE=precheck TARGET=preview "$M" 2>/dev/null)"; echo "$OUT" | grep -qx 'pending=true' && ok "precheck: an unrecorded file (earlier failed run) -> pending=true" || bad "precheck pending ($OUT)"
+rm "$T/app/db/migrations/0002.sql"
+OUT="$(STUB_NO_TABLE=1 MIGRATE_MODE=precheck TARGET=preview "$M" 2>/dev/null)"; echo "$OUT" | grep -qx 'pending=true' && ok "precheck: no migrations table -> pending=true" || bad "precheck no table ($OUT)"
+MIGRATE_MODE=precheck TARGET=preview D1_EXPECT=OTHER-ID "$M" >/dev/null 2>&1 && bad "precheck accepted a foreign D1" || ok "precheck: the config's D1 differs from the plan's -> fails before any query"
+STUB_PRECHECK_FAIL=1 MIGRATE_MODE=precheck TARGET=preview "$M" >/dev/null 2>&1 && bad "precheck failure read as none" || ok "precheck: a failing query exits non-zero (never read as nothing pending)"
+STUB_ROWS='"x"' MIGRATE_MODE=precheck TARGET=preview "$M" >/dev/null 2>&1 && bad "malformed rows read as none" || ok "precheck: malformed rows fail closed"
 # Worker without D1 binding for the target: fail closed (the job only exists when d1_migrations is true)
 printf 'name = "x"\n' > "$T/app/wrangler.toml"
 TARGET=prod "$M" >/dev/null 2>&1 && bad "no D1 accepted" || ok "target without D1 binding fails closed"
