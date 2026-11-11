@@ -21,7 +21,7 @@ Spec: `openspec/changes/redesign-cloudflare-worker-cicd-v2`; tracking issue #43.
 | `@v2` | floating major tag (same convention as `@v1`); always the latest compatible 2.x |
 | `@v2.x.y` | immutable release |
 
-The shared actions and nested workflows are referenced with the self-repository syntax `$/`, i.e. at the **same commit as the workflow you pin in `uses:`** - nothing to keep in sync. `tools_ref:` is accepted for compatibility but **ignored**; you can delete it. The runner must be **>= 2.336.0** (the org `linux` runners are 2.338.0).
+The shared actions and nested workflows are referenced with the self-repository syntax `$/`, i.e. at the **same commit as the workflow you pin in `uses:`** - nothing to keep in sync. `tools_ref` has been removed from the v2 workflow-call interface; callers must delete that obsolete input before adopting the updated workflow. The runner must be **>= 2.336.0** (the org `linux` runners are 2.338.0).
 
 | Release | Change |
 |---|---|
