@@ -22,8 +22,8 @@ name: CF Worker Pipeline v2
 #
 # Shared actions / nested workflow: `uses: $/actions/<name>` and `uses: $/.github/workflows/...` (GitHub self-repository syntax,
 # needs runner >= 2.336.0; observed: org `linux` runners 2.338.0, GitHub-hosted 2.338.2) resolve to THIS repository at the exact commit of the running workflow, with no checkout into the caller's
-# workspace (a plain `./` would resolve against the CALLER's). Version coupling is therefore exact by construction; `tools_ref` is
-# a deprecated no-op. Scripts are located relative to their action (`$GITHUB_ACTION_PATH/../cf-preview`, or actions/cf-tools).
+# workspace (a plain `./` would resolve against the CALLER's). Version coupling is therefore exact by construction.
+# Scripts are located relative to their action (`$GITHUB_ACTION_PATH/../cf-preview`, or actions/cf-tools).
 #
 # Caller MUST trigger on: push (all branches), pull_request, delete, workflow_dispatch.
 # `delete` only fires from the DEFAULT branch's workflow file.
@@ -93,14 +93,6 @@ on:
         description: pipeline_phase deploy - the validated hand-off (inputs, enabled kinds, per-kind Deploy / Migration results, concurrency group, target descriptors) for the verify call. Pass it unchanged as phase_state
         value: ${{ format('{{"inputs":{0},"kinds":{1},"deploy":{2},"migration":{3},"group":{4},"descriptors":{5}}}', toJSON(inputs), toJSON(fromJSON(jobs.plan.outputs.kinds || '[]')), format('{{"h_production":{0},"h_native_branch":{1},"h_native_dev":{2},"h_persistent_dev":{3}}}', toJSON(jobs.delivery_production.outputs.handoff), toJSON(jobs.delivery_native_branch.outputs.handoff), toJSON(jobs.delivery_native_dev.outputs.handoff), toJSON(jobs.delivery_persistent_dev.outputs.handoff)), format('{{"mj_production":{0},"mj_native_branch":{1},"mj_native_dev":{2},"mj_persistent_dev":{3}}}', toJSON(jobs.delivery_production.outputs.migration_used), toJSON(jobs.delivery_native_branch.outputs.migration_used), toJSON(jobs.delivery_native_dev.outputs.migration_used), toJSON(jobs.delivery_persistent_dev.outputs.migration_used)), toJSON(jobs.plan.outputs.group || format('cfv2-run-{0}', github.run_id)), toJSON(fromJSON(jobs.plan.outputs.descriptors || '{}'))) }}
     inputs:
-      tools_ref:
-        description: >
-          DEPRECATED, ignored (kept so existing callers keep working). The shared actions and the delivery workflow are referenced
-          with the self-repository syntax `$/`, which resolves to the repository AND commit of this workflow, so the tooling can no
-          longer drift from the workflow ref the caller pins. Safe to delete from callers.
-        type: string
-        required: false
-        default: ''
       app_name:
         description: Unique deployment/identity name (e.g. www, heaven-id). Part of the Preview identity (Worker scope).
         type: string
@@ -330,13 +322,6 @@ on:
         description: Approved ref (refs/heads/...) allowed to deploy persistent Dev via dispatch
         type: string
         default: ''
-      dev_deploy_cmd:
-        description: >
-          RETIRED - must be empty. The engine is the only publisher (it publishes the audited Dev Wrangler config itself); a non-empty
-          value fails the Plan before anything is built, migrated or published. Build in dev_build_cmd (or build_cmd). The input is kept
-          declared only so a stale caller gets this explicit error instead of a workflow-syntax failure.
-        type: string
-        default: ''
       dev_smoke_cmd:
         description: Dev smoke command (persistent-dev and Shared Dev); Shared Dev also receives TARGET_URL=app_url_dev, EXPECTED_SHA, DEPLOY_TARGET=dev
         type: string
@@ -384,7 +369,7 @@ on:
         type: string
         default: all
       phase_state:
-        description: pipeline_phase verify only - the `phase_state` output of the deploy call, passed unchanged. Validated as data; the engine inputs come from it, so a verify call repeats only app_name, app_path, tools_ref, runner, production_rollback_policy, release_cmd and the secrets.
+        description: pipeline_phase verify only - the `phase_state` output of the deploy call, passed unchanged. Validated as data; the engine inputs come from it, so a verify call repeats only app_name, app_path, runner, production_rollback_policy, release_cmd and the secrets.
         type: string
         default: '{}'
       upstream_gate:
