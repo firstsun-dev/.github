@@ -553,6 +553,9 @@ jobs:
     timeout-minutes: 45
     environment:
       name: ${{ fromJSON(needs.plan.outputs.migration || '{}').environment }}
+      # Protection (required reviewers, wait timer, branch policy) and environment secrets still apply; only the GitHub Deployment record is
+      # not created - the Deploy job owns it. NOT usable with an environment that has a custom (GitHub App) deployment protection rule: the job fails.
+      deployment: false
     permissions:
       contents: read
       deployments: read # Preview identity guard reads the ledger owner (no ledger entry is written here)

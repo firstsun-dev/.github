@@ -803,6 +803,9 @@ def group_migration_d1():
           "(9) the verified no-pending result is bound to the owner, the exact D1 id and the commit, and is distinct from `applied` (migration is empty, never `applied`)")
     used = json.loads(m["res"]["delivery_native_branch"]["jobs"]["deploy"]["outputs"]["migration_used"])
     check(used["precheck"] == "verified_no_pending" and used["migration"] == "none" and used["schema_changed"] == "false", "(1) the Deploy gate accepted the verified no-pending result and hands over a normalised migration_used (migration none, schema_changed false)")
+    nodep = lambda t: "-X POST" not in t and "versions upload" not in t and "preview --name" not in t and "PUBLISH" not in t
+    check(nodep(mlog(m)), "Migration (precheck path): no GitHub Deployment API call, no ledger entry, no Worker publish")
+    check(nodep(mlog(deploy(FEAT, inputs=MBI, env=dict(e200, STUB_PENDING="1")))), "Migration (pending path): schema changes only - no GitHub Deployment API call, no ledger entry, no Worker publish")
     m = deploy(MAIN, inputs=MBI, env=dict(e200, STUB_PENDING="0"))
     check(m["result"] == "success" and "BUILD" not in mlog(m) and verdict(m)["d1_id"] == "PROD-ID" and verdict(m)["kind"] == "production" and "PROD-ID" in "".join(m["res"]["migration"]["outputs"].values()),
           "(7) Production: the precheck runs INSIDE the Migration job (Environment <app>/prod with its approval), reads ONLY the Production D1, and Production is deployed after its own build")

@@ -291,6 +291,9 @@ check(render(env_expr, scenario("push", MAIN, {"d1_migrations": True}, {"plan": 
       and render(env_expr, scenario("push", FEAT, {"d1_migrations": True}, {"plan": pl(("native_branch", "native_dev"), True)})) == "app/preview"
       and render(env_expr, scenario("push", FEAT, {"d1_migrations": True}, {"plan": pl(("native_dev",), True)})) == "app/native-dev",
       "Migration: runs in the GitHub Environment of the plan's migration owner (<app>/prod keeps its approval protection; Production approval cannot be bypassed)")
+check(mj["environment"].get("deployment") is False and set(mj["environment"]) == {"name", "deployment"},
+      "Migration: environment.deployment is false (no GitHub Deployment record; the Environment name, its protection rules and secrets are unchanged) and the Deploy job keeps creating the Deployment (its environment has no `deployment: false`)")
+check("deployment" not in djobs["deploy"]["environment"] and "deployment" not in djobs["rollback"]["environment"], "Deploy / Rollback environments keep the default: a Deployment record is created for the real publish")
 check(mj["permissions"] == {"contents": "read", "deployments": "read"}, "Migration: read-only token (deployments read for the Preview identity guard)")
 check(mj["outputs"]["migration_json"] == "${{ steps.precheck.outputs.precheck == 'pending' && toJSON(steps.migrate.outputs) || toJSON(steps.precheck.outputs) }}" and [x.get("id") for x in mj["steps"] if x.get("id") in ("precheck", "migrate", "result")] == ["precheck", "migrate", "result"] and mj["outputs"]["migration_status"] == "${{ steps.result.outputs.status }}", "Migration: ONE deterministic result - the outputs of its single `migrate` step (pending) or of the read-only `precheck` step (verified no-pending), and an always-run status step (applied | none | failed)")
 MS = mj["steps"]
