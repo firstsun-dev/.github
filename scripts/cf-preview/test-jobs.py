@@ -866,8 +866,14 @@ def group_migration_d1():
     m = run_order(CHAIN, inputs=dict(BD, **D1), env=dict(e200, STUB_PENDING="1"))
     check(m["res"]["migration"].get("log", "").count("BUILD") == 2 and m["log"].count("migrations apply") == 1, "(6) shared D1 with pending migrations: the full path is unchanged (non-owner preflight build + owner build, ONE apply)")
     # (10) deferred verification (pipeline_phase) carries the no-pending evidence through phase_state and never repeats the precheck
-    md = deferred(FEAT, inputs=MBI, env=dict(e200, STUB_PENDING="0"))
+    md = deferred(FEAT, inputs=MBI, env=dict(e200, STUB_PENDING="0"), deploy_env=dict(e200, STUB_PENDING="0"))
     check("d1 execute" not in md["log"] and "migrations apply" not in md["log"], "(10) pipeline_phase verify never repeats the precheck or the Migration")
+    check(md["deploy"]["result"] == "success" and md["deploy"]["log"].count("BUILD") == 1 and "BUILD" not in mlog(md["deploy"]) and md["jobs"]["smoke"]["result"] == "success" and md["jobs"]["smoke"]["outputs"]["deployed_and_verified"] == "true" and md["jobs"]["rollback"]["result"] == "skipped",
+          "(10) deferred verification after a verified no-pending Migration: the Deploy built once, the hand-off (migration_used with the marker) passes the verify call's validation and the deployment is verified")
+    # persistent Dev as the migration owner: same contract (its own D1 from env.<dev>, its own build in the Deploy)
+    r = dev(inputs=dict(D1, dev_build_cmd=MB), env=dict(e200, STUB_PENDING="0"))
+    check(r["result"] == "success" and "BUILD" not in mlog(r) and json.loads(r["res"]["migration"]["outputs"]["migration_json"])["precheck"] == "verified_no_pending" and json.loads(r["res"]["migration"]["outputs"]["migration_json"])["kind"] == "persistent-dev" and "migrations apply" not in r["log"],
+          "persistent-dev as the owner: a verified no-pending result, zero Migration builds, the Dev delivery succeeds")
 
 
 def group_shared_dev():
