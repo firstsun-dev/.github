@@ -6,6 +6,10 @@ description: >
               stale check -> publish -> smoke -> mark verified | last-known-good recovery
     deploy    Shared Dev only, opt-in (pipeline_phase): the `all` job WITHOUT smoke and recovery. A later `verify` job smokes
               it and a `rollback` job recovers it, so a cross-service smoke can wait for another Worker's deployment.
+    precheck  Migration job, FIRST step: read-only look at the planned owner's physical D1 (two SELECTs, no build, nothing created or
+              changed). Verdict `precheck` = verified_no_pending (bound to owner, D1 id and commit; the Migration job then builds and
+              migrates nothing) | pending (the full preflight/migrate path follows). Failure, identity mismatch or a superseded run
+              never produce verified_no_pending.
     preflight Pre-mutation validation of one target: URL resolution + build + effective-config audit + exact D1 binding check.
               Non-publishing, mutates nothing remote. The single Migration job runs it for every enabled target that is not the
               migration owner, then `migrate` for the owner.
@@ -26,7 +30,7 @@ inputs:
     description: production | native-branch | native-dev | persistent-dev. Empty = the kind implied by target (prod -> production, preview -> native-branch, dev -> persistent-dev). native-dev is target preview.
     default: ''
   stage:
-    description: all | deploy | preflight | migrate | publish | verify | rollback (see description). dev supports all, deploy, preflight, migrate, publish, verify, rollback; prod and preview support preflight, migrate, publish, verify, rollback.
+    description: all | deploy | precheck | preflight | migrate | publish | verify | rollback (see description). dev supports all, deploy, precheck, preflight, migrate, publish, verify, rollback; prod and preview support precheck, preflight, migrate, publish, verify, rollback.
     default: all
   inputs_json:
     description: toJSON(inputs) of the calling workflow (data only; never interpolated into a script)
@@ -127,11 +131,17 @@ outputs:
     description: applied | failed | none
     value: ${{ steps.migration_state.outputs.state }}
   schema_changed:
-    description: true when this run applied pending D1 migrations (migrate / all stage)
-    value: ${{ steps.migrate.outputs.schema_changed }}
+    description: true when this run applied pending D1 migrations (migrate / all stage); false for a verified no-pending precheck
+    value: ${{ steps.migrate.outputs.schema_changed || steps.precheck.outputs.schema_changed }}
   d1_scan:
-    description: none | additive | non-additive | unknown - static classification of the migrations this run applied
-    value: ${{ steps.migrate.outputs.d1_scan }}
+    description: none | additive | non-additive | unknown - static classification of the migrations this run applied (none for a verified no-pending precheck)
+    value: ${{ steps.migrate.outputs.d1_scan || steps.precheck.outputs.d1_scan }}
+  precheck:
+    description: precheck stage only - verified_no_pending | pending; empty when the precheck did not run, failed or the run was superseded (never authorizes anything)
+    value: ${{ steps.precheck.outputs.precheck }}
+  precheck_sha:
+    description: precheck stage only - the commit the verified_no_pending verdict is bound to
+    value: ${{ steps.precheck.outputs.precheck_sha }}
   rollback_result:
     description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed | no_known_good (rollback stage)
     value: ${{ steps.rbfinal.outputs.result }}
@@ -207,18 +217,27 @@ runs:
       with:
         setup-node: 'false'
         setup-pnpm: 'false'
+    # Read-only: decides whether the Migration job has anything to do BEFORE any build (see stage precheck). Needs only the installed
+    # dependencies (the project's pinned Wrangler) and the source config; never a build, a ledger entry or a remote write.
+    - name: Read-only D1 migration precheck (no build)
+      id: precheck
+      if: env.STALE != 'true' && inputs.stage == 'precheck'
+      shell: bash
+      env:
+        ENGINE_TARGET: ${{ inputs.target }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" precheck | tee -a "$GITHUB_OUTPUT"'
     - name: Prepare (Wrangler version, Preview identity and ledger, ledger entry)
-      if: env.STALE != 'true' && inputs.stage != 'verify' && inputs.stage != 'rollback'
+      if: env.STALE != 'true' && inputs.stage != 'verify' && inputs.stage != 'rollback' && inputs.stage != 'precheck'
       shell: bash
       env:
         PREPARE_LEDGER: ${{ inputs.stage != 'migrate' && inputs.stage != 'preflight' }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" prepare'
     - name: Build and audit the deployable (nothing remote is changed)
-      if: env.STALE != 'true' && inputs.stage != 'verify' && inputs.stage != 'rollback'
+      if: env.STALE != 'true' && inputs.stage != 'verify' && inputs.stage != 'rollback' && inputs.stage != 'precheck'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" build'
     - name: Validate the exact migration target (same physical D1 as the deployed config)
-      if: env.STALE != 'true' && inputs.stage != 'verify' && inputs.stage != 'rollback'
+      if: env.STALE != 'true' && inputs.stage != 'verify' && inputs.stage != 'rollback' && inputs.stage != 'precheck'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" audit-d1'
     - name: Stale-SHA guard (before migration)

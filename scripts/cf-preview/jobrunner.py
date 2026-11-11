@@ -82,6 +82,14 @@ case "$3 $4 $5" in
   "versions view"*) [ -n "${STUB_PREV_MESSAGE:-}" ] && echo '{"annotations":{"workers/message":"'"$STUB_PREV_MESSAGE"'"}}';;
   "versions upload"*) [ "${STUB_UPLOAD_FAIL:-}" = 1 ] && exit 6; echo "Worker Version ID: new-2";;
   "versions deploy prev-1@100") [ "${STUB_ROLLBACK_FAIL:-}" = 1 ] && exit 8;;
+  "d1 execute"*) # the read-only precheck: two SELECTs as JSON. STUB_PRECHECK_FAIL / STUB_PRECHECK_BAD simulate an API / auth failure and garbage output
+               [ "${STUB_PRECHECK_FAIL:-}" = 1 ] && { echo "auth error" >&2; exit 4; }
+               [ "${STUB_PRECHECK_BAD:-}" = 1 ] && { echo "not json"; exit 0; }
+               case "$*" in
+                 *sqlite_master*) [ "${STUB_NO_TABLE:-}" = 1 ] && echo '[{"results":[],"success":true,"meta":{}}]' || echo '[{"results":[{"name":"d1_migrations"}],"success":true,"meta":{}}]';;
+                 *) A="${STUB_APPLIED-$([ "${STUB_PENDING:-1}" = 1 ] || echo 0001.sql)}"; R=""
+                    IFS='|' read -ra AF <<< "$A"; for f in "${AF[@]}"; do R="$R${R:+,}{\"name\":\"$f\"}"; done; echo "[{\"results\":[$R],\"success\":true,\"meta\":{}}]";;
+               esac;;
   "d1 migrations list") [ "${STUB_PENDING:-1}" = 1 ] && echo "Migrations to be applied: ${STUB_PENDING_FILES-0001.sql}" || echo "No migrations to apply!";;
   "d1 migrations apply") [ "${STUB_APPLY_FAIL:-}" = 1 ] && exit 7
                [ -n "${STUB_APPLY_FAIL_CFG:-}" ] && [[ "$*" == *"$STUB_APPLY_FAIL_CFG"* ]] && exit 7;;

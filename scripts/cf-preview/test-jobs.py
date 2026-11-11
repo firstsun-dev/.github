@@ -15,6 +15,7 @@ publishes/verifies, the Rollback job is conditional and fail-closed, application
 touched before the guards pass. Mocked: no Cloudflare, no GitHub. See docs/cf-worker-v2-unified-delivery.md for what this does
 NOT prove (the real-runner evidence is recorded there)."""
 import json
+import re
 import os
 import sys
 
@@ -187,7 +188,7 @@ def _run_jobs(names, ref, inputs, secrets, base_needs, event, env, toml, env_by_
         senv.update(env or {})
         senv.update((env_by_job or {}).get(name, {}))
         r = run_job(doc, name, c, ws, senv, verbose=bool(os.environ.get("CHAIN_VERBOSE") and name in os.environ["CHAIN_VERBOSE"].split(",")))
-        res[name] = {"result": r["result"], "outputs": r["outputs"]}
+        res[name] = {"result": r["result"], "outputs": r["outputs"], "log": r["log"]}
         logs.append(r["log"]); summ.append(r["summary"]); steps.extend(r["steps"])
         ctl["wss"][name] = ws
     return res, logs, summ, steps, ctl["wss"]
@@ -787,6 +788,92 @@ def group_migration_d1():
     check(m["result"] == "failure" and not migrated(m) and not published(m), "a Production D1 mapped into the Preview/Dev side fails inside the Migration job before any mutation")
     md = deferred(MAIN, inputs=dict(D1), env=e200)
     check(md["deploy"]["log"].count("migrations apply") == 1 and "migrations apply" not in md["log"], "pipeline_phase deferred verification never repeats the Migration (it ran once in the deploy call)")
+
+    # ---- Read-only D1 migration precheck (the Migration job builds nothing when the owner's D1 has nothing pending)
+    MBI = dict(D1, build_cmd=MB)
+    mlog = lambda r: r["res"]["migration"].get("log", "")
+    verdict = lambda r: json.loads(r["res"]["migration"]["outputs"]["migration_json"])
+    m = deploy(FEAT, inputs=MBI, env=dict(e200, STUB_PENDING="0"))
+    v = verdict(m)
+    check(m["result"] == "success" and m["res"]["migration"]["result"] == "success" and "BUILD" not in mlog(m) and mlog(m).count("d1 execute") == 2 and "migrations apply" not in m["log"] and "migrations list" not in m["log"],
+          "(1) no pending migrations: the Migration job reads the D1 state (two read-only SELECTs) and runs NO build, no audit, no `migrations list` / `apply`")
+    check(m["log"].count("BUILD") == 1 and published(m) and m["res"]["delivery_native_branch"]["result"] == "success" and public_outputs(m, MBI)["migration_status"] == "none",
+          "(1) no pending migrations: the Deploy still builds (and audits) its own artifact exactly once and publishes; migration_status=none")
+    check(v["precheck"] == "verified_no_pending" and v["kind"] == "native-branch" and v["d1_id"] == "PREV-ID" and v["precheck_sha"] == SHA and v["schema_changed"] == "false" and v["d1_scan"] == "none" and v.get("migration", "") != "applied" and not re.search(r'--command "(INSERT|UPDATE|CREATE|DELETE|DROP|ALTER|REPLACE)', m["log"]),
+          "(9) the verified no-pending result is bound to the owner, the exact D1 id and the commit, and is distinct from `applied` (migration is empty, never `applied`)")
+    used = json.loads(m["res"]["delivery_native_branch"]["jobs"]["deploy"]["outputs"]["migration_used"])
+    check(used["precheck"] == "verified_no_pending" and used["migration"] == "none" and used["schema_changed"] == "false", "(1) the Deploy gate accepted the verified no-pending result and hands over a normalised migration_used (migration none, schema_changed false)")
+    nodep = lambda t: "-X POST" not in t and "versions upload" not in t and "preview --name" not in t and "PUBLISH" not in t
+    check(nodep(mlog(m)), "Migration (precheck path): no GitHub Deployment API call, no ledger entry, no Worker publish")
+    check(nodep(mlog(deploy(FEAT, inputs=MBI, env=dict(e200, STUB_PENDING="1")))), "Migration (pending path): schema changes only - no GitHub Deployment API call, no ledger entry, no Worker publish")
+    m = deploy(MAIN, inputs=MBI, env=dict(e200, STUB_PENDING="0"))
+    check(m["result"] == "success" and "BUILD" not in mlog(m) and verdict(m)["d1_id"] == "PROD-ID" and verdict(m)["kind"] == "production" and "PROD-ID" in "".join(m["res"]["migration"]["outputs"].values()),
+          "(7) Production: the precheck runs INSIDE the Migration job (Environment <app>/prod with its approval), reads ONLY the Production D1, and Production is deployed after its own build")
+    m = deploy(FEAT, inputs=MBI, env=dict(e200, STUB_PENDING="1"))
+    ml = mlog(m)
+    check(m["result"] == "success" and ml.count("BUILD") == 1 and ml.count("migrations apply") == 1 and ml.index("d1 execute") < ml.index("BUILD") < ml.index("migrations apply") and public_outputs(m, MBI)["migration_status"] == "applied" and verdict(m).get("precheck", "") == "",
+          "(2) pending migrations: precheck -> build -> audit -> exact D1 -> stale guard -> apply, exactly as before (one build in the Migration job, one apply); migration_status=applied")
+    m = deploy(FEAT, inputs=MBI, env=dict(e200, STUB_PENDING="1", STUB_NO_TABLE="1"))
+    check(m["res"]["migration"]["log"].count("migrations apply") == 1, "(8) a D1 without migrations table (first run / earlier failed migration that never recorded anything) is PENDING, never `none`: the full path runs")
+    m = deploy(FEAT, inputs=MBI, env=dict(e200, STUB_PENDING="1", STUB_APPLIED="0000.sql"))
+    check(m["res"]["migration"]["log"].count("migrations apply") == 1, "(8) a migration file that the remote table does not record (previous failed deployment left it unapplied) is PENDING: the full path runs, a git diff is never consulted")
+    # Wrangler discovers `${migrations_dir}/*.sql` by exact file name: spaces and Unicode names count (a restrictive filename filter would fail open)
+    ODD = {"migrations/0002_add status.sql": "CREATE TABLE a (id INTEGER);", "migrations/0003_調整.sql": "CREATE TABLE b (id INTEGER);"}
+    m = deploy(FEAT, inputs=MBI, files=ODD, env=dict(e200, STUB_PENDING="1", STUB_APPLIED="0001.sql"))
+    check(m["res"]["migration"]["log"].count("BUILD") == 1 and m["log"].count("migrations apply") == 1 and verdict(m).get("precheck", "") == "" and m["res"]["delivery_native_branch"]["result"] == "success",
+          "unrecorded `0002_add status.sql` / `0003_調整.sql` (only the standard name applied) are PENDING: the full Build -> Audit -> Migration path runs")
+    m = deploy(FEAT, inputs=MBI, files=ODD, env=dict(e200, STUB_PENDING="0", STUB_APPLIED="0001.sql|0002_add status.sql|0003_調整.sql"))
+    check(m["result"] == "success" and "BUILD" not in mlog(m) and verdict(m)["precheck"] == "verified_no_pending" and not migrated(m) and m["log"].count("BUILD") == 1,
+          "every migration file recorded remotely (spaces / Unicode included): verified no-op, zero Migration builds, the Deploy builds once")
+    PAT = APP_TOML.replace('database_id = "PREV-ID"', 'database_id = "PREV-ID"\nmigrations_dir = "migrations"\nmigrations_pattern = "migrations/*.sql"')
+    m = deploy(FEAT, inputs=MBI, toml=PAT, env=dict(e200, STUB_PENDING="0"))
+    check(m["result"] == "success" and mlog(m).count("BUILD") == 1 and "d1 execute" not in mlog(m) and verdict(m).get("precheck", "") == "",
+          "a custom migrations_pattern is not covered by the precheck: conservative full path (build + audit in the Migration job, no precheck verdict, no remote SELECT)")
+    for nm, e_ in (("the Cloudflare API / authentication fails", {"STUB_PRECHECK_FAIL": "1"}), ("the query output is not valid JSON", {"STUB_PRECHECK_BAD": "1"})):
+        m = deploy(FEAT, inputs=MBI, env=dict(e200, STUB_PENDING="0", **e_))
+        check(m["res"]["migration"]["result"] == "failure" and public_outputs(m, MBI)["migration_status"] == "failed" and "BUILD" not in m["log"] and not migrated(m) and not published(m) and m["res"]["delivery_native_branch"]["result"] == "skipped",
+              f"(3) precheck failure ({nm}): fail closed - never read as `no pending`; nothing built, migrated or published, Delivery blocked")
+    # (4) wrong database: the plan expects another D1 than the source config binds -> fails BEFORE the first remote read
+    ok_ = deploy(FEAT, inputs=MBI, env=e200)["res"]["plan"]["outputs"]
+    fpj = dict(ok_, descriptors=json.dumps({"native-branch": json.loads(desc("native-branch", "FOREIGN-ID", "native-branch"))}), migration=json.dumps({"kind": "native-branch", "environment": "app/preview", "d1_id": "FOREIGN-ID", "kinds": ["native-branch"]}))
+    fr = run_job(doc, "migration", ctx(FEAT, MBI, PROD_SECRETS, {"gate": {"result": "success", "outputs": {}}, "plan": {"result": "success", "outputs": fpj}}), make_workspace(), {"STUB_TIPS": SHA, "STUB_PENDING": "0"})
+    check(fr["result"] == "failure" and "d1 execute" not in fr["log"] and "BUILD" not in fr["log"] and not migrated(fr),
+          "(4) wrong D1 (source config binds another database than the plan): the precheck fails immediately, before any remote read, build or migration")
+    # (5) a superseded run: the precheck verdict is never authorization
+    m = deploy(FEAT, inputs=MBI, env=dict(e200, STUB_PENDING="0", STUB_TIPS="f" * 40))
+    check(m["res"]["migration"]["outputs"]["migration_json"].count("verified_no_pending") == 0 and not published(m) and m["res"]["delivery_native_branch"]["result"] == "failure",
+          "(5) stale run: the precheck prints no verified marker, so the Delivery gate refuses and nothing is published")
+    # (9) the marker cannot be forged from a skipped / failed / stale / foreign result: the gate itself (a Delivery with a hand-built migration_json)
+    VNP = {"precheck": "verified_no_pending", "kind": "native-branch", "d1_id": "PREV-ID", "precheck_sha": SHA, "schema_changed": "false", "d1_scan": "none"}
+    for nm, over_, ok_expected in (("an honest verified no-pending result", {}, True),
+                                   ("a skipped Migration job", {"migration_result": "skipped"}, False), ("a failed Migration job", {"migration_result": "failure"}, False),
+                                   ("a marker bound to another commit", {"migration_json": json.dumps(dict(VNP, precheck_sha="b" * 40))}, False),
+                                   ("a marker for another D1 (Production id on a Preview kind)", {"migration_json": json.dumps(dict(VNP, d1_id="PROD-ID"))}, False),
+                                   ("a marker of another owner kind", {"migration_json": json.dumps(dict(VNP, kind="native-dev"))}, False),
+                                   ("a marker without commit binding", {"migration_json": json.dumps({k: v for k, v in VNP.items() if k != "precheck_sha"})}, False),
+                                   ("a marker plus a stale flag", {"migration_json": json.dumps(dict(VNP, stale="true"))}, False),
+                                   ("an unmarked `none` (a skipped migrate step)", {"migration_json": json.dumps({"migration": "none", "kind": "native-branch", "d1_id": "PREV-ID"})}, False),
+                                   ("empty outputs", {"migration_json": "{}"}, False)):
+        gj = dict({"migration_result": "success", "migration_json": json.dumps(VNP)}, **over_)
+        dc = Ctx({"github": ctx(FEAT)["github"], "inputs": dict(DINPUT_DEFAULTS, descriptor=desc("native-branch", "PREV-ID", "native-branch"), d1_migrations="true", inputs_json=json.dumps(dict(ctx(FEAT)["inputs"], d1_migrations=True)), **gj), "needs": {}}, PROD_SECRETS)
+        rr_ = run_job(ddoc, "deploy", dc, make_workspace(APP_TOML), {"STUB_TIPS": SHA})
+        check((rr_["result"] == "success" and published({"log": rr_["log"]})) == ok_expected, f"(9) Deploy gate with {nm}: {'accepted' if ok_expected else 'refused before any build or publish'}")
+    # (6) several kinds sharing ONE physical D1: ONE precheck serves both, no peer is built in the Migration job, each Deploy builds for itself
+    m = run_order(CHAIN, inputs=dict(BD, **D1), env=dict(e200, STUB_PENDING="0"))
+    check(m["result"] == "success" and mlog(m).count("d1 execute") == 2 and "BUILD" not in mlog(m) and m["res"]["delivery_native_dev"]["result"] == "success" and m["res"]["delivery_native_branch"]["result"] == "success" and m["log"].count("BUILD") == 2
+          and json.loads(m["res"]["delivery_native_dev"]["jobs"]["deploy"]["outputs"]["migration_used"])["kind"] == "native-branch",
+          "(6) Native Branch + Native Dev on one D1: a single precheck (2 SELECTs) authorizes BOTH deliveries (owner native-branch); the Migration job builds nothing, each Deploy builds once")
+    m = run_order(CHAIN, inputs=dict(BD, **D1), env=dict(e200, STUB_PENDING="1"))
+    check(m["res"]["migration"].get("log", "").count("BUILD") == 2 and m["log"].count("migrations apply") == 1, "(6) shared D1 with pending migrations: the full path is unchanged (non-owner preflight build + owner build, ONE apply)")
+    # (10) deferred verification (pipeline_phase) carries the no-pending evidence through phase_state and never repeats the precheck
+    md = deferred(FEAT, inputs=MBI, env=dict(e200, STUB_PENDING="0"), deploy_env=dict(e200, STUB_PENDING="0"))
+    check("d1 execute" not in md["log"] and "migrations apply" not in md["log"], "(10) pipeline_phase verify never repeats the precheck or the Migration")
+    check(md["deploy"]["result"] == "success" and md["deploy"]["log"].count("BUILD") == 1 and "BUILD" not in mlog(md["deploy"]) and md["jobs"]["smoke"]["result"] == "success" and md["jobs"]["smoke"]["outputs"]["deployed_and_verified"] == "true" and md["jobs"]["rollback"]["result"] == "skipped",
+          "(10) deferred verification after a verified no-pending Migration: the Deploy built once, the hand-off (migration_used with the marker) passes the verify call's validation and the deployment is verified")
+    # persistent Dev as the migration owner: same contract (its own D1 from env.<dev>, its own build in the Deploy)
+    r = dev(inputs=dict(D1, dev_build_cmd=MB), env=dict(e200, STUB_PENDING="0"))
+    check(r["result"] == "success" and "BUILD" not in mlog(r) and json.loads(r["res"]["migration"]["outputs"]["migration_json"])["precheck"] == "verified_no_pending" and json.loads(r["res"]["migration"]["outputs"]["migration_json"])["kind"] == "persistent-dev" and "migrations apply" not in r["log"],
+          "persistent-dev as the owner: a verified no-pending result, zero Migration builds, the Dev delivery succeeds")
 
 
 def group_shared_dev():

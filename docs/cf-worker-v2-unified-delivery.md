@@ -384,3 +384,44 @@ Behaviour changes versus the old manual path: it now runs CI, Plan and the dedic
 - **CI environment follows the intended target** (`ci_target_env`, JS twin `ciTargetEnv`): `dev` when the run's only target is Persistent Dev (manual dispatch from any ref, `main` included, or an automatic push where Shared Dev is the only enabled channel); `prod` for `main`; `preview` otherwise (Native Branch, Native Dev, several kinds at once, PRs). With several kinds the shared validation keeps the Preview contract and each kind's own build and audit still validate its actual configuration. Exactly one build env is imported; `ci_env` applies afterwards; no Cloudflare credentials in CI.
 - **`dispatch_target` fails closed**: valid only for `workflow_dispatch` and only as exactly `persistent-dev`; unapproved ref, tag, missing `persistent_dev_ref`, non-hybrid strategy or any other value fails the Plan, including for tag / PR / push / delete events (the Plan `if:` runs for an explicit target so the run is red, never green without deploying).
 - **Non-Production recovery D1 guard** (`nonProdRecoveryBlock`, same rule as Production via `d1SchemaBlock`): last-known-good code is redeployed only when this pipeline's migration result is present, for this target's D1, and either unchanged or additive with `d1_rollback_compat: expand-contract`; otherwise recovery is blocked, the deployment is UNVERIFIED and the summary gives the reason and manual steps. D1 is never reverted.
+
+
+## Read-only D1 precheck: the Migration job builds nothing when nothing is pending
+
+**Root cause.** The Migration job (`_cf-worker-v2.yml`, job `migration`) ran the full pre-mutation path unconditionally: stage `preflight` for every non-owner target and stage `migrate` for the owner,
+each = `prepare` → `build` (`engine.sh build`, the application build) → `audit-d1` → stale guard → `migrate`. Whether anything was pending was only learned at the very end, inside `migrate.sh`
+(`wrangler d1 migrations list` printing "No migrations to apply!"), after the builds had already been paid for. A feature push that touches no migration therefore built the app once per target in
+the Migration job and again in each Deploy.
+
+**Fix.** A new first step of the Migration job, stage `precheck` (`engine.sh precheck` → `migrate.sh` with `MIGRATE_MODE=precheck`):
+
+1. resolves the planned owner's physical D1 from the *source* config (same `migration-config` derivation, Production/Preview/Dev isolation included) and requires it to equal the plan's `d1_expected_id` **before the first remote read**;
+2. reads the remote state with two read-only `wrangler d1 execute --remote --json` SELECTs (the migrations table exists? / its `name` column) and compares it with the `*.sql` regular files of the migrations directory by exact name, spaces and Unicode included, as Wrangler's own `${migrations_dir}/*.sql` discovery does (`classifyMigrationEntries`, `pendingMigrations`, `delivery.mjs`).
+   Output is parsed as JSON (`parseD1Rows`), never from the human-readable `migrations list` text (which, in addition, creates the migrations table). A missing table = everything pending;
+3. runs the stale-SHA guard after the read;
+4. emits `precheck=verified_no_pending` (+ `precheck_sha`, `schema_changed=false`, `d1_scan=none`) or `precheck=pending`.
+
+| State | Result |
+|---|---|
+| nothing pending | steps `preflight` / `migrate` are skipped (**no build, no audit, no `migrations list` / `apply` in the Migration job**); `migration_json` = the precheck outputs |
+| pending (incl. no migrations table, an unrecorded file left by an earlier failed run) | unchanged full path: build → audit → exact D1 → stale guard → apply |
+| unsupported migration settings (`migrations_pattern`, unusual `migrations_table`), or a `.sql`-named directory / symlink / dotfile / `.SQL` entry in `migrations_dir` | treated as pending: the full path runs (nothing is silently ignored) |
+| query / auth / network failure, non-JSON output | the job **fails** (fail closed); Delivery never starts |
+| D1 in the source config ≠ the plan's D1 | the job fails before any remote read |
+| superseded run | no marker is printed; the Delivery gate refuses; nothing published |
+
+**Authorization contract (`resolveMigrationUsed`).** A Delivery publishes only on `migration_result == success` **and** either `migration: applied` (unchanged) **or** `precheck: verified_no_pending` whose
+`kind` is the planned owner, `d1_id` equals the kind's D1 and `precheck_sha` equals the run's `GITHUB_SHA`. A skipped or failed Migration job, a `stale` flag, a marker for another D1 / owner / commit, an unmarked
+`none` or an empty result are all refused. The normalised `migration_used` of a verified no-op is `migration: none, schema_changed: false, d1_scan: none` (so recovery guards and rollback guards treat it as a known,
+unchanged schema). The **Deploy still runs Build + Effective-Config Audit + exact D1 binding check before every publish** (stage `publish`); the precheck replaces only the Migration job's own builds.
+
+**Why the precheck→deploy window is safe.** The whole run holds the run-level concurrency group of the physical D1 (`cfv2-nonprod-d1-<scope>` / `cfv2-prod-<scope>`), the marker is bound to the commit, the Delivery re-runs
+the stale guard, and a migration never becomes *less* applied: another run can only add rows to the migrations table, which can only shrink the pending set. A D1 shared with another *repository* is not covered by
+any repository-scoped lock - that limitation is unchanged (see `d1_lock_scope`). Several kinds sharing one D1 use ONE precheck (the owner's); every kind's descriptor binds the same D1 id.
+
+**Production.** The precheck runs *inside* the Migration job, so the GitHub Environment `<app>/prod` (and its required reviewers) still applies to every Production run with `d1_migrations: true`, pending or not; the
+Environment of a job cannot depend on remote state. Production behaviour is otherwise unchanged.
+
+**Result.** No pending migrations: Migration job = checkout + dependency install + 2 SELECTs (no application build); Deploy = Build + Audit per kind. Pending: precheck + the previous full path.
+**Remaining redundancy (out of scope):** each Deploy still builds its own artifact (required: the audited artifact is what is published), CI's Build Validation builds once more as validation, and the pending path still
+builds the owner (and non-owner targets) in the Migration job and again in each Deploy. The dependency install in the Migration job is also unchanged.

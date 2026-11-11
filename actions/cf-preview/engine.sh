@@ -202,6 +202,24 @@ case "$PHASE" in
     printf '%s' "$D1_ID" > "$S/d1_id"
     (cd "$APP_DIR" && node "$TOOLS_DIR/cli.mjs" migration-config --config "$WRANGLER_CONFIG" --target "$TARGET" --binding "$D1_BINDING" --dev-env "$DEV_ENV" --out "$S/migrate-check.json" | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}");;
 
+  precheck) # Migration job, BEFORE any build: read-only state of the planned owner's physical D1. Mutates nothing, builds nothing.
+    ctx
+    [ "$(inp d1_migrations)" = true ] || exit 0
+    [ "${ENGINE_TARGET:?}" = "$TARGET" ] || die "target mismatch at the migration precheck (state '$TARGET', step '$ENGINE_TARGET')"
+    [ -n "$(rd d1_expect)" ] || die "the migration precheck needs the plan's expected D1 id"
+    setenv CFV2_DEPS "done"
+    OUT="$(MIGRATE_MODE=precheck D1_EXPECT="$(rd d1_expect)" TARGET="$TARGET" APP_DIR="$APP_DIR" WRANGLER_CONFIG="$WRANGLER_CONFIG" D1_BINDING="$D1_BINDING" DEV_ENV="$DEV_ENV" "$TOOLS_DIR/migrate.sh")" || die "the D1 migration precheck failed; nothing was built, migrated or published (fail closed)"
+    PENDING="$(printf '%s\n' "$OUT" | sed -n 's/^pending=//p')"; P_ID="$(printf '%s\n' "$OUT" | sed -n 's/^d1_id=//p')"
+    case "$PENDING" in true|false) ;; *) die "the D1 migration precheck returned no verdict; failing closed";; esac
+    [ "$P_ID" = "$(rd d1_expect)" ] || die "the source config binds D1 '$P_ID' for $KIND but the plan expects '$(rd d1_expect)'; refusing (nothing was read or changed beyond a SELECT)"
+    # Superseded while reading: never authorizes anything (no marker is printed); the Delivery's gate then refuses the run.
+    stale_check precheck || exit 0
+    printf '%s' "$P_ID" > "$S/d1_id"
+    if [ "$PENDING" = false ]; then
+      echo "::notice::No pending D1 migrations on $P_ID (read-only precheck): the Migration job builds nothing; every Deploy still builds, audits and checks the D1 binding." >&2
+      echo "precheck=verified_no_pending"; echo "precheck_sha=$RUN_SHA"; echo "schema_changed=false"; echo "d1_scan=none"
+    else echo "precheck=pending"; fi;;
+
   migrate)
     ctx
     [ "$(inp d1_migrations)" = true ] || exit 0
