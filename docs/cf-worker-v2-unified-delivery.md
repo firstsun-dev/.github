@@ -396,7 +396,7 @@ the Migration job and again in each Deploy.
 **Fix.** A new first step of the Migration job, stage `precheck` (`engine.sh precheck` → `migrate.sh` with `MIGRATE_MODE=precheck`):
 
 1. resolves the planned owner's physical D1 from the *source* config (same `migration-config` derivation, Production/Preview/Dev isolation included) and requires it to equal the plan's `d1_expected_id` **before the first remote read**;
-2. reads the remote state with two read-only `wrangler d1 execute --remote --json` SELECTs (the migrations table exists? / its `name` column) and compares it with the `*.sql` files of the migrations directory (`pendingMigrations`, `delivery.mjs`).
+2. reads the remote state with two read-only `wrangler d1 execute --remote --json` SELECTs (the migrations table exists? / its `name` column) and compares it with the `*.sql` regular files of the migrations directory by exact name, spaces and Unicode included, as Wrangler's own `${migrations_dir}/*.sql` discovery does (`classifyMigrationEntries`, `pendingMigrations`, `delivery.mjs`).
    Output is parsed as JSON (`parseD1Rows`), never from the human-readable `migrations list` text (which, in addition, creates the migrations table). A missing table = everything pending;
 3. runs the stale-SHA guard after the read;
 4. emits `precheck=verified_no_pending` (+ `precheck_sha`, `schema_changed=false`, `d1_scan=none`) or `precheck=pending`.
@@ -405,7 +405,7 @@ the Migration job and again in each Deploy.
 |---|---|
 | nothing pending | steps `preflight` / `migrate` are skipped (**no build, no audit, no `migrations list` / `apply` in the Migration job**); `migration_json` = the precheck outputs |
 | pending (incl. no migrations table, an unrecorded file left by an earlier failed run) | unchanged full path: build → audit → exact D1 → stale guard → apply |
-| unsupported migration settings (`migrations_pattern`, unusual `migrations_table`) | treated as pending: the full path runs |
+| unsupported migration settings (`migrations_pattern`, unusual `migrations_table`), or a `.sql`-named directory / symlink / dotfile / `.SQL` entry in `migrations_dir` | treated as pending: the full path runs (nothing is silently ignored) |
 | query / auth / network failure, non-JSON output | the job **fails** (fail closed); Delivery never starts |
 | D1 in the source config ≠ the plan's D1 | the job fails before any remote read |
 | superseded run | no marker is printed; the Delivery gate refuses; nothing published |

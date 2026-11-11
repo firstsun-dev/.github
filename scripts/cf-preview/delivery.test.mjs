@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   DELIVERY_KINDS, resolveDeliveryTargets, resolveSmokeMode, parseSmokeOverrides, planMigrations, branchPreviewIdentity, ENGINE_TARGET,
   canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins,
-  targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor, resolveMigrationUsed, parseD1Rows, pendingMigrations, VERIFIED_NO_PENDING,
+  targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor, resolveMigrationUsed, parseD1Rows, pendingMigrations, classifyMigrationEntries, VERIFIED_NO_PENDING,
   isContentLevel, verificationOutcome, prodRollbackBlock, nonProdRecoveryBlock, ciTargetEnv, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
 } from '../../actions/cf-preview/delivery.mjs';
 
@@ -786,4 +786,21 @@ test('nonProdRecoveryBlock: a verified no-pending result is a known D1 state (sc
   assert.equal(g({ migration: 'none', precheck: VERIFIED_NO_PENDING, kind: 'native-branch', d1_id: 'DB1', schema_changed: 'false', d1_scan: 'none' }), null);
   assert.equal(g({ migration: 'none', kind: 'native-branch', d1_id: 'DB1', schema_changed: 'false' }).code, 'migration_result_missing');
   assert.equal(g({ migration: 'none', precheck: VERIFIED_NO_PENDING, kind: 'native-branch', d1_id: 'OTHER', schema_changed: 'false' }).code, 'd1_identity_mismatch');
+});
+
+test('classifyMigrationEntries: every name Wrangler discovers via *.sql is kept as-is (spaces, Unicode); anything uncertain is reported, never dropped', () => {
+  const f = (name) => ({ name, file: true });
+  const r = classifyMigrationEntries([f('0001_init.sql'), f('0002_add status.sql'), f('0003_調整.sql'), f('0004_é.sql'), f('README.md'), f('notes.sql.bak'), { name: 'sub', file: false }]);
+  assert.deepEqual(r.files, ['0001_init.sql', '0002_add status.sql', '0003_調整.sql', '0004_é.sql'].sort());
+  assert.deepEqual(r.ambiguous, []);
+  const a = classifyMigrationEntries([f('0001.sql'), { name: 'dir.sql', file: false }, { name: 'link.sql', file: false }, f('.hidden.sql'), f('UPPER.SQL')]);
+  assert.deepEqual(a.files, ['0001.sql']);
+  assert.deepEqual(a.ambiguous, ['.hidden.sql', 'UPPER.SQL', 'dir.sql', 'link.sql'].sort(), 'directories, symlinks, dotfiles and .SQL are reported, not silently ignored');
+});
+test('pendingMigrations: names with spaces / Unicode are compared exactly', () => {
+  const files = ['0001_init.sql', '0002_add status.sql', '0003_調整.sql'];
+  const rec = (...n) => n.map((name) => ({ name }));
+  assert.deepEqual(pendingMigrations({ files, tableExists: true, applied: rec('0001_init.sql') }), ['0002_add status.sql', '0003_調整.sql']);
+  assert.deepEqual(pendingMigrations({ files, tableExists: true, applied: rec('0001_init.sql', '0003_調整.sql') }), ['0002_add status.sql']);
+  assert.deepEqual(pendingMigrations({ files, tableExists: true, applied: rec(...files) }), []);
 });

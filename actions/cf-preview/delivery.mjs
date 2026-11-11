@@ -328,6 +328,22 @@ export function parseD1Rows(text) {
 }
 
 /**
+ * Migration files of a flat migrations_dir, the way Wrangler discovers them (`${migrations_dir}/*.sql`: exact file name, regular files,
+ * no dotfiles - any name, spaces and Unicode included). `entries` = [{ name, file }] from readdir (`file` = a regular file, not a symlink or
+ * directory). An entry that ends in .sql (any case) but that this rule cannot place with certainty - a directory, a symlink, a dotfile, `.SQL` -
+ * is returned in `ambiguous`: different Wrangler versions treat those differently, so the caller must NOT conclude "nothing pending"
+ * (it runs the full path). Nothing is silently discarded; only names that cannot end in `.sql` are not migrations.
+ */
+export function classifyMigrationEntries(entries) {
+  const files = []; const ambiguous = [];
+  for (const { name, file } of entries) {
+    if (!/\.sql$/i.test(name)) continue;
+    if (file && name.endsWith('.sql') && !name.startsWith('.')) files.push(name); else ambiguous.push(name);
+  }
+  return { files: files.sort(), ambiguous: ambiguous.sort() };
+}
+
+/**
  * Read-only migration precheck decision (pure). `files` = the .sql names of the migrations directory, `tableExists` = the migrations table
  * exists on the remote D1, `applied` = its `name` column. A migration is pending when its file is not recorded as applied; a missing table
  * means everything is pending. This is the same rule `wrangler d1 migrations apply` uses (file name vs. recorded name). Throws on malformed rows

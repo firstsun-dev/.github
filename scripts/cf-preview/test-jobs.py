@@ -817,6 +817,18 @@ def group_migration_d1():
     check(m["res"]["migration"]["log"].count("migrations apply") == 1, "(8) a D1 without migrations table (first run / earlier failed migration that never recorded anything) is PENDING, never `none`: the full path runs")
     m = deploy(FEAT, inputs=MBI, env=dict(e200, STUB_PENDING="1", STUB_APPLIED="0000.sql"))
     check(m["res"]["migration"]["log"].count("migrations apply") == 1, "(8) a migration file that the remote table does not record (previous failed deployment left it unapplied) is PENDING: the full path runs, a git diff is never consulted")
+    # Wrangler discovers `${migrations_dir}/*.sql` by exact file name: spaces and Unicode names count (a restrictive filename filter would fail open)
+    ODD = {"migrations/0002_add status.sql": "CREATE TABLE a (id INTEGER);", "migrations/0003_調整.sql": "CREATE TABLE b (id INTEGER);"}
+    m = deploy(FEAT, inputs=MBI, files=ODD, env=dict(e200, STUB_PENDING="1", STUB_APPLIED="0001.sql"))
+    check(m["res"]["migration"]["log"].count("BUILD") == 1 and m["log"].count("migrations apply") == 1 and verdict(m).get("precheck", "") == "" and m["res"]["delivery_native_branch"]["result"] == "success",
+          "unrecorded `0002_add status.sql` / `0003_調整.sql` (only the standard name applied) are PENDING: the full Build -> Audit -> Migration path runs")
+    m = deploy(FEAT, inputs=MBI, files=ODD, env=dict(e200, STUB_PENDING="0", STUB_APPLIED="0001.sql|0002_add status.sql|0003_調整.sql"))
+    check(m["result"] == "success" and "BUILD" not in mlog(m) and verdict(m)["precheck"] == "verified_no_pending" and not migrated(m) and m["log"].count("BUILD") == 1,
+          "every migration file recorded remotely (spaces / Unicode included): verified no-op, zero Migration builds, the Deploy builds once")
+    PAT = APP_TOML.replace('database_id = "PREV-ID"', 'database_id = "PREV-ID"\nmigrations_dir = "migrations"\nmigrations_pattern = "migrations/*.sql"')
+    m = deploy(FEAT, inputs=MBI, toml=PAT, env=dict(e200, STUB_PENDING="0"))
+    check(m["result"] == "success" and mlog(m).count("BUILD") == 1 and "d1 execute" not in mlog(m) and verdict(m).get("precheck", "") == "",
+          "a custom migrations_pattern is not covered by the precheck: conservative full path (build + audit in the Migration job, no precheck verdict, no remote SELECT)")
     for nm, e_ in (("the Cloudflare API / authentication fails", {"STUB_PRECHECK_FAIL": "1"}), ("the query output is not valid JSON", {"STUB_PRECHECK_BAD": "1"})):
         m = deploy(FEAT, inputs=MBI, env=dict(e200, STUB_PENDING="0", **e_))
         check(m["res"]["migration"]["result"] == "failure" and public_outputs(m, MBI)["migration_status"] == "failed" and "BUILD" not in m["log"] and not migrated(m) and not published(m) and m["res"]["delivery_native_branch"]["result"] == "skipped",

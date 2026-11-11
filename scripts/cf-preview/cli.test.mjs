@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { targetDescriptor, buildDescriptors } from '../../actions/cf-preview/delivery.mjs';
@@ -90,4 +90,50 @@ test('add-mask for Preview secrets goes to stderr, not into any output file', ()
   assert.match(r.stderr, /::add-mask::s3cret/);
   for (const line of records(r.stdout)) assert.match(line, RECORD);
   assert.doesNotMatch(r.stdout, /s3cret/);
+});
+
+// ---- migration-pending: real directory, real `wrangler d1 execute --json` shaped files (the precheck's file discovery must equal Wrangler's)
+const pending = (names, applied, { table = true, setup = () => {}, appliedText } = {}) => {
+  const d = mkdtempSync(join(tmpdir(), 'mp-')); const dir = join(d, 'm'); mkdirSync(dir);
+  for (const n of names) writeFileSync(join(dir, n), 'select 1;');
+  setup(dir);
+  const ex = join(d, 'e.json'); const ap = join(d, 'a.json');
+  writeFileSync(ex, JSON.stringify([{ results: table ? [{ name: 'd1_migrations' }] : [], success: true }]));
+  writeFileSync(ap, appliedText ?? JSON.stringify([{ results: applied.map((name) => ({ name })), success: true }]));
+  const r = run(['migration-pending', '--dir', dir, '--exists', ex, ...(table ? ['--applied', ap] : [])]);
+  return { status: r.status, out: r.stdout, stderr: r.stderr };
+};
+test('migration-pending: standard file recorded remotely -> nothing pending', () => {
+  assert.equal(pending(['0001_init.sql'], ['0001_init.sql']).out, 'pending=false\npending_count=0\n');
+});
+test('migration-pending: a file with a space that is not recorded is PENDING', () => {
+  assert.equal(pending(['0001_init.sql', '0002_add status.sql'], ['0001_init.sql']).out, 'pending=true\npending_count=1\n');
+});
+test('migration-pending: a Unicode file name that is not recorded is PENDING', () => {
+  assert.equal(pending(['0001_init.sql', '0003_調整.sql'], ['0001_init.sql']).out, 'pending=true\npending_count=1\n');
+});
+test('migration-pending: several files, only the standard names recorded -> pending', () => {
+  assert.equal(pending(['0001_init.sql', '0002_add status.sql', '0003_調整.sql', '0004_plain.sql'], ['0001_init.sql', '0004_plain.sql']).out, 'pending=true\npending_count=2\n');
+});
+test('migration-pending: every file recorded (spaces and Unicode included) -> verified nothing pending', () => {
+  const all = ['0001_init.sql', '0002_add status.sql', '0003_調整.sql'];
+  assert.equal(pending(all, all).out, 'pending=false\npending_count=0\n');
+});
+test('migration-pending: non-.sql files are not migrations; a missing migrations table means everything pending', () => {
+  assert.equal(pending(['0001.sql', 'README.md'], ['0001.sql']).out, 'pending=false\npending_count=0\n');
+  assert.equal(pending(['0001.sql'], [], { table: false }).out, 'pending=true\npending_count=1\n');
+});
+test('migration-pending: a directory, symlink, dotfile or .SQL entry the precheck cannot place with certainty -> pending=true, reported on stderr, never dropped', () => {
+  for (const [label, setup] of [['directory named x.sql', (dir) => mkdirSync(join(dir, 'x.sql'))], ['symlink', (dir) => symlinkSync(join(dir, '0001.sql'), join(dir, 'link.sql'))],
+    ['dotfile', (dir) => writeFileSync(join(dir, '.h.sql'), 'select 1;')], ['upper-case extension', (dir) => writeFileSync(join(dir, 'U.SQL'), 'select 1;')]]) {
+    const r = pending(['0001.sql'], ['0001.sql'], { setup });
+    assert.match(r.out, /^pending=true\n/, label);
+    assert.match(r.stderr, /cannot classify/, label);
+  }
+});
+test('migration-pending: malformed or failed query output fails closed (non-zero, no verdict on stdout)', () => {
+  for (const bad of ['not json', '{}', '[]', '[{"results":[],"success":false}]']) {
+    const r = pending(['0001.sql'], [], { appliedText: bad });
+    assert.notEqual(r.status, 0, bad); assert.equal(r.out, '', bad);
+  }
 });

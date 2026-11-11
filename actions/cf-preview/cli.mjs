@@ -9,7 +9,7 @@ import {
 } from './lib.mjs';
 import {
   DELIVERY_KINDS, ENGINE_TARGET, assertKind, branchPreviewIdentity, canonicalOrigin, checkBuildEnvOrigins, environmentName, foreignUrlsInBuildEnv, planMigrations, resolveCanonicalUrl, resolveDeliveryTargets, resolveSmokeMode,
-  buildDescriptors, parseDescriptor, resolveMigrationUsed, parseD1Rows, pendingMigrations, verificationOutcome, prodRollbackBlock, nonProdRecoveryBlock, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
+  buildDescriptors, parseDescriptor, resolveMigrationUsed, parseD1Rows, pendingMigrations, classifyMigrationEntries, verificationOutcome, prodRollbackBlock, nonProdRecoveryBlock, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
 } from './delivery.mjs';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -158,9 +158,14 @@ try {
     case 'migration-pending': {
       // Read-only precheck: --dir <migrations dir> --exists <json file> [--applied <json file>] (both `wrangler d1 execute --json` stdout).
       // Prints pending=true|false and pending_count. A missing migrations table = everything pending. Any malformed input throws (fail closed).
-      const files = readdirSync(resolve(opt('dir'))).filter((f) => /^[\w.-]+\.sql$/.test(f));
-      const tableExists = parseD1Rows(readFileSync(opt('exists'), 'utf8')).length > 0;
+      const { files, ambiguous } = classifyMigrationEntries(readdirSync(resolve(opt('dir')), { withFileTypes: true }).map((e) => ({ name: e.name, file: e.isFile() })));
+      const tableExists = parseD1Rows(readFileSync(opt('exists'), 'utf8')).length > 0;   // parsed even when unused: malformed output always throws
       const applied = tableExists ? parseD1Rows(readFileSync(opt('applied'), 'utf8')) : [];
+      if (ambiguous.length) { // cannot prove the complete migration set -> never "nothing pending"
+        console.error(`::notice::migration entries the precheck cannot classify with certainty (${JSON.stringify(ambiguous)}); running the full path.`);
+        out({ pending: 'true', pending_count: String(ambiguous.length) });
+        break;
+      }
       const pending = pendingMigrations({ files, tableExists, applied });
       out({ pending: String(pending.length > 0), pending_count: String(pending.length) });
       break;

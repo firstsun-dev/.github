@@ -88,7 +88,7 @@ case "$3 $4 $5" in
                case "$*" in
                  *sqlite_master*) [ "${STUB_NO_TABLE:-}" = 1 ] && echo '[{"results":[],"success":true,"meta":{}}]' || echo '[{"results":[{"name":"d1_migrations"}],"success":true,"meta":{}}]';;
                  *) A="${STUB_APPLIED-$([ "${STUB_PENDING:-1}" = 1 ] || echo 0001.sql)}"; R=""
-                    for f in $A; do R="$R${R:+,}{\"name\":\"$f\"}"; done; echo "[{\"results\":[$R],\"success\":true,\"meta\":{}}]";;
+                    IFS='|' read -ra AF <<< "$A"; for f in "${AF[@]}"; do R="$R${R:+,}{\"name\":\"$f\"}"; done; echo "[{\"results\":[$R],\"success\":true,\"meta\":{}}]";;
                esac;;
   "d1 migrations list") [ "${STUB_PENDING:-1}" = 1 ] && echo "Migrations to be applied: ${STUB_PENDING_FILES-0001.sql}" || echo "No migrations to apply!";;
   "d1 migrations apply") [ "${STUB_APPLY_FAIL:-}" = 1 ] && exit 7
