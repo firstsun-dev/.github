@@ -71,14 +71,14 @@ force-pushed back to the original commit in between (A → B → A) the tip look
 | Nesting depth | caller → `_cf-worker-v2.yml` → `_cf-worker-delivery.yml` / `-ci` / `-lifecycle` = 3 levels (limit 10); none of them calls a further workflow |
 | Permission ceiling | each `uses:` job declares the permissions the called jobs need (`contents: read`; `deployments: read` for the Migration job, `deployments: write` + `pull-requests: write` for Delivery); the caller of the public workflow already had to grant these |
 | Static `uses:` | `$/.github/workflows/_cf-worker-delivery.yml` per call (no expression); actions are `uses: $/actions/<name>` (this repository at the running commit) |
-| `tools_ref` | deprecated and ignored: `$/` makes the engine always come from the commit of the running workflow |
+| Tooling version | `$/` always selects the running workflow's commit; there is no caller-side `tools_ref` input |
 | Secrets | passed explicitly per call (smoke credentials only to Delivery); never `secrets: inherit` |
 | Environments | job property inside the called workflow (`<app>/prod`, `/preview`, `/native-dev`, `/dev`); the Migration job runs in the owner's Environment; Smoke has none |
 | Concurrency | the run-level group stays on the public workflow; the delivery workflow has **only job-level** groups (`cfv2-leg-<run>-<kind>[-rollback]`, persistent Dev keeps `cfv2-dev-<repo>-<scope>`) so nothing deadlocks |
 
 ## Inputs
 
-All pre-existing inputs are unchanged (names, types, defaults). New, all optional and default-off:
+The retired `tools_ref` and `dev_deploy_cmd` compatibility inputs are no longer declared. Other active inputs keep their contracts. This section records the earlier v2 interface expansion; additions were optional and default-off:
 
 | Input | Default | Meaning |
 | --- | --- | --- |
