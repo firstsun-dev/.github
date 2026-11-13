@@ -89,6 +89,13 @@ ident preview native-preview native-branch "$URL"; build preview
 (GITHUB_RUN_ID=78 EXPECTED_URL=$URL pub preview >/dev/null 2>&1) && bad "refused: artifact of another run" || ok "refused: artifact of another run"
 (CFV2_TARGET=dev CFV2_DRIVER=worker CFV2_SLOT=persistent-dev EXPECTED_URL=$URL pub preview >/dev/null 2>&1) && bad "refused: artifact built for another target" || ok "refused: artifact built for another target"
 
+# artifact-verify recorded the audited digest; a rewrite between the audit and the publish (shared host) is refused before any remote call
+ident preview native-preview native-branch "$URL"; build preview
+mkdir -p "$T/state"; node "$ROOT/actions/cf-preview/cli.mjs" verify-artifact --dir "$T/artifact" | sed -n 's/^artifact_digest=//p' > "$T/state/artifact.digest"
+echo evil > "$T/artifact/worker/index.js"
+node -e 'const fs=require("fs"),c=require("crypto"),d=process.argv[1];const m=JSON.parse(fs.readFileSync(d+"/manifest.json"));const h=c.createHash("sha256");for(const f of ["wrangler.json","worker/index.js"].sort())h.update(f+"\0"+c.createHash("sha256").update(fs.readFileSync(d+"/"+f)).digest("hex")+"\n");m.files_digest=h.digest("hex");fs.writeFileSync(d+"/manifest.json",JSON.stringify(m))' "$T/artifact"
+if EXPECTED_URL=$URL pub preview >/dev/null 2>&1; then bad "refused: artifact rewritten after its audit (consistent manifest)"; elif grep -q "^wr " "$STUB_LOG"; then bad "TOCTOU refusal must precede any remote call"; else ok "refused before any remote call: artifact rewritten between audit and publish (digest recorded by artifact-verify)"; fi
+
 # ---- production: versions upload -> versions deploy, previous version recorded --------------------------------------------------------------
 ident production worker production "https://app.example.com"; build prod
 OUT="$(APP_URL=https://app.example.com pub prod)" && printf '%s' "$OUT" | grep -qx 'version_id=new-2' && printf '%s' "$OUT" | grep -qx 'previous_version_id=prev-1' && ok "prod: uploads then deploys the artifact; records the previous version" || { bad "prod publish"; echo "$OUT"; cat "$T/pub.err"; }

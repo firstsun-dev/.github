@@ -20,7 +20,7 @@
 # AFTER another Worker's deployment (workflow input pipeline_phase) verifies the published Dev deployment later.
 #
 # State ($STATE_DIR, default $RUNNER_TEMP/cfv2, 0700): inputs.json, target, build.env / smoke.env /
-# preview.env (validated KEY=VALUE data), config.* and artifact.sha (from build.sh), ledger_id, preview_name, ...
+# preview.env (validated KEY=VALUE data), config.* and artifact.digest (from build.sh), ledger_id, preview_name, ...
 # Application env (build_env_*, smoke_env, preview secrets) is only ever loaded inside the process that needs it and
 # can never set a reserved control variable (parse-env.mjs RESERVED). The target is bound ONCE in `init` (from the
 # composite input, not from the environment) and re-read from state by every phase.
@@ -120,10 +120,12 @@ run_publish() { # <out file> <app version> <commit message>: publishes ONLY $ART
 }
 # The privileged side's OWN expectations (descriptor, GitHub context, inputs, event) - never the artifact's claims.
 artifact_env() {
-  local drv url
+  local drv url att
   drv="$(rd driver)"; url="$(target_url)"
+  [ -s "$S/artifact_attempt" ] || printf '%s' "${GITHUB_RUN_ATTEMPT:-1}" > "$S/artifact_attempt"
+  att="$(rd artifact_attempt)"
   export CFV2_REPOSITORY="$GITHUB_REPOSITORY" CFV2_APP="$APP_NAME" CFV2_TARGET="$DELIVERY_TARGET" CFV2_DRIVER="$drv" CFV2_SLOT="$KIND" \
-    CFV2_RUN_ID="${GITHUB_RUN_ID:-0}" CFV2_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}" CFV2_SOURCE_SHA="$SOURCE_SHA" CFV2_TESTED_SHA="$TESTED_SHA" CFV2_ARTIFACT_SHA="$TESTED_SHA" CFV2_TARGET_URL="$url"
+    CFV2_RUN_ID="${GITHUB_RUN_ID:-0}" CFV2_RUN_ATTEMPT="$att" CFV2_SOURCE_SHA="$SOURCE_SHA" CFV2_TESTED_SHA="$TESTED_SHA" CFV2_ARTIFACT_SHA="$TESTED_SHA" CFV2_TARGET_URL="$url"
 }
 
 stale_check() { # sets STALE for the rest of the job when the branch moved on; FAILS when the tip cannot be resolved
@@ -156,6 +158,7 @@ case "$PHASE" in
     # The Plan resolved the canonical URL (the only step that may need Cloudflare to know it) and the artifact lives in a directory the workflow downloaded.
     [ -z "${ENGINE_ARTIFACT_DIR:-}" ] || printf '%s' "$ENGINE_ARTIFACT_DIR" > "$S/artifact_dir"
     [ -z "${ENGINE_TARGET_URL:-}" ] || printf '%s' "$ENGINE_TARGET_URL" > "$S/target_url"
+    [ -z "${ENGINE_ARTIFACT_ATTEMPT:-}" ] || printf '%s' "$ENGINE_ARTIFACT_ATTEMPT" > "$S/artifact_attempt"
     # Prod, Preview and Dev all use the one account credential pair (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID). The stages that RUN APPLICATION CODE
     # - the Build and the Smoke - never receive Cloudflare credentials; the stages that hold them (migrate, publish, rollback) never run an application build.
     case "$(rd stage)" in
@@ -211,12 +214,19 @@ case "$PHASE" in
     ctx
     [ -d "$ARTIFACT_DIR" ] || die "no artifact at '$ARTIFACT_DIR': the Build job did not hand one over; refusing"
     artifact_env
+    # The Worker name of Production is pinned to the (protected-revision) source config the job checked out; the artifact cannot choose it.
+    if [ "$TARGET" = prod ]; then
+      CFV2_WORKER_NAME="$(node "$TOOLS_DIR/cli.mjs" worker-name --config "$APP_DIR/$WRANGLER_CONFIG" | sed -n 's/^worker_name=//p')"; export CFV2_WORKER_NAME
+      [ -n "$CFV2_WORKER_NAME" ] || die "no safe Worker name in the source config; refusing"
+    fi
+    export CFV2_DEV_ENV="$DEV_ENV"
     V="$(node "$TOOLS_DIR/cli.mjs" verify-artifact --dir "$ARTIFACT_DIR")" || die "artifact verification failed; nothing was migrated or published"
+    # The audit / publish mode is DERIVED from the packaged config by the privileged side (never from the manifest): a Dev Worker whose config keeps a
+    # named environment is audited and published through that environment; everything else is flat.
     MODE="$(printf '%s\n' "$V" | sed -n 's/^config_mode=//p')"; CFG_PATH="$ARTIFACT_DIR/wrangler.json"
     case "$TARGET" in
       preview) node "$TOOLS_DIR/cli.mjs" preflight --config "$CFG_PATH" --allow "$(inp preview_binding_allow)" --deny "$(inp preview_deny_resources)" >&2 || die "the packaged Preview config violates the resource policy";;
-      prod)
-        if [ "$MODE" = effective ]; then node "$TOOLS_DIR/cli.mjs" audit-prod --effective "$CFG_PATH" --source "$APP_DIR/$WRANGLER_CONFIG" --allow "$(inp preview_binding_allow)" >&2 || die "the packaged Production config violates the resource policy"; fi;;
+      prod) node "$TOOLS_DIR/cli.mjs" audit-prod --effective "$CFG_PATH" --source "$APP_DIR/$WRANGLER_CONFIG" --allow "$(inp preview_binding_allow)" >&2 || die "the packaged Production config violates the resource policy";;
       dev)
         if [ "$MODE" = effective ]; then DEVEFF="$CFG_PATH"; DEVSRC="$APP_DIR/$WRANGLER_CONFIG"; else DEVEFF=""; DEVSRC="$CFG_PATH"; fi
         node "$TOOLS_DIR/cli.mjs" dev-config-check --effective "$DEVEFF" --source "$DEVSRC" --worker "$(inp dev_worker_name)" --deny "$(inp dev_deny_resources)" --dev-env "$DEV_ENV" \
@@ -224,15 +234,16 @@ case "$PHASE" in
     esac
     printf '%s' "$CFG_PATH" > "$S/config.path"; printf '%s' "$MODE" > "$S/config.mode"
     sha256sum "$CFG_PATH" | cut -d' ' -f1 > "$S/config.sha"
-    printf '%s\n' "$V" | sed -n 's/^artifact_digest=//p' > "$S/artifact.sha"
-    echo "artifact_digest=$(rd artifact.sha)"; echo "artifact_sha=$TESTED_SHA";;
+    printf '%s\n' "$V" | sed -n 's/^artifact_digest=//p' > "$S/artifact.digest"
+    echo "artifact_digest=$(rd artifact.digest)"; echo "artifact_sha=$TESTED_SHA";;
 
   audit-d1)
     ctx
     [ "$(inp d1_migrations)" = true ] || exit 0
+    [ "$DELIVERY_TARGET" != preview ] || exit 0   # a Preview never migrates a remote D1 and has no source checkout here; its packaged config was audited by artifact-verify
     # The D1 the DEPLOYED config binds must be the exact physical database the migration targets, and the migration
     # directory must be real: checked read-only before any remote command.
-    D1R="$(node "$TOOLS_DIR/cli.mjs" d1-consistency --config "$(rd config.path)" --source "$APP_DIR/$WRANGLER_CONFIG" --target "$TARGET" --binding "$D1_BINDING" --dev-env "$DEV_ENV" --mode "$(rd config.mode)")" || die "the built $KIND config does not bind the audited D1"
+    D1R="$(node "$TOOLS_DIR/cli.mjs" d1-consistency --config "$(rd config.path)" --source "$APP_DIR/$WRANGLER_CONFIG" --target "$TARGET" --binding "$D1_BINDING" --dev-env "$DEV_ENV" --mode effective)" || die "the built $KIND config does not bind the audited D1"
     printf '%s\n' "$D1R" >&2
     D1_ID="$(printf '%s\n' "$D1R" | sed -n 's/^d1_id=//p')"
     [ -n "$D1_ID" ] || die "the built $KIND config binds no D1 database id"
@@ -296,7 +307,7 @@ case "$PHASE" in
     artifact_env
     run_publish "$S/preview.json" "$(inp app_version)" "$COMMIT_MSG"
     # Reached only when publish.sh succeeded: the hand-off of this deployment to the Smoke / Rollback jobs.
-    echo "published=true"; echo "published_sha=$RUN_SHA"; echo "artifact_digest=$(rd artifact.sha)"; echo "source_sha=$SOURCE_SHA"; echo "ledger_id=$LEDGER_ID"; echo "preview_name=$PREVIEW_NAME"
+    echo "published=true"; echo "published_sha=$RUN_SHA"; echo "artifact_digest=$(rd artifact.digest)"; echo "source_sha=$SOURCE_SHA"; echo "ledger_id=$LEDGER_ID"; echo "preview_name=$PREVIEW_NAME"
     echo "worker_name=$AUDITED_NAME"; echo "kind=$KIND"; echo "target_url=$(target_url)"; echo "d1_id=$(rd d1_id)";;
 
   hydrate) # Smoke / Rollback jobs: validated hand-off from the Migration / Deploy / Smoke jobs (data, never runner files)
@@ -371,7 +382,7 @@ case "$PHASE" in
     TARGET_URL="$URL" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="$RUN_SHA" SMOKE_CMD="$(kind_smoke_cmd)" SMOKE_CWD="$APP_DIR" SHA_PATH="$(inp sha_path)" \
       PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" \
       ACCESS_TARGETS="$(inp access_protected_targets)" SMOKE_ENV_FILE="$S/smoke.env" PREVIEW_ENV_FILE="$S/preview.env" NO_PROXY='*' \
-      "$TOOLS_DIR/smoke.sh";;
+      env -u GH_TOKEN -u GITHUB_TOKEN -u CLOUDFLARE_API_TOKEN -u CLOUDFLARE_ACCOUNT_ID "$TOOLS_DIR/smoke.sh";;
 
   verified) # smoke passed: published; "verified" only at content level (liveness = Access login reachable only)
     ctx
@@ -497,16 +508,16 @@ case "$PHASE" in
       summary "### 🚨 Automatic rollback to \`$PREV\` FAILED — Production may serve the unverified version \`$NEW\`. Roll back manually: \`$MANUAL\`."
     fi;;
 
-  prod-rollback-verify) # smoke the RESTORED deployment: previous commit when resolvable, else "no longer serves the failed commit"
+  prod-rollback-verify) # (built-in probe only: this credential-bearing job runs no application smoke command) smoke the RESTORED deployment: previous commit when resolvable, else "no longer serves the failed commit"
     ctx
     RB="$S/rollback"; PREV_SHA=""
     VIEW="$(cd "$RB" && "$WRANGLER" versions view "${PREVIOUS_VERSION_ID:?}" --config "$RB/wrangler.json" --json 2>/dev/null || true)"
     PREV_SHA="$(printf '%s' "$VIEW" | jq -r '.annotations["workers/message"] // .message // empty' 2>/dev/null | grep -oE '^\[[0-9a-f]{7}\]' | tr -d '[]' | head -1 || true)"
     [ -z "$PREV_SHA" ] || PREV_SHA="$(cd "$APP_DIR" && git rev-parse --verify --quiet "$PREV_SHA^{commit}" 2>/dev/null || echo "$PREV_SHA")"
     echo "previous_commit=$PREV_SHA"
-    TARGET_URL="$(target_url)" DEPLOY_TARGET=prod TEST_ENV=prod EXPECTED_SHA="$PREV_SHA" ABSENT_SHA="$RUN_SHA" SMOKE_CMD="$(kind_smoke_cmd)" SMOKE_CWD="$APP_DIR" SHA_PATH="$(inp sha_path)" \
+    TARGET_URL="$(target_url)" DEPLOY_TARGET=prod TEST_ENV=prod EXPECTED_SHA="$PREV_SHA" ABSENT_SHA="$RUN_SHA" SMOKE_CMD="" SMOKE_CWD="$APP_DIR" SHA_PATH="$(inp sha_path)" \
       PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" ACCESS_TARGETS="$(inp access_protected_targets)" \
-      SMOKE_ENV_FILE="$S/smoke.env" PREVIEW_ENV_FILE="$S/preview.env" NO_PROXY='*' "$TOOLS_DIR/smoke.sh";;
+      SMOKE_ENV_FILE="$S/smoke.env" PREVIEW_ENV_FILE="$S/preview.env" NO_PROXY='*' env -u GH_TOKEN -u GITHUB_TOKEN -u CLOUDFLARE_API_TOKEN -u CLOUDFLARE_ACCOUNT_ID "$TOOLS_DIR/smoke.sh";;
 
   rollback-finish) # final, target-independent verdict of the Rollback job (ok=true only when restored AND content-verified)
     ctx

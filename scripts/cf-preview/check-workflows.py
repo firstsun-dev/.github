@@ -89,6 +89,10 @@ else:
         errors.append("build job permissions must be exactly {contents: read}")
     if b.get("runs-on") and "ubuntu-24.04" not in str(b["runs-on"]):
         errors.append("build job must run on the approved hosted runner for pull_request events")
+if b and "PREVIEW_SECRETS" in yaml.dump(b):
+    errors.append("build job must not receive PREVIEW_SECRETS (the PR's build command could exfiltrate them)")
+if b and "artifact_name" not in (b.get("outputs") or {}):
+    errors.append("build job must output artifact_name / artifact_attempt (consumers use them, so a partial re-run still finds the artifact)")
 for jid in ("migration", "delivery"):
     need = set(pub[jid].get("needs", []))
     if not {"ci", "build"} <= need:
@@ -108,6 +112,16 @@ for st in act:
         errors.append("the engine must not install application dependencies in the migrate / publish / precheck stages")
     if "engine.sh\" build" in str(st.get("run", "")) and "inputs.stage == 'build'" not in cond:
         errors.append("the build phase must be limited to stage build")
+for st in act:
+    n = str(st.get("name", "")); cond = str(st.get("if", ""))
+    if n.startswith("Stale-SHA guard (start)") and ("'build'" in cond or "!= 'verify'" in cond):
+        errors.append("the stale guard needs a GitHub token: it must run only for precheck / migrate / publish, never the token-less build")
+    if n == "Setup dependencies" and "'rollback'" in cond:
+        errors.append("the credential-bearing rollback must not install application dependencies")
+for jid in ("smoke", "rollback", "deploy"):
+    for st in dlv[jid].get("steps", []):
+        if str(st.get("uses", "")).startswith("actions/checkout") and "head.sha" in str(st.get("with", {})):
+            errors.append(f"delivery job '{jid}' must check out the tested merge candidate (github.sha), not the PR head")
 names = [str(st.get("name", "")) for st in act]
 iv = next((i for i, n in enumerate(names) if n.startswith("Verify the artifact")), -1)
 ip = next((i for i, n in enumerate(names) if n.startswith("Prepare")), -1)

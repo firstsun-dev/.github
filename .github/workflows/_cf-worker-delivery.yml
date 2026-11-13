@@ -68,6 +68,10 @@ on:
         description: Name of the build artifact the unprivileged Build job of THIS run uploaded (downloaded and verified before anything else; the deploy never builds).
         type: string
         default: ''
+      artifact_attempt:
+        description: run_attempt of the Build job that produced the artifact (a partial re-run keeps an earlier attempt's artifact).
+        type: string
+        default: ''
       target_url:
         description: Canonical URL the Plan resolved before the build; the artifact and the published URL must both match it.
         type: string
@@ -163,12 +167,12 @@ jobs:
           kind: ${{ fromJSON(inputs.descriptor).slot }}
           stage: publish
           artifact_dir: ${{ runner.temp }}/cfv2-artifact
+          artifact_attempt: ${{ inputs.artifact_attempt }}
           target_url: ${{ inputs.target_url }}
           migration_result: ${{ inputs.migration_result }}
           migration_json: ${{ inputs.migration_json }}
           inputs_json: ${{ inputs.inputs_json }}
           d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
-          preview_secrets: ${{ fromJSON(inputs.descriptor).engine_target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
 
   # -------------------------------------------------------------------------
   # Smoke — verifies THIS kind's deployment only (stage verify, no Cloudflare credentials): smoke_mode full | basic | skip.
@@ -220,7 +224,7 @@ jobs:
       - uses: actions/checkout@v6
         if: steps.go.outputs.go == 'true'
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - id: engine
         if: steps.go.outputs.go == 'true'
@@ -304,7 +308,7 @@ jobs:
       - uses: actions/checkout@v6
         if: steps.go.outputs.go == 'true'
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - id: engine

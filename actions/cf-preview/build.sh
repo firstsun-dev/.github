@@ -72,7 +72,6 @@ esac
 printf '%s' "$CONFIG_PATH" > "$STATE_DIR/config.path"
 printf '%s' "$MODE" > "$STATE_DIR/config.mode"
 sha256sum "$CONFIG_PATH" | cut -d' ' -f1 > "$STATE_DIR/config.sha"
-node "$TOOLS_DIR/cli.mjs" artifact-digest --config "$CONFIG_PATH" | sed -n 's/^artifact_digest=//p' > "$STATE_DIR/artifact.sha"
 echo "config_path=$CONFIG_PATH"
 echo "config_mode=$MODE"
 

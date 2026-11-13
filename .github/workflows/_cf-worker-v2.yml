@@ -482,6 +482,9 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    outputs:
+      artifact_name: ${{ format('cfv2-artifact-{0}-{1}', github.run_id, github.run_attempt) }}
+      artifact_attempt: ${{ github.run_attempt }}
     env:
       PR_NUMBER: ${{ github.event.pull_request.number }}
       PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
@@ -502,7 +505,6 @@ jobs:
           target_url: ${{ needs.plan.outputs.target_url }}
           inputs_json: ${{ needs.plan.outputs.inputs_json }}
           d1_expected_id: ${{ fromJSON(needs.plan.outputs.descriptor).d1_expected_id }}
-          preview_secrets: ${{ fromJSON(needs.plan.outputs.descriptor).engine_target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
       - uses: actions/upload-artifact@v7
         with:
           name: cfv2-artifact-${{ github.run_id }}-${{ github.run_attempt }}
@@ -549,7 +551,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v7
         with:
-          name: cfv2-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ needs.build.outputs.artifact_name }}
           path: ${{ runner.temp }}/cfv2-artifact
       - id: precheck
         name: Check pending D1 migrations (read-only, no build)
@@ -571,10 +573,10 @@ jobs:
           kind: ${{ fromJSON(needs.plan.outputs.descriptor).slot }}
           stage: migrate
           artifact_dir: ${{ runner.temp }}/cfv2-artifact
+          artifact_attempt: ${{ needs.build.outputs.artifact_attempt }}
           target_url: ${{ needs.plan.outputs.target_url }}
           inputs_json: ${{ needs.plan.outputs.inputs_json }}
           d1_expected_id: ${{ fromJSON(needs.plan.outputs.migration).d1_id }}
-          preview_secrets: ${{ fromJSON(needs.plan.outputs.descriptor).engine_target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
       # The one deterministic public status: applied | none (nothing was pending / superseded) when the job succeeded, failed otherwise
       # (also when a validation step stopped the job before the migrate step ran).
       - id: result
@@ -600,7 +602,8 @@ jobs:
       pull-requests: write
     with:
       descriptor: ${{ needs.plan.outputs.descriptor }}
-      artifact_name: ${{ inputs.pipeline_phase == 'verify' && '' || format('cfv2-artifact-{0}-{1}', github.run_id, github.run_attempt) }}
+      artifact_name: ${{ needs.build.outputs.artifact_name }}
+      artifact_attempt: ${{ needs.build.outputs.artifact_attempt }}
       target_url: ${{ needs.plan.outputs.target_url }}
       runner: ${{ inputs.runner }}
       inputs_json: ${{ needs.plan.outputs.inputs_json }}

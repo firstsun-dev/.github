@@ -25,7 +25,11 @@ TOOLS_DIR="$(cd "$TOOLS_DIR" && pwd)"  # absolute before `cd` (a relative path b
 WRANGLER="${WRANGLER:-$TOOLS_DIR/node_modules/.bin/wrangler}"
 [ "$CONFIG_PATH" = "$(cd "$ARTIFACT_DIR" && pwd)/wrangler.json" ] || [ "$CONFIG_PATH" = "$ARTIFACT_DIR/wrangler.json" ] || { echo "::error::the audited config is not the artifact's wrangler.json; refusing to publish" >&2; exit 1; }
 # Re-verify immediately before the remote call (identity from the privileged side's own env, see engine.sh artifact_env).
-node "$TOOLS_DIR/cli.mjs" verify-artifact --dir "$ARTIFACT_DIR" >/dev/null
+VER_OUT="$(node "$TOOLS_DIR/cli.mjs" verify-artifact --dir "$ARTIFACT_DIR")"
+# ...and it must be byte-for-byte the artifact artifact-verify audited (no rewrite between the audit and this call).
+if [ -s "$STATE_DIR/artifact.digest" ] && [ "$(printf '%s\n' "$VER_OUT" | sed -n 's/^artifact_digest=//p')" != "$(cat "$STATE_DIR/artifact.digest")" ]; then
+  echo "::error::the artifact changed between its verification and the publish; refusing to publish" >&2; exit 1
+fi
 cd "$ARTIFACT_DIR"
 export CLOUDFLARE_ENV=""   # the audited config is already flattened; a named env must never be applied on top
 CFG_ARGS=(--config "$CONFIG_PATH")

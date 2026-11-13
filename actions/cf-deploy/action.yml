@@ -20,6 +20,9 @@ inputs:
   artifact_dir:
     description: Directory of the build artifact. build stage - where the Build writes it; migrate / publish - where the workflow downloaded it (verified before anything else).
     default: ''
+  artifact_attempt:
+    description: run_attempt of the Build job that produced the artifact (a partial re-run keeps an earlier attempt's artifact). Empty = this attempt.
+    default: ''
   target_url:
     description: Canonical URL the Plan resolved BEFORE the build (the only Cloudflare read involved); every stage re-checks it against the artifact manifest and the published URL.
     default: ''
@@ -168,6 +171,8 @@ runs:
         ENGINE_STAGE: ${{ inputs.stage }}
         ENGINE_D1_EXPECT: ${{ inputs.d1_expected_id }}
         ENGINE_ARTIFACT_DIR: ${{ inputs.artifact_dir }}
+        ENGINE_ARTIFACT_ATTEMPT: ${{ inputs.artifact_attempt }}
+        ENGINE_DEV_ENV: ${{ fromJSON(inputs.inputs_json).dev_wrangler_env }}
         ENGINE_TARGET_URL: ${{ inputs.target_url }}
         ENGINE_DESCRIPTOR: ${{ inputs.descriptor }}
         INPUTS_JSON: ${{ inputs.inputs_json }}
@@ -212,12 +217,18 @@ runs:
         MIGRATION_JSON: ${{ inputs.migration_json }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" migration-gate | tee -a "$GITHUB_OUTPUT"'
     - name: Stale-SHA guard (start)
-      if: inputs.stage != 'verify' && inputs.stage != 'rollback'
+      if: inputs.stage == 'precheck' || inputs.stage == 'migrate' || inputs.stage == 'publish'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" guard start'
     - name: Setup dependencies
-      if: env.STALE != 'true' && env.CFV2_DEPS != 'done' && (inputs.stage == 'build' || inputs.stage == 'verify' || (inputs.stage == 'rollback' && inputs.target == 'prod'))
+      if: env.STALE != 'true' && env.CFV2_DEPS != 'done' && (inputs.stage == 'build' || inputs.stage == 'verify')
       uses: $/actions/setup
+      env:
+        # Dependency lifecycle scripts run application code: they get no GitHub token and no Cloudflare / smoke secret (the Build has none anyway).
+        GH_TOKEN: ''
+        GITHUB_TOKEN: ''
+        SMOKE_USERNAME: ''
+        SMOKE_PASSWORD: ''
       with:
         setup-node: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
         setup-pnpm: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}

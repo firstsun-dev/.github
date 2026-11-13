@@ -89,6 +89,11 @@ Removed (no compatibility shim): `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `
   (repository, app, target, driver, slot, run id + attempt, `source_sha`, `tested_sha`, `artifact_sha == tested_sha`, canonical URL). The Preview host Worker, Preview name and
   Worker name for Dev are set by the publisher. The digest detects corruption and mix-ups, **not** a malicious Build: the defence is that the Build holds no credential and
   the publisher re-audits the packaged config (`preview_binding_allow` / `preview_deny_resources`, Dev / Production audits, structural rules) before anything runs on Cloudflare.
+* The Build receives **no secret**: `PREVIEW_SECRETS` is not passed to it (a PR's build command could read it); build-time values must be non-secret `build_env_*`. Audit / publish mode
+  (flat vs a Dev Worker's named environment), the Production Worker name and the Preview host Worker are derived by the publisher, never from the manifest. A packaged config may not
+  carry `build`, `site`, `containers`, `alias`, `tsconfig`, `find_additional_modules`, `base_dir`, `dev`; the artifact may contain only `manifest.json`, `wrangler.json`, `worker/**`, `assets/**` (no hidden files).
+* The artifact name and attempt come from the Build job's outputs, so "Re-run failed jobs" keeps using the artifact of the attempt that built it.
+* Application code (`smoke_cmd`) never receives GitHub or Cloudflare tokens; the credential-bearing Production rollback re-smokes with the built-in probe only and installs no application dependency.
 * **Revision contract**: `source_sha` = PR head, `tested_sha` = the merge candidate CI tested, `artifact_sha` = what the Build checked out (must equal `tested_sha`), `deployed_sha` = recorded
   in the ledger = `tested_sha`. A PR Preview is built from and published as the tested merge candidate. Publish proceeds only while the PR is open, its head is still `source_sha` and
   GitHub's merge candidate is still `tested_sha` (a newer synchronization or a moved base makes the run stale). Main / Dev publish the pushed / approved commit under the existing branch-tip guard.

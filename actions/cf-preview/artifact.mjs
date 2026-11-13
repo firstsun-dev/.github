@@ -24,6 +24,9 @@ export const MANIFEST_KEYS = [
   'config_mode', 'worker_name', 'files_digest',
 ];
 const SHA_RE = /^[0-9a-f]{40}$/;
+/** Config keys with local side effects or that select behaviour of the publisher host: never allowed in a packaged config (root or any environment). */
+export const FORBIDDEN_KEYS = ['build', 'site', 'containers', 'alias', 'tsconfig', 'find_additional_modules', 'base_dir', 'dev'];
+const ALLOWED_TOP = (f) => f === 'manifest.json' || f === 'wrangler.json' || /^worker\//.test(f) || /^assets\//.test(f);
 const SAFE_REL = /^[A-Za-z0-9._@+-]+(\/[A-Za-z0-9._@+-]+)*$/;
 
 /** Every regular file below dir (sorted relative POSIX paths). Symlinks, sockets and other special files are refused: an artifact is plain files only. */
@@ -95,6 +98,12 @@ export function bundleEntryFor(outdir, main) {
   throw new Error(`cannot tell which file of the bundle (${names.join(', ') || 'none'}) is the Worker entry for main '${main}'`);
 }
 
+/**
+ * The audit / publish mode is DERIVED from the packaged config by the privileged side, never taken from the manifest: only a Dev Worker whose config keeps its
+ * named Wrangler environment is `source` (audited and published through `--env <devEnv>`); everything else is flat (`effective`).
+ */
+export const configMode = (cfg, { target, driver, devEnv = 'dev' }) => (target === 'dev' && driver === 'worker' && cfg?.env?.[devEnv] && typeof cfg.env[devEnv] === 'object' ? 'source' : 'effective');
+
 /** Assemble artifact/ from the audited config, the dry-run bundle and the asset directories, then write the manifest. */
 export function packageArtifact({ cfg, configDir, workspace, bundleDir, dest, manifest, effectiveMain }) {
   if (!existsSync(bundleDir)) throw new Error(`no bundle at ${bundleDir}: the dry-run build produced nothing`);
@@ -124,6 +133,7 @@ export function validateManifestShape(m) {
   if (extra.length || missing.length) throw new Error(`artifact manifest keys: unexpected [${extra}] missing [${missing}]`);
   if (m.v !== MANIFEST_VERSION) throw new Error(`artifact manifest version ${m.v} is not supported`);
   for (const k of ['source_sha', 'tested_sha', 'artifact_sha']) if (!SHA_RE.test(String(m[k]))) throw new Error(`artifact manifest ${k} is not a 40-hex commit`);
+  if (!['source', 'effective'].includes(m.config_mode)) throw new Error(`artifact manifest config_mode '${m.config_mode}' is not source | effective`);
   if (!/^[0-9a-f]{64}$/.test(String(m.files_digest))) throw new Error('artifact manifest files_digest is not a sha256');
   return m;
 }
@@ -154,18 +164,18 @@ export function verifyArtifact(dir, expect) {
   const cfg = JSON.parse(readFileSync(join(dir, 'wrangler.json'), 'utf8'));
   const problems = structuralProblems(cfg, files, expect);
   if (problems.length) throw new Error(`artifact configuration rejected: ${problems.join('; ')}`);
-  return { manifest: m, config: cfg };
+  return { manifest: m, config: cfg, mode: configMode(cfg, { target: expect.target, driver: expect.driver, devEnv: expect.devEnv }) };
 }
 
 /** Rules every packaged config must satisfy, whatever the target (the target-specific resource audit runs after this). */
 export function structuralProblems(cfg, files, expect = {}) {
   const bad = [];
+  for (const f of files) if (!ALLOWED_TOP(f) || f.split('/').some((seg) => seg.startsWith('.'))) bad.push(`unexpected file '${f}' (only manifest.json, wrangler.json, worker/**, assets/** without hidden files)`);
   if (cfg === null || typeof cfg !== 'object' || Array.isArray(cfg)) return ['wrangler.json is not an object'];
   if (cfg.no_bundle !== true) bad.push('no_bundle must be true (the publisher never bundles)');
   const names = [];
   for (const s of sections(cfg)) {
-    if ('build' in s) bad.push('a `build` command is not allowed');
-    if ('site' in s) bad.push('`site` is not allowed');
+    for (const k of FORBIDDEN_KEYS) if (k in s) bad.push(`config key '${k}' is not allowed in a packaged config`);
     if (typeof s.main === 'string') {
       names.push(s.main);
       if (!/^worker\//.test(s.main) || s.main.includes('..') || !SAFE_REL.test(s.main) || !files.includes(s.main)) bad.push(`main '${s.main}' is not a bundled file under worker/`);

@@ -72,7 +72,9 @@ try {
       break;
     case 'd1-consistency': {
       // The D1 the audited/published config binds must be the exact database the migration targets.
-      const r = checkDeployedD1(readConfig(opt('config')), readConfig(opt('source')), opt('target'), {
+      let deployed = readConfig(opt('config'));
+      if (opt('target') === 'dev' && deployed.env?.[opt('dev-env', 'dev')]) deployed = { ...deployed.env[opt('dev-env', 'dev')] }; // a Dev Worker packaged with its named environment
+      const r = checkDeployedD1(deployed, readConfig(opt('source')), opt('target'), {
         binding: opt('binding'), devEnv: opt('dev-env', 'dev'), mode: opt('mode', 'effective'),
       });
       out({ d1_binding: r.binding, d1_id: r.databaseId });
@@ -140,11 +142,11 @@ try {
     case 'verify-artifact': {
       // PRIVILEGED jobs: the artifact must match what THIS job expects (its own trusted data), before any audit or publish.
       const e = process.env;
-      const { manifest } = verifyArtifact(resolve(opt('dir')), {
+      const { manifest, mode } = verifyArtifact(resolve(opt('dir')), {
         repository: e.GITHUB_REPOSITORY, app: e.CFV2_APP, target: e.CFV2_TARGET, driver: e.CFV2_DRIVER, slot: e.CFV2_SLOT, runId: e.GITHUB_RUN_ID, runAttempt: e.GITHUB_RUN_ATTEMPT,
-        sourceSha: e.CFV2_SOURCE_SHA, testedSha: e.CFV2_TESTED_SHA, targetUrl: e.CFV2_TARGET_URL ?? '', workerName: '',
+        sourceSha: e.CFV2_SOURCE_SHA, testedSha: e.CFV2_TESTED_SHA, targetUrl: e.CFV2_TARGET_URL ?? '', workerName: e.CFV2_WORKER_NAME ?? '', devEnv: e.CFV2_DEV_ENV || 'dev',
       });
-      out({ artifact_digest: manifest.files_digest, artifact_sha: manifest.artifact_sha, config_mode: manifest.config_mode, worker_name: manifest.worker_name });
+      out({ artifact_digest: manifest.files_digest, artifact_sha: manifest.artifact_sha, config_mode: mode, worker_name: manifest.worker_name });
       break;
     }
     case 'effective-config': {

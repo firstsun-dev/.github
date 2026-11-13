@@ -30,7 +30,7 @@ cat > "$T/bin/gh" <<'STUB'
 printf '%s\t%s\t%s\n' "${PR_STATE:-open}" "${PR_HEAD:-aaaa}" "${PR_MERGE-bbbb}"
 STUB
 chmod +x "$T/bin/gh"
-fresh() { PATH="$T/bin:$PATH" GITHUB_REPOSITORY=o/r PR_NUMBER=4 BRANCH=feat RUN_SHA=bbbb SOURCE_SHA=aaaa "$@" "$GUARD" fresh 2>/dev/null; }
+fresh() { PATH="$T/bin:$PATH" GUARD_RETRY_SLEEP=0 GITHUB_REPOSITORY=o/r PR_NUMBER=4 BRANCH=feat RUN_SHA=bbbb SOURCE_SHA=aaaa "$@" "$GUARD" fresh 2>/dev/null; }
 [ "$(fresh env)" = stale=false ] && ok "PR fresh: open, same head, same merge candidate" || bad "PR fresh: current run"
 [ "$(fresh env PR_HEAD=cccc)" = stale=true ] && ok "PR stale: a newer synchronization moved the head" || bad "PR stale: head moved"
 [ "$(fresh env PR_MERGE=dddd)" = stale=true ] && ok "PR stale: the base moved (different merge candidate)" || bad "PR stale: merge candidate moved"
@@ -39,5 +39,11 @@ fresh() { PATH="$T/bin:$PATH" GITHUB_REPOSITORY=o/r PR_NUMBER=4 BRANCH=feat RUN_
 fresh env GH_FAIL=1 >/dev/null && bad "PR fresh: an unreadable PR fails closed (non-zero)" || ok "PR fresh: an unreadable PR fails closed (non-zero)"
 # A -> B -> A: head returns to the old value, but GitHub computes a new merge candidate, so the old run (old merge SHA) is still stale.
 [ "$(fresh env PR_HEAD=aaaa PR_MERGE=eeee)" = stale=true ] && ok "PR stale: A -> B -> A (same head, newer merge candidate) is superseded" || bad "PR stale: A->B->A"
+
+# ---- a Preview of an app with d1_migrations has NO source checkout in the privileged job: audit-d1 must not read it ------------------------------------
+echo '{"app_name":"blog","build_cmd":"true","production_rollback_policy":"manual","preview_policy":"pr","d1_migrations":true}' > "$T/in.json"
+init publish CLOUDFLARE_API_TOKEN=t CLOUDFLARE_ACCOUNT_ID=a || { bad "preview+d1_migrations init"; cat "$T/err"; }
+env -i PATH="$PATH" HOME="$T" RUNNER_TEMP="$T/rt" STATE_DIR="$T/s-publish" TOOLS_DIR="$TOOLS" GITHUB_WORKSPACE="$T/no-checkout" GITHUB_EVENT_NAME=pull_request GITHUB_REF=refs/pull/4/merge \
+  GITHUB_SHA=bbbb PR_NUMBER=4 PR_HEAD_REF=feat PR_HEAD_SHA=aaaa "$ENGINE" audit-d1 >/dev/null 2>"$T/err" && ok "audit-d1: a Preview with d1_migrations needs no source checkout" || { bad "audit-d1: Preview without checkout"; cat "$T/err"; }
 
 [ "$fail" = 0 ] && echo "ALL PASSED" || { echo "FAILURES"; exit 1; }

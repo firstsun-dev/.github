@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { packageArtifact, verifyArtifact, rewriteConfig, structuralProblems, filesDigest, bundleEntryFor } from '../../actions/cf-preview/artifact.mjs';
+import { packageArtifact, verifyArtifact, rewriteConfig, structuralProblems, filesDigest, bundleEntryFor, configMode } from '../../actions/cf-preview/artifact.mjs';
 
 const SHA = (c) => c.repeat(40);
 const ID = { repository: 'o/r', app: 'blog', target: 'preview', driver: 'native-preview', slot: 'native-branch', run_id: '77', run_attempt: '1',
@@ -71,6 +71,9 @@ test('verify: a forged config (even with a recomputed digest) is rejected by the
   assert.throws(() => verifyArtifact(forge((c) => { c.assets.directory = '/'; }), EXPECT), /assets directory/);
   assert.throws(() => verifyArtifact(forge((c) => { c.env = { dev: { main: 'worker/missing.js' } }; }), EXPECT), /bundled file/);
   assert.throws(() => verifyArtifact(forge((c) => { c.site = { bucket: '.' }; }), EXPECT), /site/);
+  assert.throws(() => verifyArtifact(forge((c) => { c.containers = [{ image: './Dockerfile' }]; }), EXPECT), /containers/);
+  assert.throws(() => verifyArtifact(forge((c) => { c.alias = { a: '/etc/x' }; }), EXPECT), /alias/);
+  assert.throws(() => verifyArtifact(forge((c) => { c.env = { dev: { containers: [] } }; }), EXPECT), /containers/, 'forbidden keys are checked in every environment section');
   assert.doesNotThrow(() => verifyArtifact(f.dest, EXPECT));
 });
 test('rewrite: env sections are rewritten too; an assets directory outside the workspace is refused', () => {
@@ -85,4 +88,30 @@ test('bundle entry: matches main by stem, else the single JS file, else refuses'
   assert.equal(bundleEntryFor(d, 'src/index.ts'), 'index.js');
   assert.throws(() => bundleEntryFor(d, 'src/other.ts'), /cannot tell/);
   assert.deepEqual(structuralProblems({ name: 'x', no_bundle: true, main: 'worker/index.js' }, ['worker/index.js'], { workerName: 'y' }), ["Worker name 'x' is not the expected 'y'"]);
+});
+
+test('verify: only manifest.json, wrangler.json, worker/** and assets/** are allowed; hidden files are refused', () => {
+  for (const extra of ['.env', 'worker/.dev.vars', 'assets/0/.env', 'package.json', 'node_modules/x.js']) {
+    const f = fixture(); pack(f);
+    mkdirSync(join(f.dest, extra.includes('/') ? extra.split('/').slice(0, -1).join('/') : '.'), { recursive: true });
+    writeFileSync(join(f.dest, extra), 'x');
+    // re-seal so only the surface rule can reject it
+    const mp = join(f.dest, 'manifest.json'); const m = JSON.parse(readFileSync(mp, 'utf8')); m.files_digest = filesDigest(f.dest); writeFileSync(mp, JSON.stringify(m));
+    assert.throws(() => verifyArtifact(f.dest, EXPECT), /unexpected file/, extra);
+  }
+});
+test('config mode is derived by the privileged side from the packaged config, never from the manifest', () => {
+  const dev = { target: 'dev', driver: 'worker', devEnv: 'dev' };
+  assert.equal(configMode({ env: { dev: { name: 'x' } } }, dev), 'source');
+  assert.equal(configMode({ env: { dev: { name: 'x' } } }, { ...dev, driver: 'native-preview' }), 'effective');
+  assert.equal(configMode({ env: { dev: { name: 'x' } } }, { target: 'production', driver: 'worker' }), 'effective');
+  assert.equal(configMode({ name: 'x' }, dev), 'effective');
+  const f = fixture(); pack(f, { ...ID, config_mode: 'effective' });
+  assert.equal(verifyArtifact(f.dest, EXPECT).mode, 'effective');
+  assert.throws(() => pack(fixture(), { ...ID, config_mode: 'bogus' }), /config_mode/);
+});
+test('verify: the Production Worker name is pinned by the privileged side', () => {
+  const f = fixture(); pack(f);
+  assert.doesNotThrow(() => verifyArtifact(f.dest, { ...EXPECT, workerName: 'blog' }));
+  assert.throws(() => verifyArtifact(f.dest, { ...EXPECT, workerName: 'other-prod-worker' }), /Worker name 'blog' is not the expected/);
 });
