@@ -237,9 +237,6 @@ try {
       const i = JSON.parse(process.env.INPUTS_JSON ?? '{}');
       const str = (k) => (i[k] == null ? '' : String(i[k]));
       const bool = (k) => i[k] === true || i[k] === 'true';
-      // The engine is the ONLY publisher of a Worker. The former caller-supplied publish command is retired: refuse it before anything runs
-      // (an explicit, actionable error instead of a silently different deployment).
-      if (str('dev_deploy_cmd').trim() !== '') throw new Error('dev_deploy_cmd is no longer supported: the shared engine publishes the audited Wrangler config itself. Remove the input and build in dev_build_cmd (or build_cmd); nothing was built, migrated or published.');
       let kinds;
       let restored = null; // verify: the DEPLOY call's own descriptors (validated); nothing is re-derived from this call's inputs
       if (opt('phase') === 'verify') {

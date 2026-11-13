@@ -87,7 +87,7 @@ move v2 ──►  monitor
   ```
 
   The consumer-side fixes (no `CLOUDFLARE_PREVIEW_*`) are valid against both refs, so they do not need reverting.
-* **Pin one consumer** to a known-good immutable SHA instead (per-repository, no tag change): change `uses: firstsun-dev/.github/.github/workflows/_cf-worker-v2.yml@v2` to `@<40-character SHA>`. `tools_ref` is deprecated and ignored, so it needs no change. Pin to `def3679…` (old behaviour) or to `M` (new behaviour).
+* **Pin one consumer** to a known-good immutable SHA instead (per-repository, no tag change): change `uses: firstsun-dev/.github/.github/workflows/_cf-worker-v2.yml@v2` to `@<40-character SHA>`. Callers must not pass the retired `tools_ref` input (removed). Pin to `def3679…` (old behaviour) or to `M` (new behaviour).
 * **Not reverted by restoring the tag:** Workers and Preview deployments that were already published (restore with the pipeline's own Production rollback, or redeploy a known-good commit; Production rollback is `manual` or `automatic` per caller via `production_rollback_policy`); **D1 migrations** that were applied (there is no automatic schema rollback; additive-only is assumed by the `automatic` policy, which blocks otherwise); Cloudflare Previews created; GitHub Deployment ledger entries and Environments; semantic-release tags / releases; Smoke / Release side effects. A tag restore only changes what the *next* run executes. A run already in flight keeps the revision it resolved.
 
 ## Validation evidence (candidate `f86062d`)

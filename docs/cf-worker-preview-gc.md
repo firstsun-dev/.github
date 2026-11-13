@@ -42,7 +42,6 @@ Only Preview names derived from `<app>/preview/<name>` ledger environments are e
 | `targets` | required | JSON `[{"app_name","preview_worker_name?","account_id"}]`, one entry per Worker (monorepo) |
 | `protected_previews` | `[]` | JSON `[{"account_id","host_worker","preview_name"}]` — explicit allowlist, no name guessing |
 | `only_previews` | – | JSON `["name"]`, restrict a controlled cleanup to exactly these |
-| `tools_ref` | required | must equal the ref the caller pins |
 
 Secrets: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` (same pair as v2; there are no Preview-specific credentials). A target whose `account_id` differs from the supplied credentials is reported as ERROR and untouched; for several Cloudflare accounts add one caller job per account with its own secrets.
 
@@ -71,7 +70,6 @@ jobs:
   gc:
     uses: firstsun-dev/.github/.github/workflows/_cf-worker-preview-gc.yml@<immutable ref>
     with:
-      tools_ref: <same immutable ref>
       enabled: true
       dry_run: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run }}   # schedule stays dry-run until you edit this
       only_previews: ${{ github.event_name == 'workflow_dispatch' && inputs.only_previews || '' }}

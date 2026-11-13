@@ -392,12 +392,8 @@ LEGACY_OUT = {"deploy_url", "deploy_verified_url", "deploy_published_unverified"
               "migration_status", "rollback_result", "dev_url", "dev_verified_url", "dev_published_unverified", "deploy_gate_blocked", "phase_state"}
 check(LEGACY_OUT <= set(wc_out), "interface: every pre-existing output is still produced")
 check({"native_dev_url", "native_dev_verified_url", "native_dev_published_unverified", "native_dev_verified", "native_dev_smoke_level"} <= set(wc_out), "interface: Native Dev outputs added")
-LEGACY_IN = {"tools_ref", "app_name", "app_path", "app_version", "deployment_strategy", "preview_on_branch_push", "shared_dev_on_branch_push", "preview_worker_name", "wrangler_config", "lint_cmd", "typecheck_cmd", "test_unit_cmd",
-             "test_integration_cmd", "build_cmd", "ci_env", "use_mailpit", "test_e2e_cmd", "test_e2e_setup_cmd", "test_e2e_build_cmd", "test_e2e_variants", "test_e2e_env", "build_env_prod", "build_env_preview", "build_env_dev",
-             "smoke_cmd", "smoke_env", "access_protected_targets", "probe_path", "probe_expect_status", "sha_path", "preview_host_check", "preview_binding_allow", "preview_deny_resources", "app_url_prod",
-             "production_rollback_policy", "d1_migrations", "d1_binding", "d1_lock_scope", "d1_rollback_compat", "release_cmd", "persistent_dev_ref", "dev_deploy_cmd", "dev_smoke_cmd", "app_url_dev", "dev_build_cmd",
-             "dev_wrangler_env", "dev_binding_allow", "dev_deny_resources", "dev_worker_name", "dispatch_target", "pipeline_phase", "phase_state", "upstream_gate", "runner"}
-check(LEGACY_IN <= set(inputs_def), "interface: every pre-existing input is still accepted (no caller breaks)")
+check({"app_name", "build_cmd", "deployment_strategy", "d1_migrations", "smoke_cmd", "runner"} <= set(inputs_def), "public v2 inputs retain their core contract")
+check({"tools_ref", "dev_deploy_cmd"}.isdisjoint(inputs_def), "retired v1-compatible inputs are no longer accepted")
 check(all("default" in inputs_def[k] or inputs_def[k].get("required") for k in inputs_def), "interface: every input has a default or is required")
 # ---------------------------------------------------------------- 5. credentials, Environments, permissions
 SECRETS = {"CLOUDFLARE_API_TOKEN": "PROD-TOKEN", "CLOUDFLARE_ACCOUNT_ID": "PROD-ACCT", "PREVIEW_SECRETS": "K=v"}
@@ -460,8 +456,8 @@ check(CHECKOUTS and not any("repository" in s_.get("with", {}) or s_.get("with",
 ALLTXT = "".join(open(f).read() for f in (WF, DWF, CWF, LWF, ".github/workflows/_cf-worker-preview-gc.yml", "actions/cf-deploy/action.yml", "actions/cf-ci-check/action.yml", "actions/cf-tools/action.yml"))
 check(".cf-tools" not in re.sub(r"#.*", "", ALLTXT).replace("`.cf-tools`", ""), "no `.cf-tools` workspace path remains in any workflow or action")
 check(all(pathlib.Path(f"actions/{n}/action.yml").exists() for n in ("cf-deploy", "cf-ci-check", "cf-tools", "setup", "mailpit")), "all referenced shared actions exist")
-check(not any(f"{k}: ${{{{ inputs.tools_ref }}}}" in ALLTXT for k in ("ref", "tools_ref")), "tools_ref is not forwarded anywhere (the tooling is the running commit by construction)")
-check(inputs_def["tools_ref"].get("required") is not True and inputs_def["tools_ref"]["default"] == "" and "tools_ref" not in ddoc[True]["workflow_call"]["inputs"], "tools_ref stays ACCEPTED for existing callers but is optional and ignored")
+check("tools_ref" not in ALLTXT and "dev_deploy_cmd" not in ALLTXT, "retired inputs have no workflow/action plumbing")
+check("tools_ref" not in yaml.safe_load(open(".github/workflows/_cf-worker-preview-gc.yml"))[True]["workflow_call"]["inputs"], "Preview GC does not declare retired tools_ref")
 check(set(ddoc[True]["workflow_call"]["inputs"]) >= {"descriptor", "inputs_json", "migration_result", "migration_json"} and "stage" not in ddoc[True]["workflow_call"]["inputs"] and not set(ddoc[True]["workflow_call"]["inputs"]) & {"kind", "target", "environment", "deploy_group", "rollback_group", "d1_expected_id", "d1_owner_kind"}, "delivery workflow: the descriptor, inputs and the one migration result are its interface")
 _ci = open("actions/cf-ci-check/action.yml").read()
 check("rm -rf" not in _ci and "-delete" not in _ci, "cf-ci-check deletes nothing (nothing from this repository is in the app's workspace)")
@@ -474,7 +470,6 @@ for n, i, u in SELF:
         prev = [x for x in j["steps"][:i] if str(x.get("uses", "")).startswith("actions/setup-node")]
         w = j["steps"][i].get("with", {})
         check(w.get("install") != "true" or prev, f"{n}: cf-tools with install: true is preceded by setup-node")
-check(inputs_def["tools_ref"]["description"].lstrip().startswith("DEPRECATED"), "tools_ref is documented as deprecated")
 # Every call passes exactly the inputs the called workflow declares (an unknown `with` key or a missing required input is a startup_failure on GitHub)
 for n, called_doc in (("ci", cdoc), ("lifecycle", ldoc), *[(c, ddoc) for c in sorted(CALL_JOBS)]):
     decl = called_doc[True]["workflow_call"]["inputs"]
@@ -649,7 +644,7 @@ check(g(MAIN, ND_ON) == "cfv2-prod-app", "group: Production is never serialized 
 check("CANNOT lock a D1 shared with ANOTHER repository" in inputs_def["d1_lock_scope"]["description"], "the repository-scoped limit of GitHub concurrency is documented on the d1_lock_scope input")
 
 # ---------------------------------------------------------------- 11. interface preserved / Hybrid / lifecycle / retention
-check(all(k in inputs_def for k in ("app_url_dev", "dev_deploy_cmd", "dev_smoke_cmd", "build_env_dev", "dev_build_cmd", "dev_wrangler_env", "dev_worker_name", "dev_binding_allow", "dev_deny_resources")), "interface: Dev URL, deploy/smoke commands, build env, Wrangler env, identity and resource-policy inputs exist")
+check(all(k in inputs_def for k in ("app_url_dev", "dev_smoke_cmd", "build_env_dev", "dev_build_cmd", "dev_wrangler_env", "dev_worker_name", "dev_binding_allow", "dev_deny_resources")), "interface: active Dev URL, smoke/build settings, Wrangler identity and resource-policy inputs exist")
 check(inputs_def["preview_url_suffix"]["default"] == "", "interface: preview_url_suffix is optional (Cloudflare-reported suffix by default)")
 check(not {"CLOUDFLARE_DEV_API_TOKEN", "CLOUDFLARE_DEV_ACCOUNT_ID"} & set(doc[True]["workflow_call"]["secrets"]), "interface: dedicated Dev secrets removed")
 OUTS = doc[True]["workflow_call"]["outputs"]
@@ -671,7 +666,7 @@ retire = next(s for s in ljobs["lifecycle"]["steps"] if "Retire GitHub ledger" i
 check('gh.sh" retire' in retire["run"] and "Branch exists again" in retire["run"] and "Name is owned by" in retire["run"], "branch delete retires only this branch's ledger (and not if recreated / owned by another ref)")
 all_run = "\n".join(s_.get("run", "") for j in allj.values() for s_ in j.get("steps", [])) + "\n".join(s.get("run", "") for s in ASTEPS)
 check("wrangler delete" not in all_run, "no job deletes a Worker; branch deletion retains the Shared Dev Worker and Native Previews")
-check(not re.search(r"CLOUDFLARE_DEV|dev-deploy|shared_dev_on_branch_push|app_url_dev|dev_deploy_cmd", yaml.dump(ljobs["lifecycle"])), "branch-delete lifecycle never references Dev")
+check(not re.search(r"CLOUDFLARE_DEV|dev-deploy|shared_dev_on_branch_push|app_url_dev", yaml.dump(ljobs["lifecycle"])), "branch-delete lifecycle never references Dev")
 
 # ---------------------------------------------------------------- pipeline_phase: deferred verification (opt-in, default unchanged)
 PINPUTS = doc[True]["workflow_call"]["inputs"]

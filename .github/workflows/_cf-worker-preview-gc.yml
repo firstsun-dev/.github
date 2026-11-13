@@ -38,11 +38,6 @@ on:
         description: 'Optional JSON array of Preview names: restrict the run to exactly these (controlled cleanup).'
         type: string
         default: ''
-      tools_ref:
-        description: 'DEPRECATED, ignored (kept for existing callers): the GC tooling is referenced with `$/`, i.e. this repository at the commit of this workflow.'
-        type: string
-        required: false
-        default: ''
       runner:
         type: string
         default: ubuntu-latest
