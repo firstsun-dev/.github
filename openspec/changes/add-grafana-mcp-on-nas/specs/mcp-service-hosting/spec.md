@@ -4,9 +4,20 @@ This is an **additional proposed** cross-repository contract built on `openspec/
 
 ## ADDED Requirements
 
+### Requirement: Monorepo hosting SHALL preserve per-service delivery and security isolation
+
+`innovation-apps` MAY host multiple applications, but the Grafana MCP SHALL retain its own Cloudflare Worker, route, Access application/AUD, private VPC binding, secrets and per-app CI/CD caller. The monorepo detector SHALL not deploy Diet Manager or Notification Hub when only Grafana MCP source or its dedicated workflow changes.
+
+#### Scenario: Only Grafana MCP changes
+
+- **WHEN** a commit changes only `apps/grafana-mcp` or `.github/workflows/grafana-mcp.yml`
+- **THEN** the Grafana MCP verification/delivery workflow MAY run
+- **AND** Diet Manager and Notification Hub production delivery SHALL not be triggered by that change alone
+
+
 ### Requirement: Grafana SHALL use the canonical shared-hostname path with independent ownership
 
-The organization SHALL register `grafana` as the service slug, `https://mcp.firstsun.org/grafana/mcp` as the only remote MCP endpoint, `firstsun-dev/grafana-mcp` as the Proxy Worker repository, and a dedicated Worker + Cloudflare Access application/AUD. `infra-config` SHALL own its edge Terraform, NAS service and VPC Service.
+The organization SHALL register `grafana` as the service slug, `https://mcp.firstsun.org/grafana/mcp` as the only remote MCP endpoint, `firstsun-dev/innovation-apps/apps/grafana-mcp` as the owning application directory in the existing monorepo, and a dedicated Worker + Cloudflare Access application/AUD. `infra-config` SHALL own its edge Terraform, NAS service and VPC Service.
 
 #### Scenario: Approved client requests Grafana MCP
 
