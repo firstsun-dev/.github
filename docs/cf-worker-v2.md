@@ -16,7 +16,8 @@ Three logical **stages**; the caller chooses the commands, the platform owns orc
 
 ```text
 CI:        Plan -> [Verify tasks || Test tasks || E2E] -> Gate (fail closed)        (no `needs` between Verify and Test)
-Delivery:  Plan -> Migrate (production/dev only) -> Deploy -> Smoke -> Rollback? -> Release (main only)
+Delivery:  Plan ---------> Build (unprivileged) ---+            (Plan and Build run concurrently with CI; nothing is mutated before the CI Gate)
+           CI Gate -------------------------------+--> Migrate (production/dev only) -> Deploy -> Smoke -> Rollback? -> Release (main only)
 ```
 
 Targets: `production`, `preview`, `dev`. Drivers: `worker` (production, or a real `env.dev` Worker) and `native-preview` (PR Preview, stable Dev).
@@ -28,7 +29,7 @@ Targets: `production`, `preview`, `dev`. Drivers: `worker` (production, or a rea
 | --- | --- | --- | --- |
 | feature push | yes | no | none |
 | same-repo PR (opened / synchronize / reopened) | yes, on the merge candidate | yes | `preview` (only with `preview_policy: pr`), after the CI Gate |
-| fork PR | only on `fork_runner` (else the CI Plan fails closed) | same | never |
+| fork PR | only on the approved GitHub-hosted runner `ubuntu-24.04` (a constant, not an input) | same | never |
 | `merge_group` | yes | yes | none |
 | push to `main` | yes | no (ran pre-merge; protect `main` with the PR Gate) | `production` |
 | `workflow_dispatch`, `dispatch_target: dev`, ref == `approved_dev_ref` | yes | no | `dev` (the configured `dev_driver`) |
@@ -71,6 +72,28 @@ Removed (no compatibility shim): `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `
 `app_url_shared_dev_native_preview`, the per-kind outputs (`dev_*`, `native_dev_*`). Outputs now describe the one delivery:
 `deploy_target`, `deploy_driver`, `deploy_url`, `deploy_verified_url`, `deploy_published_unverified`, `deploy_verified`, `deploy_smoke_level`,
 `version_id`, `previous_version_id`, `migration_status`, `rollback_result`, `deploy_gate_blocked`, `phase_state` (opt-in `pipeline_phase`).
+
+## Build / Publish trust boundary
+
+```text
+ untrusted code ──► Build job (no Cloudflare token, no write token, no Environment; ephemeral hosted runner for PRs)
+                      deps + target build + config audit + `wrangler deploy --dry-run --outdir` + package
+                      └─► artifact  (manifest.json · wrangler.json[main→worker/, no_bundle, no `build`] · worker/ · assets/)
+                                       │  actions/upload-artifact (this run only)
+ trusted tooling ──► Migrate / Deploy jobs (credentials; Environment approvals)
+                      download ─► verify identity + digest + structure ─► re-audit resource bindings ─► stale check ─► pinned Wrangler publishes ONLY the artifact
+                      (no application dependency install, no application build, no checkout of PR code)
+```
+
+* Publisher inputs it trusts: its own Plan descriptor, GitHub context, caller inputs and the event payload - never the manifest's claims. The manifest is cross-checked
+  (repository, app, target, driver, slot, run id + attempt, `source_sha`, `tested_sha`, `artifact_sha == tested_sha`, canonical URL). The Preview host Worker, Preview name and
+  Worker name for Dev are set by the publisher. The digest detects corruption and mix-ups, **not** a malicious Build: the defence is that the Build holds no credential and
+  the publisher re-audits the packaged config (`preview_binding_allow` / `preview_deny_resources`, Dev / Production audits, structural rules) before anything runs on Cloudflare.
+* **Revision contract**: `source_sha` = PR head, `tested_sha` = the merge candidate CI tested, `artifact_sha` = what the Build checked out (must equal `tested_sha`), `deployed_sha` = recorded
+  in the ledger = `tested_sha`. A PR Preview is built from and published as the tested merge candidate. Publish proceeds only while the PR is open, its head is still `source_sha` and
+  GitHub's merge candidate is still `tested_sha` (a newer synchronization or a moved base makes the run stale). Main / Dev publish the pushed / approved commit under the existing branch-tip guard.
+* Non-production recovery is **blocked** (fail closed): redeploying an older Preview / Dev would require rebuilding it in a credential-bearing job. Fix forward. Production rollback
+  re-deploys a stored Worker version (no build) and never reverts D1.
 
 ## Safety invariants (kept)
 

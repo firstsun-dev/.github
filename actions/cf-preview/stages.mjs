@@ -60,21 +60,26 @@ export function ciTargetEnv({ event, ref = '' }) {
   return 'preview';
 }
 
-/** Fork PR trust: untrusted code may only run on the explicitly named hosted runner; never on the default (privileged / self-hosted) one. */
-export function runnerFor({ event, isFork, runner, forkRunner = '' }) {
+/**
+ * Untrusted code runs ONLY on the approved GitHub-hosted runner - an ephemeral VM that never shares a host with a credential-bearing job. A fork PR gets
+ * exactly this label; it is a constant of this repository, NOT a caller input (a caller-supplied label proves nothing about isolation).
+ */
+export const HOSTED_RUNNER = 'ubuntu-24.04';
+export const APPROVED_HOSTED_RUNNERS = [HOSTED_RUNNER];
+export function runnerFor({ event, isFork, runner }) {
   if (event === 'pull_request' && isFork) {
-    if (!forkRunner) throw new Error('fork pull request: refusing to run untrusted code on the privileged runner; set fork_runner to a GitHub-hosted runner label or do not trigger CI on pull_request');
-    return forkRunner;
+    if (!APPROVED_HOSTED_RUNNERS.includes(HOSTED_RUNNER)) throw new Error('no approved GitHub-hosted runner for an untrusted fork pull request; refusing to run it');
+    return HOSTED_RUNNER;
   }
   return runner;
 }
 
 /** Everything the CI workflow needs from its inputs, validated. Throws on any invalid configuration. */
-export function planCi({ event, ref, isFork = false, verifyTasks = '', testTasks = '', e2eCmd = '', runner = 'linux', forkRunner = '' }) {
+export function planCi({ event, ref, isFork = false, verifyTasks = '', testTasks = '', e2eCmd = '', runner = 'linux' }) {
   const verify = parseTasks(verifyTasks, 'verify_tasks');
   const test = parseTasks(testTasks, 'test_tasks');
   const route = routeEvent({ event, ref });
-  const picked = runnerFor({ event, isFork, runner, forkRunner });
+  const picked = runnerFor({ event, isFork, runner });
   const e2e = Boolean(String(e2eCmd).trim());
   return {
     stages: route.stages, reason: route.reason, runner: picked, target_env: ciTargetEnv({ event, ref }),
@@ -112,7 +117,7 @@ async function main() {
     if (cmd === 'plan') {
       const p = planCi({
         event: env.EVENT, ref: env.REF, isFork: flag('IS_FORK'), verifyTasks: env.VERIFY_TASKS, testTasks: env.TEST_TASKS, e2eCmd: env.E2E_CMD,
-        runner: env.RUNNER || 'linux', forkRunner: env.FORK_RUNNER || '',
+        runner: env.RUNNER || 'linux',
       });
       const o = {
         stages: p.stages.join(','), runner: p.runner, target_env: p.target_env,

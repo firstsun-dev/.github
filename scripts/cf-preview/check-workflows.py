@@ -72,6 +72,47 @@ for path, d in WF.items():
         if re.search(rf"\b{re.escape(bad)}\b", text):
             errors.append(f"{path}: retired symbol '{bad}'")
 
+# ---- credential boundary (G1 review P0): the job that runs application build code holds no credential; credential-bearing jobs run no application build ----
+pub = WF[".github/workflows/_cf-worker-v2.yml"]["jobs"]
+dlv = WF[".github/workflows/_cf-worker-delivery.yml"]["jobs"]
+b = pub.get("build")
+if not b:
+    errors.append("public workflow has no unprivileged `build` job")
+else:
+    btext = yaml.dump(b)
+    for bad in ("CLOUDFLARE_API_TOKEN", "RELEASE_TOKEN", "SMOKE_", "github.token", "deployments", "pull-requests", "contents: write"):
+        if bad in btext:
+            errors.append(f"build job must not reference '{bad}'")
+    if "environment" in b:
+        errors.append("build job must not use a deployment environment (no protected credentials)")
+    if b.get("permissions") != {"contents": "read"}:
+        errors.append("build job permissions must be exactly {contents: read}")
+    if b.get("runs-on") and "ubuntu-24.04" not in str(b["runs-on"]):
+        errors.append("build job must run on the approved hosted runner for pull_request events")
+for jid in ("migration", "delivery"):
+    need = set(pub[jid].get("needs", []))
+    if not {"ci", "build"} <= need:
+        errors.append(f"public job '{jid}' must need ci (the CI Gate) and build (the artifact)")
+    if "validation" not in str(pub[jid].get("if", "")):
+        errors.append(f"public job '{jid}' must be conditioned on the CI Gate verdict")
+for jid, job in dlv.items():
+    for st in job.get("steps", []):
+        w = st.get("with", {}) or {}
+        blob = yaml.dump(st)
+        if jid in ("deploy", "rollback") and ("pnpm" in blob or "actions/setup" in blob and "$/" in blob):
+            errors.append(f"credential-bearing delivery job '{jid}' must not install application dependencies")
+act = yaml.safe_load(open("actions/cf-deploy/action.yml"))["runs"]["steps"]
+for st in act:
+    cond = str(st.get("if", ""))
+    if str(st.get("uses", "")).startswith("$/actions/setup") and ("'publish'" in cond or "'migrate'" in cond or "'precheck'" in cond):
+        errors.append("the engine must not install application dependencies in the migrate / publish / precheck stages")
+    if "engine.sh\" build" in str(st.get("run", "")) and "inputs.stage == 'build'" not in cond:
+        errors.append("the build phase must be limited to stage build")
+if "ubuntu-24.04" not in open(".github/workflows/_cf-worker-ci.yml").read():
+    errors.append("the CI workflow must pin fork pull requests to the approved hosted runner")
+if re.search(r"fork_runner", open(".github/workflows/_cf-worker-v2.yml").read()):
+    errors.append("fork_runner is a caller-supplied runner label and must not exist")
+
 for e in errors:
     print("FAIL", e)
 print(f"workflow structure: {len(WF)} workflows, {'FAILED' if errors else 'clean'}")

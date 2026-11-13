@@ -340,11 +340,13 @@ test('init: class, slot, D1 and stage bindings refuse everything unknown or cros
   assert.throws(() => v({ d1Expect: 'DB1' }), /D1 id differs/);
   assert.throws(() => v({ descriptor: '' }), /descriptor is required/);
   assert.throws(() => v({ stage: 'preflight' }), /bad engine stage/);
-  assert.throws(() => v({ stage: 'all' }), /split stages/);
+  assert.throws(() => v({ stage: 'all' }), /bad engine stage/, 'the single-job `all` stage no longer exists');
+  assert.throws(() => v({ stage: 'deploy' }), /bad engine stage/);
+  assert.equal(v({ stage: 'build' }).stage, 'build');
   assert.throws(() => v({ stage: 'x' }), /bad engine stage/);
 });
 test('init: a Dev Worker needs its identity, URL and a dev build before a D1 migration', () => {
-  const dev = { ev: { event: 'workflow_dispatch', ref: 'refs/heads/main' }, stage: 'all' };
+  const dev = { ev: { event: 'workflow_dispatch', ref: 'refs/heads/main' }, stage: 'publish' };
   const inputs = (o) => ({ dispatch_target: 'dev', dev_driver: 'worker', dev_worker_name: 'app-dev', app_url_dev: 'https://dev.example.com', ...o });
   assert.equal(I(DEV_W, { ...dev, inputs: inputs({}) }).slot, 'persistent-dev');
   assert.throws(() => I(DEV_W, { ...dev, inputs: inputs({ dev_worker_name: '' }) }), /dev_worker_name/);

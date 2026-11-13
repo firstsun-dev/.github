@@ -10,7 +10,7 @@ name: CF Worker CI (stages)
 # merge candidate; workflow_dispatch = Verify. Verify and Test tasks have NO `needs` between them, so they run concurrently. The Gate is
 # the ONE aggregation: every expected job succeeded, every unexpected one was skipped, the plan succeeded - otherwise red.
 # Credential-free: no Cloudflare secret is ever passed here and no build artifact leaves this workflow (the delivery engine rebuilds for
-# its real target). A fork PR can only run on the explicitly named `fork_runner`, never on the privileged `runner`.
+# its real target). A fork PR runs ONLY on the approved GitHub-hosted runner (ubuntu-24.04, a constant of this repository - not a caller input), never on `runner`.
 # No workflow-level `concurrency` here (the public workflow owns the run-level group; reusing it would deadlock).
 # ---------------------------------------------------------------------------
 
@@ -29,10 +29,6 @@ on:
       runner:
         type: string
         default: linux
-      fork_runner:
-        description: GitHub-hosted runner label for fork pull requests. Empty = a fork PR fails closed (untrusted code never reaches `runner`).
-        type: string
-        default: ''
       verify_tasks:
         description: 'JSON array of {"id","cmd"}: fast checks (lint, check, build, unit, fast integration, ...). Runs on every eligible push and PR.'
         type: string
@@ -90,7 +86,7 @@ jobs:
   # Plan - pure data, no checkout, no credentials. Validates the task lists (malformed -> red before any command runs) and routes the event.
   plan:
     name: Plan
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && (inputs.fork_runner || 'ubuntu-latest') || inputs.runner }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || inputs.runner }}
     timeout-minutes: 5
     outputs:
       stages: ${{ steps.plan.outputs.stages }}
@@ -112,7 +108,6 @@ jobs:
           TEST_TASKS: ${{ inputs.test_tasks }}
           E2E_CMD: ${{ inputs.test_e2e_cmd }}
           RUNNER: ${{ inputs.runner }}
-          FORK_RUNNER: ${{ inputs.fork_runner }}
         run: node "$TOOLS_DIR/stages.mjs" plan | tee -a "$GITHUB_OUTPUT"
 
   verify:
@@ -185,8 +180,8 @@ jobs:
         run: node "$TOOLS_DIR/parse-env.mjs" E2E_ENV "$GITHUB_ENV"
       - uses: $/actions/setup
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
+          setup-node: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
+          setup-pnpm: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
       - name: Start Mailpit
         if: inputs.use_mailpit
         uses: $/actions/mailpit
@@ -226,7 +221,7 @@ jobs:
     name: Gate
     needs: [plan, verify, test, e2e]
     if: always()
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && (inputs.fork_runner || 'ubuntu-latest') || inputs.runner }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || inputs.runner }}
     timeout-minutes: 5
     outputs:
       validation: ${{ steps.gate.outputs.validation }}

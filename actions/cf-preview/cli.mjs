@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // CLI used by _cf-worker-v2.yml. stdout carries ONLY key=value records (it is piped into $GITHUB_OUTPUT / captured by the shell); every
 // diagnostic and workflow annotation (::error:: / ::warning:: / ::notice:: / ::add-mask::) goes to stderr. Failure = non-zero exit.
+import { packageArtifact, verifyArtifact } from './artifact.mjs';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import {
@@ -116,6 +117,36 @@ try {
       out({ d1_binding: plan.binding, d1_name: plan.databaseName, d1_id: plan.databaseId, migrate_config: dest });
       break;
     }
+    case 'package-artifact': {
+      // UNPRIVILEGED Build job: assemble the artifact from the audited config + the dry-run bundle (see artifact.mjs). Identity comes from env.
+      const e = process.env;
+      const cfgPath = resolve(opt('config'));
+      const cfg = readConfig(cfgPath);
+      const devEnv = opt('dev-env', 'dev');
+      const section = opt('mode') === 'source' && opt('target') === 'dev' ? (cfg.env?.[devEnv] ?? {}) : {};
+      const effectiveMain = section.main ?? cfg.main;
+      if (typeof effectiveMain !== 'string') throw new Error('the config has no `main`: a Worker artifact needs an entry point');
+      const m = packageArtifact({
+        cfg, configDir: dirname(cfgPath), workspace: resolve(opt('app-dir', '.')), bundleDir: resolve(opt('bundle-dir')), dest: resolve(opt('dest')), effectiveMain,
+        manifest: {
+          repository: e.CFV2_REPOSITORY, app: e.CFV2_APP, target: e.CFV2_TARGET, driver: e.CFV2_DRIVER, slot: e.CFV2_SLOT, run_id: e.CFV2_RUN_ID, run_attempt: e.CFV2_RUN_ATTEMPT,
+          source_sha: e.CFV2_SOURCE_SHA, tested_sha: e.CFV2_TESTED_SHA, artifact_sha: e.CFV2_ARTIFACT_SHA, target_url: e.CFV2_TARGET_URL ?? '', config_mode: opt('mode'),
+          worker_name: String(section.name ?? cfg.name ?? ''),
+        },
+      });
+      out({ artifact_digest: m.files_digest, worker_name: m.worker_name });
+      break;
+    }
+    case 'verify-artifact': {
+      // PRIVILEGED jobs: the artifact must match what THIS job expects (its own trusted data), before any audit or publish.
+      const e = process.env;
+      const { manifest } = verifyArtifact(resolve(opt('dir')), {
+        repository: e.GITHUB_REPOSITORY, app: e.CFV2_APP, target: e.CFV2_TARGET, driver: e.CFV2_DRIVER, slot: e.CFV2_SLOT, runId: e.GITHUB_RUN_ID, runAttempt: e.GITHUB_RUN_ATTEMPT,
+        sourceSha: e.CFV2_SOURCE_SHA, testedSha: e.CFV2_TESTED_SHA, targetUrl: e.CFV2_TARGET_URL ?? '', workerName: '',
+      });
+      out({ artifact_digest: manifest.files_digest, artifact_sha: manifest.artifact_sha, config_mode: manifest.config_mode, worker_name: manifest.worker_name });
+      break;
+    }
     case 'effective-config': {
       // Adapters (e.g. Astro) emit a redirected config at build time: .wrangler/deploy/config.json -> dist/.../wrangler.json
       const redirect = resolve(opt('dir', '.'), '.wrangler/deploy/config.json');
@@ -228,7 +259,17 @@ try {
         }
         group = runLockGroup({ ...ev, inputs: i, runId: opt('run-id', '0') });
       }
+      // Arguments of the canonical-URL resolution (the Plan's only Cloudflare read): which Preview name / host Worker / declared URL belong to this delivery.
+      const slot = descriptor?.slot ?? '';
+      const eff = (k) => (effective[k] == null ? '' : String(effective[k]));
+      const urlArgs = {
+        slot,
+        preview_name: slot === 'native-branch' ? `pr-${opt('pr-number')}` : slot === 'native-dev' ? 'dev' : '',
+        url_host: slot === 'persistent-dev' ? eff('dev_worker_name') : slot === 'production' ? eff('app_name') : slot ? (eff('preview_worker_name') || eff('app_name')) : '',
+        url_explicit: slot === 'production' ? eff('app_url_prod') : slot === 'persistent-dev' || slot === 'native-dev' ? eff('app_url_dev') : '',
+      };
       out({
+        ...urlArgs,
         has_delivery: String(Boolean(descriptor)), target: descriptor?.target ?? '', driver: descriptor?.driver ?? '', group,
         descriptor: descriptor ? JSON.stringify(descriptor) : '', inputs_json: JSON.stringify(effective),
         has_migrations: String(Boolean(descriptor?.d1_expected_id)),

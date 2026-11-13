@@ -57,10 +57,16 @@ ctx() {
   if [ "${GITHUB_EVENT_NAME:-}" = pull_request ]; then
     # A same-repository PR Preview delivers the PR HEAD commit of the PR's branch (never the synthetic merge commit); the stale guard and the
     # ledger are keyed by that branch.
-    PR_NUMBER="${PR_NUMBER:?pull request number}"; BRANCH="${PR_HEAD_REF:?pull request head ref}"; BRANCH_REF="refs/heads/$BRANCH"; RUN_SHA="${PR_HEAD_SHA:?pull request head sha}"
+    PR_NUMBER="${PR_NUMBER:?pull request number}"; BRANCH="${PR_HEAD_REF:?pull request head ref}"; BRANCH_REF="refs/heads/$BRANCH"
+    SOURCE_SHA="${PR_HEAD_SHA:?pull request head sha}"
   else
-    PR_NUMBER=""; BRANCH_REF="${GITHUB_REF:?}"; BRANCH="${GITHUB_REF#refs/heads/}"; RUN_SHA="${GITHUB_SHA:?}"
+    PR_NUMBER=""; BRANCH_REF="${GITHUB_REF:?}"; BRANCH="${GITHUB_REF#refs/heads/}"; SOURCE_SHA="${GITHUB_SHA:?}"
   fi
+  # Revision contract: the revision that PASSED CI (`tested`: the merge candidate for a PR, the pushed commit otherwise) is the revision that is
+  # built, published and smoked (`RUN_SHA` = artifact = deployed). `SOURCE_SHA` is the PR head, kept for the stale checks and the ledger only.
+  TESTED_SHA="${GITHUB_SHA:?}"; RUN_SHA="$TESTED_SHA"
+  ARTIFACT_DIR="$(rd artifact_dir)"
+  WRANGLER="${WRANGLER:-$TOOLS_DIR/node_modules/.bin/wrangler}"
   DEV_ENV="$(inp dev_wrangler_env)"; DEV_ENV="${DEV_ENV:-dev}"
   WRANGLER_CONFIG="$(inp wrangler_config)"; WRANGLER_CONFIG="${WRANGLER_CONFIG:-wrangler.toml}"
   D1_BINDING="$(inp d1_binding)"
@@ -71,6 +77,8 @@ ctx() {
   esac
   PREVIEW_NAME="$(rd preview_name)"; ENV_NAME="$(rd ledger_env)"; LEDGER_ID="$(rd ledger_id)"
   [ "$KIND" != native-dev ] || PREVIEW_NAME=dev
+  [ "$KIND" != native-branch ] || [ -n "$PREVIEW_NAME" ] || PREVIEW_NAME="pr-$PR_NUMBER"
+  export SOURCE_SHA TESTED_SHA ARTIFACT_DIR WRANGLER
   export KIND TARGET DELIVERY_TARGET PR_NUMBER APP_NAME APP_DIR BRANCH_REF BRANCH RUN_SHA DEV_ENV WRANGLER_CONFIG D1_BINDING HOST_WORKER PREVIEW_NAME ENV_NAME STATE_DIR="$S"
 }
 
@@ -83,17 +91,14 @@ declared_url() {
 }
 # The canonical URL THIS target is built for: resolved ONCE before the build (state file), else the declared one.
 target_url() { if [ -s "$S/target_url" ]; then rd target_url; else declared_url; fi; }
-# Resolve the canonical URL BEFORE any build of this target (fails closed): Preview kinds derive it from the real Preview
-# identity and the host Worker's Cloudflare-reported preview_url_suffix (or preview_url_suffix), cross-checked with the declared
-# URL; the build env is checked for self-origin consistency (callback / redirect / app origin). Writes $S/target_url.
-resolve_target_url() { # <build env file>
+# The canonical URL was resolved by the Plan BEFORE the build (the only Cloudflare read involved) and arrives as ENGINE_TARGET_URL. The Build re-validates it as
+# an https origin and checks that the build env names no other origin as this application's own (callback / redirect / app origin). No Cloudflare access.
+check_target_url() { # <build env file>
   local R
-  R="$(node "$TOOLS_DIR/cli.mjs" resolve-url --kind "$KIND" --name "$PREVIEW_NAME" --host-worker "$HOST_WORKER" --explicit "$(declared_url)" \
-    --suffix "$(inp preview_url_suffix)" --host-check "$(inp preview_host_check)" --build-env "$1")" || die "cannot resolve the canonical URL of $KIND before the build; nothing was built"
+  R="$(node "$TOOLS_DIR/cli.mjs" resolve-url --kind "$KIND" --name "$PREVIEW_NAME" --host-worker "$HOST_WORKER" --explicit "$(target_url)" --host-check false --build-env "$1")" \
+    || die "the planned canonical URL of $KIND is invalid for this build; nothing was built"
   printf '%s\n' "$R" | grep -v '^target_url=\|^url_source=' >&2 || true
-  R_URL="$(printf '%s\n' "$R" | sed -n 's/^target_url=//p')"
-  if [ -n "$R_URL" ]; then printf '%s' "$R_URL" > "$S/target_url"; else rm -f "$S/target_url"; fi
-  echo "::notice::canonical URL of $KIND resolved before the build: ${R_URL:-<none declared>} ($(printf '%s\n' "$R" | sed -n 's/^url_source=//p'))" >&2
+  echo "::notice::canonical URL of $KIND for this build: $(target_url)" >&2
 }
 # GitHub Environment (deployment history, protection rules) of the kind. Production / Preview / Dev names are unchanged.
 gh_env() { case "$KIND" in production) echo "$APP_NAME/prod";; native-branch) echo "$APP_NAME/preview";; native-dev) echo "$APP_NAME/native-dev";; persistent-dev) echo "$APP_NAME/dev";; esac; }
@@ -101,24 +106,30 @@ gh_env() { case "$KIND" in production) echo "$APP_NAME/prod";; native-branch) ec
 smoke_mode() { rd smoke_mode; }
 kind_smoke_cmd() { if [ "$(smoke_mode)" = basic ]; then echo ""; else target_smoke_cmd; fi; }
 
-# ONE audited build and ONE publish primitive, used by the normal run AND the recovery rebuild. The caller supplies only what
-# differs: the state dir, the (validated) build env file, the app version, whether the Preview host is re-checked, the commit message.
-run_build() { # <state dir> <build env file> <app version> <preview host check>
-  STATE_DIR="$1" BUILD_CMD="$(target_build_cmd)" BUILD_ENV_FILE="$2" APP_VERSION="$3" PREVIEW_ENV_FILE="$S/preview.env" \
-    PREVIEW_NAME="$PREVIEW_NAME" PREVIEW_HOST_CHECK="$4" PREVIEW_ALLOW="$(inp preview_binding_allow)" PREVIEW_DENY="$(inp preview_deny_resources)" \
+# BUILD (unprivileged job only): the audited build plus the packaged artifact. PUBLISH (privileged job): publishes the verified artifact; never builds.
+run_build() { # <build env file> <app version> -> artifact in $ARTIFACT_DIR
+  STATE_DIR="$S" BUILD_CMD="$(target_build_cmd)" BUILD_ENV_FILE="$1" APP_VERSION="$2" PREVIEW_ENV_FILE="$S/preview.env" \
+    PREVIEW_NAME="$PREVIEW_NAME" PREVIEW_HOST_CHECK=false PREVIEW_ALLOW="$(inp preview_binding_allow)" PREVIEW_DENY="$(inp preview_deny_resources)" \
     DEV_WORKER="$(inp dev_worker_name)" DEV_ALLOW="$(inp dev_binding_allow)" DEV_DENY="$(inp dev_deny_resources)" PROD_URL="$(inp app_url_prod)" \
-    DELIVERY_KIND="$KIND" TARGET_URL="$(target_url)" "$TOOLS_DIR/build.sh"
+    DELIVERY_KIND="$KIND" TARGET_URL="$(target_url)" ARTIFACT_DIR="$ARTIFACT_DIR" "$TOOLS_DIR/build.sh"
 }
-run_publish() { # <state dir> <out file> <app version> <commit message>
-  STATE_DIR="$1" APP_URL="$(target_url)" OUT_FILE="$2" APP_VERSION="$3" COMMIT_MSG="$4" \
-    WORKER_NAME="$(inp preview_worker_name)" \
+run_publish() { # <out file> <app version> <commit message>: publishes ONLY $ARTIFACT_DIR (verified by artifact-verify, re-verified by publish.sh)
+  STATE_DIR="$S" APP_URL="$(target_url)" OUT_FILE="$1" APP_VERSION="$2" COMMIT_MSG="$3" ARTIFACT_DIR="$ARTIFACT_DIR" WRANGLER="$WRANGLER" \
+    WORKER_NAME="$HOST_WORKER" \
     PREVIEW_NAME="$PREVIEW_NAME" EXPECTED_URL="$([ "$TARGET" = preview ] && target_url || true)" "$TOOLS_DIR/publish.sh"
+}
+# The privileged side's OWN expectations (descriptor, GitHub context, inputs, event) - never the artifact's claims.
+artifact_env() {
+  local drv url
+  drv="$(rd driver)"; url="$(target_url)"
+  export CFV2_REPOSITORY="$GITHUB_REPOSITORY" CFV2_APP="$APP_NAME" CFV2_TARGET="$DELIVERY_TARGET" CFV2_DRIVER="$drv" CFV2_SLOT="$KIND" \
+    CFV2_RUN_ID="${GITHUB_RUN_ID:-0}" CFV2_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}" CFV2_SOURCE_SHA="$SOURCE_SHA" CFV2_TESTED_SHA="$TESTED_SHA" CFV2_ARTIFACT_SHA="$TESTED_SHA" CFV2_TARGET_URL="$url"
 }
 
 stale_check() { # sets STALE for the rest of the job when the branch moved on; FAILS when the tip cannot be resolved
   ctx
   local fresh
-  fresh="$("$TOOLS_DIR/guard.sh" fresh)" || die "cannot resolve the tip of branch $BRANCH ($1); refusing to continue (fail closed)"
+  fresh="$(PR_NUMBER="$PR_NUMBER" SOURCE_SHA="$SOURCE_SHA" "$TOOLS_DIR/guard.sh" fresh)" || die "cannot resolve the current state of $BRANCH ($1); refusing to continue (fail closed)"
   if [ "$fresh" != "stale=false" ]; then
     echo "::notice::Superseded ($1): a newer push of this branch owns the target. Nothing further is built, migrated or published by this run."
     [ -z "$LEDGER_ID" ] || "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" inactive "" "Superseded by a newer push before publish; nothing deployed" || true
@@ -142,13 +153,16 @@ case "$PHASE" in
     # this event, per-target requirements, URL isolation, env data) and writes the validated state files. Nothing is mutated if it fails.
     node "$TOOLS_DIR/cli.mjs" init-checks --state "$S" --inputs "$IN" | { grep -v '^kind=\|^smoke_mode=' || true; }
     load_inputs
-    # Prod, Preview and Dev all use the one account credential pair (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID).
-    # The Smoke job (stage verify) never receives Cloudflare credentials: it only probes the published URL.
-    if [ "$(rd stage)" != verify ]; then
-      [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || die "$(rd target) credentials not provided (set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID)"
-    elif [ -n "${CLOUDFLARE_API_TOKEN:-}${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
-      die "the Smoke stage must not receive Cloudflare credentials"
-    fi;;
+    # The Plan resolved the canonical URL (the only step that may need Cloudflare to know it) and the artifact lives in a directory the workflow downloaded.
+    [ -z "${ENGINE_ARTIFACT_DIR:-}" ] || printf '%s' "$ENGINE_ARTIFACT_DIR" > "$S/artifact_dir"
+    [ -z "${ENGINE_TARGET_URL:-}" ] || printf '%s' "$ENGINE_TARGET_URL" > "$S/target_url"
+    # Prod, Preview and Dev all use the one account credential pair (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID). The stages that RUN APPLICATION CODE
+    # - the Build and the Smoke - never receive Cloudflare credentials; the stages that hold them (migrate, publish, rollback) never run an application build.
+    case "$(rd stage)" in
+      verify|build)
+        if [ -n "${CLOUDFLARE_API_TOKEN:-}${CLOUDFLARE_ACCOUNT_ID:-}" ]; then die "the $(rd stage) stage must not receive Cloudflare credentials"; fi;;
+      *) [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || die "$(rd target) credentials not provided (set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID)";;
+    esac;;
 
   migration-gate) # publish stage, before anything is built or published: the result of THE Migration job this kind depends on
     ctx
@@ -159,7 +173,7 @@ case "$PHASE" in
     ctx
     setenv CFV2_DEPS "done"   # the dependencies are installed (Setup step precedes this phase): a later engine call of the same job skips the install
     if [ "$TARGET" != prod ]; then
-      VER="$(cd "$APP_DIR" && pnpm exec wrangler --version | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+      VER="$("$WRANGLER" --version | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
       node "$TOOLS_DIR/cli.mjs" wrangler-check --version "$VER"
     fi
     # Preview: stable branch identity + ledger ownership (a collision fails BEFORE anything remote is touched), then
@@ -167,14 +181,12 @@ case "$PHASE" in
     if [ "$KIND" = native-dev ]; then
       # The stable named Preview `dev`: fixed identity (no branch ownership), one ledger per app, shared by all branches.
       printf '%s' dev > "$S/preview_name"; printf '%s' "$APP_NAME/native-dev/dev" > "$S/ledger_env"
-      (cd "$APP_DIR" && node "$TOOLS_DIR/cli.mjs" preflight --config "$WRANGLER_CONFIG" --allow "$(inp preview_binding_allow)" --deny "$(inp preview_deny_resources)")
       PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg w "$APP_NAME" --arg h "$HOST_WORKER" --arg r "$GITHUB_REPOSITORY" '{kind:"native-dev",branch_ref:$ref,preview_name:"dev",worker:$w,host_worker:$h,repo:$r}')"
       DESC="Native Dev Preview"
     elif [ "$TARGET" = preview ]; then
       OUT="$(PR_NUMBER="$PR_NUMBER" "$TOOLS_DIR/guard.sh" identity)"
       printf '%s' "$(printf '%s\n' "$OUT" | sed -n 's/^PREVIEW_NAME=//p')" > "$S/preview_name"
       printf '%s' "$(printf '%s\n' "$OUT" | sed -n 's/^ENV_NAME=//p')" > "$S/ledger_env"
-      (cd "$APP_DIR" && node "$TOOLS_DIR/cli.mjs" preflight --config "$WRANGLER_CONFIG" --allow "$(inp preview_binding_allow)" --deny "$(inp preview_deny_resources)")
       PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg n "$(rd preview_name)" --arg w "$APP_NAME" --arg h "$HOST_WORKER" --arg r "$GITHUB_REPOSITORY" '{kind:"native-branch",branch_ref:$ref,preview_name:$n,worker:$w,host_worker:$h,repo:$r}')"
       DESC="Native Preview"
     elif [ "$TARGET" = dev ]; then
@@ -189,10 +201,31 @@ case "$PHASE" in
       "$TOOLS_DIR/gh.sh" status "$ID" in_progress "" "Deploying $RUN_SHA from $BRANCH"
     fi;;
 
-  build)
+  build) # UNPRIVILEGED Build job: audited target build + packaged artifact. No Cloudflare credential, no ledger, no remote call.
     ctx
-    resolve_target_url "$S/build.env"
-    run_build "$S" "$S/build.env" "$(inp app_version)" "$(inp preview_host_check)";;
+    [ -n "$ARTIFACT_DIR" ] || die "no artifact directory"
+    check_target_url "$S/build.env"
+    run_build "$S/build.env" "$(inp app_version)";;
+
+  artifact-verify) # PRIVILEGED jobs: the artifact must be what THIS job expects, then the resource audit runs on the PACKAGED config. Nothing is built.
+    ctx
+    [ -d "$ARTIFACT_DIR" ] || die "no artifact at '$ARTIFACT_DIR': the Build job did not hand one over; refusing"
+    artifact_env
+    V="$(node "$TOOLS_DIR/cli.mjs" verify-artifact --dir "$ARTIFACT_DIR")" || die "artifact verification failed; nothing was migrated or published"
+    MODE="$(printf '%s\n' "$V" | sed -n 's/^config_mode=//p')"; CFG_PATH="$ARTIFACT_DIR/wrangler.json"
+    case "$TARGET" in
+      preview) node "$TOOLS_DIR/cli.mjs" preflight --config "$CFG_PATH" --allow "$(inp preview_binding_allow)" --deny "$(inp preview_deny_resources)" >&2 || die "the packaged Preview config violates the resource policy";;
+      prod)
+        if [ "$MODE" = effective ]; then node "$TOOLS_DIR/cli.mjs" audit-prod --effective "$CFG_PATH" --source "$APP_DIR/$WRANGLER_CONFIG" --allow "$(inp preview_binding_allow)" >&2 || die "the packaged Production config violates the resource policy"; fi;;
+      dev)
+        if [ "$MODE" = effective ]; then DEVEFF="$CFG_PATH"; DEVSRC="$APP_DIR/$WRANGLER_CONFIG"; else DEVEFF=""; DEVSRC="$CFG_PATH"; fi
+        node "$TOOLS_DIR/cli.mjs" dev-config-check --effective "$DEVEFF" --source "$DEVSRC" --worker "$(inp dev_worker_name)" --deny "$(inp dev_deny_resources)" --dev-env "$DEV_ENV" \
+          --allow "$(inp dev_binding_allow)" --prod-url "$(inp app_url_prod)" >&2 || die "the packaged Dev config violates the resource policy";;
+    esac
+    printf '%s' "$CFG_PATH" > "$S/config.path"; printf '%s' "$MODE" > "$S/config.mode"
+    sha256sum "$CFG_PATH" | cut -d' ' -f1 > "$S/config.sha"
+    printf '%s\n' "$V" | sed -n 's/^artifact_digest=//p' > "$S/artifact.sha"
+    echo "artifact_digest=$(rd artifact.sha)"; echo "artifact_sha=$TESTED_SHA";;
 
   audit-d1)
     ctx
@@ -259,10 +292,11 @@ case "$PHASE" in
     # safe name must stop here, while nothing is changed yet.
     AUDITED_NAME=""
     if [ "$TARGET" = prod ]; then AUDITED_NAME="$(node "$TOOLS_DIR/cli.mjs" worker-name --config "$(rd config.path)" | sed -n 's/^worker_name=//p')"; [ -n "$AUDITED_NAME" ] || die "no safe Worker name in the audited config; refusing to publish"; fi
-    COMMIT_MSG=""; [ -z "${GITHUB_EVENT_PATH:-}" ] || [ ! -f "$GITHUB_EVENT_PATH" ] || COMMIT_MSG="$(jq -r '.head_commit.message // ""' "$GITHUB_EVENT_PATH")"
-    run_publish "$S" "$S/preview.json" "$(inp app_version)" "$COMMIT_MSG"
+    COMMIT_MSG=""; [ -z "${GITHUB_EVENT_PATH:-}" ] || [ ! -f "$GITHUB_EVENT_PATH" ] || COMMIT_MSG="$(jq -r '.head_commit.message // .pull_request.title // ""' "$GITHUB_EVENT_PATH")"
+    artifact_env
+    run_publish "$S/preview.json" "$(inp app_version)" "$COMMIT_MSG"
     # Reached only when publish.sh succeeded: the hand-off of this deployment to the Smoke / Rollback jobs.
-    echo "published=true"; echo "published_sha=$RUN_SHA"; echo "ledger_id=$LEDGER_ID"; echo "preview_name=$PREVIEW_NAME"
+    echo "published=true"; echo "published_sha=$RUN_SHA"; echo "artifact_digest=$(rd artifact.sha)"; echo "source_sha=$SOURCE_SHA"; echo "ledger_id=$LEDGER_ID"; echo "preview_name=$PREVIEW_NAME"
     echo "worker_name=$AUDITED_NAME"; echo "kind=$KIND"; echo "target_url=$(target_url)"; echo "d1_id=$(rd d1_id)";;
 
   hydrate) # Smoke / Rollback jobs: validated hand-off from the Migration / Deploy / Smoke jobs (data, never runner files)
@@ -418,94 +452,17 @@ case "$PHASE" in
     # The Environment deployment GitHub created for the Deploy job is "success" (it published). Record that it is NOT verified.
     "$TOOLS_DIR/gh.sh" mark-env-deployment "$(gh_env)" "$RUN_SHA" failure "Smoke failed — UNVERIFIED (served $RUN_SHA)" || echo "::warning::could not annotate the Environment deployment as unverified" >&2;;
 
-  recover-find)
-    ctx
-    ROW=""
-    # D1 compatibility guard (before anything is looked up or published): older code is only redeployed when the D1 state of
-    # THIS pipeline is known and the code is proven to cope. D1 is never reverted. Decision: delivery.mjs nonProdRecoveryBlock.
-    G="$(env D1_MIGRATIONS="$(inp d1_migrations)" MIGRATION_JSON="$([ -s "$S/migration.json" ] && cat "$S/migration.json" || echo null)" D1_EXPECT="$(rd d1_expect)" D1_COMPAT="$(inp d1_rollback_compat)" \
-      node "$TOOLS_DIR/cli.mjs" recovery-guard)"
-    BC="$(printf '%s\n' "$G" | sed -n 's/^block_code=//p')"
-    if [ -n "$BC" ]; then
-      BW="$(printf '%s\n' "$G" | sed -n 's/^block_why=//p')"
-      echo "::error::Automatic recovery of $TARGET is BLOCKED ($BC): $BW" >&2
-      summary "### 🛑 Automatic recovery of $TARGET **blocked** (\`$BC\`) — $TARGET serves \`$RUN_SHA\`, which FAILED its smoke, and is **UNVERIFIED**."
-      summary "- Why: $BW"
-      summary "- Nothing was redeployed and the D1 schema was NOT reverted. Required manual recovery: push a forward fix (preferred); or restore the last verified commit only after confirming it runs on the CURRENT D1 schema."
-      [ -z "$LEDGER_ID" ] || "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" failure "" "Smoke failed for $RUN_SHA; recovery blocked ($BC) — $TARGET UNVERIFIED" || true
-      "$TOOLS_DIR/gh.sh" mark-env-deployment "$(gh_env)" "$RUN_SHA" failure "Smoke failed, recovery blocked ($BC) — UNVERIFIED (served $RUN_SHA)" || echo "::warning::could not annotate the Environment deployment as unverified" >&2
-      echo "sha="; echo "url="; echo "blocked=true"; echo "block_code=$BC"
-      exit 0
-    fi
-    case "$KIND" in
-      native-branch) ROW="$("$TOOLS_DIR/gh.sh" last-good-preview "$(rd ledger_env)" "$LEDGER_ID" "$BRANCH_REF" "$HOST_WORKER" "$APP_NAME" || true)";;
-      native-dev) ROW="$("$TOOLS_DIR/gh.sh" last-good-native-dev "$(rd ledger_env)" "$LEDGER_ID" "$HOST_WORKER" "$APP_NAME" || true)";;
-      persistent-dev) ROW="$("$TOOLS_DIR/gh.sh" last-good-dev "$(rd ledger_env)" "$LEDGER_ID" "$HOST_WORKER" "$APP_NAME" || true)";;
-    esac
-    # Deferred Shared Dev (stage rollback): the Dev group was released between deploy and rollback, so ANOTHER branch may
-    # have started a newer Dev deployment meanwhile. Recovery must never replace it.
-    if [ -n "$ROW" ] && { [ "$KIND" = persistent-dev ] || [ "$KIND" = native-dev ]; } && [ "$(rd stage)" = rollback ] && [ "$("$TOOLS_DIR/gh.sh" newest-id "$(rd ledger_env)")" != "$LEDGER_ID" ]; then
-      summary "### ⚠️ Recovery skipped — a newer $KIND deployment started after this one; it owns the target and is never replaced by an older run."
-      ROW=""
-    fi
-    # Never act on a superseded run: a newer push of this branch will redeploy, and recovery must not replace it.
-    if [ -n "$ROW" ] && [ "$("$TOOLS_DIR/guard.sh" fresh)" != "stale=false" ]; then
-      summary "### ⚠️ Recovery skipped — a newer push of this branch superseded this run; its own run owns the target."
-      ROW=""
-    fi
-    if [ -n "$ROW" ]; then
-      echo "sha=${ROW%% *}"; echo "url=${ROW#* }"
-    else
-      echo "sha="; echo "url="
-      echo "::error::No eligible known-good $TARGET deployment (same repository, application, ${TARGET} identity and host Worker '$HOST_WORKER'). Fix forward by pushing a new commit." >&2
-      summary "### ⚠️ No prior verified $TARGET deployment on host Worker \`$HOST_WORKER\` — manual recovery required: push a fix."
-    fi;;
-
-  recover-run)
-    ctx
-    : "${GOOD_SHA:?}" "${GOOD_URL:?}"
-    # The recovered deployment is the SAME pipeline (build -> audit -> publish -> smoke) on the last-good tree with
-    # its OWN identity: the target build env is restored from the validated file with the failed SHA rebound to the
-    # last-good SHA (smoke-only variables are never part of it). No migration: D1 is never rolled back.
-    export APP_DIR_OVERRIDE="$GITHUB_WORKSPACE/recover/$APP_PATH"
-    APP_DIR="$APP_DIR_OVERRIDE"
-    R="$S/recover"; mkdir -p "$R"; chmod 700 "$R"
-    # parse-env writes no file for an empty build env: that is a valid (empty) environment, not an error.
-    export CFV2_REBIND_ENV; CFV2_REBIND_ENV="$(rd build.env)"
-    CFV2_REBIND_ENV="$(node "$TOOLS_DIR/cli.mjs" rebind-env --var CFV2_REBIND_ENV --from "$RUN_SHA" --to "$GOOD_SHA")"
-    node "$TOOLS_DIR/parse-env.mjs" CFV2_REBIND_ENV "$R/build.env" --reserved >/dev/null
-    VERSION="$(APP_VERSION_IN="$(inp app_version)" node "$TOOLS_DIR/cli.mjs" rebind-env --var APP_VERSION_IN --from "$RUN_SHA" --to "$GOOD_SHA")"
-    [ -z "$(inp app_version)" ] || [ "$VERSION" != "$(inp app_version)" ] || echo "::warning::app_version is not derived from the commit SHA; recovery keeps it as configured" >&2
-    (cd "$APP_DIR" && pnpm install --frozen-lockfile)
-    resolve_target_url "$R/build.env"
-    run_build "$R" "$R/build.env" "$VERSION" false >&2
-    OUT="$(run_publish "$R" "$R/preview.json" "$VERSION" "")"
-    URL="$(printf '%s\n' "$OUT" | sed -n 's/^url=//p')"
-    [ -n "$URL" ] || die "recovery produced no URL"
-    [ "$URL" = "$GOOD_URL" ] || die "recovered URL $URL differs from the recorded last-good URL $GOOD_URL; refusing to verify a different deployment"
-    echo "url=$URL";;
-
-  recover-verify)
-    ctx
-    TARGET_URL="${RECOVERED_URL:?}" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="${GOOD_SHA:?}" SMOKE_CMD="$(kind_smoke_cmd)" SMOKE_CWD="$APP_DIR" SHA_PATH="$(inp sha_path)" \
-      PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" \
-      ACCESS_TARGETS="$(inp access_protected_targets)" SMOKE_ENV_FILE="$S/smoke.env" PREVIEW_ENV_FILE="$S/preview.env" NO_PROXY='*' "$TOOLS_DIR/smoke.sh";;
-
-  recover-record)
-    ctx
-    if [ "${RECOVERED:-}" = success ] && [ "${VERIFIED:-}" = success ] && { [ "${SMOKE_LEVEL:-}" = content ] || [ "${SMOKE_LEVEL:-}" = content-sha ]; }; then
-      "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" failure "" "Smoke failed for $RUN_SHA; $TARGET restored to $GOOD_SHA and verified" || true
-      summary "### ♻️ $TARGET restored to last good commit \`$GOOD_SHA\` and verified (content-level smoke). Run remains FAILED for the bad commit. D1 migrations (if any) were NOT reverted."
-    elif [ "${RECOVERED:-}" = success ] && [ "${VERIFIED:-}" = success ]; then
-      "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" failure "" "Smoke failed for $RUN_SHA; $TARGET redeployed from $GOOD_SHA — Access liveness only, content NOT verified" || true
-      summary "### ⚠️ $TARGET redeployed from \`$GOOD_SHA\` but only Cloudflare Access liveness was observed (${SMOKE_LEVEL:-}): content and commit identity are **NOT verified**. Run remains FAILED. D1 migrations were NOT reverted."
-    else
-      "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" error "" "Smoke failed for $RUN_SHA; recovery to $GOOD_SHA FAILED — $TARGET UNVERIFIED" || true
-      summary "### 🚨 Automatic recovery FAILED — $TARGET serves unverified code. Push a fix (deleting the branch keeps the Preview)."
-    fi
-    if [ "${RECOVERED:-}" = success ] && [ "${VERIFIED:-}" = success ] && [ -z "$(inp sha_path)" ]; then
-      summary "- Commit identity was NOT verified (set sha_path)."
-    fi;;
+  recover-find) # non-Production recovery. A recovery would REBUILD the last known-good revision, and no credential-bearing job may build application code:
+    ctx           # it is therefore blocked (fail closed) until a verified artifact is retained for it. Production never rebuilds: it re-deploys a stored Worker VERSION.
+    BC=no_retained_artifact
+    BW="redeploying an older $TARGET deployment needs its retained, verified artifact; none is kept, and a credential-bearing job must not rebuild application code."
+    echo "::error::Automatic recovery of $TARGET is BLOCKED ($BC): $BW" >&2
+    summary "### 🛑 Automatic recovery of $TARGET **blocked** (\`$BC\`) — $TARGET serves \`$RUN_SHA\`, which FAILED its smoke, and is **UNVERIFIED**."
+    summary "- Why: $BW"
+    summary "- Nothing was redeployed and the D1 schema was NOT reverted. Required manual recovery: push a forward fix (preferred)."
+    [ -z "$LEDGER_ID" ] || "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" failure "" "Smoke failed for $RUN_SHA; recovery blocked ($BC) — $TARGET UNVERIFIED" || true
+    "$TOOLS_DIR/gh.sh" mark-env-deployment "$(gh_env)" "$RUN_SHA" failure "Smoke failed, recovery blocked ($BC) — UNVERIFIED (served $RUN_SHA)" || echo "::warning::could not annotate the Environment deployment as unverified" >&2
+    echo "sha="; echo "url="; echo "blocked=true"; echo "block_code=$BC";;
 
   prod-rollback) # Rollback job, Production: fail-closed. Prints rollback_result=rolled_back|blocked|failed (always exits 0)
     ctx
@@ -529,11 +486,11 @@ case "$PHASE" in
     }
     guard
     RB="$S/rollback"; mkdir -p "$RB"; node -e 'const [n,f]=process.argv.slice(1);require("fs").writeFileSync(f,JSON.stringify({name:n,compatibility_date:"2025-01-01"}))' "$W" "$RB/wrangler.json"
-    LIVE="$(cd "$APP_DIR" && pnpm exec wrangler deployments list --config "$RB/wrangler.json" --json 2>/dev/null \
+    LIVE="$(cd "$RB" && "$WRANGLER" deployments list --config "$RB/wrangler.json" --json 2>/dev/null \
       | jq -r 'sort_by(.created_on) | reverse | .[0].versions | max_by(.percentage // 0) | .version_id // empty' 2>/dev/null || echo "")"
     # Never roll back a deployment that is no longer ours (someone deployed out of band): fail closed.
     guard LIVE="$LIVE"
-    if (cd "$APP_DIR" && pnpm exec wrangler versions deploy "$PREV@100" --config "$RB/wrangler.json" --message "Revert: smoke failed on $RUN_SHA" --yes) >&2; then
+    if (cd "$RB" && "$WRANGLER" versions deploy "$PREV@100" --config "$RB/wrangler.json" --message "Revert: smoke failed on $RUN_SHA" --yes) >&2; then
       echo "rollback_result=rolled_back"; echo "rollback_reason=rolled back to $PREV"
     else
       echo "rollback_result=failed"; echo "rollback_reason=wrangler versions deploy failed"
@@ -543,7 +500,7 @@ case "$PHASE" in
   prod-rollback-verify) # smoke the RESTORED deployment: previous commit when resolvable, else "no longer serves the failed commit"
     ctx
     RB="$S/rollback"; PREV_SHA=""
-    VIEW="$(cd "$APP_DIR" && pnpm exec wrangler versions view "${PREVIOUS_VERSION_ID:?}" --config "$RB/wrangler.json" --json 2>/dev/null || true)"
+    VIEW="$(cd "$RB" && "$WRANGLER" versions view "${PREVIOUS_VERSION_ID:?}" --config "$RB/wrangler.json" --json 2>/dev/null || true)"
     PREV_SHA="$(printf '%s' "$VIEW" | jq -r '.annotations["workers/message"] // .message // empty' 2>/dev/null | grep -oE '^\[[0-9a-f]{7}\]' | tr -d '[]' | head -1 || true)"
     [ -z "$PREV_SHA" ] || PREV_SHA="$(cd "$APP_DIR" && git rev-parse --verify --quiet "$PREV_SHA^{commit}" 2>/dev/null || echo "$PREV_SHA")"
     echo "previous_commit=$PREV_SHA"

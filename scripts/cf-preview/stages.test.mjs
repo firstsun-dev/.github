@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseTasks, routeEvent, ciTargetEnv, runnerFor, planCi, gateVerdict, MAX_TASKS } from '../../actions/cf-preview/stages.mjs';
+import { parseTasks, routeEvent, ciTargetEnv, runnerFor, planCi, gateVerdict, MAX_TASKS, HOSTED_RUNNER, APPROVED_HOSTED_RUNNERS } from '../../actions/cf-preview/stages.mjs';
 
 const T = (id, cmd = 'true') => ({ id, cmd });
 
@@ -46,10 +46,11 @@ test('ciTargetEnv: production env only for a main push', () => {
   assert.equal(ciTargetEnv({ event: 'workflow_dispatch', ref: 'refs/heads/main' }), 'dev');
 });
 
-test('runnerFor: fork PR never lands on the privileged runner', () => {
-  assert.throws(() => runnerFor({ event: 'pull_request', isFork: true, runner: 'linux' }), /fork pull request/);
-  assert.equal(runnerFor({ event: 'pull_request', isFork: true, runner: 'linux', forkRunner: 'ubuntu-latest' }), 'ubuntu-latest');
-  assert.equal(runnerFor({ event: 'pull_request', isFork: false, runner: 'linux', forkRunner: 'ubuntu-latest' }), 'linux');
+test('runnerFor: a fork PR always gets the approved hosted runner, never the privileged one, and a caller cannot choose', () => {
+  assert.equal(runnerFor({ event: 'pull_request', isFork: true, runner: 'linux' }), HOSTED_RUNNER);
+  assert.equal(runnerFor({ event: 'pull_request', isFork: true, runner: 'self-hosted-big' }), HOSTED_RUNNER, 'the caller runner label is ignored for untrusted code');
+  assert.ok(APPROVED_HOSTED_RUNNERS.includes(HOSTED_RUNNER) && /^ubuntu-\d/.test(HOSTED_RUNNER));
+  assert.equal(runnerFor({ event: 'pull_request', isFork: false, runner: 'linux' }), 'linux');
   assert.equal(runnerFor({ event: 'push', isFork: false, runner: 'linux' }), 'linux');
 });
 

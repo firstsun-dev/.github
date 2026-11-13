@@ -2,7 +2,9 @@
 # BUILD stage of the single delivery engine (target = prod | preview | dev). Builds the deployable, resolves the
 # config that will be PUBLISHED, audits that exact config and records its fingerprint. Nothing remote is mutated, so
 # a failed build or audit leaves the live Worker / Preview / Dev untouched. publish.sh later publishes only this config.
-# Env: TARGET APP_DIR TOOLS_DIR STATE_DIR BUILD_CMD [BUILD_ENV_FILE] [APP_VERSION] [WRANGLER_CONFIG=wrangler.toml]
+# Env: TARGET APP_DIR TOOLS_DIR STATE_DIR BUILD_CMD [BUILD_ENV_FILE] [APP_VERSION] [WRANGLER_CONFIG=wrangler.toml] [ARTIFACT_DIR]
+#      ARTIFACT_DIR set: also bundle the audited config (`wrangler deploy --dry-run --outdir`, offline, no credential) and package the publishable artifact
+#      (artifact.mjs) - the ONLY thing the privileged jobs ever publish. The caller must not hold Cloudflare credentials.
 #      preview: PREVIEW_NAME [HOST_WORKER] [PREVIEW_HOST_CHECK] [PREVIEW_ENV_FILE] [PREVIEW_ALLOW] [PREVIEW_DENY]
 #      dev:     DEV_ENV DEV_WORKER [DEV_ALLOW] [DEV_DENY] [PROD_URL]
 # Writes $STATE_DIR/{config.path,config.mode,config.sha,artifact.sha}.
@@ -73,3 +75,13 @@ sha256sum "$CONFIG_PATH" | cut -d' ' -f1 > "$STATE_DIR/config.sha"
 node "$TOOLS_DIR/cli.mjs" artifact-digest --config "$CONFIG_PATH" | sed -n 's/^artifact_digest=//p' > "$STATE_DIR/artifact.sha"
 echo "config_path=$CONFIG_PATH"
 echo "config_mode=$MODE"
+
+if [ -n "${ARTIFACT_DIR:-}" ]; then
+  [ -z "${CLOUDFLARE_API_TOKEN:-}${CLOUDFLARE_ACCOUNT_ID:-}" ] || { echo "::error::the Build must not run with Cloudflare credentials" >&2; exit 1; }
+  BUNDLE="$STATE_DIR/bundle"; rm -rf "$BUNDLE"
+  # A named Wrangler environment of a SOURCE config is selected explicitly; an adapter-generated config is already flattened.
+  ENV_ARGS=(); [ "$TARGET" = dev ] && [ "$MODE" = source ] && ENV_ARGS=(--env "$DEV_ENV")
+  pnpm exec wrangler deploy --dry-run --outdir "$BUNDLE" --config "$CONFIG_PATH" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} >&2
+  node "$TOOLS_DIR/cli.mjs" package-artifact --config "$CONFIG_PATH" --mode "$MODE" --target "$TARGET" --dev-env "$DEV_ENV" --app-dir "$APP_DIR" \
+    --bundle-dir "$BUNDLE" --dest "$ARTIFACT_DIR" >&2
+fi

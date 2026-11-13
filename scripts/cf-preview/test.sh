@@ -32,13 +32,13 @@ static() {
 }
 unit() {
   local rc=0
-  run "node unit" node --test scripts/cf-preview/lib.test.mjs scripts/cf-preview/delivery.test.mjs scripts/cf-preview/stages.test.mjs scripts/cf-preview/cli.test.mjs scripts/cf-preview-gc/gc.test.mjs || rc=1
+  run "node unit" node --test scripts/cf-preview/lib.test.mjs scripts/cf-preview/delivery.test.mjs scripts/cf-preview/stages.test.mjs scripts/cf-preview/artifact.test.mjs scripts/cf-preview/cli.test.mjs scripts/cf-preview-gc/gc.test.mjs || rc=1
   run "parse-env" scripts/cf-preview/test-parse-env.sh || rc=1
   return "$rc"
 }
 safety() {
   local rc=0
-  for t in deploy migrate smoke probe gh; do run "$t" "scripts/cf-preview/test-$t.sh" || rc=1; done
+  for t in deploy engine migrate smoke probe gh; do run "$t" "scripts/cf-preview/test-$t.sh" || rc=1; done
   return "$rc"
 }
 

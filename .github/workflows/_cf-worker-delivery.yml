@@ -64,6 +64,14 @@ on:
         description: verify only - needs.<job>.result of the job the cross-service smoke depends on
         type: string
         default: ''
+      artifact_name:
+        description: Name of the build artifact the unprivileged Build job of THIS run uploaded (downloaded and verified before anything else; the deploy never builds).
+        type: string
+        default: ''
+      target_url:
+        description: Canonical URL the Plan resolved before the build; the artifact and the published URL must both match it.
+        type: string
+        default: ''
       descriptor:
         description: toJSON of THIS kind's target descriptor (versioned, validated by the Plan job and re-validated by the engine). Carries the engine target, GitHub Environment, concurrency groups, expected physical D1, migration owner and smoke mode; never a secret.
         type: string
@@ -105,8 +113,8 @@ defaults:
 
 jobs:
   # -------------------------------------------------------------------------
-  # Deploy — target-specific Build + Publish (stage publish) of THIS kind: its own URL (resolved before the build), its own build
-  # env, the audited artifact only. Depends on the run's single Migration result and on nothing
+  # Deploy — Publish (stage publish) of THIS kind: verifies the artifact the unprivileged Build job produced (identity, digest, structure, resource audit) and
+  # publishes ONLY that. No application dependency is installed and no application build runs in this credential-bearing job. Depends on the run's single Migration result and on nothing
   # of any other kind. A green Deploy means "published", not "verified".
   # -------------------------------------------------------------------------
   deploy:
@@ -135,11 +143,18 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
+      # Production / Dev revisions are protected (main / approved ref): their SOURCE config is read (never executed) by the artifact audit. A Preview (untrusted
+      # PR code) is never checked out here: the job sees the artifact only.
       - uses: actions/checkout@v6
+        if: fromJSON(inputs.descriptor).target != 'preview'
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ runner.temp }}/cfv2-artifact
       - id: engine
         uses: $/actions/cf-deploy
         with:
@@ -147,6 +162,8 @@ jobs:
           descriptor: ${{ inputs.descriptor }}
           kind: ${{ fromJSON(inputs.descriptor).slot }}
           stage: publish
+          artifact_dir: ${{ runner.temp }}/cfv2-artifact
+          target_url: ${{ inputs.target_url }}
           migration_result: ${{ inputs.migration_result }}
           migration_json: ${{ inputs.migration_json }}
           inputs_json: ${{ inputs.inputs_json }}

@@ -486,7 +486,7 @@ export function restoreDescriptor(state, { repo, runId = '0', event = '', ref = 
 // Engine initialisation (pure): every check of `engine.sh init`, evaluated once over the validated inputs. Throws (fail closed, BEFORE any
 // mutation) with the message the operator sees. Credentials stay a shell check.
 // ---------------------------------------------------------------------------------------------------------------------
-const STAGES = ['all', 'deploy', 'precheck', 'migrate', 'publish', 'verify', 'rollback'];
+const STAGES = ['build', 'precheck', 'migrate', 'publish', 'verify', 'rollback'];
 
 export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expect = '', descriptor = '', callInputs = '', event, ref, isFork = false, prAction = '', previewSecrets = '' }) {
   if (inputs === null || typeof inputs !== 'object' || Array.isArray(inputs)) throw new Error('inputs_json is not an object');
@@ -498,10 +498,6 @@ export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expec
   if (kind && d.slot !== kind) throw new Error(`delivery descriptor slot '${d.slot}' differs from the stage's '${kind}'`);
   if (d.d1_expected_id !== d1Expect) throw new Error("delivery descriptor D1 id differs from the stage's expected D1");
   if (!STAGES.includes(stage)) throw new Error(`bad engine stage: ${stage}`);
-  // Only the stable Worker Dev may run every phase in ONE job; every other delivery runs as split stages.
-  if (target !== 'dev' && !['precheck', 'migrate', 'publish', 'verify', 'rollback'].includes(stage)) {
-    throw new Error(`${d.target}/${d.driver} must run as split stages (precheck/migrate/publish/verify/rollback), got '${stage}'`);
-  }
   if (d.target === 'preview' && ['precheck', 'migrate'].includes(stage)) throw new Error('a Preview never migrates a remote D1');
   if (!/^[A-Za-z0-9_-]*$/.test(d1Expect)) throw new Error('malformed expected D1 id');
   if (callInputs) { // deferred verification: the verify call's identity inputs must equal the deploy call's

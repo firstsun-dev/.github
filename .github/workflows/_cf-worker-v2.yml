@@ -118,11 +118,6 @@ on:
         description: 'JSON array of {"id","cmd"} - costly checks (heavy integration, contract ...). Runs on pull_request and merge_group only. Empty is valid.'
         type: string
         default: ''
-      fork_runner:
-        description: >
-          GitHub-hosted runner label for fork pull requests. Empty = a fork PR fails closed (untrusted code never reaches `runner`).
-        type: string
-        default: ''
       build_cmd:
         description: >
           Application build, run from app_path. The Build Validation job runs it as validation (no deploy artifact);
@@ -383,7 +378,7 @@ env:
 jobs:
   # -------------------------------------------------------------------------
   # CI — ONE call of _cf-worker-ci.yml: Plan, the Verify / Test task matrices and E2E in parallel, then the fail-closed Gate. Credential-free. The event
-  # decides the stages (push = Verify; pull_request / merge_group = Verify + Test on the merge candidate). Its Gate is the only upstream condition of the Plan.
+  # decides the stages (push = Verify; pull_request / merge_group = Verify + Test on the merge candidate). Its Gate is an upstream condition of every Migrate / Deploy (not of the Plan or the Build, which run concurrently with it).
   # -------------------------------------------------------------------------
   ci:
     name: CI
@@ -394,7 +389,6 @@ jobs:
       app_path: ${{ inputs.app_path }}
       app_version: ${{ inputs.app_version }}
       runner: ${{ inputs.runner }}
-      fork_runner: ${{ inputs.fork_runner }}
       verify_tasks: ${{ inputs.verify_tasks }}
       test_tasks: ${{ inputs.test_tasks }}
       ci_env: ${{ inputs.ci_env }}
@@ -409,15 +403,15 @@ jobs:
       test_e2e_env: ${{ inputs.test_e2e_env }}
 
   # -------------------------------------------------------------------------
-  # Plan — pure data, no Cloudflare credentials: THE delivery of this event (or none), its descriptor, the physical D1 to migrate and the canonical lock
-  # `group`. Runs only after a passed CI Gate and only for an event that can deliver (main push, same-repo PR with preview_policy pr, dispatch), so a
-  # feature push does not pay for it. A verify call plans from phase_state. An explicit but unservable dispatch_target always reaches the Plan, which then
-  # ALWAYS fails (resolveDelivery): such a run is red instead of silently green.
+  # Plan — pure data and the ONLY Cloudflare read before the build: THE delivery of this event (or none), its descriptor, the physical D1 to migrate, the canonical
+  # lock `group` and the canonical target URL (a Preview's URL comes from Cloudflare, so one step - that runs only this repository's tooling, never application code
+  # - gets the token). It does NOT wait for CI: the Build runs concurrently with Verify / Test, and every mutation below waits for the CI Gate. Runs only for an event
+  # that can deliver (main push, same-repo PR with preview_policy pr, dispatch), so a feature push does not pay for it. A verify call plans from phase_state. An
+  # explicit but unservable dispatch_target always reaches the Plan, which then ALWAYS fails (resolveDelivery): such a run is red instead of silently green.
   # -------------------------------------------------------------------------
   plan:
     name: Plan
-    needs: [ci]
-    if: always() && (inputs.pipeline_phase == 'verify' || (needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && inputs.preview_policy == 'pr') || github.event_name == 'workflow_dispatch')) || (inputs.dispatch_target != '' && github.event_name != 'workflow_dispatch'))
+    if: inputs.pipeline_phase == 'verify' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && inputs.preview_policy == 'pr') || github.event_name == 'workflow_dispatch' || inputs.dispatch_target != ''
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     outputs:
@@ -429,11 +423,17 @@ jobs:
       has_migrations: ${{ steps.plan.outputs.has_migrations }}
       migration: ${{ steps.plan.outputs.migration }}
       group: ${{ steps.plan.outputs.group }}
+      slot: ${{ steps.plan.outputs.slot }}
+      preview_name: ${{ steps.plan.outputs.preview_name }}
+      url_host: ${{ steps.plan.outputs.url_host }}
+      url_explicit: ${{ steps.plan.outputs.url_explicit }}
+      target_url: ${{ steps.url.outputs.target_url }}
     steps:
+      # Only a Production / Dev plan reads the project's Wrangler config (the D1 to migrate); a PR (untrusted code) is never checked out here.
       - uses: actions/checkout@v6
-        if: inputs.pipeline_phase != 'verify'
+        if: inputs.pipeline_phase != 'verify' && github.event_name != 'pull_request'
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@v6
         with:
@@ -452,6 +452,63 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           node "$TOOLS_DIR/cli.mjs" plan --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" --phase "$PHASE" --run-id "$GITHUB_RUN_ID" --fork "$IS_FORK" --pr-action "$PR_ACTION" --pr-number "$PR_NUMBER" --app-dir "$GITHUB_WORKSPACE/${{ inputs.app_path }}" | tee -a "$GITHUB_OUTPUT"
+      # The canonical URL, resolved BEFORE the build (a Preview's comes from the host Worker's Cloudflare-reported suffix; read-only). Build and Publish both
+      # require the artifact and the published URL to equal it.
+      - id: url
+        if: steps.plan.outputs.has_delivery == 'true' && inputs.pipeline_phase != 'verify'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SLOT: ${{ steps.plan.outputs.slot }}
+          NAME: ${{ steps.plan.outputs.preview_name }}
+          HOST: ${{ steps.plan.outputs.url_host }}
+          EXPLICIT: ${{ steps.plan.outputs.url_explicit }}
+          URL_SUFFIX: ${{ inputs.preview_url_suffix }}
+          HOST_CHECK: ${{ inputs.preview_host_check }}
+        run: |
+          node "$TOOLS_DIR/cli.mjs" resolve-url --kind "$SLOT" --name "$NAME" --host-worker "$HOST" --explicit "$EXPLICIT" --suffix "$URL_SUFFIX" --host-check "$HOST_CHECK" | sed -n 's/^target_url=/target_url=/p' | tee -a "$GITHUB_OUTPUT"
+
+  # -------------------------------------------------------------------------
+  # Build — the UNPRIVILEGED target build (stage build of the delivery engine). It runs the application's dependency install and build for the planned target,
+  # audits the effective config, bundles it offline and uploads ONE artifact. No Cloudflare credential, no write token, no environment: the only job that runs
+  # application build code. A pull request builds the merge candidate CI tests, on an ephemeral GitHub-hosted runner that never shares a host with a credential-bearing
+  # job. It needs only the Plan, so it runs concurrently with Verify / Test; nothing it produces is used before the CI Gate passes.
+  # -------------------------------------------------------------------------
+  build:
+    name: Build
+    needs: [plan]
+    if: needs.plan.result == 'success' && needs.plan.outputs.has_delivery == 'true' && inputs.pipeline_phase != 'verify'
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || inputs.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: engine
+        uses: $/actions/cf-deploy
+        with:
+          target: ${{ fromJSON(needs.plan.outputs.descriptor).engine_target }}
+          descriptor: ${{ needs.plan.outputs.descriptor }}
+          kind: ${{ fromJSON(needs.plan.outputs.descriptor).slot }}
+          stage: build
+          artifact_dir: ${{ runner.temp }}/cfv2-artifact
+          target_url: ${{ needs.plan.outputs.target_url }}
+          inputs_json: ${{ needs.plan.outputs.inputs_json }}
+          d1_expected_id: ${{ fromJSON(needs.plan.outputs.descriptor).d1_expected_id }}
+          preview_secrets: ${{ fromJSON(needs.plan.outputs.descriptor).engine_target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cfv2-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cfv2-artifact
+          if-no-files-found: error
+          retention-days: 7
 
   # =========================================================================
   # Migration — the ONE job that mutates a database (production and dev only; a Preview never migrates). Its steps run in order and a failing step stops the
@@ -465,8 +522,8 @@ jobs:
   # =========================================================================
   migration:
     name: Migrate
-    needs: [plan]
-    if: always() && inputs.pipeline_phase != 'verify' && needs.plan.result == 'success' && needs.plan.outputs.has_migrations == 'true'
+    needs: [plan, ci, build]
+    if: always() && inputs.pipeline_phase != 'verify' && needs.plan.result == 'success' && needs.plan.outputs.has_migrations == 'true' && needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed' && needs.build.result == 'success'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     environment:
@@ -490,6 +547,10 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: cfv2-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cfv2-artifact
       - id: precheck
         name: Check pending D1 migrations (read-only, no build)
         uses: $/actions/cf-deploy
@@ -509,6 +570,8 @@ jobs:
           descriptor: ${{ needs.plan.outputs.descriptor }}
           kind: ${{ fromJSON(needs.plan.outputs.descriptor).slot }}
           stage: migrate
+          artifact_dir: ${{ runner.temp }}/cfv2-artifact
+          target_url: ${{ needs.plan.outputs.target_url }}
           inputs_json: ${{ needs.plan.outputs.inputs_json }}
           d1_expected_id: ${{ fromJSON(needs.plan.outputs.migration).d1_id }}
           preview_secrets: ${{ fromJSON(needs.plan.outputs.descriptor).engine_target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
@@ -527,8 +590,9 @@ jobs:
   # =========================================================================
   delivery:
     name: ${{ needs.plan.outputs.target || 'delivery' }}
-    needs: [plan, migration]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.has_delivery == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
+    needs: [plan, ci, build, migration]
+    # Every remote mutation waits for: a plan, the CI Gate (not for a deferred verify call: its CI ran in the deploy call), the Build's artifact, and the Migration.
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.has_delivery == 'true' && (inputs.pipeline_phase == 'verify' || (needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed' && needs.build.result == 'success')) && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
     uses: $/.github/workflows/_cf-worker-delivery.yml
     permissions:
       contents: read
@@ -536,6 +600,8 @@ jobs:
       pull-requests: write
     with:
       descriptor: ${{ needs.plan.outputs.descriptor }}
+      artifact_name: ${{ inputs.pipeline_phase == 'verify' && '' || format('cfv2-artifact-{0}-{1}', github.run_id, github.run_attempt) }}
+      target_url: ${{ needs.plan.outputs.target_url }}
       runner: ${{ inputs.runner }}
       inputs_json: ${{ needs.plan.outputs.inputs_json }}
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
