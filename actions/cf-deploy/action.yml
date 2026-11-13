@@ -230,6 +230,11 @@ runs:
       env:
         ENGINE_TARGET: ${{ inputs.target }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" precheck | tee -a "$GITHUB_OUTPUT"'
+    - name: Verify the artifact and audit its packaged config (nothing is built here; BEFORE any ledger entry or remote call)
+      id: artifact
+      if: env.STALE != 'true' && (inputs.stage == 'migrate' || inputs.stage == 'publish')
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" artifact-verify | tee -a "$GITHUB_OUTPUT"'
     - name: Prepare (Wrangler version, Preview identity and ledger, ledger entry)
       if: env.STALE != 'true' && (inputs.stage == 'migrate' || inputs.stage == 'publish')
       shell: bash
@@ -240,11 +245,6 @@ runs:
       if: env.STALE != 'true' && inputs.stage == 'build'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" build'
-    - name: Verify the artifact and audit its packaged config (nothing is built here)
-      id: artifact
-      if: env.STALE != 'true' && (inputs.stage == 'migrate' || inputs.stage == 'publish')
-      shell: bash
-      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" artifact-verify | tee -a "$GITHUB_OUTPUT"'
     - name: Validate the exact migration target (same physical D1 as the deployed config)
       if: env.STALE != 'true' && (inputs.stage == 'migrate' || inputs.stage == 'publish')
       shell: bash

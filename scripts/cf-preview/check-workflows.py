@@ -108,6 +108,11 @@ for st in act:
         errors.append("the engine must not install application dependencies in the migrate / publish / precheck stages")
     if "engine.sh\" build" in str(st.get("run", "")) and "inputs.stage == 'build'" not in cond:
         errors.append("the build phase must be limited to stage build")
+names = [str(st.get("name", "")) for st in act]
+iv = next((i for i, n in enumerate(names) if n.startswith("Verify the artifact")), -1)
+ip = next((i for i, n in enumerate(names) if n.startswith("Prepare")), -1)
+if iv < 0 or ip < 0 or iv > ip:
+    errors.append("the artifact must be verified BEFORE Prepare (the ledger entry is the first remote effect)")
 if "ubuntu-24.04" not in open(".github/workflows/_cf-worker-ci.yml").read():
     errors.append("the CI workflow must pin fork pull requests to the approved hosted runner")
 if re.search(r"fork_runner", open(".github/workflows/_cf-worker-v2.yml").read()):
