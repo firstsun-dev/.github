@@ -70,7 +70,7 @@ GitHub changelog 2026-07-30: `uses: $/path` is *this workflow's repository at th
 Sibling files are **not** assumed to land in `$GITHUB_WORKSPACE`. The runner downloads this repository at the running SHA; each action finds its scripts relative to itself
 (`$GITHUB_ACTION_PATH/../cf-preview`, already how `cf-deploy` and `cf-ci-check` worked), and `cf-tools` exports that path for the jobs that run the scripts directly. The application checkout
 is unchanged; nothing from this repository is ever in the application's workspace (the old `find .cf-tools … -delete` workaround in `cf-ci-check` is gone).
-`tools_ref` is still accepted (required → optional, default empty) and ignored; a caller passing a non-existent ref keeps working (scenario r6 below).
+`tools_ref` was accepted and ignored during the rollout; it has since been removed (see the note at the top).
 **New environmental requirement:** every runner that executes a pipeline job (the `runner` input) must be ≥ 2.336.0; the org `linux` runners are 2.338.0 and GitHub-hosted images 2.338.2. A caller on an older self-hosted runner fails at "Prepare all required actions".
 `actionlint` 1.7.12 does not know `$/`; `.github/actionlint.yaml` ignores exactly those two message formats and the contract test validates every `$/` reference itself (static, no `@ref`, target exists).
 
