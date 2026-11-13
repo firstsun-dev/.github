@@ -208,6 +208,7 @@ case "$PHASE" in
     ctx
     [ -n "$ARTIFACT_DIR" ] || die "no artifact directory"
     check_target_url "$S/build.env"
+    artifact_env   # the identity the manifest records (the privileged jobs compare it with their OWN derivation)
     run_build "$S/build.env" "$(inp app_version)";;
 
   artifact-verify) # PRIVILEGED jobs: the artifact must be what THIS job expects, then the resource audit runs on the PACKAGED config. Nothing is built.

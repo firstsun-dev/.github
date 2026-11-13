@@ -46,4 +46,21 @@ init publish CLOUDFLARE_API_TOKEN=t CLOUDFLARE_ACCOUNT_ID=a || { bad "preview+d1
 env -i PATH="$PATH" HOME="$T" RUNNER_TEMP="$T/rt" STATE_DIR="$T/s-publish" TOOLS_DIR="$TOOLS" GITHUB_WORKSPACE="$T/no-checkout" GITHUB_EVENT_NAME=pull_request GITHUB_REF=refs/pull/4/merge \
   GITHUB_SHA=bbbb PR_NUMBER=4 PR_HEAD_REF=feat PR_HEAD_SHA=aaaa "$ENGINE" audit-d1 >/dev/null 2>"$T/err" && ok "audit-d1: a Preview with d1_migrations needs no source checkout" || { bad "audit-d1: Preview without checkout"; cat "$T/err"; }
 
+# ---- the Build stage end to end through the engine (regression: the first real-runner canary found the manifest identity was not exported) -----------
+mkdir -p "$T/ws/src" "$T/bin2"
+printf 'name = "blog"\nmain = "src/index.js"\ncompatibility_date = "2025-01-01"\n[previews]\n' > "$T/ws/wrangler.toml"; echo 'export default {}' > "$T/ws/src/index.js"
+cat > "$T/bin2/pnpm" <<'STUB'
+#!/usr/bin/env bash
+while [ $# -gt 0 ]; do [ "$1" = --outdir ] && { mkdir -p "$2"; echo 'export default {}' > "$2/index.js"; }; shift; done
+STUB
+chmod +x "$T/bin2/pnpm"
+echo '{"app_name":"blog","build_cmd":"true","production_rollback_policy":"manual","preview_policy":"pr"}' > "$T/in.json"
+PRENV=(GITHUB_EVENT_NAME=pull_request GITHUB_REF=refs/pull/4/merge GITHUB_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb PR_NUMBER=4 PR_HEAD_REF=feat PR_HEAD_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=9 GITHUB_RUN_ATTEMPT=2)
+benv() { env -i PATH="$T/bin2:$PATH" HOME="$T" RUNNER_TEMP="$T/rt" STATE_DIR="$T/s-b" TOOLS_DIR="$TOOLS" GITHUB_WORKSPACE="$T/ws" "${PRENV[@]}" "$@"; }
+benv INPUTS_JSON="$(cat "$T/in.json")" ENGINE_TARGET=preview ENGINE_KIND=native-branch ENGINE_STAGE=build ENGINE_DESCRIPTOR="$DESC" ENGINE_D1_EXPECT= ENGINE_ARTIFACT_DIR="$T/art" \
+  ENGINE_TARGET_URL=https://pr-4-blog.x.workers.dev CFV2_PR_ACTION=synchronize "$ENGINE" init >/dev/null 2>"$T/err" || { bad "build init"; cat "$T/err"; }
+benv "$ENGINE" build >/dev/null 2>"$T/err" && ok "build stage: produces the artifact" || { bad "build stage: produces the artifact"; cat "$T/err"; }
+node -e 'const m=require(process.argv[1]);const ok=m.source_sha==="a".repeat(40)&&m.tested_sha==="b".repeat(40)&&m.artifact_sha==="b".repeat(40)&&m.run_id==="9"&&m.run_attempt==="2"&&m.target==="preview"&&m.slot==="native-branch"&&m.target_url==="https://pr-4-blog.x.workers.dev";process.exit(ok?0:1)' "$T/art/manifest.json" \
+  && ok "build stage: the manifest records source=PR head, tested=artifact=merge candidate, run id/attempt, target, URL" || { bad "build stage manifest identity"; cat "$T/art/manifest.json"; }
+
 [ "$fail" = 0 ] && echo "ALL PASSED" || { echo "FAILURES"; exit 1; }
