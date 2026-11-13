@@ -11,7 +11,7 @@
 
 `https://mcp.firstsun.org/{service}/mcp` is the *complete client-configured MCP Streamable HTTP endpoint*. Bare `/{service}` is only a namespace and SHALL NOT initialize MCP. No second `/mcp` suffix follows `/{service}/mcp`.
 
-A service slug must be registered once, be lowercase ASCII, and match `^[a-z][a-z0-9-]{1,31}$`. Reserved names include `mcp`, `health`, `cdn-cgi` and `.well-known`. Slugs are organization-level service identities, not necessarily the Worker or repo name. A registration maps one service slug to one owning repository, Worker, protected endpoint and Access application.
+A service slug must be registered once, be lowercase ASCII, and match `^[a-z][a-z0-9-]{1,31}$`. Reserved names include `mcp`, `health`, `cdn-cgi` and `.well-known`. Slugs are organization-level service identities, not necessarily the Worker or repo name. A registration maps one service slug to one owning application (repository plus optional monorepo subdirectory), one independently deployed Worker, one protected endpoint and one Access application/AUD. Multiple slugs MAY share a monorepo, but never a Worker, Access audience, route or runtime secrets merely because they share source control.
 
 The MCP handler accepts supported Streamable HTTP methods at its **exact** `/{service}/mcp` path. Bare `/{service}`, trailing slashes, longer prefixes and extra suffixes SHALL NOT initialize MCP. A trailing slash, suffix path or URL normalization must be explicitly tested; clients should use the exact canonical URL.
 
@@ -37,7 +37,7 @@ A Worker serving one registered service must reject unrelated paths, even if req
 
 ### Single configuration owner
 
-Terraform in `infra-config` remains authoritative for the hostname, Worker route patterns, Access applications, service-token policies, and non-secret AUD outputs. Runtime Worker repos do not redeclare those Cloudflare Route resources in Wrangler. Onboarding docs record the mapping and the approved integration-owned Service Token(s). Avoid Terraform resource replacement, orphaned route state and ambiguous ownership. Review a refreshed plan before apply.
+Terraform in `infra-config` remains authoritative for the hostname, Worker route patterns, Access applications, service-token policies, and non-secret AUD outputs. Runtime Worker apps (including apps hosted in monorepos) do not redeclare those Cloudflare Route resources in Wrangler. Each app has explicit ownership and independent change detection/CI. Onboarding docs record the mapping and the approved integration-owned Service Token(s). Avoid Terraform resource replacement, orphaned route state and ambiguous ownership. Review a refreshed plan before apply.
 
 ## Per-service Cloudflare Access and origin validation
 
