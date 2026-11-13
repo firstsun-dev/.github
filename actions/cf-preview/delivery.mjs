@@ -18,6 +18,8 @@ export const DEV_DRIVERS = ['none', 'native-preview', 'worker'];
 export const SMOKE_MODES = ['full', 'basic', 'skip'];
 /** Fixed name of the stable Native Dev Preview. */
 export const NATIVE_DEV_NAME = 'dev';
+/** Preview names no GC / retention action may ever delete (the stable Dev). PR Previews are `pr-<number>` and can never collide with it. */
+export const RESERVED_PREVIEW_NAMES = [NATIVE_DEV_NAME];
 
 const SLOT = { 'production/worker': 'production', 'preview/native-preview': 'native-branch', 'dev/native-preview': 'native-dev', 'dev/worker': 'persistent-dev' };
 const ENVIRONMENT_SUFFIX = { production: 'prod', 'native-branch': 'preview', 'native-dev': 'native-dev', 'persistent-dev': 'dev' };
@@ -451,7 +453,7 @@ export function runLockGroup({ event, ref, inputs, runId, isFork = false, prNumb
 const plainObject = (o) => o !== null && typeof o === 'object' && !Array.isArray(o);
 
 /** Descriptor for a verify call, from the validated phase_state of the deploy call. `repo` = this run's repository. */
-export function restoreDescriptor(state, { repo, runId = '0', event = '', ref = '', isFork = false, prNumber = '' }) {
+export function restoreDescriptor(state, { repo, runId = '0', event = '', ref = '', isFork = false, prNumber = '', prAction = '' }) {
   if (!plainObject(state)) throw new Error('phase_state is not an object');
   if (!plainObject(state.inputs) || !state.inputs.app_name) throw new Error('phase_state.inputs.app_name is missing: cannot bind the hand-off to an application');
   const app = String(state.inputs.app_name);
@@ -462,6 +464,12 @@ export function restoreDescriptor(state, { repo, runId = '0', event = '', ref = 
     throw new Error(`phase_state.group '${state.group}' is not the lock identity the deploy inputs imply ('${expectedGroup}'); refusing to verify under another lock`);
   }
   const d = validateDescriptor(state.descriptor);
+  // The descriptor must be exactly the delivery the deploy call's own inputs plan for THIS event (a swapped target / driver is rejected here).
+  const planned = resolveDelivery({
+    event, ref, isFork, prAction, previewPolicy: String(state.inputs.preview_policy ?? '') || 'none', devDriver: String(state.inputs.dev_driver ?? '') || 'none',
+    dispatchTarget: String(state.inputs.dispatch_target ?? ''), approvedDevRef: String(state.inputs.approved_dev_ref ?? ''),
+  });
+  if (!planned || planned.target !== d.target || planned.driver !== d.driver) throw new Error(`descriptor ${d.target}/${d.driver} is not the delivery the deploy inputs plan for this event (${planned ? `${planned.target}/${planned.driver}` : 'none'})`);
   if (d.phase !== 'deploy') throw new Error(`descriptor is in phase '${d.phase}'; only a deploy-phase descriptor can be verified`);
   if (d.environment !== environmentName(app, d)) throw new Error(`descriptor belongs to another application (${d.environment}, expected ${environmentName(app, d)})`);
   if (d.slot === 'persistent-dev') { // the Dev lock is the shared-D1 group of THIS repository and the deploy call's own scope / app
@@ -494,6 +502,7 @@ export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expec
   if (target !== 'dev' && !['precheck', 'migrate', 'publish', 'verify', 'rollback'].includes(stage)) {
     throw new Error(`${d.target}/${d.driver} must run as split stages (precheck/migrate/publish/verify/rollback), got '${stage}'`);
   }
+  if (d.target === 'preview' && ['precheck', 'migrate'].includes(stage)) throw new Error('a Preview never migrates a remote D1');
   if (!/^[A-Za-z0-9_-]*$/.test(d1Expect)) throw new Error('malformed expected D1 id');
   if (callInputs) { // deferred verification: the verify call's identity inputs must equal the deploy call's
     let c;

@@ -1,157 +1,115 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  DELIVERY_KINDS, resolveDeliveryTargets, resolveSmokeMode, parseSmokeOverrides, planMigrations, branchPreviewIdentity, ENGINE_TARGET,
-  canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins,
-  targetDescriptor, validateDescriptor, buildDescriptors, parseDescriptor, resolveMigrationUsed, parseD1Rows, pendingMigrations, classifyMigrationEntries, VERIFIED_NO_PENDING,
-  isContentLevel, verificationOutcome, prodRollbackBlock, nonProdRecoveryBlock, ciTargetEnv, rollbackVerdict, restoreDescriptors, validateInit, runLockGroup,
+  TARGETS, DRIVERS, assertDelivery, slotOf, engineTarget, environmentName, resolveDelivery, resolveSmokeMode, parseSmokeOverrides, planMigration,
+  canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins, foreignUrlsInBuildEnv, sameUrl,
+  targetDescriptor, validateDescriptor, buildDescriptor, parseDescriptor, resolveMigrationUsed, parseD1Rows, pendingMigrations, classifyMigrationEntries, VERIFIED_NO_PENDING,
+  isContentLevel, verificationOutcome, prodRollbackBlock, nonProdRecoveryBlock, rollbackVerdict, restoreDescriptor, validateInit, runLockGroup,
 } from '../../actions/cf-preview/delivery.mjs';
 
-const base = { event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-preview', previewOnPush: true };
-const T = (o) => resolveDeliveryTargets({ ...base, ...o });
+const PROD = { target: 'production', driver: 'worker' };
+const PREV = { target: 'preview', driver: 'native-preview' };
+const DEV_N = { target: 'dev', driver: 'native-preview' };
+const DEV_W = { target: 'dev', driver: 'worker' };
 
-test('deployment target matrix: exactly the enabled targets run, nothing else', () => {
-  assert.deepEqual(T({ ref: 'refs/heads/main' }), ['production']);
-  assert.deepEqual(T({ ref: 'refs/heads/main', sharedDevNativeOnPush: true, sharedDevOnPush: false }), ['production']);
-  assert.deepEqual(T({}), ['native-branch']);
-  assert.deepEqual(T({ previewOnPush: false }), []);
-  assert.deepEqual(T({ previewOnPush: false, sharedDevNativeOnPush: true }), ['native-dev']);
-  assert.deepEqual(T({ sharedDevNativeOnPush: true }), ['native-branch', 'native-dev']);
-  assert.deepEqual(T({ previewOnPush: false, sharedDevOnPush: true }), ['persistent-dev']);
-  assert.deepEqual(T({ sharedDevOnPush: true }), ['native-branch', 'persistent-dev']);
+// ---- vocabulary and target policy ------------------------------------------------------------------------------------
+test('three targets x two drivers; production -> worker, preview -> native-preview, dev -> either', () => {
+  assert.deepEqual(TARGETS, ['production', 'preview', 'dev']);
+  assert.deepEqual(DRIVERS, ['worker', 'native-preview']);
+  for (const d of [PROD, PREV, DEV_N, DEV_W]) assert.equal(assertDelivery(d), d);
+  assert.throws(() => assertDelivery({ target: 'production', driver: 'native-preview' }), /worker driver only/);
+  assert.throws(() => assertDelivery({ target: 'preview', driver: 'worker' }), /native-preview driver only/);
+  assert.throws(() => assertDelivery({ target: 'staging', driver: 'worker' }), /unknown delivery target/);
+  assert.throws(() => assertDelivery({ target: 'dev', driver: 'x' }), /unknown delivery driver/);
 });
-test('non-deploy events and refs never produce a target', () => {
-  assert.deepEqual(T({ event: 'pull_request', sharedDevNativeOnPush: true }), []);
-  assert.deepEqual(T({ event: 'delete', sharedDevNativeOnPush: true }), []);
-  assert.deepEqual(T({ ref: 'refs/tags/v1', sharedDevNativeOnPush: true }), []);
-  assert.deepEqual(T({ ref: 'refs/pull/1/merge' }), []);
-});
-test('manual persistent-dev dispatch only SELECTS the persistent-dev kind (approved ref, hybrid); everything else rejects', () => {
-  const d = { event: 'workflow_dispatch', strategy: 'hybrid', dispatchTarget: 'persistent-dev', devRef: 'refs/heads/dev-ref', ref: 'refs/heads/dev-ref' };
-  assert.deepEqual(T(d), ['persistent-dev']);
-  assert.throws(() => T({ ...d, ref: 'refs/heads/other' }), /rejected.*approved persistent_dev_ref/);
-  assert.throws(() => T({ ...d, strategy: 'production-preview' }), /rejected.*requires hybrid/);
-  assert.throws(() => T({ ...d, devRef: '' }), /rejected/);
-  assert.throws(() => T({ ...d, ref: 'refs/tags/v1', devRef: 'refs/tags/v1' }), /rejected/);
-  assert.throws(() => T({ ...d, dispatchTarget: 'production' }), /dispatch_target 'production' is not valid/);
-  // approved ref = main: still ONLY persistent-dev, never production, and no automatic Preview target alongside it
-  assert.deepEqual(T({ ...d, ref: 'refs/heads/main', devRef: 'refs/heads/main', sharedDevOnPush: true }), ['persistent-dev']);
-  // dispatch without a target keeps the existing behaviour (main -> production, branch -> the enabled automatic previews)
-  assert.deepEqual(T({ event: 'workflow_dispatch', strategy: 'hybrid', ref: 'refs/heads/main', devRef: 'refs/heads/main' }), ['production']);
-  assert.deepEqual(T({ event: 'workflow_dispatch', strategy: 'hybrid', ref: 'refs/heads/x', sharedDevOnPush: true }), ['native-branch', 'persistent-dev']);
-});
-test('dispatch_target fails closed: the full event / ref / target matrix', () => {
-  const H = { strategy: 'hybrid', devRef: 'refs/heads/dev-ref', sharedDevOnPush: true };
-  const rej = /only valid for a workflow_dispatch|rejected|not valid/;
-  // push / PR / delete: a non-empty target is a conflicting request - never ignored, never a Production fallback
-  assert.deepEqual(T({ ...H, event: 'push', ref: 'refs/heads/main' }), ['production'], 'push main, no target');
-  assert.throws(() => T({ ...H, event: 'push', ref: 'refs/heads/main', dispatchTarget: 'persistent-dev' }), /only valid for a workflow_dispatch/);
-  assert.deepEqual(T({ ...H, event: 'push', ref: 'refs/heads/feat' }), ['native-branch', 'persistent-dev'], 'push feature, no target: the existing enabled targets');
-  assert.throws(() => T({ ...H, event: 'push', ref: 'refs/heads/feat', dispatchTarget: 'persistent-dev' }), /only valid for a workflow_dispatch/);
-  assert.throws(() => T({ ...H, event: 'pull_request', ref: 'refs/pull/1/merge', dispatchTarget: 'persistent-dev' }), /only valid for a workflow_dispatch/);
-  assert.throws(() => T({ ...H, event: 'delete', ref: 'refs/heads/feat', dispatchTarget: 'persistent-dev' }), /only valid for a workflow_dispatch/);
-  assert.throws(() => T({ ...H, event: 'push', ref: 'refs/tags/v1', dispatchTarget: 'persistent-dev' }), /only valid for a workflow_dispatch/);
-  for (const ev of ['push', 'pull_request', 'delete', 'schedule', '']) assert.throws(() => T({ ...H, event: ev, ref: 'refs/heads/main', dispatchTarget: 'production' }), /only valid for a workflow_dispatch/);
-  // dispatch
-  assert.deepEqual(T({ ...H, event: 'workflow_dispatch', ref: 'refs/heads/dev-ref', dispatchTarget: 'persistent-dev' }), ['persistent-dev'], 'approved feature');
-  assert.deepEqual(T({ ...H, event: 'workflow_dispatch', ref: 'refs/heads/main', devRef: 'refs/heads/main', dispatchTarget: 'persistent-dev' }), ['persistent-dev'], 'approved main');
-  assert.throws(() => T({ ...H, event: 'workflow_dispatch', ref: 'refs/heads/other', dispatchTarget: 'persistent-dev' }), rej, 'unapproved ref');
-  assert.throws(() => T({ ...H, event: 'workflow_dispatch', ref: 'refs/heads/main', dispatchTarget: 'persistent-dev' }), rej, 'main is not the approved ref');
-  assert.throws(() => T({ ...H, event: 'workflow_dispatch', ref: 'refs/tags/v1', devRef: 'refs/tags/v1', dispatchTarget: 'persistent-dev' }), rej, 'tag');
-  assert.throws(() => T({ ...H, event: 'workflow_dispatch', ref: 'refs/heads/dev-ref', devRef: '', dispatchTarget: 'persistent-dev' }), rej, 'missing persistent_dev_ref');
-  for (const strategy of ['production-only', 'production-preview']) assert.throws(() => T({ event: 'workflow_dispatch', strategy, ref: 'refs/heads/dev-ref', devRef: 'refs/heads/dev-ref', dispatchTarget: 'persistent-dev' }), rej, `strategy ${strategy}`);
-  for (const bad of ['production', 'native-dev', 'Persistent-Dev', ' persistent-dev', 'persistent-dev ', 'unknown']) {
-    for (const ref of ['refs/heads/main', 'refs/heads/dev-ref', 'refs/heads/x']) assert.throws(() => T({ ...H, event: 'workflow_dispatch', ref, dispatchTarget: bad }), /not valid/, `${bad} on ${ref}`);
-  }
-  assert.deepEqual(T({ ...H, event: 'workflow_dispatch', ref: 'refs/heads/main', devRef: 'refs/heads/main' }), ['production'], 'dispatch main, no target: existing default');
-  // no combination ever falls back to Production
-  for (const ev of ['push', 'workflow_dispatch', 'pull_request', 'delete']) for (const ref of ['refs/heads/main', 'refs/heads/x', 'refs/tags/v1']) for (const t of ['persistent-dev', 'x']) {
-    let r; try { r = T({ ...H, event: ev, ref, dispatchTarget: t }); } catch { r = 'throws'; }
-    assert.ok(r === 'throws' || (Array.isArray(r) && r.length === 1 && r[0] === 'persistent-dev' && ev === 'workflow_dispatch'), `${ev} ${ref} ${t} -> ${JSON.stringify(r)}`);
-  }
-});
-test('production-only rejects every Dev channel; conflicting automatic Dev channels are rejected', () => {
-  assert.throws(() => T({ strategy: 'production-only', sharedDevNativeOnPush: true }), /production-only/);
-  assert.throws(() => T({ strategy: 'production-only', sharedDevOnPush: true }), /production-only/);
-  assert.throws(() => T({ sharedDevOnPush: true, sharedDevNativeOnPush: true }), /conflicting automatic Dev channels/);
-  assert.deepEqual(T({ strategy: 'production-only', ref: 'refs/heads/main' }), ['production']); // existing: ignores preview default
-  assert.deepEqual(T({ strategy: 'production-only' }), []);
-});
-test('unknown strategy rejects', () => assert.throws(() => T({ strategy: 'x' }), /Unknown deployment_strategy/));
-test('every kind maps to an engine target class', () => {
-  for (const k of DELIVERY_KINDS) assert.ok(ENGINE_TARGET[k], k);
-  assert.equal(ENGINE_TARGET['native-dev'], 'preview'); // Native Dev is a Preview, never a [env.dev] Worker
+test('engine class and persistence slot are derived once; Environment names are the historical ones', () => {
+  assert.deepEqual([PROD, PREV, DEV_N, DEV_W].map(engineTarget), ['prod', 'preview', 'preview', 'dev']);
+  assert.deepEqual([PROD, PREV, DEV_N, DEV_W].map(slotOf), ['production', 'native-branch', 'native-dev', 'persistent-dev']);
+  assert.deepEqual([PROD, PREV, DEV_N, DEV_W].map((d) => environmentName('app', d)), ['app/prod', 'app/preview', 'app/native-dev', 'app/dev']);
 });
 
+// ---- event -> delivery routing (THE policy table) ---------------------------------------------------------------------
+const R = (o) => resolveDelivery({ event: 'push', ref: 'refs/heads/feat/x', ...o });
+const DEVCFG = { devDriver: 'native-preview', approvedDevRef: 'refs/heads/main' };
+test('routing: a feature push never delivers, whatever is enabled', () => {
+  for (const o of [{}, { previewPolicy: 'pr' }, DEVCFG, { previewPolicy: 'pr', ...DEVCFG }]) assert.equal(R(o), null);
+});
+test('routing: main push is Production (worker); nothing else is automatic', () => {
+  assert.deepEqual(R({ ref: 'refs/heads/main' }), PROD);
+  assert.deepEqual(R({ ref: 'refs/heads/main', previewPolicy: 'pr', ...DEVCFG }), PROD, 'enabled Preview / Dev never add a second target');
+  assert.equal(R({ ref: 'refs/tags/v1' }), null);
+});
+test('routing: a same-repo PR gets ONE Preview only with preview_policy pr; fork, closed, none -> nothing', () => {
+  const pr = (o) => resolveDelivery({ event: 'pull_request', ref: 'refs/pull/7/merge', previewPolicy: 'pr', ...o });
+  assert.deepEqual(pr({ prAction: 'synchronize' }), PREV);
+  assert.deepEqual(pr({ prAction: 'opened' }), PREV);
+  assert.equal(pr({ isFork: true }), null, 'fork PR never deploys');
+  assert.equal(pr({ prAction: 'closed' }), null);
+  assert.equal(pr({ previewPolicy: 'none' }), null);
+});
+test('routing: merge_group, delete and other events never deliver', () => {
+  for (const event of ['merge_group', 'delete', 'schedule', 'release']) assert.equal(resolveDelivery({ event, ref: 'refs/heads/main', previewPolicy: 'pr', ...DEVCFG }), null, event);
+});
+test('routing: manual Dev promotion needs dispatch_target dev, a dev driver and EXACTLY the approved ref', () => {
+  const d = (o) => resolveDelivery({ event: 'workflow_dispatch', ref: 'refs/heads/main', dispatchTarget: 'dev', ...DEVCFG, ...o });
+  assert.deepEqual(d({}), DEV_N);
+  assert.deepEqual(d({ devDriver: 'worker' }), DEV_W);
+  assert.throws(() => d({ ref: 'refs/heads/feat/x' }), /not the approved_dev_ref/);
+  assert.throws(() => d({ ref: 'refs/tags/v1' }), /not the approved_dev_ref/);
+  assert.throws(() => d({ devDriver: 'none', approvedDevRef: '' }), /no Dev/);
+  assert.throws(() => d({ dispatchTarget: '' }), /only promotes to Dev/);
+  assert.throws(() => d({ dispatchTarget: 'production' }), /only promotes to Dev/, 'a manual dispatch can never reach Production');
+  assert.throws(() => d({ dispatchTarget: 'persistent-dev' }), /only promotes to Dev/, 'the old kind name is gone');
+});
+test('routing: an explicit dispatch_target on any other event is refused, never ignored', () => {
+  for (const event of ['push', 'pull_request', 'delete', 'merge_group']) assert.throws(() => R({ event, dispatchTarget: 'dev', ...DEVCFG }), /only valid for a workflow_dispatch/, event);
+});
+test('routing: invalid policy values fail closed', () => {
+  assert.throws(() => R({ previewPolicy: 'branch' }), /preview_policy/);
+  assert.throws(() => R({ devDriver: 'both', approvedDevRef: 'refs/heads/main' }), /dev_driver/);
+  assert.throws(() => R({ devDriver: 'worker' }), /requires approved_dev_ref/);
+  assert.throws(() => R({ devDriver: 'worker', approvedDevRef: 'main' }), /branch ref/);
+});
+
+// ---- smoke mode ------------------------------------------------------------------------------------------------------
 test('smoke_mode: default full, per-target override wins, strict validation', () => {
   assert.equal(resolveSmokeMode('production'), 'full');
-  assert.equal(resolveSmokeMode('native-dev', 'basic'), 'basic');
-  assert.equal(resolveSmokeMode('native-dev', 'basic', '{"native-dev":"skip"}'), 'skip');
-  assert.equal(resolveSmokeMode('production', 'basic', '{"native-dev":"skip"}'), 'basic');
-  assert.equal(resolveSmokeMode('production', '', ''), 'full');
-  assert.throws(() => resolveSmokeMode('production', 'quick'), /Unknown smoke_mode/);
-  assert.throws(() => resolveSmokeMode('prod'), /Unknown delivery kind/);
-  assert.throws(() => parseSmokeOverrides('{"prod":"skip"}'), /unknown delivery kind/);
-  assert.throws(() => parseSmokeOverrides('{"production":"off"}'), /unknown smoke mode/);
-  assert.throws(() => parseSmokeOverrides('[1]'), /JSON object/);
-  assert.throws(() => parseSmokeOverrides('{bad'), /not valid JSON/);
-  assert.deepEqual(parseSmokeOverrides('  '), {});
+  assert.equal(resolveSmokeMode('dev', 'basic'), 'basic');
+  assert.equal(resolveSmokeMode('dev', 'full', '{"dev":"skip"}'), 'skip');
+  assert.equal(resolveSmokeMode('production', 'full', '{"dev":"skip"}'), 'full');
+  assert.throws(() => resolveSmokeMode('production', 'sometimes'), /Unknown smoke_mode/);
+  assert.throws(() => resolveSmokeMode('native-dev'), /unknown target/);
+  assert.throws(() => parseSmokeOverrides('{"native-dev":"basic"}'), /unknown target/);
+  assert.throws(() => parseSmokeOverrides('{"dev":"maybe"}'), /unknown smoke mode/);
+  assert.throws(() => parseSmokeOverrides('[]'), /JSON object/);
+  assert.throws(() => parseSmokeOverrides('{'), /not valid JSON/);
+  assert.deepEqual(parseSmokeOverrides(''), {});
 });
 
-test('Native Dev owns the preview name "dev": a branch called dev gets b-dev when Native Dev is on', () => {
-  const a = { repo: 'o/r', worker: 'blog', ref: 'refs/heads/dev' };
-  assert.equal(branchPreviewIdentity(a).name, 'dev'); // legacy behaviour unchanged while Native Dev is off
-  assert.equal(branchPreviewIdentity(a, { reserveNativeDev: true }).name, 'b-dev');
-  assert.equal(branchPreviewIdentity({ ...a, ref: 'refs/heads/feat/x' }, { reserveNativeDev: true }).name, 'feat-x');
-});
-
+// ---- migration plan: ONE delivery, ONE physical D1 -------------------------------------------------------------------------
 const cfg = (prev, dev, prod = 'PROD') => ({
   name: 'app', d1_databases: [{ binding: 'DB', database_name: 'prod-db', database_id: prod }],
   previews: { d1_databases: [{ binding: 'DB', database_name: 'prev-db', database_id: prev }] },
   env: { dev: { d1_databases: [{ binding: 'DB', database_name: 'dev-db', database_id: dev }] } },
 });
-test('migration plan: Branch and Native Dev sharing one preview D1 migrate ONCE', () => {
-  const g = planMigrations(cfg('PREV', 'DEV'), ['native-branch', 'native-dev'], { accountId: 'acc' });
-  assert.equal(g.length, 1);
-  assert.equal(g[0].id, 'acc/PREV');
-  assert.deepEqual(g[0].members, ['native-branch', 'native-dev']);
-  assert.equal(g[0].owner, 'native-branch');
+test('migration plan: production and dev migrate their own database; account scopes the identity', () => {
+  assert.equal(planMigration(cfg('PREV', 'DEV'), PROD, { accountId: 'acc' }).id, 'acc/PROD');
+  assert.equal(planMigration(cfg('PREV', 'DEV'), DEV_W, { accountId: 'acc' }).databaseName, 'dev-db');
+  assert.equal(planMigration(cfg('PREV', 'DEV'), DEV_N, { accountId: 'acc' }).databaseName, 'prev-db', 'native Dev uses the [previews] database');
+  assert.notEqual(planMigration(cfg('X', 'D'), DEV_W, { accountId: 'a1' }).id, planMigration(cfg('X', 'D'), DEV_W, { accountId: 'a2' }).id);
 });
-test('migration plan: single-DB rule - distinct physical D1s fail closed before any mutation', () => {
-  assert.throws(() => planMigrations(cfg('PREV', 'DEV'), ['native-branch', 'persistent-dev'], { accountId: 'acc' }), /2 distinct physical D1 databases: prev-db \(native-branch\) vs dev-db \(persistent-dev\).*nothing was changed/);
-  assert.throws(() => planMigrations(cfg('PREV', 'DEV'), ['native-branch', 'native-dev', 'persistent-dev'], { accountId: 'acc' }), /distinct physical D1/);
+test('migration plan: a Preview NEVER migrates a remote D1', () => {
+  assert.throws(() => planMigration(cfg('PREV', 'DEV'), PREV, { accountId: 'acc' }), /never migrates/);
 });
-test('migration plan: Preview and persistent Dev on the SAME physical D1 dedupe (owner = first in order)', () => {
-  const g = planMigrations(cfg('SHARED', 'SHARED'), ['persistent-dev', 'native-dev'], { accountId: 'acc' });
-  assert.equal(g.length, 1);
-  assert.equal(g[0].owner, 'native-dev');
+test('migration plan: the production D1 can never be reached from Dev', () => {
+  assert.throws(() => planMigration(cfg('PROD', 'DEV', 'PROD'), DEV_N, { accountId: 'acc' }), /shared across trust boundaries/);
+  assert.throws(() => planMigration(cfg('PREV', 'PROD', 'PROD'), DEV_W, { accountId: 'acc' }), /shared across trust boundaries/);
 });
-test('migration plan: production D1 can never be reached from Preview/Dev', () => {
-  assert.throws(() => planMigrations(cfg('PROD', 'DEV', 'PROD'), ['native-dev'], { accountId: 'acc' }), /shared across trust boundaries/);
-  assert.throws(() => planMigrations(cfg('PREV', 'PROD', 'PROD'), ['persistent-dev'], { accountId: 'acc' }), /shared across trust boundaries/);
-  assert.equal(planMigrations(cfg('PREV', 'DEV'), ['production'], { accountId: 'acc' })[0].id, 'acc/PROD');
-});
-test('migration plan: a target without a D1 binding fails closed; no kinds = empty plan', () => {
-  assert.throws(() => planMigrations({ name: 'a' }, ['native-dev'], { accountId: 'acc' }), /No D1 binding/);
-  assert.deepEqual(planMigrations(cfg('P', 'D'), [], { accountId: 'acc' }), []);
-});
-test('same database_id under a different account is a different physical D1', () => {
-  const a = planMigrations(cfg('X', 'D'), ['native-dev'], { accountId: 'a1' })[0].id;
-  const b = planMigrations(cfg('X', 'D'), ['native-dev'], { accountId: 'a2' })[0].id;
-  assert.notEqual(a, b);
+test('migration plan: a target without a D1 binding fails closed', () => {
+  assert.throws(() => planMigration({ name: 'a' }, DEV_W, { accountId: 'acc' }), /No D1 binding/);
 });
 
-import { environmentName, ledgerEnv, foreignUrlsInBuildEnv, sameUrl } from '../../actions/cf-preview/delivery.mjs';
-test('environment and ledger names: legacy names unchanged, Native Dev gets its own', () => {
-  assert.equal(environmentName('blog', 'production'), 'blog/prod');
-  assert.equal(environmentName('blog', 'native-branch'), 'blog/preview');
-  assert.equal(environmentName('blog', 'persistent-dev'), 'blog/dev');
-  assert.equal(environmentName('blog', 'native-dev'), 'blog/native-dev');
-  assert.equal(ledgerEnv('blog', 'native-dev'), 'blog/native-dev/dev');
-  assert.equal(ledgerEnv('blog', 'persistent-dev'), 'blog/dev/shared');
-  assert.equal(ledgerEnv('blog', 'native-branch', 'feat-x'), 'blog/preview/feat-x');
-  assert.throws(() => environmentName('blog', 'prod'), /Unknown delivery kind/);
-});
+// ---- URL helpers ------------------------------------------------------------------------------------------------------
 test('build env URL isolation: another target URL in this build env is reported', () => {
   const urls = { production: 'https://app.example.com', 'native-dev': 'https://dev-app.x.workers.dev' };
   assert.deepEqual(foreignUrlsInBuildEnv('native-dev', 'PUBLIC_URL=https://dev-app.x.workers.dev\nIDP=https://id.example.org', urls), []);
@@ -215,168 +173,200 @@ test('Branch and Native Dev never share a build URL: each resolves its own Previ
   assert.deepEqual(checkBuildEnvOrigins('PUBLIC_APP_URL=' + a, b).length, 1);
 });
 
-// ---------------------------------------------------------------------------------------------------------------------
-// P2-B: migration plan - one execution per physical D1; the owner is the first member; Production D1 is never shared.
-// ---------------------------------------------------------------------------------------------------------------------
-test('planMigrations: Branch + Native Dev on one preview D1 -> ONE group (owner native-branch); distinct D1s are refused', () => {
-  const cfg = { name: 'app', d1_databases: [{ binding: 'DB', database_name: 'prod', database_id: 'PROD' }],
-    previews: { d1_databases: [{ binding: 'DB', database_name: 'prev', database_id: 'PREV' }] },
-    env: { dev: { name: 'app-dev', d1_databases: [{ binding: 'DB', database_name: 'devdb', database_id: 'DEV' }] } } };
-  const g = planMigrations(cfg, ['native-branch', 'native-dev'], { accountId: 'A' });
-  assert.equal(g.length, 1);
-  assert.deepEqual(g[0].members, ['native-branch', 'native-dev']);
-  assert.equal(g[0].owner, 'native-branch');
-  assert.equal(g[0].databaseId, 'PREV');
-  assert.throws(() => planMigrations(cfg, ['native-branch', 'persistent-dev'], { accountId: 'A' }), /distinct physical D1/);
-  assert.deepEqual(planMigrations(cfg, ['production'], { accountId: 'A' })[0].members, ['production']);
-});
-test('planMigrations: a Production D1 exposed to Preview/Dev is refused', () => {
-  const cfg = { name: 'app', d1_databases: [{ binding: 'DB', database_name: 'prod', database_id: 'PROD' }],
-    previews: { d1_databases: [{ binding: 'DB', database_name: 'prod', database_id: 'PROD' }] } };
-  assert.throws(() => planMigrations(cfg, ['native-branch'], { accountId: 'A' }), /Production D1|production/i);
-});
 
-// ---- target descriptor: the single versioned record the thin per-kind calls consume -------------------------------------
-const D = { kind: 'native-dev', app: 'app', runId: 77, d1ExpectedId: 'DB1', ownerKind: 'native-branch' };
-
-test('descriptor: derived once from the kind - engine target, environment, concurrency groups', () => {
-  const expect = { production: ['prod', 'app/prod'], 'native-branch': ['preview', 'app/preview'], 'native-dev': ['preview', 'app/native-dev'], 'persistent-dev': ['dev', 'app/dev'] };
-  for (const k of DELIVERY_KINDS) {
-    const d = targetDescriptor({ kind: k, app: 'app', runId: 5, repo: 'o/r' });
-    assert.deepEqual([d.target, d.environment], expect[k]);
-    if (k !== 'persistent-dev') {
-      assert.equal(d.deploy_group, `cfv2-leg-5-${k}`);
-      assert.equal(d.rollback_group, `cfv2-leg-5-${k}-rollback`);
-    }
-    assert.equal(d.v, 1);
-  }
+// ---- descriptor -------------------------------------------------------------------------------------------------------
+const D = (delivery, o = {}) => targetDescriptor({ delivery, app: 'app', runId: '42', repo: 'o/r', ...o });
+test('descriptor: derived once from target x driver - engine class, slot, Environment, concurrency groups', () => {
+  const p = D(PROD);
+  assert.deepEqual([p.target, p.driver, p.slot, p.engine_target, p.environment], ['production', 'worker', 'production', 'prod', 'app/prod']);
+  assert.equal(p.deploy_group, 'cfv2-leg-42-production');
+  assert.equal(p.rollback_group, 'cfv2-leg-42-production-rollback');
+  const w = D(DEV_W, { lockScope: 'shared' });
+  assert.equal(w.deploy_group, 'cfv2-dev-o/r-shared', 'Dev Worker keeps the shared-D1 group');
+  assert.equal(w.rollback_group, w.deploy_group);
+  assert.equal(D(DEV_N).environment, 'app/native-dev');
+  assert.equal(D(PREV).engine_target, 'preview');
 });
-
-test('descriptor: migration ownership - only the owner of the physical D1 owns the migration', () => {
-  assert.equal(targetDescriptor(D).owns_migration, false);
-  assert.equal(targetDescriptor({ ...D, kind: 'native-branch' }).owns_migration, true);
-  assert.equal(targetDescriptor({ ...D, d1ExpectedId: '', ownerKind: '' }).owns_migration, false);
+test('descriptor: only a D1-migrating delivery owns a migration; a Preview can never carry a D1', () => {
+  assert.equal(D(PROD).owns_migration, false);
+  assert.equal(D(DEV_W, { d1ExpectedId: 'DB1' }).owns_migration, true);
+  assert.throws(() => D(PREV, { d1ExpectedId: 'DB1' }), /Preview never migrates/);
 });
-
-test('descriptor: buildDescriptors maps the D1 plan (shared D1 -> one owner) and keeps enabled kinds only, in stable order', () => {
-  const groups = [{ databaseId: 'SHARED', members: ['native-branch', 'native-dev'], owner: 'native-branch' }, { databaseId: 'PROD', members: ['production'], owner: 'production' }];
-  const m = buildDescriptors({ kinds: ['native-dev', 'production', 'native-branch'], app: 'app', runId: 9, groups, smokeOverrides: '{"native-dev":"skip"}' });
-  assert.deepEqual(Object.keys(m), ['production', 'native-branch', 'native-dev']);
-  assert.equal(m['native-dev'].d1_expected_id, 'SHARED');
-  assert.equal(m['native-dev'].d1_owner_kind, 'native-branch');
-  assert.equal(m['native-dev'].owns_migration, false);
-  assert.equal(m['native-branch'].owns_migration, true);
-  assert.equal(m.production.d1_expected_id, 'PROD');
-  assert.equal(m['native-dev'].smoke_mode, 'skip');
-  assert.equal(m['native-branch'].smoke_mode, 'full');
+test('descriptor: buildDescriptor resolves the per-target smoke mode', () => {
+  assert.equal(buildDescriptor({ delivery: DEV_N, app: 'a', runId: '1', smokeMode: 'full', smokeOverrides: '{"dev":"basic"}' }).smoke_mode, 'basic');
+  assert.equal(buildDescriptor({ delivery: PROD, app: 'a', runId: '1', smokeMode: 'full', smokeOverrides: '{"dev":"basic"}' }).smoke_mode, 'full');
+});
+test('descriptor: validation rejects forged, cross-target, unknown-key and wrong-version records (trust boundary)', () => {
+  const d = D(DEV_W, { d1ExpectedId: 'DB1' });
+  assert.deepEqual(validateDescriptor({ ...d }), d);
+  const bad = {
+    'extra key': { ...d, secret: 'x' }, 'missing key': (({ phase, ...r }) => r)(d), 'wrong version': { ...d, v: 1 },
+    'bad driver': { ...d, driver: 'native-preview', slot: 'persistent-dev' }, 'slot mismatch': { ...d, slot: 'native-dev' },
+    'class mismatch': { ...d, engine_target: 'preview' }, 'foreign environment': { ...d, environment: 'app/prod' },
+    'forged group': { ...d, deploy_group: 'cfv2-prod-app', rollback_group: 'cfv2-prod-app' }, 'split dev group': { ...d, rollback_group: 'cfv2-dev-o/r-other' },
+    'owner contradiction': { ...d, owns_migration: false }, 'bad d1': { ...d, d1_expected_id: 'a b' }, 'bad smoke': { ...d, smoke_mode: 'none' }, 'bad phase': { ...d, phase: 'later' },
+    'not an object': null, 'array': [],
+  };
+  for (const [name, v] of Object.entries(bad)) assert.throws(() => validateDescriptor(v), /delivery descriptor/, name);
+  assert.throws(() => parseDescriptor('{nope'), /not valid JSON/);
+  assert.deepEqual(parseDescriptor(JSON.stringify(d)), d);
+});
+test('descriptor: carries no secret and no URL', () => {
+  const t = JSON.stringify(D(PROD, { d1ExpectedId: 'DB1' }));
+  assert.doesNotMatch(t, /https?:|token|secret|password/i);
 });
 
-test('descriptor: deferred verify takes the D1 ids from the hand-off, not from a re-plan', () => {
-  const m = buildDescriptors({ kinds: ['production'], app: 'app', runId: 9, d1ByKind: { production: 'HANDED' }, phase: 'verify' });
-  assert.equal(m.production.d1_expected_id, 'HANDED');
-  assert.equal(m.production.phase, 'verify');
+// ---- migration gate (publish stage) -----------------------------------------------------------------------------------
+const MD = (o = {}) => D(DEV_W, { d1ExpectedId: 'DB1', ...o });
+const MJ = (o = {}) => JSON.stringify({ migration: 'applied', schema_changed: 'true', d1_scan: 'additive', kind: 'persistent-dev', d1_id: 'DB1', ...o });
+const U = (o = {}) => resolveMigrationUsed({ descriptor: MD(), result: 'success', json: MJ(), ...o });
+const SHA = 'a'.repeat(40);
+const NP = (o = {}) => JSON.stringify({ precheck: VERIFIED_NO_PENDING, precheck_sha: SHA, migration: 'none', kind: 'persistent-dev', d1_id: 'DB1', ...o });
+
+test('migration used: a delivery without a D1 migration needs nothing (even with garbage lying around)', () => {
+  assert.deepEqual(resolveMigrationUsed({ descriptor: D(PROD) }), {});
+  assert.deepEqual(resolveMigrationUsed({ descriptor: D(PREV), result: 'skipped', json: JSON.stringify({ stale: 'true' }) }), {});
 });
-
-test('descriptor: validation rejects forged, cross-kind, unknown-key and wrong-version records (trust boundary)', () => {
-  const ok = targetDescriptor(D);
-  assert.doesNotThrow(() => validateDescriptor({ ...ok }));
-  const bad = (patch, re) => assert.throws(() => validateDescriptor({ ...ok, ...patch }), re);
-  bad({ v: 2 }, /version/);
-  bad({ target: 'prod' }, /engine target/);
-  bad({ environment: 'app/prod' }, /environment/);
-  bad({ environment: 'a b/native-dev' }, /environment/);
-  bad({ deploy_group: 'cfv2-leg-77-production' }, /concurrency groups/);
-  bad({ rollback_group: 'cfv2-leg-77-native-dev' }, /concurrency groups/);
-  bad({ deploy_group: 'other' }, /concurrency groups/);
-  assert.throws(() => validateDescriptor({ ...targetDescriptor({ kind: 'persistent-dev', app: 'app', runId: 1, repo: 'o/r' }), rollback_group: 'cfv2-dev-o/r-other' }), /concurrency groups/);
-  assert.throws(() => validateDescriptor({ ...targetDescriptor({ kind: 'persistent-dev', app: 'app', runId: 1, repo: 'o/r' }), deploy_group: 'cfv2-leg-1-persistent-dev', rollback_group: 'cfv2-leg-1-persistent-dev-rollback' }), /concurrency groups/);
-  bad({ d1_expected_id: 'a b' }, /database id/);
-  bad({ d1_owner_kind: 'bogus' }, /Unknown delivery kind/);
-  bad({ owns_migration: true }, /owns_migration/);
-  bad({ smoke_mode: 'maybe' }, /smoke mode/);
-  bad({ phase: 'later' }, /phase/);
-  bad({ CLOUDFLARE_API_TOKEN: 'x' }, /unexpected/);
-  assert.throws(() => validateDescriptor({ ...ok, kind: undefined }), /./);
-  const { phase, ...noPhase } = ok;
-  assert.throws(() => validateDescriptor(noPhase), /missing \[phase\]/);
-  assert.throws(() => validateDescriptor(null), /object/);
-  assert.throws(() => parseDescriptor('{'), /not valid JSON/);
-  assert.throws(() => parseDescriptor(JSON.stringify(ok), 'production'), /not production/);
-  assert.equal(parseDescriptor(JSON.stringify(ok), 'native-dev').kind, 'native-dev');
+test('migration used: an applied migration of exactly this delivery and D1 authorizes', () => {
+  assert.equal(U().d1_id, 'DB1');
+  assert.equal(U({ descriptor: D(PROD, { d1ExpectedId: 'P1' }), json: MJ({ kind: 'production', d1_id: 'P1' }) }).kind, 'production');
 });
-
-test('descriptor: carries no secret and no URL (secrets stay in job env, URLs are resolved per build)', () => {
-  const s = JSON.stringify(targetDescriptor(D));
-  assert.doesNotMatch(s, /https?:|token|secret|password/i);
-});
-
-test('descriptor: persistent-dev keeps the legacy Shared Dev group (Deploy AND Rollback serialise per repo + shared-D1 scope)', () => {
-  const g = (o) => targetDescriptor({ kind: 'persistent-dev', app: 'blog', runId: 9, repo: 'o/r', ...o });
-  assert.equal(g({ lockScope: 'shared-db' }).deploy_group, 'cfv2-dev-o/r-shared-db');
-  assert.equal(g({}).deploy_group, 'cfv2-dev-o/r-blog');
-  assert.equal(g({}).rollback_group, g({}).deploy_group);
-  assert.notEqual(g({}).deploy_group, g({ app: 'wiki' }).deploy_group);
-  assert.notEqual(g({ lockScope: 'a' }).deploy_group, g({ lockScope: 'b' }).deploy_group);
-  // other kinds never share a group across runs' legs or kinds
-  assert.notEqual(targetDescriptor({ kind: 'native-dev', app: 'a', runId: 1 }).deploy_group, targetDescriptor({ kind: 'native-branch', app: 'a', runId: 1 }).deploy_group);
-});
-
-// ---- migration gates (were inline bash/jq in the delivery workflow) -----------------------------------------------------
-const MJ = (o = {}) => JSON.stringify({ migration: 'applied', kind: 'native-branch', d1_id: 'DB1', ...o });
-const U = (o) => resolveMigrationUsed({ d1Migrations: true, kind: 'native-branch', ownerKind: 'native-branch', expectedId: 'DB1', result: 'success', json: MJ(), ...o });
-
-test('migration used: without d1_migrations nothing is required', () => {
-  assert.deepEqual(resolveMigrationUsed({ d1Migrations: false, kind: 'production' }), {});
-});
-
-test('migration used: every kind (owner or sharing sibling) validates the ONE migration result against the planned owner and its own D1', () => {
-  assert.equal(U({}).d1_id, 'DB1');
-  const shared = resolveMigrationUsed({ d1Migrations: true, kind: 'native-dev', ownerKind: 'native-branch', expectedId: 'DB1', result: 'success', json: MJ() });
-  assert.equal(shared.kind, 'native-branch');
-  const dev = resolveMigrationUsed({ d1Migrations: true, kind: 'persistent-dev', ownerKind: 'persistent-dev', expectedId: 'DB1', result: 'success', json: MJ({ kind: 'persistent-dev' }) });
-  assert.equal(dev.kind, 'persistent-dev');
-});
-
 test('migration used: fails closed on a missing, failed, foreign or malformed migration result', () => {
-  assert.throws(() => U({ ownerKind: '' }), /no migration owner is planned/);
-  assert.throws(() => U({ ownerKind: 'persistent-dev' }), /another kind/);
-  assert.throws(() => U({ result: 'failure' }), /finished 'failure'/);
-  assert.throws(() => U({ result: 'cancelled' }), /finished 'cancelled'/);
-  assert.throws(() => U({ result: '' }), /finished 'missing'/);
-  assert.throws(() => U({ result: 'skipped' }), /finished 'skipped'/);
+  for (const r of ['failure', 'cancelled', '', 'skipped']) assert.throws(() => U({ result: r }), /finished/, `result '${r}'`);
   assert.throws(() => U({ json: MJ({ migration: 'none' }) }), /no applied migration/);
-  assert.throws(() => U({ json: '' }), /missing or not valid JSON/);
-  assert.throws(() => U({ json: '{not json' }), /missing or not valid JSON/);
-  assert.throws(() => U({ json: '[1]' }), /malformed/);
-  assert.throws(() => U({ json: 'null' }), /malformed/);
-  assert.throws(() => U({ json: '"applied"' }), /malformed/);
+  for (const j of ['', '{not json']) assert.throws(() => U({ json: j }), /missing or not valid JSON/);
+  for (const j of ['[1]', 'null', '"applied"']) assert.throws(() => U({ json: j }), /malformed/);
   assert.throws(() => U({ json: '{}' }), /no applied migration/);
-  assert.throws(() => U({ json: MJ({ kind: 'persistent-dev' }) }), /another kind/);
+  assert.throws(() => U({ json: MJ({ kind: 'native-dev' }) }), /another delivery/);
   assert.throws(() => U({ json: MJ({ d1_id: 'FOREIGN' }) }), /another D1/);
-  assert.throws(() => U({ expectedId: 'OTHER' }), /another D1/);
+  assert.throws(() => U({ descriptor: MD({ d1ExpectedId: 'OTHER' }) }), /another D1/);
 });
-
-test('migration used: a stale-skipped migration NEVER authorizes a publish (P1: the branch can point at this commit again, A -> B -> A)', () => {
-  // The Migration job succeeds when it was superseded (nothing applied); its result then carries stale=true. Every shape of it is refused.
+test('migration used: a stale-skipped migration NEVER authorizes a publish (the branch can point at this commit again, A -> B -> A)', () => {
   for (const stale of [true, 'true']) {
-    assert.throws(() => U({ json: JSON.stringify({ stale }) }), /became stale/, `stale=${JSON.stringify(stale)} without owner/D1 metadata`);
-    assert.throws(() => U({ json: MJ({ stale }) }), /became stale/, `stale=${JSON.stringify(stale)} with otherwise valid applied/owner/D1 metadata`);
-    assert.throws(() => U({ json: JSON.stringify({ stale, migration: 'none', kind: 'native-branch', d1_id: 'DB1' }) }), /became stale/);
+    assert.throws(() => U({ json: JSON.stringify({ stale }) }), /became stale/);
+    assert.throws(() => U({ json: MJ({ stale }) }), /became stale/, 'even with otherwise valid applied metadata');
+    assert.throws(() => U({ json: JSON.stringify({ stale, migration: 'none', kind: 'persistent-dev', d1_id: 'DB1' }) }), /became stale/);
   }
-  // stale is checked before the owner / D1 comparison, but those stay mandatory for everything else
-  assert.throws(() => U({ json: MJ({ stale: 'true', kind: 'persistent-dev', d1_id: 'FOREIGN' }) }), /became stale/);
-  // only an explicit non-stale flag value passes through
   assert.equal(U({ json: MJ({ stale: 'false' }) }).d1_id, 'DB1');
-  assert.equal(U({ json: MJ({ stale: false }) }).kind, 'native-branch');
-  // 'none' (nothing pending is still reported as applied by the engine; a bare none/absent migration is not an authorization)
-  assert.throws(() => U({ json: MJ({ migration: 'none' }) }), /no applied migration/);
-  assert.throws(() => U({ json: JSON.stringify({ stale: 'false', kind: 'native-branch', d1_id: 'DB1' }) }), /no applied migration/);
-  // d1_migrations=false stays migration-free, even with a stale-looking or garbage result lying around
-  assert.deepEqual(resolveMigrationUsed({ d1Migrations: false, kind: 'production', result: 'skipped', json: JSON.stringify({ stale: 'true' }) }), {});
+  assert.throws(() => U({ json: JSON.stringify({ stale: 'false', kind: 'persistent-dev', d1_id: 'DB1' }) }), /no applied migration/);
+});
+test('migration used: a verified no-pending precheck authorizes only for the exact slot, D1 and commit', () => {
+  const r = U({ json: NP(), runSha: SHA });
+  assert.deepEqual([r.migration, r.schema_changed, r.d1_scan], ['none', 'false', 'none']);
+  assert.throws(() => U({ json: NP(), runSha: 'b'.repeat(40) }), /belongs to commit/);
+  assert.throws(() => U({ json: NP(), runSha: '' }), /belongs to commit/);
+  assert.throws(() => U({ json: NP({ kind: 'native-dev' }), runSha: SHA }), /another delivery/);
+  assert.throws(() => U({ json: NP({ d1_id: 'X' }), runSha: SHA }), /another D1/);
+  assert.throws(() => U({ json: NP({ migration: 'applied' }), runSha: SHA }), /both an applied migration and a verified-empty/);
+  assert.throws(() => U({ json: NP({ stale: 'true' }), runSha: SHA }), /became stale/);
 });
 
+// ---- lock identity ---------------------------------------------------------------------------------------------------------
+const LI = { app_name: 'app', d1_migrations: false, preview_policy: 'pr', dev_driver: 'native-preview', approved_dev_ref: 'refs/heads/main' };
+test('lock identity: the run-level group follows the resource', () => {
+  const g = (o, i = {}) => runLockGroup({ event: 'push', ref: 'refs/heads/main', inputs: { ...LI, ...i }, runId: '9', ...o });
+  assert.equal(g({}), 'cfv2-prod-app');
+  assert.equal(g({}, { d1_lock_scope: 'shared' }), 'cfv2-prod-shared');
+  assert.equal(g({ event: 'workflow_dispatch' }, { dispatch_target: 'dev' }), 'cfv2-shared-dev-app', 'a Dev promotion never takes the Production group, even from main');
+  assert.equal(g({ event: 'workflow_dispatch' }, { dispatch_target: 'dev', d1_migrations: true, d1_lock_scope: 's' }), 'cfv2-nonprod-d1-s');
+  assert.equal(g({ event: 'pull_request', ref: 'refs/pull/5/merge', prNumber: '5' }), 'cfv2-app-pr-5');
+  assert.equal(g({ event: 'pull_request', ref: 'refs/pull/5/merge', prNumber: '5', isFork: true }), 'cfv2-run-9', 'fork PR: private group');
+  assert.equal(g({ event: 'pull_request', ref: 'refs/pull/5/merge', prNumber: '5' }, { preview_policy: 'none' }), 'cfv2-run-9');
+  assert.equal(g({ ref: 'refs/heads/feat/x' }), 'cfv2-run-9', 'feature push: private group');
+  assert.equal(g({ event: 'merge_group', ref: 'refs/heads/gh-readonly-queue/main/x' }), 'cfv2-run-9');
+});
 
-// ---- verification and recovery decisions ---------------------------------------------------------------------------------
+// ---- deferred verify (pipeline_phase=verify) ------------------------------------------------------------------------------
+const STATE = (o = {}) => ({ inputs: { ...LI, dev_driver: 'worker', dispatch_target: 'dev', d1_migrations: true }, descriptor: D(DEV_W, { d1ExpectedId: 'DB1', phase: 'deploy', repo: 'o/r' }), group: 'cfv2-nonprod-d1-app', ...o });
+const RST = (state, o = {}) => restoreDescriptor(state, { repo: 'o/r', runId: '77', event: 'workflow_dispatch', ref: 'refs/heads/main', ...o });
+test('deferred verify: deployment-time policy survives; only the phase changes', () => {
+  const d = RST(STATE());
+  assert.equal(d.phase, 'verify');
+  assert.deepEqual({ ...d, phase: 'deploy' }, STATE().descriptor);
+});
+test('deferred verify: Production and Preview restore too', () => {
+  const prod = { inputs: { ...LI }, descriptor: D(PROD, { phase: 'deploy', runId: '5' }), group: 'cfv2-prod-app' };
+  assert.equal(restoreDescriptor(prod, { repo: 'o/r', runId: '77', event: 'push', ref: 'refs/heads/main' }).target, 'production');
+  const pr = { inputs: { ...LI }, descriptor: D(PREV, { phase: 'deploy', runId: '5' }), group: 'cfv2-app-pr-3' };
+  assert.equal(restoreDescriptor(pr, { repo: 'o/r', runId: '77', event: 'pull_request', ref: 'refs/pull/3/merge', prNumber: '3' }).target, 'preview');
+});
+test('deferred verify: tampering is rejected (group, phase, app, repo, D1, schema)', () => {
+  const s = STATE();
+  assert.throws(() => RST({ ...s, group: 'cfv2-prod-app' }), /lock identity/);
+  assert.throws(() => RST({ ...s, group: '' }), /lock identity/);
+  assert.throws(() => RST({ ...s, descriptor: { ...s.descriptor, phase: 'verify' } }), /only a deploy-phase descriptor/);
+  assert.throws(() => RST({ ...s, descriptor: D(PROD, { phase: 'deploy' }) }), /not the delivery the deploy inputs plan/, 'swapped target');
+  assert.throws(() => RST({ ...s, descriptor: D(DEV_N, { d1ExpectedId: 'DB1', phase: 'deploy', repo: 'o/r' }) }), /not the delivery the deploy inputs plan/, 'swapped driver');
+  assert.throws(() => RST({ ...s, inputs: { ...s.inputs, app_name: 'other' } }), /another application|lock identity/);
+  assert.throws(() => RST(s, { repo: 'o/other' }), /expected 'cfv2-dev-o\/other/);
+  assert.throws(() => RST({ ...s, d1: 'OTHER' }), /hand-off recorded/);
+  for (const bad of [null, [], 'x', { inputs: {} }, { ...s, inputs: {} }, { ...s, descriptor: { ...s.descriptor, v: 9 } }]) assert.throws(() => RST(bad));
+});
+
+// ---- engine init -----------------------------------------------------------------------------------------------------------
+const IN = { app_name: 'app', build_cmd: 'build', production_rollback_policy: 'manual', preview_policy: 'pr', dev_driver: 'native-preview', approved_dev_ref: 'refs/heads/main', app_url_prod: 'https://app.example.com', dev_build_cmd: 'build-dev' };
+const I = (delivery, o = {}) => {
+  const d = D(delivery, o.dopts);
+  return validateInit({ inputs: { ...IN, ...o.inputs }, target: d.engine_target, kind: d.slot, stage: o.stage ?? 'publish', descriptor: JSON.stringify(d), event: 'push', ref: 'refs/heads/main', ...o.ev });
+};
+test('init: a valid delivery binds slot, class and the smoke policy', () => {
+  const r = I(PROD);
+  assert.deepEqual([r.slot, r.target, r.stage, r.smokeMode], ['production', 'prod', 'publish', 'full']);
+});
+test('init: a PR Preview and a manual Dev promotion validate by the same rule as everything else', () => {
+  const pr = I(PREV, { ev: { event: 'pull_request', ref: 'refs/pull/3/merge', prAction: 'synchronize' } });
+  assert.equal(pr.slot, 'native-branch');
+  const dev = I(DEV_N, { ev: { event: 'workflow_dispatch', ref: 'refs/heads/main' }, inputs: { dispatch_target: 'dev' } });
+  assert.equal(dev.slot, 'native-dev');
+});
+test('init: a Preview can never run a migration stage', () => {
+  const ev = { event: 'pull_request', ref: 'refs/pull/3/merge', prAction: 'synchronize' };
+  for (const stage of ['precheck', 'migrate']) assert.throws(() => I(PREV, { stage, ev }), /never migrates/, stage);
+  assert.equal(I(PREV, { stage: 'publish', ev }).slot, 'native-branch');
+});
+test('init: no phantom delivery - the descriptor must be what THIS event plans', () => {
+  assert.throws(() => I(PROD, { ev: { event: 'push', ref: 'refs/heads/feat/x' } }), /delivery mismatch/);
+  assert.throws(() => I(PREV, { ev: { event: 'pull_request', ref: 'refs/pull/3/merge', isFork: true } }), /delivery mismatch/);
+  assert.throws(() => I(PREV, { ev: { event: 'push', ref: 'refs/heads/main' } }), /delivery mismatch/);
+  assert.throws(() => I(DEV_N, { ev: { event: 'workflow_dispatch', ref: 'refs/heads/feat/x' }, inputs: { dispatch_target: 'dev' } }), /not the approved_dev_ref/);
+  assert.throws(() => I(DEV_W, { ev: { event: 'workflow_dispatch', ref: 'refs/heads/main' }, inputs: { dispatch_target: 'dev' } }), /delivery mismatch/, 'dev_driver native-preview cannot run as a Worker');
+});
+test('init: class, slot, D1 and stage bindings refuse everything unknown or cross-target', () => {
+  const d = D(PROD);
+  const v = (o) => validateInit({ inputs: IN, target: 'prod', kind: 'production', stage: 'publish', descriptor: JSON.stringify(d), event: 'push', ref: 'refs/heads/main', ...o });
+  assert.equal(v({}).slot, 'production');
+  assert.throws(() => v({ target: 'preview' }), /engine target/);
+  assert.throws(() => v({ kind: 'native-dev' }), /slot/);
+  assert.throws(() => v({ d1Expect: 'DB1' }), /D1 id differs/);
+  assert.throws(() => v({ descriptor: '' }), /descriptor is required/);
+  assert.throws(() => v({ stage: 'preflight' }), /bad engine stage/);
+  assert.throws(() => v({ stage: 'all' }), /split stages/);
+  assert.throws(() => v({ stage: 'x' }), /bad engine stage/);
+});
+test('init: a Dev Worker needs its identity, URL and a dev build before a D1 migration', () => {
+  const dev = { ev: { event: 'workflow_dispatch', ref: 'refs/heads/main' }, stage: 'all' };
+  const inputs = (o) => ({ dispatch_target: 'dev', dev_driver: 'worker', dev_worker_name: 'app-dev', app_url_dev: 'https://dev.example.com', ...o });
+  assert.equal(I(DEV_W, { ...dev, inputs: inputs({}) }).slot, 'persistent-dev');
+  assert.throws(() => I(DEV_W, { ...dev, inputs: inputs({ dev_worker_name: '' }) }), /dev_worker_name/);
+  assert.throws(() => I(DEV_W, { ...dev, inputs: inputs({ app_url_dev: '' }) }), /app_url_dev/);
+  assert.throws(() => I(DEV_W, { ...dev, inputs: inputs({ d1_migrations: 'true', dev_build_cmd: '' }) }), /dev_build_cmd/);
+});
+test('init: env data - reserved names and another target URL in a build env are rejected; each target uses ONLY its own env', () => {
+  assert.throws(() => I(PROD, { inputs: { build_env_prod: 'CLOUDFLARE_API_TOKEN=x' } }), /CFV2_BUILD_ENV/);
+  assert.throws(() => I(PROD, { inputs: { build_env_prod: 'PUBLIC=https://dev.example.com', app_url_dev: 'https://dev.example.com' } }), /dev URL/);
+  const r = I(PROD, { inputs: { build_env_prod: 'A=1', build_env_preview: 'A=2', build_env_dev: 'A=3' } });
+  assert.deepEqual(r.buildEnv, [['A', '1']]);
+});
+test('init: deferred verify identity inputs must equal the deploy call\'s', () => {
+  const d = D(PROD, { phase: 'verify' });
+  const v = (call) => validateInit({ inputs: { ...IN, app_path: '.' }, target: 'prod', kind: 'production', stage: 'verify', descriptor: JSON.stringify(d), callInputs: JSON.stringify(call), event: 'push', ref: 'refs/heads/main' });
+  const ok = { app_name: 'app', app_path: '.', production_rollback_policy: 'manual' };
+  assert.equal(v(ok).slot, 'production');
+  for (const k of ['app_name', 'app_path', 'production_rollback_policy']) assert.throws(() => v({ ...ok, [k]: 'other' }), new RegExp(k));
+  assert.throws(() => v('x'), /call inputs/);
+});
+
+// ---- verification and recovery decisions (unchanged) -----------------------------------------------------------------
 test('verification: ONLY a content-level smoke verifies a deployment', () => {
   for (const l of ['content', 'content-sha']) assert.deepEqual(verificationOutcome(l), { verified: true, kind: 'content' });
   for (const l of ['liveness', 'access', '', undefined, 'CONTENT', 'content ']) assert.equal(verificationOutcome(l).verified, false);
@@ -437,280 +427,6 @@ test('rollback verdict (Preview / Dev): known-good recovery must be rebuilt AND 
   assert.equal(rollbackVerdict({ target: 'dev', goodSha: 'x', recovered: 'success', verified: 'success', smokeLevel: 'content-sha' }).ok, true);
 });
 
-// ---- deferred verification: the deploy call's descriptors are the source of truth ------------------------------------------
-const REPO = 'o/r';
-const deployState = (over = {}, kinds = ['native-branch', 'native-dev'], dOver = {}) => {
-  const descriptors = buildDescriptors({
-    kinds, app: 'app', runId: 11, repo: REPO, lockScope: 'shared-db', smokeMode: 'skip', phase: 'deploy',
-    groups: [{ databaseId: 'DB1', members: kinds, owner: kinds[0] }], ...dOver,
-  });
-  const inputs = { app_name: 'app', d1_lock_scope: 'shared-db', smoke_mode: 'skip', deployment_strategy: 'hybrid', preview_on_branch_push: true, d1_migrations: true };
-  return {
-    inputs, group: runLockGroup({ ...EV, inputs, runId: 11 }), kinds, d1: Object.fromEntries(kinds.map((k) => [k.replace(/-/g, '_'), 'DB1'])),
-    migration: Object.fromEntries(kinds.map((k) => [`mj_${k.replace(/-/g, '_')}`, JSON.stringify({ kind: kinds[0], d1_id: 'DB1' })])), descriptors, ...over,
-  };
-};
-const EV = { event: 'push', ref: 'refs/heads/feat/x' };
-const R = (state, o = {}) => restoreDescriptors(state, { repo: REPO, runId: 99, ...EV, ...o });
-
-test('deferred verify: deployment-time policy survives (smoke skip, lock scope, owner, D1, groups); only the phase changes', () => {
-  const st = deployState();
-  const r = R(st);
-  for (const k of ['native-branch', 'native-dev']) assert.deepEqual({ ...r[k], phase: 'deploy' }, st.descriptors[k]);
-  assert.equal(r['native-dev'].smoke_mode, 'skip');
-  assert.equal(r['native-dev'].phase, 'verify');
-  assert.equal(r['native-dev'].d1_owner_kind, 'native-branch');
-  const pd = R(deployState({}, ['persistent-dev']));
-  assert.equal(pd['persistent-dev'].deploy_group, 'cfv2-dev-o/r-shared-db', 'persistent Dev keeps the deploy-time lock identity, not a verify-call default');
-  assert.equal(pd['persistent-dev'].rollback_group, pd['persistent-dev'].deploy_group);
-});
-
-test('deferred verify: every kind restores (Native Branch, Native Dev, Persistent Dev, Production)', () => {
-  for (const k of DELIVERY_KINDS) assert.equal(R(deployState({}, [k]))[k].phase, 'verify');
-});
-
-test('deferred verify: tampering is rejected (kind set, cross-target injection, D1, owner, app, repo, phase, schema)', () => {
-  const bad = (st, re) => assert.throws(() => R(st), re);
-  const st = deployState();
-  bad({ ...st, descriptors: { 'native-branch': st.descriptors['native-branch'] } }, /do not match phase_state.kinds/);
-  bad({ ...st, descriptors: { ...st.descriptors, production: targetDescriptor({ kind: 'production', app: 'app', runId: 1, phase: 'deploy' }) } }, /do not match/);
-  bad({ ...st, descriptors: { 'native-branch': st.descriptors['native-dev'], 'native-dev': st.descriptors['native-branch'] } }, /filed under/);
-  bad({ ...st, d1: { native_branch: 'FOREIGN', native_dev: 'DB1' } }, /hand-off recorded 'FOREIGN'/);
-  bad({ ...st, descriptors: { ...st.descriptors, 'native-dev': { ...st.descriptors['native-dev'], d1_expected_id: 'FOREIGN' } } }, /binds D1 'FOREIGN'/);
-  bad({ ...st, descriptors: { ...st.descriptors, 'native-dev': { ...st.descriptors['native-dev'], d1_owner_kind: 'native-dev', owns_migration: true } } }, /migration owner/);
-  bad({ ...st, inputs: { ...st.inputs, app_name: 'other' } }, /another application/);
-});
-
-test('deferred verify: wrong repository, wrong phase, schema violations and missing identity fail closed', () => {
-  const st = deployState({}, ['persistent-dev']);
-  assert.throws(() => R(st, { repo: 'evil/r' }), /carries lock/);
-  const allPhase = deployState({}, ['native-branch'], { phase: 'all' });
-  assert.throws(() => R(allPhase), /only a deploy-phase descriptor/);
-  const already = deployState({}, ['native-branch'], { phase: 'verify' });
-  assert.throws(() => R(already), /only a deploy-phase descriptor/);
-  const forged = deployState({}, ['native-branch']);
-  forged.descriptors['native-branch'] = { ...forged.descriptors['native-branch'], smoke_mode: 'maybe' };
-  assert.throws(() => R(forged), /smoke mode/);
-  assert.throws(() => R({ ...deployState(), kinds: [] }), /no delivery kind/);
-  assert.throws(() => R({ ...deployState(), kinds: ['native-dev', 'native-dev'] }), /duplicate/);
-  assert.throws(() => R({ ...deployState(), kinds: ['bogus'] }), /unknown/);
-  assert.throws(() => R({ ...deployState(), inputs: {} }), /app_name is missing/);
-  assert.throws(() => R(null), /not an object/);
-  assert.throws(() => R({ ...deployState(), descriptors: [] }), /not an object/);
-});
-
-test('deferred verify: a legacy hand-off (no descriptors) is rebuilt ONLY from the deploy call\'s own inputs, else fails closed', () => {
-  const { descriptors, ...legacy } = deployState();
-  const r = R(legacy);
-  assert.equal(r['native-dev'].smoke_mode, 'skip', 'from phase_state.inputs (the deploy call), not from the verify call');
-  assert.equal(r['native-dev'].d1_expected_id, 'DB1');
-  assert.equal(r['native-dev'].phase, 'verify');
-  const pd = R({ ...deployState({}, ['persistent-dev']), descriptors: undefined });
-  assert.equal(pd['persistent-dev'].deploy_group, 'cfv2-dev-o/r-shared-db');
-  const badIn = { ...legacy.inputs, smoke_mode: 'maybe' };
-  assert.throws(() => R({ ...legacy, inputs: badIn, group: runLockGroup({ ...EV, inputs: badIn, runId: 11 }) }), /smoke_mode/);
-  assert.throws(() => R({ ...legacy, inputs: { smoke_mode: 'skip' } }), /app_name is missing/);
-});
-
-// ---- engine initialisation: one pure validation (was ~6 Node processes + jq in engine.sh init) --------------------------------
-const IN0 = {
-  app_name: 'app', deployment_strategy: 'production-preview', production_rollback_policy: 'automatic', build_cmd: 'pnpm build', preview_on_branch_push: true,
-  app_url_prod: 'https://app.example.com', app_url_dev: 'https://dev.example.com', dev_worker_name: 'app-dev', smoke_env: '', build_env_prod: '', build_env_preview: '',
-};
-const INIT = (o = {}, i = {}) => validateInit({ inputs: { ...IN0, ...i }, target: 'preview', stage: 'migrate', event: 'push', ref: 'refs/heads/feat/x', ...o });
-const initFails = (re, o, i) => assert.throws(() => INIT(o, i), re);
-
-test('init: a valid Native Branch push binds kind, stage and the smoke policy', () => {
-  const r = INIT();
-  assert.deepEqual([r.kind, r.target, r.stage, r.smokeMode], ['native-branch', 'preview', 'migrate', 'full']);
-  assert.equal(INIT({ target: 'prod', stage: 'publish', ref: 'refs/heads/main' }).kind, 'production');
-});
-
-test('init: target, kind, and stage binding refuse everything unknown or cross-target', () => {
-  initFails(/bad engine target/, { target: 'staging' });
-  initFails(/does not belong to engine target/, { kind: 'production' });
-  initFails(/must run as split stages/, { stage: 'all' });
-  initFails(/bad engine stage/, { stage: 'nope' });
-  initFails(/malformed expected D1 id/, { d1Expect: 'a b' });
-  assert.throws(() => validateInit({ inputs: [], target: 'preview', event: 'push', ref: 'refs/heads/x' }), /inputs_json is not an object/);
-});
-
-test('init: strategy, rollback policy and Dev channel combinations fail closed before anything runs', () => {
-  initFails(/bad deployment_strategy/, {}, { deployment_strategy: 'x' });
-  initFails(/bad production_rollback_policy/, {}, { production_rollback_policy: 'maybe' });
-  initFails(/production-only cannot be combined/, { ref: 'refs/heads/main' }, { deployment_strategy: 'production-only', shared_dev_on_branch_push: true });
-  initFails(/conflicting automatic Dev channels/, {}, { shared_dev_on_branch_push: true, shared_dev_native_preview_on_branch_push: true });
-});
-
-test('init: the engine kind must be among the kinds this event enables (no phantom delivery)', () => {
-  initFails(/target mismatch/, { target: 'prod', stage: 'publish' }); // branch push never enables production
-  initFails(/target mismatch/, {}, { preview_on_branch_push: false });
-  initFails(/target mismatch/, { ref: 'refs/heads/main' }); // main push enables production only
-  assert.equal(INIT({ kind: 'native-dev' }, { shared_dev_native_preview_on_branch_push: true }).kind, 'native-dev');
-});
-
-test('init: a manual persistent Dev dispatch is validated by the same rule as every other event (approved ref via dispatch only)', () => {
-  const M = (o = {}, i = {}) => validateInit({ inputs: { ...IN0, deployment_strategy: 'hybrid', dev_build_cmd: 'x', persistent_dev_ref: 'refs/heads/dev', dispatch_target: 'persistent-dev', ...i }, target: 'dev', kind: 'persistent-dev', stage: 'publish', event: 'workflow_dispatch', ref: 'refs/heads/dev', ...o });
-  assert.equal(M().kind, 'persistent-dev');
-  assert.throws(() => M({ ref: 'refs/heads/other' }), /manual persistent-dev dispatch rejected/);
-  assert.throws(() => M({}, { deployment_strategy: 'production-preview' }), /rejected/);
-  assert.throws(() => M({}, { persistent_dev_ref: '' }), /rejected/);
-  assert.throws(() => M({}, { dispatch_target: 'production' }), /dispatch_target 'production' is not valid/);
-  assert.throws(() => M({ kind: 'production', target: 'prod' }), /target mismatch|does not belong/, 'a dispatch from the approved main ref never validates as Production');
-  const onMain = (o = {}) => M({ ref: 'refs/heads/main', ...o }, { persistent_dev_ref: 'refs/heads/main' });
-  assert.equal(onMain().kind, 'persistent-dev');
-  assert.throws(() => onMain({ kind: 'production', target: 'prod' }), /target mismatch/);
-});
-
-test('init: per-target requirements (Native Dev flag, Dev identity/URL/build, build command)', () => {
-  initFails(/target mismatch/, { kind: 'native-dev' }); // without the flag Native Dev is not an enabled kind at all
-  const D = (i = {}) => validateInit({ inputs: { ...IN0, deployment_strategy: 'hybrid', shared_dev_on_branch_push: true, dev_build_cmd: 'x', ...i }, target: 'dev', stage: 'all', event: 'push', ref: 'refs/heads/feat/x' });
-  assert.equal(D().kind, 'persistent-dev');
-  assert.throws(() => D({ dev_worker_name: '' }), /dev_worker_name/);
-  assert.throws(() => D({ app_url_dev: '' }), /app_url_dev/);
-  assert.throws(() => D({ dev_build_cmd: '', build_cmd: '' }), /no build command for target dev/);
-  assert.throws(() => D({ dev_build_cmd: '', d1_migrations: true }), /requires dev_build_cmd/);
-  assert.equal(D({ dev_build_cmd: '' }).kind, 'persistent-dev', 'dev_build_cmd falls back to build_cmd without D1 migrations');
-  initFails(/no build command for target preview/, {}, { build_cmd: '' });
-});
-
-test('init: env data - reserved/forbidden names rejected, foreign target URLs rejected, each kind uses ONLY its own build env', () => {
-  initFails(/CFV2_BUILD_ENV: .*TARGET may not be set/, {}, { build_env_preview: 'TARGET=prod' });
-  initFails(/CFV2_SMOKE_ENV/, {}, { smoke_env: 'GITHUB_TOKEN=x' });
-  initFails(/CFV2_PS/, { previewSecrets: 'CLOUDFLARE_API_TOKEN=x' });
-  initFails(/contains the production URL/, {}, { build_env_preview: 'PUBLIC_URL=https://app.example.com' });
-  const r = INIT({ previewSecrets: 'API_KEY=s3cret' }, { build_env_preview: 'A=1\nB=2', build_env_prod: 'PROD_ONLY=1', smoke_env: 'S=1' });
-  assert.deepEqual(r.buildEnv, [['A', '1'], ['B', '2']], 'a Preview build never sees the Production build env');
-  assert.deepEqual(r.smokeEnv, [['S', '1']]);
-  assert.deepEqual(r.previewEnv, [['API_KEY', 's3cret']]);
-  assert.equal(INIT({ target: 'prod', stage: 'publish', ref: 'refs/heads/main', previewSecrets: 'API_KEY=s3cret' }).previewEnv, null, 'Preview secrets are only read for the Preview target');
-});
-
-test('init: deferred verify identity inputs must equal the deploy call\'s; a descriptor must match the stage', () => {
-  const ci = (o = {}) => JSON.stringify({ app_name: 'app', app_path: '', production_rollback_policy: 'automatic', ...o });
-  assert.doesNotThrow(() => INIT({ callInputs: ci() }));
-  for (const k of ['app_name', 'app_path', 'production_rollback_policy']) initFails(new RegExp(`'${k}' differs`), { callInputs: ci({ [k]: 'x' }) });
-  initFails(/call inputs are not an object/, { callInputs: '[1]' });
-  const d = targetDescriptor({ kind: 'native-branch', app: 'app', runId: 1, repo: 'o/r', smokeMode: 'skip' });
-  assert.equal(INIT({ descriptor: JSON.stringify(d) }).smokeMode, 'skip', 'the smoke policy comes from the descriptor');
-  initFails(/is for production, not native-branch/, { descriptor: JSON.stringify(targetDescriptor({ kind: 'production', app: 'app', runId: 1 })) });
-  initFails(/D1 id differs/, { descriptor: JSON.stringify({ ...d, d1_expected_id: 'X', d1_owner_kind: '' }) });
-});
-
-// ---- lock identity integrity across Deploy -> Verify -> Rollback -------------------------------------------------------------
-const PD = (o = {}, i = {}) => deployState({ inputs: { ...deployState().inputs, shared_dev_on_branch_push: true, preview_on_branch_push: false, ...i }, ...o }, ['persistent-dev']);
-
-test('lock identity: run-level group follows the same rule as the workflow (scope or app, channel, ref)', () => {
-  const I = { app_name: 'blog', deployment_strategy: 'hybrid', preview_on_branch_push: true, d1_migrations: true };
-  assert.equal(runLockGroup({ event: 'push', ref: 'refs/heads/main', inputs: I, runId: 1 }), 'cfv2-prod-blog');
-  assert.equal(runLockGroup({ event: 'push', ref: 'refs/heads/main', inputs: { ...I, d1_lock_scope: 'shared-db' }, runId: 1 }), 'cfv2-prod-shared-db');
-  assert.equal(runLockGroup({ event: 'push', ref: 'refs/heads/x', inputs: { ...I, d1_lock_scope: 'shared-db' }, runId: 1 }), 'cfv2-nonprod-d1-shared-db');
-  assert.equal(runLockGroup({ event: 'push', ref: 'refs/heads/x', inputs: { ...I, d1_migrations: false, shared_dev_on_branch_push: true }, runId: 1 }), 'cfv2-shared-dev-blog');
-  assert.equal(runLockGroup({ event: 'push', ref: 'refs/heads/x', inputs: { ...I, d1_migrations: false }, runId: 1 }), 'cfv2-blog-preview-x');
-  assert.equal(runLockGroup({ event: 'pull_request', ref: 'refs/pull/1/merge', inputs: I, runId: 7 }), 'cfv2-run-7');
-  assert.equal(runLockGroup({ event: 'push', ref: 'refs/tags/v1', inputs: I, runId: 7 }), 'cfv2-run-7');
-  // a manual persistent-dev dispatch takes the SAME group as the automatic Shared Dev push (never the Production group, even from main)
-  const M = { ...I, dispatch_target: 'persistent-dev', d1_lock_scope: 'shared-db' };
-  assert.equal(runLockGroup({ event: 'workflow_dispatch', ref: 'refs/heads/dev', inputs: M, runId: 7 }), 'cfv2-nonprod-d1-shared-db');
-  assert.equal(runLockGroup({ event: 'workflow_dispatch', ref: 'refs/heads/main', inputs: M, runId: 7 }), 'cfv2-nonprod-d1-shared-db');
-  assert.equal(runLockGroup({ event: 'workflow_dispatch', ref: 'refs/heads/main', inputs: { ...M, d1_migrations: false }, runId: 7 }), 'cfv2-shared-dev-blog');
-  assert.equal(runLockGroup({ event: 'workflow_dispatch', ref: 'refs/heads/main', inputs: I, runId: 7 }), 'cfv2-prod-blog', 'a dispatch without a target keeps the Production group on main');
-});
-
-test('lock identity: same Deploy/Verify d1_lock_scope -> same effective lock; a verify default never selects another', () => {
-  const st = PD();
-  const r = R(st)['persistent-dev'];
-  assert.equal(r.deploy_group, 'cfv2-dev-o/r-shared-db');
-  assert.equal(r.rollback_group, r.deploy_group);
-  assert.equal(st.group, 'cfv2-nonprod-d1-shared-db', 'the run-level group is also keyed by the deploy-time scope');
-  // restoring takes ONLY the hand-off: there is no verify-call input to override the scope
-  assert.equal(R(PD())['persistent-dev'].deploy_group, r.deploy_group);
-});
-
-test('lock identity: modified Persistent Dev group, rollback group, repository and application are rejected', () => {
-  const st = PD();
-  const tamper = (patch) => ({ ...st, descriptors: { 'persistent-dev': { ...st.descriptors['persistent-dev'], ...patch } } });
-  assert.throws(() => R(tamper({ deploy_group: 'cfv2-dev-o/r-other', rollback_group: 'cfv2-dev-o/r-other' })), /carries lock/);
-  assert.throws(() => R(tamper({ rollback_group: 'cfv2-dev-o/r-other' })), /rollback_group|concurrency groups|carries lock/);
-  assert.throws(() => R(tamper({ deploy_group: 'cfv2-dev-o/r-app', rollback_group: 'cfv2-dev-o/r-app' })), /carries lock/, 'the scope-less lock is a different lock');
-  assert.throws(() => R(st, { repo: 'evil/r' }), /carries lock/);
-  assert.throws(() => R({ ...st, inputs: { ...st.inputs, app_name: 'other' } }), /another application|phase_state.group|carries lock/);
-  assert.throws(() => R({ ...st, inputs: { ...st.inputs, d1_lock_scope: '' } }), /carries lock|phase_state.group/, 'a different deploy-time scope is not the original lock');
-});
-
-test('lock identity: phase_state.group must be the lock the deploy inputs imply (inconsistent / forged / missing -> rejected)', () => {
-  const st = deployState();
-  for (const g of ['cfv2-prod-app', 'attacker-group', '', undefined, 'cfv2-nonprod-d1-other']) assert.throws(() => R({ ...st, group: g }), /phase_state.group/);
-  assert.doesNotThrow(() => R(st));
-  // no branch push (e.g. a rerun on a PR event): only the numeric cfv2-run-<id> shape is acceptable
-  const pr = { event: 'pull_request', ref: 'refs/pull/1/merge' };
-  assert.doesNotThrow(() => R({ ...st, group: 'cfv2-run-123' }, pr));
-  assert.throws(() => R({ ...st, group: 'cfv2-run-abc' }, pr), /phase_state.group/);
-  assert.throws(() => R({ ...st, group: 'cfv2-nonprod-d1-shared-db' }, pr), /phase_state.group/);
-  // verifying from another ref/event than the deploy ran on cannot silently join a different lock
-  assert.throws(() => R(st, { ref: 'refs/heads/main' }), /phase_state.group/);
-});
-
-test('lock identity: Native Branch / Native Dev / Production restore exactly as before', () => {
-  for (const k of ['native-branch', 'native-dev', 'production']) {
-    const st = deployState({}, [k]);
-    const r = R(st)[k];
-    assert.equal(r.deploy_group, st.descriptors[k].deploy_group);
-    assert.equal(r.rollback_group, `${st.descriptors[k].deploy_group}-rollback`);
-    assert.equal(r.phase, 'verify');
-  }
-});
-
-// ---- legacy hand-off (no descriptors): migration ownership is reconstructed only from proof ---------------------------------------
-const legacyOf = (o = {}, kinds = ['native-branch', 'native-dev']) => { const { descriptors, ...l } = deployState(o, kinds); return l; };
-const mj = (kind, d1 = 'DB1') => JSON.stringify({ migration: 'applied', kind, d1_id: d1 });
-
-test('legacy migration ownership: no D1 -> valid, empty owner; D1 migrations disabled -> no ownership needed', () => {
-  const noD1 = legacyOf({ inputs: { ...deployState().inputs, d1_migrations: false }, d1: {}, migration: {} });
-  const r = R({ ...noD1, group: runLockGroup({ ...EV, inputs: noD1.inputs, runId: 1 }) });
-  assert.equal(r['native-dev'].d1_expected_id, '');
-  assert.equal(r['native-dev'].d1_owner_kind, '');
-  assert.equal(r['native-dev'].owns_migration, false);
-});
-
-test('legacy migration ownership: one D1 shared by Native Branch and Native Dev -> the proven owner and member relationship', () => {
-  const r = R(legacyOf());
-  assert.equal(r['native-branch'].d1_owner_kind, 'native-branch');
-  assert.equal(r['native-branch'].owns_migration, true);
-  assert.equal(r['native-dev'].d1_owner_kind, 'native-branch');
-  assert.equal(r['native-dev'].owns_migration, false);
-  assert.equal(r['native-dev'].d1_expected_id, 'DB1');
-});
-
-test('legacy migration ownership: a single kind owns its own D1; distinct D1s have independent owners', () => {
-  const one = R(legacyOf({}, ['production']));
-  assert.equal(one.production.owns_migration, true);
-  const two = legacyOf({ d1: { native_branch: 'DB1', persistent_dev: 'DB2' }, migration: { mj_native_branch: mj('native-branch', 'DB1'), mj_persistent_dev: mj('persistent-dev', 'DB2') } }, ['native-branch', 'persistent-dev']);
-  const r = R(two);
-  assert.deepEqual([r['native-branch'].owns_migration, r['persistent-dev'].owns_migration], [true, true]);
-  assert.deepEqual([r['native-branch'].d1_expected_id, r['persistent-dev'].d1_expected_id], ['DB1', 'DB2']);
-});
-
-test('legacy migration ownership: conflicting, missing, foreign or self-contradicting evidence fails closed', () => {
-  const base = legacyOf();
-  assert.throws(() => R({ ...base, migration: { mj_native_branch: mj('native-branch'), mj_native_dev: mj('native-dev') } }), /conflicting migration owners/);
-  assert.throws(() => R({ ...base, migration: {} }), /no migration-owner evidence/);
-  assert.throws(() => R({ ...base, migration: { mj_native_branch: mj('native-branch'), mj_native_dev: JSON.stringify({ stale: 'true' }) } }), /no migration-owner evidence/);
-  assert.throws(() => R({ ...base, migration: { mj_native_branch: mj('native-branch'), mj_native_dev: mj('native-branch', 'OTHER') } }), /for D1 'OTHER'/);
-  assert.throws(() => R({ ...base, migration: { mj_native_branch: mj('production'), mj_native_dev: mj('production') } }), /not among the kinds/);
-  // The owner is whatever the hand-off consistently proves; a self-consistent swap cannot be told from the truth (it only changes the informational
-  // owns_migration of a verify descriptor - verify/rollback never run a migration). It is accepted, and only the consistent owner is reported:
-  const swapped = R({ ...base, migration: { mj_native_branch: mj('native-dev'), mj_native_dev: mj('native-dev') } });
-  assert.deepEqual([swapped['native-dev'].d1_owner_kind, swapped['native-dev'].owns_migration, swapped['native-branch'].owns_migration], ['native-dev', true, false]);
-});
-
-test('legacy migration ownership: D1 identity mismatch is rejected; the descriptor-based hand-off is unchanged', () => {
-  const base = legacyOf();
-  assert.throws(() => R({ ...base, d1: { native_branch: 'DB1', native_dev: 'DB2' } }), /conflicting migration owners|for D1/);
-  const withDesc = deployState();
-  assert.deepEqual(R(withDesc)['native-dev'], { ...withDesc.descriptors['native-dev'], phase: 'verify' });
-});
-
 test('nonProdRecoveryBlock: non-Production recovery is fail-closed against the migration result of the same pipeline', () => {
   const M = { migration: 'applied', schema_changed: 'true', d1_scan: 'additive', kind: 'persistent-dev', d1_id: 'D1' };
   const b = (o) => nonProdRecoveryBlock({ d1Migrations: true, migration: M, expectedId: 'D1', d1Compat: 'expand-contract', ...o });
@@ -730,22 +446,6 @@ test('nonProdRecoveryBlock: non-Production recovery is fail-closed against the m
   assert.equal(rollbackVerdict({ target: 'dev', rbResult: 'blocked', goodSha: '' }).ok, false);
 });
 
-test('ciTargetEnv: the CI environment follows the intended target (automatic and manual Persistent Dev alike)', () => {
-  const E = (o) => ciTargetEnv({ strategy: 'hybrid', previewOnPush: true, ...o });
-  assert.equal(E({ event: 'push', ref: 'refs/heads/main' }), 'prod');
-  assert.equal(E({ event: 'push', ref: 'refs/heads/feat' }), 'preview', 'Native Branch');
-  assert.equal(E({ event: 'push', ref: 'refs/heads/feat', previewOnPush: false, sharedDevNativeOnPush: true }), 'preview', 'Native Dev only: existing contract');
-  assert.equal(E({ event: 'push', ref: 'refs/heads/feat', previewOnPush: false, sharedDevOnPush: true }), 'dev', 'automatic Persistent Dev only');
-  assert.equal(E({ event: 'push', ref: 'refs/heads/feat', sharedDevOnPush: true }), 'preview', 'several kinds: shared Preview contract');
-  assert.equal(E({ event: 'workflow_dispatch', ref: 'refs/heads/dev', dispatchTarget: 'persistent-dev' }), 'dev');
-  assert.equal(E({ event: 'workflow_dispatch', ref: 'refs/heads/main', dispatchTarget: 'persistent-dev' }), 'dev');
-  assert.equal(E({ event: 'workflow_dispatch', ref: 'refs/heads/main' }), 'prod');
-  assert.equal(E({ event: 'pull_request', ref: 'refs/pull/1/merge', previewOnPush: false, sharedDevOnPush: true }), 'preview');
-  assert.equal(E({ event: 'push', ref: 'refs/heads/main', dispatchTarget: 'persistent-dev' }), 'prod');
-  assert.equal(E({ event: 'workflow_dispatch', ref: 'refs/heads/main', dispatchTarget: 'Persistent-Dev' }), 'prod');
-});
-
-// ---- read-only D1 migration precheck: pure decision + the verified no-pending evidence
 const rows = (results, success = true) => JSON.stringify([{ results, success, meta: {} }]);
 test('parseD1Rows: only a single successful statement result is data; everything else throws (fail closed)', () => {
   assert.deepEqual(parseD1Rows(rows([{ name: 'a.sql' }])), [{ name: 'a.sql' }]);
@@ -764,23 +464,6 @@ test('pendingMigrations: unrecorded files are pending; a missing table means eve
   assert.throws(() => pendingMigrations({ files: [], tableExists: true, applied: [] }), /no \.sql files/);
 });
 const VNP = (o = {}) => JSON.stringify({ precheck: VERIFIED_NO_PENDING, kind: 'native-branch', d1_id: 'DB1', precheck_sha: 'abc1234', ...o });
-test('resolveMigrationUsed: a verified no-pending precheck authorizes only for the exact owner, D1 and commit', () => {
-  const R = (o) => resolveMigrationUsed({ d1Migrations: true, kind: 'native-dev', ownerKind: 'native-branch', expectedId: 'DB1', result: 'success', json: VNP(), runSha: 'abc1234', ...o });
-  const ok = R({});
-  assert.equal(ok.migration, 'none'); assert.equal(ok.schema_changed, 'false'); assert.equal(ok.d1_scan, 'none'); assert.equal(ok.precheck, VERIFIED_NO_PENDING);
-  assert.throws(() => R({ result: 'skipped' }), /finished 'skipped'/);
-  assert.throws(() => R({ result: 'failure' }), /finished 'failure'/);
-  assert.throws(() => R({ runSha: 'def5678' }), /belongs to commit/);
-  assert.throws(() => R({ runSha: '' }), /belongs to commit/);
-  assert.throws(() => R({ json: VNP({ precheck_sha: undefined }) }), /belongs to commit/);
-  assert.throws(() => R({ json: VNP({ d1_id: 'PROD' }) }), /another D1/);
-  assert.throws(() => R({ json: VNP({ kind: 'native-dev' }) }), /another kind/);
-  assert.throws(() => R({ json: VNP({ stale: 'true' }) }), /stale/);
-  assert.throws(() => R({ json: VNP({ migration: 'applied' }) }), /both an applied migration/);
-  assert.throws(() => R({ json: JSON.stringify({ migration: 'none', kind: 'native-branch', d1_id: 'DB1', precheck_sha: 'abc1234' }) }), /no verified-empty precheck/);
-  assert.throws(() => R({ json: JSON.stringify({ precheck: 'pending', kind: 'native-branch', d1_id: 'DB1' }) }), /no verified-empty precheck/);
-  assert.deepEqual(resolveMigrationUsed({ d1Migrations: false, kind: 'production', result: 'skipped', json: VNP() }), {}, 'without d1_migrations nothing is required');
-});
 test('nonProdRecoveryBlock: a verified no-pending result is a known D1 state (schema unchanged); an unmarked none is not', () => {
   const g = (m) => nonProdRecoveryBlock({ d1Migrations: true, migration: m, expectedId: 'DB1', d1Compat: '' });
   assert.equal(g({ migration: 'none', precheck: VERIFIED_NO_PENDING, kind: 'native-branch', d1_id: 'DB1', schema_changed: 'false', d1_scan: 'none' }), null);

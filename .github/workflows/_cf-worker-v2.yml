@@ -325,8 +325,9 @@ on:
         type: string
         default: all
       phase_state:
-        description: pipeline_phase deploy - the validated hand-off (inputs, enabled kinds, per-kind Deploy / Migration results, concurrency group, target descriptors) for the verify call. Pass it unchanged as phase_state
-        value: ${{ format('{{"inputs":{0},"kinds":{1},"deploy":{2},"migration":{3},"group":{4},"descriptors":{5}}}', toJSON(inputs), toJSON(fromJSON(jobs.plan.outputs.kinds || '[]')), format('{{"h_production":{0},"h_native_branch":{1},"h_native_dev":{2},"h_persistent_dev":{3}}}', toJSON(jobs.delivery_production.outputs.handoff), toJSON(jobs.delivery_native_branch.outputs.handoff), toJSON(jobs.delivery_native_dev.outputs.handoff), toJSON(jobs.delivery_persistent_dev.outputs.handoff)), format('{{"mj_production":{0},"mj_native_branch":{1},"mj_native_dev":{2},"mj_persistent_dev":{3}}}', toJSON(jobs.delivery_production.outputs.migration_used), toJSON(jobs.delivery_native_branch.outputs.migration_used), toJSON(jobs.delivery_native_dev.outputs.migration_used), toJSON(jobs.delivery_persistent_dev.outputs.migration_used)), toJSON(jobs.plan.outputs.group || format('cfv2-run-{0}', github.run_id)), toJSON(fromJSON(jobs.plan.outputs.descriptors || '{}'))) }}
+        description: pipeline_phase verify only - the `phase_state` output of the deploy call, passed unchanged. Validated as data; the engine inputs come from it, so a verify call repeats only app_name, app_path, runner, production_rollback_policy, release_cmd and the secrets.
+        type: string
+        default: '{}'
       upstream_gate:
         description: pipeline_phase verify only - `needs.<job>.result` of the job the cross-service smoke depends on. success or skipped (unchanged Worker, existing verified environment) satisfies it; anything else blocks the verification, fail closed (no rollback)
         type: string

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  assertWranglerSupported, auditPreviewConfig, PREVIEW_NAME_RE, classifyEvent, extractPreviewUrl, isStale, previewIdentity,
+  assertWranglerSupported, auditPreviewConfig, PREVIEW_NAME_RE, extractPreviewUrl, isStale, previewIdentity,
   classifyMigrationSql, workerName,
 } from '../../actions/cf-preview/lib.mjs';
 
@@ -58,26 +58,6 @@ test('wrangler version gate', () => {
   assert.throws(() => assertWranglerSupported(''));
 });
 
-const c = (o) => classifyEvent({ strategy: 'production-preview', ...o });
-test('event matrix', () => {
-  assert.equal(c({ event: 'push', ref: 'refs/heads/feat/a' }).action, 'preview');
-  assert.equal(c({ event: 'push', ref: 'refs/heads/main' }).action, 'production');
-  assert.equal(c({ event: 'pull_request', ref: 'refs/pull/1/merge' }).action, 'ci-only');
-  assert.equal(c({ event: 'pull_request', ref: 'x', isFork: true }).action, 'ci-only');
-  assert.equal(c({ event: 'delete', ref: 'refs/heads/feat/a', deletedRefType: 'branch' }).action, 'cleanup');
-  assert.equal(c({ event: 'delete', ref: 'refs/heads/main', deletedRefType: 'branch' }).action, 'skip');
-  assert.equal(c({ event: 'delete', ref: 'refs/tags/v1', deletedRefType: 'tag' }).action, 'skip');
-  assert.equal(c({ event: 'push', ref: 'refs/heads/feat/a', strategy: 'production-only' }).action, 'ci-only');
-  assert.equal(c({ event: 'delete', ref: 'refs/heads/a', deletedRefType: 'branch', strategy: 'production-only' }).action, 'skip');
-});
-test('tag pushes are skipped', () => assert.equal(c({ event: 'push', ref: 'refs/heads/' }).action, 'skip'));
-test('hybrid: feature push previews, dev only on approved dispatch', () => {
-  const h = { strategy: 'hybrid', devRef: 'refs/heads/dev' };
-  assert.equal(classifyEvent({ ...h, event: 'push', ref: 'refs/heads/dev' }).action, 'preview');
-  assert.equal(classifyEvent({ ...h, event: 'workflow_dispatch', ref: 'refs/heads/dev', dispatchTarget: 'persistent-dev' }).action, 'persistent-dev');
-  assert.equal(classifyEvent({ ...h, event: 'workflow_dispatch', ref: 'refs/heads/feat', dispatchTarget: 'persistent-dev' }).action, 'skip');
-  assert.equal(classifyEvent({ strategy: 'production-preview', event: 'workflow_dispatch', ref: 'refs/heads/dev', dispatchTarget: 'persistent-dev', devRef: 'refs/heads/dev' }).action, 'skip');
-});
 test('stale-SHA guard', () => {
   assert.equal(isStale({ runSha: 'a', branchTipSha: 'a' }), false);
   assert.equal(isStale({ runSha: 'a', branchTipSha: 'b' }), true);
@@ -196,24 +176,9 @@ test('preflight: Preview binding without id is an error (Cloudflare 10021)', () 
 });
 
 // ---- v2 refactor: target resolution, migration target, production audit, env import ----
-import { previewHostReadiness, rebindSha, auditDevConfig, auditProdConfig, d1ForTarget, migrationPlan, resolveSharedDev, sharedPreviewDevD1, resolveTarget } from '../../actions/cf-preview/lib.mjs';
+import { previewHostReadiness, rebindSha, auditDevConfig, auditProdConfig, d1ForTarget, migrationPlan, sharedPreviewDevD1 } from '../../actions/cf-preview/lib.mjs';
 import { parseEnvLines } from '../../actions/cf-preview/parse-env.mjs';
 
-test('resolveTarget: only trusted push/dispatch deploys; main=prod, branch=preview', () => {
-  const r = (o) => resolveTarget({ strategy: 'production-preview', ...o });
-  assert.equal(r({ event: 'push', ref: 'refs/heads/main' }), 'prod');
-  assert.equal(r({ event: 'push', ref: 'refs/heads/feat/x' }), 'preview');
-  assert.equal(r({ event: 'workflow_dispatch', ref: 'refs/heads/main' }), 'prod');
-  assert.equal(r({ event: 'pull_request', ref: 'refs/heads/feat/x' }), 'none');
-  assert.equal(r({ event: 'pull_request', ref: 'refs/heads/main' }), 'none');
-  assert.equal(r({ event: 'delete', ref: 'refs/heads/feat/x' }), 'none');
-  assert.equal(r({ event: 'push', ref: 'refs/tags/v1' }), 'none');
-  assert.equal(r({ event: 'push', ref: 'refs/heads/feat/x', previewOnPush: false }), 'none');
-  assert.equal(resolveTarget({ event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-only' }), 'none');
-  assert.equal(resolveTarget({ event: 'push', ref: 'refs/heads/main', strategy: 'production-only' }), 'prod');
-  // Hybrid persistent Dev is never a prod/preview target
-  assert.equal(resolveTarget({ event: 'workflow_dispatch', ref: 'refs/heads/dev', strategy: 'hybrid', devRef: 'refs/heads/dev', dispatchTarget: 'persistent-dev' }), 'none');
-});
 
 const D1CFG = {
   name: 'blog',
@@ -303,32 +268,6 @@ test('migrationPlan keeps migrations_table / migrations_pattern and resolves the
   assert.deepEqual([d.migrations_dir, d.migrations_table, d.migrations_pattern], ['/abs/sql', 't', '*.sql']);
 });
 
-// ---- Shared Dev channel (independent of Native Preview) ----
-test('resolveSharedDev: non-main push/dispatch only, switch required, never production-only', () => {
-  const r = (o) => resolveSharedDev({ strategy: 'production-preview', sharedDevOnPush: true, ...o });
-  assert.equal(r({ event: 'push', ref: 'refs/heads/feat/x' }), 'dev');
-  assert.equal(r({ event: 'push', ref: 'refs/heads/feat/y' }), 'dev'); // every branch targets the same Dev
-  assert.equal(r({ event: 'workflow_dispatch', ref: 'refs/heads/feat/x' }), 'dev');
-  assert.equal(r({ event: 'push', ref: 'refs/heads/main' }), 'none');
-  assert.equal(r({ event: 'push', ref: 'refs/tags/v1' }), 'none');
-  assert.equal(r({ event: 'pull_request', ref: 'refs/heads/feat/x' }), 'none');
-  assert.equal(r({ event: 'delete', ref: 'refs/heads/feat/x' }), 'none'); // branch deletion never touches Dev
-  assert.equal(r({ event: 'workflow_dispatch', ref: 'refs/heads/dev', dispatchTarget: 'persistent-dev' }), 'none'); // manual path stays separate
-  assert.equal(r({ event: 'push', ref: 'refs/heads/feat/x', sharedDevOnPush: false }), 'none');
-  assert.equal(r({ event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-only' }), 'none');
-});
-test('four toggle combinations resolve independently', () => {
-  const both = (feature, dev) => [
-    resolveTarget({ event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-preview', previewOnPush: feature }),
-    resolveSharedDev({ event: 'push', ref: 'refs/heads/feat/x', strategy: 'production-preview', sharedDevOnPush: dev }),
-  ];
-  assert.deepEqual(both(true, true), ['preview', 'dev']);
-  assert.deepEqual(both(true, false), ['preview', 'none']);
-  assert.deepEqual(both(false, true), ['none', 'dev']);
-  assert.deepEqual(both(false, false), ['none', 'none']);
-  // main is always Production, whatever the switches say
-  assert.equal(resolveTarget({ event: 'push', ref: 'refs/heads/main', strategy: 'production-preview', previewOnPush: false }), 'prod');
-});
 const DEVCFG = {
   name: 'blog',
   d1_databases: [{ binding: 'DB', database_name: 'blog-db', database_id: 'PROD-ID', migrations_dir: 'm' }],

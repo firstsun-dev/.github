@@ -1,5 +1,7 @@
 # CF Worker v2 — unified target-driven delivery (shared-engine contract)
 
+> **Superseded (2026-11-13).** This record describes the four-kind (`production / native-branch / native-dev / persistent-dev`) model replaced by the stage/target design in [cf-worker-v2.md](cf-worker-v2.md) and `openspec/changes/simplify-cf-ci-stages-and-dev-delivery`. Kept as history; its inputs no longer exist.
+
 Spec: `openspec/changes/unify-cf-worker-v2-delivery-targets`. This document is the **frozen Phase 1 contract** consumers build against.
 It supersedes the job topology in `cf-worker-v2-refactor.md` ("Job DAG", "Shared Dev job order"); the engine, security rules, ledger
 and recovery rules described there still apply. `_cf-worker-v2.yml` remains the only public entrypoint; `_cf-worker-delivery.yml` is an
