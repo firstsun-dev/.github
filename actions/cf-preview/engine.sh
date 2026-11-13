@@ -5,10 +5,12 @@
 # actions/cf-deploy/action.yml calls one phase per step; every phase reads the workflow inputs from the validated
 # inputs.json written by `init`, so no workflow text is interpolated into a script.
 #
-# Delivery KIND (ENGINE_KIND, bound once in `init`): production | native-branch | native-dev | persistent-dev. TARGET stays the
-# config/credential class (prod | preview | dev): native-branch and native-dev are BOTH `preview` (wrangler preview, [previews]
-# bindings); native-dev is the fixed, protected Preview name `dev`. Everything kind-specific (build env, URL, ledger,
-# Environment, smoke mode) is resolved from KIND, never from application env.
+# The delivery is (target production|preview|dev) x (driver worker|native-preview), bound once in `init` from the validated descriptor.
+# DELIVERY_TARGET is the public target. TARGET is the config/credential class (prod | preview | dev): a native-preview Dev and a PR Preview
+# are BOTH `preview` (wrangler preview, [previews] bindings; Dev is the fixed, protected Preview name `dev`). KIND is the internal persistence
+# slot (production | native-branch | native-dev | persistent-dev) that keys the GitHub Environment and the known-good ledger; it is DERIVED
+# from target x driver by delivery.mjs and never a public input. Everything delivery-specific (build env, URL, ledger, Environment, smoke
+# mode) is resolved from it, never from application env.
 #
 # Stages (ENGINE_STAGE, set once in `init`): `all` = every phase in ONE job (Shared Dev, persistent Dev); the Production /
 # Preview path is split across jobs that each re-run `init` (same inputs, same target binding) and exchange only
@@ -48,11 +50,17 @@ rd() { [ -f "$S/$1" ] && cat "$S/$1" || true; }
 # Engine-owned context, derived from state and the runner (never from caller env text).
 ctx() {
   [ -s "$S/target" ] || die "delivery engine not initialised"
-  TARGET="$(rd target)"; KIND="$(rd kind)"
-  if [ -z "$KIND" ]; then case "$TARGET" in prod) KIND=production;; preview) KIND=native-branch;; dev) KIND=persistent-dev;; esac; fi
+  TARGET="$(rd target)"; KIND="$(rd kind)"; DELIVERY_TARGET="$(rd delivery_target)"
+  [ -n "$KIND" ] && [ -n "$DELIVERY_TARGET" ] || die "delivery engine state has no delivery slot/target"
   APP_NAME="$(inp app_name)"; APP_PATH="$(inp app_path)"; APP_PATH="${APP_PATH:-.}"
   APP_DIR="${APP_DIR_OVERRIDE:-${GITHUB_WORKSPACE:?}/$APP_PATH}"
-  BRANCH_REF="${GITHUB_REF:?}"; BRANCH="${GITHUB_REF#refs/heads/}"; RUN_SHA="${GITHUB_SHA:?}"
+  if [ "${GITHUB_EVENT_NAME:-}" = pull_request ]; then
+    # A same-repository PR Preview delivers the PR HEAD commit of the PR's branch (never the synthetic merge commit); the stale guard and the
+    # ledger are keyed by that branch.
+    PR_NUMBER="${PR_NUMBER:?pull request number}"; BRANCH="${PR_HEAD_REF:?pull request head ref}"; BRANCH_REF="refs/heads/$BRANCH"; RUN_SHA="${PR_HEAD_SHA:?pull request head sha}"
+  else
+    PR_NUMBER=""; BRANCH_REF="${GITHUB_REF:?}"; BRANCH="${GITHUB_REF#refs/heads/}"; RUN_SHA="${GITHUB_SHA:?}"
+  fi
   DEV_ENV="$(inp dev_wrangler_env)"; DEV_ENV="${DEV_ENV:-dev}"
   WRANGLER_CONFIG="$(inp wrangler_config)"; WRANGLER_CONFIG="${WRANGLER_CONFIG:-wrangler.toml}"
   D1_BINDING="$(inp d1_binding)"
@@ -63,15 +71,15 @@ ctx() {
   esac
   PREVIEW_NAME="$(rd preview_name)"; ENV_NAME="$(rd ledger_env)"; LEDGER_ID="$(rd ledger_id)"
   [ "$KIND" != native-dev ] || PREVIEW_NAME=dev
-  export KIND TARGET APP_NAME APP_DIR BRANCH_REF BRANCH RUN_SHA DEV_ENV WRANGLER_CONFIG D1_BINDING HOST_WORKER PREVIEW_NAME ENV_NAME STATE_DIR="$S"
+  export KIND TARGET DELIVERY_TARGET PR_NUMBER APP_NAME APP_DIR BRANCH_REF BRANCH RUN_SHA DEV_ENV WRANGLER_CONFIG D1_BINDING HOST_WORKER PREVIEW_NAME ENV_NAME STATE_DIR="$S"
 }
 
 # Which commands/env belong to the target. Never falls back across targets (except dev_build_cmd -> build_cmd).
-target_build_cmd() { case "$TARGET" in dev) local c; c="$(inp dev_build_cmd)"; echo "${c:-$(inp build_cmd)}";; *) inp build_cmd;; esac; }
-target_smoke_cmd() { case "$TARGET" in dev) local c; c="$(inp dev_smoke_cmd)"; echo "${c:-$(inp smoke_cmd)}";; *) inp smoke_cmd;; esac; }
+target_build_cmd() { case "$DELIVERY_TARGET" in dev) local c; c="$(inp dev_build_cmd)"; echo "${c:-$(inp build_cmd)}";; *) inp build_cmd;; esac; }
+target_smoke_cmd() { case "$DELIVERY_TARGET" in dev) local c; c="$(inp dev_smoke_cmd)"; echo "${c:-$(inp smoke_cmd)}";; *) inp smoke_cmd;; esac; }
 # Declared (caller-supplied) canonical URL of the kind; Preview kinds additionally derive theirs from Cloudflare (resolve_target_url).
 declared_url() {
-  case "$KIND" in production) inp app_url_prod;; persistent-dev) inp app_url_dev;; native-dev) inp app_url_shared_dev_native_preview;; *) echo "";; esac
+  case "$KIND" in production) inp app_url_prod;; persistent-dev) inp app_url_dev;; native-dev) inp app_url_dev;; *) echo "";; esac
 }
 # The canonical URL THIS target is built for: resolved ONCE before the build (state file), else the declared one.
 target_url() { if [ -s "$S/target_url" ]; then rd target_url; else declared_url; fi; }
@@ -163,7 +171,7 @@ case "$PHASE" in
       PAYLOAD="$(jq -nc --arg ref "$BRANCH_REF" --arg w "$APP_NAME" --arg h "$HOST_WORKER" --arg r "$GITHUB_REPOSITORY" '{kind:"native-dev",branch_ref:$ref,preview_name:"dev",worker:$w,host_worker:$h,repo:$r}')"
       DESC="Native Dev Preview"
     elif [ "$TARGET" = preview ]; then
-      OUT="$(RESERVE_NATIVE_DEV="$(inp shared_dev_native_preview_on_branch_push)" "$TOOLS_DIR/guard.sh" identity)"
+      OUT="$(PR_NUMBER="$PR_NUMBER" "$TOOLS_DIR/guard.sh" identity)"
       printf '%s' "$(printf '%s\n' "$OUT" | sed -n 's/^PREVIEW_NAME=//p')" > "$S/preview_name"
       printf '%s' "$(printf '%s\n' "$OUT" | sed -n 's/^ENV_NAME=//p')" > "$S/ledger_env"
       (cd "$APP_DIR" && node "$TOOLS_DIR/cli.mjs" preflight --config "$WRANGLER_CONFIG" --allow "$(inp preview_binding_allow)" --deny "$(inp preview_deny_resources)")

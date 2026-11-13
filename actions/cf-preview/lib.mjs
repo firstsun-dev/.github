@@ -7,7 +7,6 @@ import { parse as parseToml } from 'smol-toml';
 import { parse as parseJsonc } from 'jsonc-parser';
 import { DEV_SHAREABLE_KINDS } from './dev-policy.mjs';
 
-export const STRATEGIES = ['production-preview', 'hybrid', 'production-only'];
 export const MIN_WRANGLER = '4.135.0';
 
 /** Compare dotted numeric versions; returns <0, 0, >0. Ignores prerelease tags. */
@@ -127,42 +126,6 @@ export async function previewHostReadiness(fetchFn, { accountId, token, worker, 
     return { ok: false, level: 'block', message: `Worker "${worker}" has previews_enabled=false: no Preview URL host exists. Enable Preview URLs for that Worker (Settings > Domains & Routes > Preview URLs, or deploy it with \`preview_urls = true\`) — this pipeline never changes the Worker automatically. For custom-domain Preview hosting set preview_host_check: false.` };
   }
   return { ok: false, level: 'unknown', message: 'Preview host check: previews_enabled not reported' };
-}
-
-/**
- * Event classification. Returns { action, reason }.
- * action: preview | ci-only | cleanup | production | persistent-dev | skip
- */
-export function classifyEvent({ event, ref, strategy, isFork = false, baseRef = '', deletedRefType = '', devRef = '', dispatchTarget = '' }) {
-  if (!STRATEGIES.includes(strategy)) throw new Error(`Unknown deployment_strategy: ${strategy}`);
-  if (!ref || ref === 'refs/heads/') return { action: 'skip', reason: 'not a branch ref (tag or other)' };
-  const isMain = ref === 'refs/heads/main';
-  switch (event) {
-    case 'pull_request':
-      return { action: 'ci-only', reason: isFork ? 'fork PR: no credentials' : 'PR: CI/report only; push owns Preview lifecycle' };
-    case 'delete':
-      if (deletedRefType !== 'branch') return { action: 'skip', reason: 'not a branch deletion' };
-      if (isMain) return { action: 'skip', reason: 'refusing to clean up main' };
-      return strategy === 'production-only'
-        ? { action: 'skip', reason: 'production-only has no Preview' }
-        : { action: 'cleanup', reason: 'branch deleted' };
-    case 'push':
-      if (isMain) return { action: 'production', reason: 'main push' };
-      if (strategy === 'production-only') return { action: 'ci-only', reason: 'production-only: no Preview' };
-      return { action: 'preview', reason: 'non-main push' };
-    case 'workflow_dispatch':
-      if (dispatchTarget === 'persistent-dev') {
-        if (strategy !== 'hybrid') return { action: 'skip', reason: 'persistent Dev requires hybrid' };
-        if (!devRef || ref !== devRef) return { action: 'skip', reason: 'ref is not the approved persistent_dev_ref' };
-        return { action: 'persistent-dev', reason: 'approved dispatch' };
-      }
-      if (isMain) return { action: 'production', reason: 'dispatch on main' };
-      return strategy === 'production-only'
-        ? { action: 'ci-only', reason: 'production-only' }
-        : { action: 'preview', reason: 'dispatch on branch' };
-    default:
-      return { action: 'skip', reason: `unhandled event ${event}` };
-  }
 }
 
 export function readConfig(path) {
@@ -291,33 +254,6 @@ export function auditPreviewConfig(cfg, { allow = [], denyResources = [] } = {})
 /** Is `candidateSha` still the tip of the branch? Guards stale/out-of-order runs. */
 export function isStale({ runSha, branchTipSha }) {
   return !branchTipSha || runSha !== branchTipSha;
-}
-
-/**
- * Which deployment target does this event deploy to? 'prod' | 'preview' | 'none'.
- * Single source of truth shared by the Migration and Deploy jobs (they re-check it fail-closed in addition
- * to their job-level `if`), so a mismatch between the two can never silently select Production.
- */
-export function resolveTarget({ event, ref, strategy, previewOnPush = true, devRef = '', dispatchTarget = '' }) {
-  if (!String(ref).startsWith('refs/heads/')) return 'none'; // tags, refs/pull/*: never a deploy target
-  const r = classifyEvent({ event, ref, strategy, devRef, dispatchTarget });
-  if (r.action === 'production') return 'prod';
-  if (r.action === 'preview') return previewOnPush ? 'preview' : 'none';
-  return 'none';
-}
-
-/**
- * Does this event deploy the SHARED persistent Dev Worker? 'dev' | 'none'.
- * Independent of the Native Preview channel: only the Shared Dev switch matters. Never main (Production),
- * never a PR / delete / tag, never the manual persistent-dev dispatch, never a production-only Worker.
- */
-export function resolveSharedDev({ event, ref, strategy, sharedDevOnPush = false, dispatchTarget = '' }) {
-  if (!STRATEGIES.includes(strategy)) throw new Error(`Unknown deployment_strategy: ${strategy}`);
-  if (!sharedDevOnPush || strategy === 'production-only') return 'none';
-  if (!String(ref).startsWith('refs/heads/') || ref === 'refs/heads/main') return 'none';
-  if (event === 'push') return 'dev';
-  if (event === 'workflow_dispatch' && dispatchTarget !== 'persistent-dev') return 'dev';
-  return 'none';
 }
 
 /** D1 bindings the given target will use, straight from the project's SOURCE Wrangler config. */

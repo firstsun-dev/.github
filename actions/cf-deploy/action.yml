@@ -8,11 +8,8 @@ description: >
               it and a `rollback` job recovers it, so a cross-service smoke can wait for another Worker's deployment.
     precheck  Migration job, FIRST step: read-only look at the planned owner's physical D1 (two SELECTs, no build, nothing created or
               changed). Verdict `precheck` = verified_no_pending (bound to owner, D1 id and commit; the Migration job then builds and
-              migrates nothing) | pending (the full preflight/migrate path follows). Failure, identity mismatch or a superseded run
+              migrates nothing) | pending (the full migrate path follows). Failure, identity mismatch or a superseded run
               never produce verified_no_pending.
-    preflight Pre-mutation validation of one target: URL resolution + build + effective-config audit + exact D1 binding check.
-              Non-publishing, mutates nothing remote. The single Migration job runs it for every enabled target that is not the
-              migration owner, then `migrate` for the owner.
     migrate   Migration job (prod | preview | dev): build + audit + D1 target check + stale check + migrate (ONCE per run). Publishes nothing.
     publish   Deploy job   (prod | preview): build + audit + stale check + publish the audited artifact. Runs no smoke.
     verify    Smoke job    (prod | preview | dev): smoke the published URL; mark verified | unverified. NO Cloudflare credentials.
@@ -24,13 +21,13 @@ description: >
   `$/actions/cf-deploy` (this repository at the running workflow's commit); the engine scripts are found next to it, in `../cf-preview`.
 inputs:
   target:
-    description: prod | preview | dev (config / credential class). Bound once by the engine; application env can never change it.
+    description: prod | preview | dev (config / credential class = descriptor.engine_target). Bound once by the engine; application env can never change it.
     required: true
   kind:
-    description: production | native-branch | native-dev | persistent-dev. Empty = the kind implied by target (prod -> production, preview -> native-branch, dev -> persistent-dev). native-dev is target preview.
+    description: Internal persistence slot of the delivery (production | native-branch | native-dev | persistent-dev), DERIVED from the descriptor's target x driver; must equal descriptor.slot.
     default: ''
   stage:
-    description: all | deploy | precheck | preflight | migrate | publish | verify | rollback (see description). dev supports all, deploy, precheck, preflight, migrate, publish, verify, rollback; prod and preview support precheck, preflight, migrate, publish, verify, rollback.
+    description: all | deploy | precheck | migrate | publish | verify | rollback (see description). dev supports all, deploy, precheck, migrate, publish, verify, rollback; prod and preview support precheck, preflight, migrate, publish, verify, rollback.
     default: all
   inputs_json:
     description: toJSON(inputs) of the calling workflow (data only; never interpolated into a script)
@@ -52,7 +49,7 @@ inputs:
     description: toJSON(needs.smoke.outputs) - hand-off to the rollback stage
     default: '{}'
   d1_expected_id:
-    description: Physical D1 database id the plan resolved for this kind. Every build of this kind must bind exactly it (preflight, migrate, publish); empty = no D1.
+    description: Physical D1 database id the plan resolved for this kind. Every build of this kind must bind exactly it (migrate, publish); empty = no D1.
     default: ''
   migration_result:
     description: publish stage only - needs.migration.result of the single Migration job
@@ -171,6 +168,8 @@ runs:
         INPUTS_JSON: ${{ inputs.inputs_json }}
         CALL_INPUTS_JSON: ${{ inputs.call_inputs_json }}
         PREVIEW_SECRETS: ${{ inputs.target == 'preview' && inputs.preview_secrets || '' }}
+        CFV2_IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        CFV2_PR_ACTION: ${{ github.event.action }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" init'
     - name: Resolved smoke mode
       id: mode
@@ -230,7 +229,7 @@ runs:
       if: env.STALE != 'true' && inputs.stage != 'verify' && inputs.stage != 'rollback' && inputs.stage != 'precheck'
       shell: bash
       env:
-        PREPARE_LEDGER: ${{ inputs.stage != 'migrate' && inputs.stage != 'preflight' }}
+        PREPARE_LEDGER: ${{ inputs.stage != 'migrate' }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" prepare'
     - name: Build and audit the deployable (nothing remote is changed)
       if: env.STALE != 'true' && inputs.stage != 'verify' && inputs.stage != 'rollback' && inputs.stage != 'precheck'
