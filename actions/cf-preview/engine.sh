@@ -401,7 +401,7 @@ case "$PHASE" in
     if [ "$(smoke_mode)" != full ] || [ -z "$CMD" ]; then echo "::notice::no application smoke command for this Preview" >&2; echo "app_smoke=none"; exit 0; fi
     URL="${PUBLISHED_URL:-}"; [ -n "$URL" ] || die "no published Preview URL to smoke"
     # Readiness only (anonymous, trusted script, no auth header); the verdict on content / SHA belongs to the Smoke job.
-    TARGET_URL="$URL" PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" TOOLS_DIR="$TOOLS_DIR" \
+    TARGET_URL="$URL" PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" \
       env -u PROBE_HEADERS -u CF_ACCESS_CLIENT_ID -u CF_ACCESS_CLIENT_SECRET "$TOOLS_DIR/probe.sh" >&2 || die "the Preview $URL is not reachable for the application smoke command"
     # smoke_env is caller data, but the platform's own credentials in it are for the trusted probe ONLY: they never reach the PR command.
     (
