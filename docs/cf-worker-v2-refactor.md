@@ -1,5 +1,7 @@
 # CF Worker v2 — in-place refactor: interface, concurrency design, migration guide
 
+> **Superseded (2026-11-13).** This record describes the four-kind (`production / native-branch / native-dev / persistent-dev`) model replaced by the stage/target design in [cf-worker-v2.md](cf-worker-v2.md) and `openspec/changes/simplify-cf-ci-stages-and-dev-delivery`. Kept as history; its inputs no longer exist.
+
 > **Current interface note (2026-11-11):** The historical rollout notes below mention `tools_ref` and `dev_deploy_cmd` for context. Both retired inputs have now been removed from the v2 workflow-call declaration. Do not pass either to new consumers.
 
 `.github/workflows/_cf-worker-v2.yml` was refactored **in place** (breaking, no `v3`). Spec: `openspec/changes/refactor-cloudflare-worker-cicd-v2` (PR #57). Shipped v2.x behavior stays documented by `docs/cf-worker-v2.md` / PR #56 as the historical record; **the interface below replaces it**. The floating `@v2` tag has not moved and no consumer has been changed.

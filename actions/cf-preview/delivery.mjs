@@ -1,134 +1,105 @@
-// Pure decision logic of the target-driven delivery architecture (OpenSpec unify-cf-worker-v2-delivery-targets).
-// One normalised vocabulary for the four delivery kinds; no I/O. Imported by cli.mjs, unit-tested in lib.test.mjs.
-import { classifyEvent, migrationPlan, previewIdentity, STRATEGIES } from './lib.mjs';
+// Pure decision logic of the target-driven delivery (OpenSpec simplify-cf-ci-stages-and-dev-delivery). No I/O. Imported by cli.mjs,
+// unit-tested in scripts/cf-preview/delivery.test.mjs.
+//
+// ONE vocabulary: three TARGETS (production | preview | dev) delivered by two DRIVERS (worker | native-preview). An event selects AT MOST
+// ONE delivery (resolveDelivery); everything downstream (plan, migration, publish, smoke, recovery, release) is the same engine and differs
+// only at the driver boundary.
+//
+// Internal persistence slot: the engine still keys GitHub Environments (`<app>/prod|preview|native-dev|dev`) and the known-good ledger by one of
+// four historical slot names. They are DERIVED from (target, driver) in ONE place (SLOT below) and never appear in a public input or
+// output: renaming them would orphan the existing known-good records and Environment protection rules at cutover.
+import { migrationPlan } from './lib.mjs';
 import { parseEnvLines } from './parse-env.mjs';
 
-export const DELIVERY_KINDS = ['production', 'native-branch', 'native-dev', 'persistent-dev'];
+export const TARGETS = ['production', 'preview', 'dev'];
+export const DRIVERS = ['worker', 'native-preview'];
+export const PREVIEW_POLICIES = ['none', 'pr'];
+export const DEV_DRIVERS = ['none', 'native-preview', 'worker'];
 export const SMOKE_MODES = ['full', 'basic', 'skip'];
-/** Fixed name of the stable Native Dev Preview. Reserved: no branch Preview may ever take it. */
+/** Fixed name of the stable Native Dev Preview. */
 export const NATIVE_DEV_NAME = 'dev';
+/** Preview names no GC / retention action may ever delete (the stable Dev). PR Previews are `pr-<number>` and can never collide with it. */
 export const RESERVED_PREVIEW_NAMES = [NATIVE_DEV_NAME];
 
-/** Engine "target class" (config source / credentials / wrangler command family) of each kind. */
-export const ENGINE_TARGET = { production: 'prod', 'native-branch': 'preview', 'native-dev': 'preview', 'persistent-dev': 'dev' };
-/** Back-compat: the kind an engine target implies when the caller passes none. */
-export const DEFAULT_KIND = { prod: 'production', preview: 'native-branch', dev: 'persistent-dev' };
+const SLOT = { 'production/worker': 'production', 'preview/native-preview': 'native-branch', 'dev/native-preview': 'native-dev', 'dev/worker': 'persistent-dev' };
+const ENVIRONMENT_SUFFIX = { production: 'prod', 'native-branch': 'preview', 'native-dev': 'native-dev', 'persistent-dev': 'dev' };
 
-export function assertKind(kind) {
-  if (!DELIVERY_KINDS.includes(kind)) throw new Error(`Unknown delivery kind '${kind}' (expected ${DELIVERY_KINDS.join(' | ')})`);
-  return kind;
+/** Target policy: production -> worker, preview -> native-preview, dev -> either. Throws on anything else. */
+export function assertDelivery(d) {
+  if (d === null || typeof d !== 'object' || !TARGETS.includes(d.target)) throw new Error(`unknown delivery target '${d?.target}' (expected ${TARGETS.join(' | ')})`);
+  if (!DRIVERS.includes(d.driver)) throw new Error(`unknown delivery driver '${d.driver}' (expected ${DRIVERS.join(' | ')})`);
+  if (d.target === 'production' && d.driver !== 'worker') throw new Error('target production is delivered by the worker driver only');
+  if (d.target === 'preview' && d.driver !== 'native-preview') throw new Error('target preview is delivered by the native-preview driver only');
+  return d;
 }
+export const slotOf = (d) => SLOT[`${assertDelivery(d).target}/${d.driver}`];
+/** Engine config / credential class: prod | preview | dev. A native-preview Dev uses the `[previews]` bindings, i.e. the `preview` class. */
+export const engineTarget = (d) => (assertDelivery(d).target === 'production' ? 'prod' : d.target === 'preview' || d.driver === 'native-preview' ? 'preview' : 'dev');
+export const environmentName = (app, d) => `${app}/${ENVIRONMENT_SUFFIX[slotOf(d)]}`;
 
-/** smoke_mode_overrides: JSON object keyed by delivery kind; values full|basic|skip. Strict: unknown key/value rejects. */
+/** smoke_mode_overrides: JSON object keyed by TARGET; values full|basic|skip. Strict: unknown key/value rejects. */
 export function parseSmokeOverrides(text) {
   const s = String(text ?? '').trim();
   if (!s) return {};
   let o;
   try { o = JSON.parse(s); } catch (e) { throw new Error(`smoke_mode_overrides is not valid JSON: ${e.message}`); }
-  if (o === null || typeof o !== 'object' || Array.isArray(o)) throw new Error('smoke_mode_overrides must be a JSON object keyed by delivery kind');
+  if (o === null || typeof o !== 'object' || Array.isArray(o)) throw new Error('smoke_mode_overrides must be a JSON object keyed by target');
   for (const [k, v] of Object.entries(o)) {
-    if (!DELIVERY_KINDS.includes(k)) throw new Error(`smoke_mode_overrides: unknown delivery kind '${k}' (expected ${DELIVERY_KINDS.join(' | ')})`);
+    if (!TARGETS.includes(k)) throw new Error(`smoke_mode_overrides: unknown target '${k}' (expected ${TARGETS.join(' | ')})`);
     if (!SMOKE_MODES.includes(v)) throw new Error(`smoke_mode_overrides.${k}: unknown smoke mode '${v}' (expected ${SMOKE_MODES.join(' | ')})`);
   }
   return o;
 }
 
-export function resolveSmokeMode(kind, smokeMode = 'full', overridesText = '') {
-  assertKind(kind);
+export function resolveSmokeMode(target, smokeMode = 'full', overridesText = '') {
+  if (!TARGETS.includes(target)) throw new Error(`unknown target '${target}'`);
   const base = smokeMode === '' || smokeMode == null ? 'full' : smokeMode;
   if (!SMOKE_MODES.includes(base)) throw new Error(`Unknown smoke_mode '${base}' (expected ${SMOKE_MODES.join(' | ')})`);
-  return parseSmokeOverrides(overridesText)[kind] ?? base;
+  return parseSmokeOverrides(overridesText)[target] ?? base;
 }
 
 /**
- * Enabled delivery kinds for one event, in a stable order. Exactly the enabled targets - a disabled channel creates no
- * phantom path. A protected manual dispatch (`dispatchTarget: persistent-dev`) is NOT a special pipeline: it only SELECTS the
- * `persistent-dev` kind, and every downstream stage (CI, Plan, Migration, Deploy, Smoke, Rollback) is the standard one.
- * Rejects (throws, so the Plan fails before any mutation) the combinations the spec forbids instead of silently dropping them:
- * an unknown dispatch_target, or persistent-dev outside hybrid / without an exact match of the dispatch ref and persistent_dev_ref.
+ * THE event -> delivery routing. Returns null (CI only) or ONE { target, driver }. Throws (the Plan fails before any mutation) on an
+ * explicit request that cannot be served, instead of silently dropping it.
+ *   push main                        -> production (worker)
+ *   push, any other ref              -> nothing (feature pushes never deploy)
+ *   pull_request, same repo, opened/synchronize/reopened, preview_policy=pr -> preview (native-preview); fork PR / closed -> nothing
+ *   merge_group, delete, schedule    -> nothing
+ *   workflow_dispatch dispatch_target=dev, ref == approved_dev_ref, dev_driver != none -> dev (the configured driver); anything else rejects
+ * No automatic event ever reaches the stable Dev, and a manual dispatch can never reach Production.
  */
-export function resolveDeliveryTargets({
-  event, ref, strategy, previewOnPush = true, sharedDevOnPush = false, sharedDevNativeOnPush = false, dispatchTarget = '', devRef = '',
-}) {
-  if (!STRATEGIES.includes(strategy)) throw new Error(`Unknown deployment_strategy: ${strategy}`);
-  if (strategy === 'production-only' && (sharedDevOnPush || sharedDevNativeOnPush)) {
-    throw new Error('deployment_strategy: production-only cannot be combined with shared_dev_on_branch_push / shared_dev_native_preview_on_branch_push (a production-only Worker must not expose a Dev deployment)');
+export function resolveDelivery({ event, ref = '', isFork = false, prAction = '', previewPolicy = 'none', devDriver = 'none', dispatchTarget = '', approvedDevRef = '' }) {
+  if (!PREVIEW_POLICIES.includes(previewPolicy)) throw new Error(`Unknown preview_policy '${previewPolicy}' (expected ${PREVIEW_POLICIES.join(' | ')})`);
+  if (!DEV_DRIVERS.includes(devDriver)) throw new Error(`Unknown dev_driver '${devDriver}' (expected ${DEV_DRIVERS.join(' | ')})`);
+  if (approvedDevRef !== '' && !String(approvedDevRef).startsWith('refs/heads/')) throw new Error(`approved_dev_ref '${approvedDevRef}' must be a branch ref (refs/heads/...)`);
+  if (devDriver !== 'none' && !approvedDevRef) throw new Error('dev_driver requires approved_dev_ref (only an approved ref may be promoted to Dev)');
+  if (dispatchTarget !== '' && event !== 'workflow_dispatch') throw new Error(`dispatch_target '${dispatchTarget}' is only valid for a workflow_dispatch (event: ${event || 'unknown'}); refusing to ignore it (nothing was changed)`);
+  switch (event) {
+    case 'workflow_dispatch':
+      if (dispatchTarget !== 'dev') throw new Error(`a manual dispatch only promotes to Dev (dispatch_target 'dev'), got '${dispatchTarget}'; Production deploys only from a main push (nothing was changed)`);
+      if (devDriver === 'none') throw new Error('manual Dev promotion rejected: this application has no Dev (dev_driver none); nothing was changed');
+      if (ref !== approvedDevRef) throw new Error(`manual Dev promotion rejected: ref '${ref}' is not the approved_dev_ref '${approvedDevRef}'; nothing was changed`);
+      return { target: 'dev', driver: devDriver };
+    case 'pull_request':
+      if (previewPolicy !== 'pr' || isFork || prAction === 'closed') return null;
+      return { target: 'preview', driver: 'native-preview' };
+    case 'push':
+      return ref === 'refs/heads/main' ? { target: 'production', driver: 'worker' } : null;
+    default:
+      return null;
   }
-  if (sharedDevOnPush && sharedDevNativeOnPush) {
-    throw new Error('shared_dev_on_branch_push (separate persistent Dev Worker) and shared_dev_native_preview_on_branch_push (named Native Preview "dev") are conflicting automatic Dev channels; enable only one');
-  }
-  // Fail closed: an explicit deployment request is honoured exactly or refused - never ignored. A non-empty dispatch_target is only
-  // meaningful for a workflow_dispatch (push / pull_request / delete / anything else with a target is a conflicting request).
-  if (dispatchTarget !== '' && event !== 'workflow_dispatch') throw new Error(`dispatch_target '${dispatchTarget}' is only valid for a workflow_dispatch (event: ${event || 'unknown'}); refusing to ignore it or fall back to another target (nothing was changed)`);
-  if (event === 'workflow_dispatch' && dispatchTarget !== '') {
-    if (dispatchTarget !== 'persistent-dev') throw new Error(`dispatch_target '${dispatchTarget}' is not valid (expected persistent-dev or empty); refusing to fall back to another target`);
-    const r = String(ref).startsWith('refs/heads/') ? classifyEvent({ event, ref, strategy, devRef, dispatchTarget }) : { action: 'skip', reason: 'not a branch ref' };
-    if (r.action !== 'persistent-dev') throw new Error(`manual persistent-dev dispatch rejected: ${r.reason} (requires deployment_strategy hybrid and the dispatch ref equal to persistent_dev_ref; nothing was changed)`);
-    return ['persistent-dev'];
-  }
-  if (!String(ref).startsWith('refs/heads/')) return [];
-  const r = classifyEvent({ event, ref, strategy, devRef, dispatchTarget });
-  if (r.action === 'production') return ['production'];
-  if (r.action !== 'preview' || !(event === 'push' || event === 'workflow_dispatch')) return [];
-  const kinds = [];
-  if (previewOnPush) kinds.push('native-branch');
-  if (sharedDevNativeOnPush) kinds.push('native-dev');
-  if (sharedDevOnPush) kinds.push('persistent-dev');
-  return kinds;
-}
-
-/** Native branch Preview identity that can never take a reserved name (the stable Native Dev Preview owns `dev`). */
-export function branchPreviewIdentity(args, { reserveNativeDev = false } = {}) {
-  const id = previewIdentity(args);
-  if (reserveNativeDev && RESERVED_PREVIEW_NAMES.includes(id.name)) return { ...id, name: `b-${id.name}` };
-  return id;
 }
 
 /**
- * Migration plan across the enabled targets: at most ONE physical D1 (`account/database_id`) per pipeline. Kinds that name the same
- * D1 (e.g. Native Branch + Native Dev) are deduplicated into one group; two DISTINCT databases fail closed before any mutation
- * (documented compatibility restriction: docs/cf-worker-v2-unified-delivery.md). Returns [] without kinds, else [group].
- * `cfg` is the SOURCE Wrangler config; `kinds` the enabled kinds. Production D1 must never be reachable from a non-production
- * kind (migrationPlan already refuses a D1 declared on both sides; this re-checks the final identities).
- * Owner = the first member in OWNER_ORDER: the kind whose build + audit + Environment the single Migration job uses.
+ * Migration plan of the ONE delivery: the physical D1 (`account/database_id`) it migrates. Production and Dev migrate their own
+ * database; Preview NEVER migrates (a PR must not change a shared remote schema), so the caller passes migrations off for it.
+ * migrationPlan refuses a D1 declared on both the production and the non-production side.
  */
-const OWNER_ORDER = ['native-branch', 'native-dev', 'persistent-dev', 'production'];
-export function planMigrations(cfg, kinds, { accountId = '', binding = '', devEnv = 'dev', migrationsDirAbs = (d) => d } = {}) {
-  const groups = new Map();
-  for (const kind of kinds) {
-    assertKind(kind);
-    const p = migrationPlan(cfg, ENGINE_TARGET[kind], { binding, devEnv, migrationsDirAbs });
-    const id = `${accountId}/${p.databaseId}`;
-    if (!groups.has(id)) groups.set(id, { id, databaseId: p.databaseId, databaseName: p.databaseName, binding: p.binding, members: [] });
-    groups.get(id).members.push(kind);
-  }
-  if (groups.size > 1) {
-    const list = [...groups.values()].map((g) => `${g.databaseName} (${g.members.join(', ')})`).join(' vs ');
-    throw new Error(`d1_migrations: the enabled targets name ${groups.size} distinct physical D1 databases: ${list}. One pipeline migrates at most one database; point the targets at the same D1 or disable one channel (nothing was changed)`);
-  }
-  const out = [...groups.values()].map((g) => {
-    g.members.sort((a, b) => OWNER_ORDER.indexOf(a) - OWNER_ORDER.indexOf(b));
-    return { ...g, owner: g.members[0] };
-  });
-  const prod = out.find((g) => g.members.includes('production'));
-  if (prod && prod.members.length > 1) {
-    throw new Error(`Production D1 ${prod.databaseName} is also mapped to ${prod.members.filter((m) => m !== 'production').join(', ')}; Preview/Dev must never migrate or bind Production D1`);
-  }
-  return out;
-}
-
-/** GitHub Environment of each kind (protection rules / deployment history). Production and Preview names are unchanged. */
-export const ENVIRONMENT_SUFFIX = { production: 'prod', 'native-branch': 'preview', 'native-dev': 'native-dev', 'persistent-dev': 'dev' };
-export const environmentName = (app, kind) => `${app}/${ENVIRONMENT_SUFFIX[assertKind(kind)]}`;
-
-/** Ledger environment (GitHub Deployments) used for known-good lookup. Native Dev has ONE fixed ledger per app. */
-export function ledgerEnv(app, kind, previewName = '') {
-  switch (assertKind(kind)) {
-    case 'native-branch': return `${app}/preview/${previewName}`;
-    case 'native-dev': return `${app}/native-dev/${NATIVE_DEV_NAME}`;
-    case 'persistent-dev': return `${app}/dev/shared`;
-    default: return '';
-  }
+export function planMigration(cfg, delivery, { accountId = '', binding = '', devEnv = 'dev', migrationsDirAbs = (d) => d } = {}) {
+  const d = assertDelivery(delivery);
+  if (d.target === 'preview') throw new Error('a Preview never migrates a remote D1 (remote schema changes from an arbitrary PR are not allowed)');
+  const p = migrationPlan(cfg, engineTarget(d), { binding, devEnv, migrationsDirAbs });
+  return { id: `${accountId}/${p.databaseId}`, databaseId: p.databaseId, databaseName: p.databaseName, binding: p.binding };
 }
 
 /**
@@ -136,9 +107,9 @@ export function ledgerEnv(app, kind, previewName = '') {
  * `urls` = { kind: url } of every known target URL; `env` = the parsed KEY=VALUE text of THIS kind's build env.
  * Returns the offending lines (empty = isolated).
  */
-export function foreignUrlsInBuildEnv(kind, buildEnvText, urls) {
+export function foreignUrlsInBuildEnv(self, buildEnvText, urls) {
   const origin = (u) => { try { return new URL(u).origin; } catch { return ''; } };
-  const foreign = Object.entries(urls).filter(([k, u]) => k !== kind && u && origin(u)).map(([k, u]) => [k, origin(u)]);
+  const foreign = Object.entries(urls).filter(([k, u]) => k !== self && u && origin(u)).map(([k, u]) => [k, origin(u)]);
   const bad = [];
   for (const line of String(buildEnvText ?? '').split('\n')) {
     const t = line.trim();
@@ -227,92 +198,77 @@ export function checkBuildEnvOrigins(buildEnvText, targetUrl) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Target descriptor: ONE versioned, validated record per enabled kind, produced by the Plan job and consumed by the
-// thin per-kind workflow calls (and by every engine stage). It replaces the per-field `with:` copies (engine target, GitHub
-// Environment, concurrency groups, expected D1, migration owner, smoke policy). Pure data: never a secret, never a URL
-// (URLs are resolved against Cloudflare before each build), validated at generation AND at every consumer.
+// Delivery descriptor: ONE versioned, validated record per run, produced by the Plan job and consumed by the delivery workflow and every
+// engine stage. Pure data: never a secret, never a URL (URLs are resolved against Cloudflare before each build); validated at generation
+// AND at every consumer (a trust boundary).
 // ---------------------------------------------------------------------------------------------------------------------
-export const DESCRIPTOR_VERSION = 1;
+export const DESCRIPTOR_VERSION = 2;
 export const PHASES = ['all', 'deploy', 'verify'];
-const DESCRIPTOR_KEYS = ['v', 'kind', 'target', 'environment', 'deploy_group', 'rollback_group', 'd1_expected_id', 'd1_owner_kind', 'owns_migration', 'smoke_mode', 'phase'];
+const DESCRIPTOR_KEYS = ['v', 'target', 'driver', 'slot', 'engine_target', 'environment', 'deploy_group', 'rollback_group', 'd1_expected_id', 'owns_migration', 'smoke_mode', 'phase'];
 
 /**
- * Concurrency identity of a kind. Production / Native Branch / Native Dev get uncontended per-run groups (no cross-target
- * waiting). persistent-dev keeps the LEGACY Shared Dev group - keyed by repository and the shared-D1 scope (or the app) - for
- * Deploy AND Rollback, so it serialises with the manual persistent-dev dispatch (same kind, same descriptor) and with every other app using the same physical D1.
+ * Concurrency identity of the delivery. The stable Worker Dev keeps the shared-Dev group - keyed by repository and the shared-D1 scope (or
+ * the app) - for Deploy AND Rollback, so it serialises with every other app using the same physical D1. Everything else gets an
+ * uncontended per-run group (the run-level group already serialises shared state).
  */
-export function concurrencyGroups(kind, { runId, repo = '', app, lockScope = '' }) {
-  if (assertKind(kind) === 'persistent-dev') {
+export function concurrencyGroups(delivery, { runId, repo = '', app, lockScope = '' }) {
+  const slot = slotOf(delivery);
+  if (slot === 'persistent-dev') {
     const g = `cfv2-dev-${repo}-${lockScope || app}`;
     return { deploy_group: g, rollback_group: g };
   }
-  return { deploy_group: `cfv2-leg-${runId}-${kind}`, rollback_group: `cfv2-leg-${runId}-${kind}-rollback` };
+  return { deploy_group: `cfv2-leg-${runId}-${slot}`, rollback_group: `cfv2-leg-${runId}-${slot}-rollback` };
 }
 
-export function targetDescriptor({ kind, app, runId, repo = '', lockScope = '', d1ExpectedId = '', ownerKind = '', smokeMode = 'full', phase = 'all' }) {
-  assertKind(kind);
+export function targetDescriptor({ delivery, app, runId, repo = '', lockScope = '', d1ExpectedId = '', smokeMode = 'full', phase = 'all' }) {
+  assertDelivery(delivery);
   return validateDescriptor({
-    v: DESCRIPTOR_VERSION, kind, target: ENGINE_TARGET[kind], environment: environmentName(app, kind),
-    ...concurrencyGroups(kind, { runId, repo, app, lockScope }),
-    d1_expected_id: d1ExpectedId, d1_owner_kind: ownerKind, owns_migration: Boolean(d1ExpectedId && ownerKind === kind),
-    smoke_mode: smokeMode, phase,
+    v: DESCRIPTOR_VERSION, target: delivery.target, driver: delivery.driver, slot: slotOf(delivery), engine_target: engineTarget(delivery),
+    environment: environmentName(app, delivery), ...concurrencyGroups(delivery, { runId, repo, app, lockScope }),
+    d1_expected_id: d1ExpectedId, owns_migration: Boolean(d1ExpectedId), smoke_mode: smokeMode, phase,
   });
 }
 
-/** Strict schema check (throws; returns the descriptor). Unknown/missing keys, cross-kind values and forged groups all reject. */
+/** Strict schema check (throws; returns the descriptor). Unknown/missing keys, cross-target values and forged groups all reject. */
 export function validateDescriptor(d) {
-  if (d === null || typeof d !== 'object' || Array.isArray(d)) throw new Error('target descriptor must be an object');
+  if (d === null || typeof d !== 'object' || Array.isArray(d)) throw new Error('delivery descriptor must be an object');
   const keys = Object.keys(d);
   const extra = keys.filter((k) => !DESCRIPTOR_KEYS.includes(k));
   const missing = DESCRIPTOR_KEYS.filter((k) => !keys.includes(k));
-  if (extra.length || missing.length) throw new Error(`target descriptor keys: unexpected [${extra}] missing [${missing}]`);
-  if (d.v !== DESCRIPTOR_VERSION) throw new Error(`target descriptor version ${d.v} is not supported (expected ${DESCRIPTOR_VERSION})`);
-  assertKind(d.kind);
-  if (d.target !== ENGINE_TARGET[d.kind]) throw new Error(`target descriptor: kind ${d.kind} runs on engine target ${ENGINE_TARGET[d.kind]}, not ${d.target}`);
+  if (extra.length || missing.length) throw new Error(`delivery descriptor keys: unexpected [${extra}] missing [${missing}]`);
+  if (d.v !== DESCRIPTOR_VERSION) throw new Error(`delivery descriptor version ${d.v} is not supported (expected ${DESCRIPTOR_VERSION})`);
+  const delivery = assertDelivery({ target: d.target, driver: d.driver });
+  if (d.slot !== slotOf(delivery) || d.engine_target !== engineTarget(delivery)) throw new Error(`delivery descriptor: ${d.target}/${d.driver} does not run as slot '${d.slot}' / engine target '${d.engine_target}'`);
   const app = String(d.environment).slice(0, String(d.environment).lastIndexOf('/'));
-  if (!app || /\s/.test(app) || d.environment !== environmentName(app, d.kind)) throw new Error(`target descriptor: environment '${d.environment}' does not belong to kind ${d.kind}`);
-  if (typeof d.deploy_group !== 'string' || typeof d.rollback_group !== 'string') throw new Error('target descriptor: concurrency groups must be strings');
-  const legit = d.kind === 'persistent-dev'
+  if (!app || /\s/.test(app) || d.environment !== environmentName(app, delivery)) throw new Error(`delivery descriptor: environment '${d.environment}' does not belong to ${d.target}/${d.driver}`);
+  if (typeof d.deploy_group !== 'string' || typeof d.rollback_group !== 'string') throw new Error('delivery descriptor: concurrency groups must be strings');
+  const legit = d.slot === 'persistent-dev'
     ? /^cfv2-dev-\S+-\S+$/.test(d.deploy_group) && d.rollback_group === d.deploy_group
-    : new RegExp(`^cfv2-leg-\\d+-${d.kind}$`).test(d.deploy_group) && d.rollback_group === `${d.deploy_group}-rollback`;
-  if (!legit) throw new Error(`target descriptor: concurrency groups '${d.deploy_group}' / '${d.rollback_group}' do not belong to kind ${d.kind}`);
-  if (typeof d.d1_expected_id !== 'string' || !/^[\w-]*$/.test(d.d1_expected_id)) throw new Error('target descriptor: d1_expected_id is not a database id');
-  if (d.d1_owner_kind !== '') assertKind(d.d1_owner_kind);
-  if (d.owns_migration !== Boolean(d.d1_expected_id && d.d1_owner_kind === d.kind)) throw new Error('target descriptor: owns_migration contradicts the migration owner');
-  if (!SMOKE_MODES.includes(d.smoke_mode)) throw new Error(`target descriptor: unknown smoke mode '${d.smoke_mode}'`);
-  if (!PHASES.includes(d.phase)) throw new Error(`target descriptor: unknown phase '${d.phase}'`);
+    : new RegExp(`^cfv2-leg-\\d+-${d.slot}$`).test(d.deploy_group) && d.rollback_group === `${d.deploy_group}-rollback`;
+  if (!legit) throw new Error(`delivery descriptor: concurrency groups '${d.deploy_group}' / '${d.rollback_group}' do not belong to ${d.target}/${d.driver}`);
+  if (typeof d.d1_expected_id !== 'string' || !/^[\w-]*$/.test(d.d1_expected_id)) throw new Error('delivery descriptor: d1_expected_id is not a database id');
+  if (d.owns_migration !== Boolean(d.d1_expected_id)) throw new Error('delivery descriptor: owns_migration contradicts d1_expected_id');
+  if (d.target === 'preview' && d.d1_expected_id) throw new Error('delivery descriptor: a Preview never migrates a D1');
+  if (!SMOKE_MODES.includes(d.smoke_mode)) throw new Error(`delivery descriptor: unknown smoke mode '${d.smoke_mode}'`);
+  if (!PHASES.includes(d.phase)) throw new Error(`delivery descriptor: unknown phase '${d.phase}'`);
   return d;
 }
 
-/**
- * All descriptors of a run, keyed by kind (enabled kinds only, stable order). `groups` = planMigrations() result of the run
- * (owner/members per physical D1); `d1ByKind` = { kind: id } override for the deferred verify phase (comes from phase_state).
- */
-export function buildDescriptors({ kinds, app, runId, repo = '', lockScope = '', groups = [], d1ByKind = null, smokeMode = 'full', smokeOverrides = '', phase = 'all' }) {
-  const out = {};
-  for (const kind of DELIVERY_KINDS.filter((k) => kinds.includes(k))) {
-    const g = groups.find((m) => m.members.includes(kind));
-    out[kind] = targetDescriptor({
-      kind, app, runId, repo, lockScope, d1ExpectedId: d1ByKind ? String(d1ByKind[kind] ?? '') : (g ? g.databaseId : ''), ownerKind: g ? g.owner : '',
-      smokeMode: resolveSmokeMode(kind, smokeMode, smokeOverrides), phase,
-    });
-  }
-  return out;
+/** Descriptor of a run. `d1ExpectedId` = the planned physical D1 (empty without migrations or for a Preview). */
+export function buildDescriptor({ delivery, app, runId, repo = '', lockScope = '', d1ExpectedId = '', smokeMode = 'full', smokeOverrides = '', phase = 'all' }) {
+  return targetDescriptor({ delivery, app, runId, repo, lockScope, d1ExpectedId, smokeMode: resolveSmokeMode(delivery.target, smokeMode, smokeOverrides), phase });
 }
 
-/** Parse + validate a descriptor (or a map of them) arriving from a workflow output / phase_state - a trust boundary. */
-export function parseDescriptor(text, expectKind = '') {
+/** Parse + validate a descriptor arriving from a workflow output / phase_state - a trust boundary. */
+export function parseDescriptor(text) {
   let d;
-  try { d = JSON.parse(String(text)); } catch (e) { throw new Error(`target descriptor is not valid JSON: ${e.message}`); }
-  validateDescriptor(d);
-  if (expectKind && d.kind !== expectKind) throw new Error(`target descriptor is for ${d.kind}, not ${expectKind}`);
-  return d;
+  try { d = JSON.parse(String(text)); } catch (e) { throw new Error(`delivery descriptor is not valid JSON: ${e.message}`); }
+  return validateDescriptor(d);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Migration gate (pure). Runs in the engine before any build or publish of a Delivery call and is unit-tested here. (The
-// pre-mutation validation of every target lives in the single Migration job: its steps run in order, so a failed target
-// check stops the job before the migrate step - no peer-result bookkeeping.)
+// Migration gate (pure). Runs in the engine before any build or publish of the Delivery and is unit-tested here. (The pre-mutation
+// validation lives in the single Migration job: its steps run in order, so a failed check stops the job before the migrate step.)
 // ---------------------------------------------------------------------------------------------------------------------
 /** Marker of the Migration job's read-only precheck proving that the planned D1 has NOTHING pending (see migrationPrecheck below). */
 export const VERIFIED_NO_PENDING = 'verified_no_pending';
@@ -361,32 +317,32 @@ export function pendingMigrations({ files, tableExists, applied = [] }) {
 }
 
 /**
- * Publish stage: the result of THE Migration job this kind's deployment depends on. Fails closed unless that job succeeded and
- * reports EITHER an APPLIED migration of the planned owner on exactly this kind's D1, OR a read-only precheck that VERIFIED nothing was
- * pending on that D1 for exactly this commit (`precheck: verified_no_pending`, bound to owner, D1 id and `runSha`). A skipped, failed or
- * stale-skipped Migration job never carries either. A stale-skipped migration (`stale` true) is NEVER
- * authorization: nothing was applied, and the branch may point at this commit again by the time the Delivery runs (A -> B -> A), so
- * the later branch-tip check cannot prove the migration happened. Returns the validated migration result, or {} when the app has no
- * D1 migrations. A verified no-pending result is normalised to `migration: none, schema_changed: false, d1_scan: none`.
+ * Publish stage: the result of THE Migration job the delivery depends on. Fails closed unless that job succeeded and reports EITHER an
+ * APPLIED migration on exactly this delivery's D1, OR a read-only precheck that VERIFIED nothing was pending on that D1 for exactly this
+ * commit (`precheck: verified_no_pending`, bound to the slot, the D1 id and `runSha`). A skipped, failed or stale-skipped Migration job never
+ * carries either. A stale-skipped migration (`stale` true) is NEVER authorization: nothing was applied, and the branch may point at this
+ * commit again by the time the Delivery runs (A -> B -> A). Returns the validated migration result, or {} when the delivery has no D1
+ * migration (descriptor.d1_expected_id empty). A verified no-pending result is normalised to `migration: none, schema_changed: false, d1_scan: none`.
  */
-export function resolveMigrationUsed({ d1Migrations, kind, ownerKind = '', expectedId = '', result = '', json = '', runSha = '' }) {
-  if (!d1Migrations) return {};
-  assertKind(kind);
-  if (!ownerKind) throw new Error(`no migration owner is planned for ${kind}; nothing is published`);
-  if (result !== 'success') throw new Error(`the D1 migration ${kind} depends on (owner ${ownerKind}) finished '${result || 'missing'}'; nothing is published`);
+export function resolveMigrationUsed({ descriptor, result = '', json = '', runSha = '' }) {
+  const d = validateDescriptor(descriptor);
+  if (!d.d1_expected_id) return {};
+  const label = `${d.target}/${d.driver}`;
+  if (result !== 'success') throw new Error(`the D1 migration ${label} depends on finished '${result || 'missing'}'; nothing is published`);
   let m;
-  try { m = JSON.parse(json); } catch { throw new Error(`the migration result for ${kind} is missing or not valid JSON; nothing is published`); }
-  if (m === null || typeof m !== 'object' || Array.isArray(m)) throw new Error(`the migration result for ${kind} is malformed; nothing is published`);
-  if (m.stale === true || m.stale === 'true') throw new Error(`the migration for ${kind} was skipped because its run became stale; it does not authorize a publish (nothing is published)`);
+  try { m = JSON.parse(json); } catch { throw new Error(`the migration result for ${label} is missing or not valid JSON; nothing is published`); }
+  if (m === null || typeof m !== 'object' || Array.isArray(m)) throw new Error(`the migration result for ${label} is malformed; nothing is published`);
+  if (m.stale === true || m.stale === 'true') throw new Error(`the migration for ${label} was skipped because its run became stale; it does not authorize a publish (nothing is published)`);
   const noPending = m.precheck === VERIFIED_NO_PENDING;
-  if (m.migration !== 'applied' && !noPending) throw new Error(`the migration result for ${kind} reports no applied migration and no verified-empty precheck; nothing is published`);
-  if (m.kind !== ownerKind) throw new Error(`the migration result belongs to another kind than the planned owner ${ownerKind}; refusing`);
-  if (m.d1_id !== expectedId) throw new Error(`the migration result is for another D1 than ${kind}'s (${expectedId}); refusing`);
+  if (m.migration !== 'applied' && !noPending) throw new Error(`the migration result for ${label} reports no applied migration and no verified-empty precheck; nothing is published`);
+  if (m.kind !== d.slot) throw new Error(`the migration result belongs to another delivery than ${label}; refusing`);
+  if (m.d1_id !== d.d1_expected_id) throw new Error(`the migration result is for another D1 than ${label}'s (${d.d1_expected_id}); refusing`);
   if (!noPending) return m;
-  if (m.migration === 'applied') throw new Error(`the migration result for ${kind} claims both an applied migration and a verified-empty precheck; refusing`);
-  if (!runSha || m.precheck_sha !== runSha) throw new Error(`the verified-empty precheck for ${kind} belongs to commit '${m.precheck_sha || 'unknown'}', not this run's ${runSha || 'unknown'}; nothing is published`);
+  if (m.migration === 'applied') throw new Error(`the migration result for ${label} claims both an applied migration and a verified-empty precheck; refusing`);
+  if (!runSha || m.precheck_sha !== runSha) throw new Error(`the verified-empty precheck for ${label} belongs to commit '${m.precheck_sha || 'unknown'}', not this run's ${runSha || 'unknown'}; nothing is published`);
   return { ...m, migration: 'none', schema_changed: 'false', d1_scan: 'none' };
 }
+
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Verification and recovery decisions (pure). The engine only gathers facts (levels, versions, the live version) and
@@ -401,23 +357,6 @@ export function verificationOutcome(level) {
 }
 
 /**
- * Which build env the CI validation commands import (and the value of VITE_APP_ENV): the env of the INTENDED deployment, resolved from
- * pure event/input data because CI runs before the Plan (the Plan stays the authorization gate). JS twin of the `ci_target_env`
- * expression of _cf-worker-v2.yml (the contract test compares them and checks `dev` against resolveDeliveryTargets).
- *   dev     : the run's only automatic target is persistent-dev - a manual dispatch with dispatch_target persistent-dev (any ref, `main`
- *             included), or a push / dispatch to a non-main branch where Shared Dev is the only enabled channel
- *   prod    : refs/heads/main otherwise
- *   preview : everything else - Native Branch, Native Dev, several kinds at once (their shared validation keeps the Preview contract;
- *             each kind's own build and audit still validate its actual deployment configuration downstream), PRs, tags
- */
-export function ciTargetEnv({ event = '', ref = '', dispatchTarget = '', strategy = '', previewOnPush = true, sharedDevOnPush = false, sharedDevNativeOnPush = false }) {
-  if (event === 'workflow_dispatch' && dispatchTarget === 'persistent-dev') return 'dev';
-  if ((event === 'push' || event === 'workflow_dispatch') && String(ref).startsWith('refs/heads/') && ref !== 'refs/heads/main' && dispatchTarget === ''
-      && strategy !== 'production-only' && sharedDevOnPush && !previewOnPush && !sharedDevNativeOnPush) return 'dev';
-  return ref === 'refs/heads/main' ? 'prod' : 'preview';
-}
-
-/**
  * The ONE D1 compatibility rule for restoring older Worker code (Production rollback and non-Production recovery alike):
  * after an applied schema change the older code must be attested (d1_rollback_compat) AND the applied migrations provably
  * additive. D1 itself is never reverted. null = allowed.
@@ -427,29 +366,6 @@ export function d1SchemaBlock({ d1Pending = false, d1Compat = '', d1Scan = '' })
   if (d1Compat !== 'expand-contract') return { code: 'd1_unattested', why: "This run applied D1 migrations and d1_rollback_compat is not 'expand-contract': compatibility of the previous Worker version with the new schema is unproven." };
   if (d1Scan !== 'additive') return { code: 'd1_not_additive', why: `This run applied D1 migrations that are not provably additive (scan: ${d1Scan || 'unknown'}); the previous Worker version may not work on the new schema.` };
   return null;
-}
-
-/**
- * Non-Production recovery (Native Branch / Native Dev / Persistent Dev): may the last known-good code be redeployed?
- * Fails closed on everything it cannot prove, using the migration result of THIS pipeline.
- *   d1Migrations false            -> allowed (no D1 involved)
- *   migration result missing/bad  -> blocked (state of D1 unknown)
- *   result for another D1         -> blocked
- *   schema_changed not true/false -> blocked; false -> allowed; true -> d1SchemaBlock
- * `migration` = the parsed hand-off of the Migration job (or null). null = allowed.
- */
-export function nonProdRecoveryBlock({ d1Migrations = false, migration = null, expectedId = '', d1Compat = '' }) {
-  if (!d1Migrations) return null;
-  const verifiedEmpty = migration !== null && typeof migration === 'object' && migration.precheck === VERIFIED_NO_PENDING && migration.migration === 'none';
-  if (migration === null || typeof migration !== 'object' || Array.isArray(migration) || (migration.migration !== 'applied' && !verifiedEmpty)) {
-    return { code: 'migration_result_missing', why: 'D1 migrations are enabled but this pipeline handed over no valid applied-migration result: the D1 schema state is unknown, so older code cannot be proven compatible.' };
-  }
-  if (!expectedId || migration.d1_id !== expectedId) {
-    return { code: 'd1_identity_mismatch', why: `The migration result is for D1 '${migration.d1_id || 'unknown'}', not this target's D1 '${expectedId || 'unknown'}'.` };
-  }
-  const changed = String(migration.schema_changed ?? '');
-  if (changed !== 'true' && changed !== 'false') return { code: 'migration_result_invalid', why: `The migration result has no valid schema_changed value ('${changed || 'missing'}').` };
-  return d1SchemaBlock({ d1Pending: changed === 'true', d1Compat, d1Scan: String(migration.d1_scan ?? '') });
 }
 
 /**
@@ -471,142 +387,91 @@ export function prodRollbackBlock({ policy, previous = '', current = '', worker 
 }
 
 /**
- * Final verdict of the Rollback job. restored_verified only when the restored deployment was re-smoked at CONTENT level.
- * Production: facts = rolled back? post-rollback smoke? level. Preview/Dev: known-good found? recovered? re-verified? level.
+ * Final verdict of the Rollback job (PRODUCTION only; Preview / Dev are fixed forward, they have no rollback job).
+ * restored_verified only when the restored deployment was re-smoked at CONTENT level.
  */
-export function rollbackVerdict({ target, rbResult = '', rbVerify = '', rbLevel = '', goodSha = '', recovered = '', verified = '', smokeLevel = '' }) {
+export function rollbackVerdict({ rbResult = '', rbVerify = '', rbLevel = '' }) {
   let result;
   let level = '';
-  if (target === 'prod') {
-    if (rbResult === 'rolled_back') {
-      if (rbVerify === 'success') { result = isContentLevel(rbLevel) ? 'restored_verified' : 'restored_unverified'; level = rbLevel; } else result = 'restored_unhealthy';
-    } else result = rbResult === 'blocked' ? 'blocked' : 'failed';
-  } else if (rbResult === 'blocked') result = 'blocked';
-  else if (!goodSha) result = 'no_known_good';
-  else if (recovered === 'success' && verified === 'success') { result = isContentLevel(smokeLevel) ? 'restored_verified' : 'restored_unverified'; level = smokeLevel; } else result = 'failed';
+  if (rbResult === 'rolled_back') {
+    if (rbVerify === 'success') { result = isContentLevel(rbLevel) ? 'restored_verified' : 'restored_unverified'; level = rbLevel; } else result = 'restored_unhealthy';
+  } else result = rbResult === 'blocked' ? 'blocked' : 'failed';
   return { result, level, ok: result === 'restored_verified' };
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Run-level lock identity (the workflow's top-level `concurrency.group`). GitHub evaluates that expression BEFORE any job, so it can
-// only use data available at scheduling time. This is its JavaScript twin (a contract test renders the YAML expression and compares
-// both over a scenario matrix). For a verify call the YAML applies the same rule to the DEPLOY call's inputs (phase_state.inputs),
-// never to an arbitrary caller-supplied group string.
+// Run-level lock identity (the workflow's top-level `concurrency.group`). GitHub evaluates that expression BEFORE any job, so it can only
+// use data available at scheduling time. This is its JavaScript twin (the workflow YAML is the tested twin of this rule).
+//   main push                    -> cfv2-prod-<d1_lock_scope|app>
+//   manual Dev promotion         -> cfv2-nonprod-d1-<scope> with d1_migrations, else cfv2-shared-dev-<app> (never the Production group)
+//   same-repo PR with Preview    -> cfv2-<app>-pr-<number>
+//   everything else              -> a private per-run group (never queues behind a deploy)
+// For a verify call the YAML applies the same rule to the DEPLOY call's inputs (phase_state.inputs), never to a caller-supplied string.
 // ---------------------------------------------------------------------------------------------------------------------
-export function runLockGroup({ event, ref, inputs, runId }) {
+export function runLockGroup({ event, ref, inputs, runId, isFork = false, prNumber = '' }) {
   const s = (k) => (inputs?.[k] == null ? '' : String(inputs[k]));
   const on = (k) => inputs?.[k] === true || inputs?.[k] === 'true';
-  const branch = String(ref ?? '').startsWith('refs/heads/');
   const scope = s('d1_lock_scope') || s('app_name');
-  if ((event === 'push' || event === 'workflow_dispatch') && branch) {
-    // A manual persistent-dev dispatch mutates the same Dev D1 / Dev Worker as the automatic Shared Dev channel, so it takes the SAME
-    // run-level group (never the Production one, even from main) and serialises with every feature-branch Shared Dev push.
-    if (event === 'workflow_dispatch' && s('dispatch_target') === 'persistent-dev') return on('d1_migrations') ? `cfv2-nonprod-d1-${scope}` : `cfv2-shared-dev-${s('app_name')}`;
-    if (ref === 'refs/heads/main') return `cfv2-prod-${scope}`;
-    const nonProdOnly = s('deployment_strategy') !== 'production-only';
-    const channels = on('preview_on_branch_push') || on('shared_dev_on_branch_push') || on('shared_dev_native_preview_on_branch_push');
-    if (nonProdOnly && channels && on('d1_migrations')) return `cfv2-nonprod-d1-${scope}`;
-    if (nonProdOnly && (on('shared_dev_on_branch_push') || on('shared_dev_native_preview_on_branch_push'))) return `cfv2-shared-dev-${s('app_name')}`;
-    return `cfv2-${s('app_name')}-preview-${String(ref).slice('refs/heads/'.length)}`;
-  }
+  if (event === 'workflow_dispatch' && s('dispatch_target') === 'dev') return on('d1_migrations') ? `cfv2-nonprod-d1-${scope}` : `cfv2-shared-dev-${s('app_name')}`;
+  if (event === 'push' && ref === 'refs/heads/main') return `cfv2-prod-${scope}`;
+  if (event === 'pull_request' && !isFork && s('preview_policy') === 'pr' && prNumber !== '') return `cfv2-${s('app_name')}-pr-${prNumber}`;
   return `cfv2-run-${runId}`;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Deferred verification (pipeline_phase=verify): the descriptors of the DEPLOY call are the source of truth. The verify call
-// receives only phase_state; it must never re-derive deployment-time policy (smoke mode, lock scope, owner, D1) from its own
-// inputs. The only change allowed is the phase transition deploy -> verify.
+// Deferred verification (pipeline_phase=verify): the descriptor of the DEPLOY call is the source of truth. The verify call receives only
+// phase_state; it must never re-derive deployment-time policy (smoke mode, lock scope, D1) from its own inputs. The only change allowed is
+// the phase transition deploy -> verify.
 // ---------------------------------------------------------------------------------------------------------------------
-const keyOf = (k) => k.replace(/-/g, '_');
 const plainObject = (o) => o !== null && typeof o === 'object' && !Array.isArray(o);
 
-/**
- * Descriptors for a verify call, from the validated phase_state of the deploy call. `repo` = this run's repository.
- * - With `state.descriptors`: parsed, validated and cross-checked against the rest of the hand-off (kinds, app, repository,
- *   D1 ids, migration owner); phase must be `deploy`; the result is identical except phase = `verify`.
- * - Legacy hand-off (no `descriptors`): reconstructed ONLY from the deploy call's own `state.inputs` (never the verify call's);
- *   anything ambiguous or missing fails closed.
- */
-export function restoreDescriptors(state, { repo, runId = '0', event = '', ref = '' }) {
+/** Descriptor for a verify call, from the validated phase_state of the deploy call. `repo` = this run's repository. */
+export function restoreDescriptor(state, { repo, runId = '0', event = '', ref = '', isFork = false, prNumber = '', prAction = '' }) {
   if (!plainObject(state)) throw new Error('phase_state is not an object');
-  if (!Array.isArray(state.kinds) || !state.kinds.length) throw new Error('phase_state names no delivery kind');
-  const kinds = DELIVERY_KINDS.filter((k) => state.kinds.includes(k));
-  if (kinds.length !== state.kinds.length || new Set(state.kinds).size !== state.kinds.length) throw new Error('phase_state.kinds contains an unknown or duplicate delivery kind');
   if (!plainObject(state.inputs) || !state.inputs.app_name) throw new Error('phase_state.inputs.app_name is missing: cannot bind the hand-off to an application');
   const app = String(state.inputs.app_name);
   // The handoff's run-level group must be exactly what the deploy call's own inputs imply here (same rule as the workflow's top-level
-  // concurrency expression). A `cfv2-run-<id>` fallback group (no branch push) carries the deploy run's id, which only has to be numeric.
-  const expectedGroup = runLockGroup({ event, ref, inputs: state.inputs, runId });
+  // concurrency expression). A `cfv2-run-<id>` fallback group carries the deploy run's id, which only has to be numeric.
+  const expectedGroup = runLockGroup({ event, ref, inputs: state.inputs, runId, isFork, prNumber });
   if (expectedGroup.startsWith('cfv2-run-') ? !/^cfv2-run-\d+$/.test(String(state.group ?? '')) : state.group !== expectedGroup) {
     throw new Error(`phase_state.group '${state.group}' is not the lock identity the deploy inputs imply ('${expectedGroup}'); refusing to verify under another lock`);
   }
-  const d1Of = (k) => (plainObject(state.d1) && state.d1[keyOf(k)] != null ? String(state.d1[keyOf(k)]) : null);
-  const ownerOf = (k) => {
-    const raw = plainObject(state.migration) ? state.migration[`mj_${keyOf(k)}`] : null;
-    if (!raw) return null;
-    const m = typeof raw === 'string' ? (() => { try { return JSON.parse(raw); } catch { return null; } })() : raw;
-    return plainObject(m) && m.kind ? String(m.kind) : null;
-  };
-
-  if (state.descriptors === undefined) {
-    const s = state.inputs;
-    return buildDescriptors({
-      kinds, app, runId, repo, lockScope: s.d1_lock_scope == null ? '' : String(s.d1_lock_scope),
-      d1ByKind: Object.fromEntries(kinds.map((k) => [k, d1Of(k) ?? ''])), groups: legacyMigrationGroups(state, kinds, d1Of, ownerOf),
-      smokeMode: s.smoke_mode ? String(s.smoke_mode) : 'full', smokeOverrides: s.smoke_mode_overrides == null ? '' : String(s.smoke_mode_overrides), phase: 'verify',
-    });
-  }
-
-  if (!plainObject(state.descriptors)) throw new Error('phase_state.descriptors is not an object');
-  const have = Object.keys(state.descriptors).sort().join(',');
-  if (have !== [...kinds].sort().join(',')) throw new Error(`phase_state.descriptors [${have}] do not match phase_state.kinds [${kinds}]`);
-  const out = {};
-  for (const k of kinds) {
-    const d = validateDescriptor(state.descriptors[k]);
-    if (d.kind !== k) throw new Error(`descriptor filed under ${k} is for ${d.kind}`);
-    if (d.phase !== 'deploy') throw new Error(`descriptor for ${k} is in phase '${d.phase}'; only a deploy-phase descriptor can be verified`);
-    if (d.environment !== environmentName(app, k)) throw new Error(`descriptor for ${k} belongs to another application (${d.environment}, expected ${environmentName(app, k)})`);
-    if (k === 'persistent-dev') { // the Dev lock is the legacy shared-D1 group of THIS repository and the deploy call's own scope / app
-      const want = concurrencyGroups(k, { runId, repo, app, lockScope: state.inputs.d1_lock_scope == null ? '' : String(state.inputs.d1_lock_scope) });
-      if (d.deploy_group !== want.deploy_group || d.rollback_group !== want.rollback_group) {
-        throw new Error(`descriptor for persistent-dev carries lock '${d.deploy_group}' / '${d.rollback_group}', expected '${want.deploy_group}' for repository ${repo}, application ${app} and the deploy call's d1_lock_scope`);
-      }
+  const d = validateDescriptor(state.descriptor);
+  // The descriptor must be exactly the delivery the deploy call's own inputs plan for THIS event (a swapped target / driver is rejected here).
+  const planned = resolveDelivery({
+    event, ref, isFork, prAction, previewPolicy: String(state.inputs.preview_policy ?? '') || 'none', devDriver: String(state.inputs.dev_driver ?? '') || 'none',
+    dispatchTarget: String(state.inputs.dispatch_target ?? ''), approvedDevRef: String(state.inputs.approved_dev_ref ?? ''),
+  });
+  if (!planned || planned.target !== d.target || planned.driver !== d.driver) throw new Error(`descriptor ${d.target}/${d.driver} is not the delivery the deploy inputs plan for this event (${planned ? `${planned.target}/${planned.driver}` : 'none'})`);
+  if (d.phase !== 'deploy') throw new Error(`descriptor is in phase '${d.phase}'; only a deploy-phase descriptor can be verified`);
+  if (d.environment !== environmentName(app, d)) throw new Error(`descriptor belongs to another application (${d.environment}, expected ${environmentName(app, d)})`);
+  if (d.slot === 'persistent-dev') { // the Dev lock is the shared-D1 group of THIS repository and the deploy call's own scope / app
+    const want = concurrencyGroups(d, { runId, repo, app, lockScope: state.inputs.d1_lock_scope == null ? '' : String(state.inputs.d1_lock_scope) });
+    if (d.deploy_group !== want.deploy_group || d.rollback_group !== want.rollback_group) {
+      throw new Error(`descriptor carries lock '${d.deploy_group}' / '${d.rollback_group}', expected '${want.deploy_group}' for repository ${repo}, application ${app} and the deploy call's d1_lock_scope`);
     }
-    const d1 = d1Of(k);
-    if (d1 !== null && d1 !== d.d1_expected_id) throw new Error(`descriptor for ${k} binds D1 '${d.d1_expected_id}' but the hand-off recorded '${d1}'`);
-    const owner = ownerOf(k);
-    if (owner !== null && owner !== d.d1_owner_kind) throw new Error(`descriptor for ${k} names migration owner '${d.d1_owner_kind}' but the migration result belongs to '${owner}'`);
-    out[k] = validateDescriptor({ ...d, phase: 'verify' });
   }
-  return out;
+  if (state.d1 != null && String(state.d1) !== d.d1_expected_id) throw new Error(`descriptor binds D1 '${d.d1_expected_id}' but the hand-off recorded '${state.d1}'`);
+  return validateDescriptor({ ...d, phase: 'verify' });
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Engine initialisation (pure): every check that used to be a separate Node/jq call in `engine.sh init`, evaluated once over the
-// validated inputs. Throws (fail closed, BEFORE any mutation) with the message the operator sees. Credentials stay a shell check.
+// Engine initialisation (pure): every check of `engine.sh init`, evaluated once over the validated inputs. Throws (fail closed, BEFORE any
+// mutation) with the message the operator sees. Credentials stay a shell check.
 // ---------------------------------------------------------------------------------------------------------------------
-const KIND_OF_TARGET = { prod: 'production', preview: 'native-branch', dev: 'persistent-dev' };
-const STAGES = ['all', 'deploy', 'precheck', 'preflight', 'migrate', 'publish', 'verify', 'rollback'];
-const BUILD_ENV_INPUT = { production: 'build_env_prod', 'native-branch': 'build_env_preview', 'native-dev': 'build_env_shared_dev_native_preview', 'persistent-dev': 'build_env_dev' };
+const STAGES = ['build', 'precheck', 'migrate', 'publish', 'verify', 'app-smoke', 'rollback'];
 
-export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expect = '', descriptor = '', callInputs = '', event, ref, previewSecrets = '' }) {
+export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expect = '', descriptor = '', callInputs = '', event, ref, isFork = false, prAction = '', previewSecrets = '' }) {
   if (inputs === null || typeof inputs !== 'object' || Array.isArray(inputs)) throw new Error('inputs_json is not an object');
   const s = (k) => (inputs[k] == null ? '' : String(inputs[k]));
-  const on = (k) => s(k) === 'true';
-  if (!['prod', 'preview', 'dev'].includes(target)) throw new Error(`bad engine target: ${target}`);
-  const K = kind || KIND_OF_TARGET[target];
-  if (ENGINE_TARGET[K] !== target) throw new Error(`delivery kind '${K}' does not belong to engine target '${target}'`);
-  let smokeMode;
-  if (descriptor) {
-    const d = parseDescriptor(descriptor, K);
-    if (d.target !== target) throw new Error(`target descriptor engine target '${d.target}' differs from the stage's '${target}'`);
-    if (d.d1_expected_id !== d1Expect) throw new Error("target descriptor D1 id differs from the stage's expected D1");
-    smokeMode = d.smoke_mode;
-  } else smokeMode = resolveSmokeMode(K, s('smoke_mode'), s('smoke_mode_overrides'));
+  if (!descriptor) throw new Error('a delivery descriptor is required');
+  const d = parseDescriptor(descriptor);
+  const delivery = { target: d.target, driver: d.driver };
+  if (!['prod', 'preview', 'dev'].includes(target) || d.engine_target !== target) throw new Error(`delivery descriptor engine target '${d.engine_target}' differs from the stage's '${target}'`);
+  if (kind && d.slot !== kind) throw new Error(`delivery descriptor slot '${d.slot}' differs from the stage's '${kind}'`);
+  if (d.d1_expected_id !== d1Expect) throw new Error("delivery descriptor D1 id differs from the stage's expected D1");
   if (!STAGES.includes(stage)) throw new Error(`bad engine stage: ${stage}`);
-  if (target === 'dev') { /* every stage is allowed for persistent Dev */ } else if (!['precheck', 'preflight', 'migrate', 'publish', 'verify', 'rollback'].includes(stage)) {
-    throw new Error(`${K} must run as split stages (precheck/preflight/migrate/publish/verify/rollback), got '${stage}'`);
-  }
+  if (d.target === 'preview' && ['precheck', 'migrate'].includes(stage)) throw new Error('a Preview never migrates a remote D1');
   if (!/^[A-Za-z0-9_-]*$/.test(d1Expect)) throw new Error('malformed expected D1 id');
   if (callInputs) { // deferred verification: the verify call's identity inputs must equal the deploy call's
     let c;
@@ -616,36 +481,34 @@ export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expec
       if ((c[k] == null ? '' : String(c[k])) !== s(k)) throw new Error(`verify call input '${k}' differs from the deploy call that produced the hand-off; refusing to verify another deployment`);
     }
   }
-  const strategy = s('deployment_strategy');
-  if (!STRATEGIES.includes(strategy)) throw new Error('bad deployment_strategy');
   if (!['automatic', 'manual', 'disabled'].includes(s('production_rollback_policy'))) throw new Error('bad production_rollback_policy');
-  if (strategy === 'production-only' && (on('shared_dev_on_branch_push') || on('shared_dev_native_preview_on_branch_push'))) {
-    throw new Error('deployment_strategy: production-only cannot be combined with shared_dev_on_branch_push / shared_dev_native_preview_on_branch_push: true; refusing to publish or migrate anything');
+  // The descriptor must be what THIS event and these inputs plan: no phantom delivery. (A deferred verify call has its own event: its
+  // descriptor was already tied to the deploy call's inputs by restoreDescriptor.)
+  if (d.phase !== 'verify') {
+    const planned = resolveDelivery({
+      event, ref, isFork, prAction, previewPolicy: s('preview_policy') || 'none', devDriver: s('dev_driver') || 'none',
+      dispatchTarget: s('dispatch_target'), approvedDevRef: s('approved_dev_ref'),
+    });
+    if (!planned || planned.target !== d.target || planned.driver !== d.driver) throw new Error(`delivery mismatch (this event plans '${planned ? `${planned.target}/${planned.driver}` : 'nothing'}', engine '${d.target}/${d.driver}'); refusing to deploy`);
   }
-  if (on('shared_dev_on_branch_push') && on('shared_dev_native_preview_on_branch_push')) throw new Error('shared_dev_on_branch_push and shared_dev_native_preview_on_branch_push are conflicting automatic Dev channels; enable only one');
-  const kinds = resolveDeliveryTargets({
-    event, ref, strategy, previewOnPush: on('preview_on_branch_push'), sharedDevOnPush: on('shared_dev_on_branch_push'),
-    sharedDevNativeOnPush: on('shared_dev_native_preview_on_branch_push'), dispatchTarget: s('dispatch_target'), devRef: s('persistent_dev_ref'),
-  });
-  if (!kinds.includes(K)) throw new Error(`target mismatch (enabled kinds '${kinds.join(',')}', engine '${K}'); refusing to deploy`);
-  return { kind: K, stage, target, smokeMode, d1Expect, ...validateTargetConfig({ inputs, kind: K, target, previewSecrets }) };
+  return { slot: d.slot, delivery, stage, target, smokeMode: d.smoke_mode, d1Expect, ...validateTargetConfig({ inputs, delivery, previewSecrets }) };
 }
 
-/** Per-target requirements and the validated KEY=VALUE env data each kind builds/smokes with (a build env never falls back to another kind's). */
-function validateTargetConfig({ inputs, kind, target, previewSecrets }) {
+/** Per-target requirements and the validated KEY=VALUE env data each target builds/smokes with (a build env never falls back to another target's). */
+function validateTargetConfig({ inputs, delivery, previewSecrets }) {
   const s = (k) => (inputs[k] == null ? '' : String(inputs[k]));
   const on = (k) => s(k) === 'true';
-  if (kind === 'native-dev' && !on('shared_dev_native_preview_on_branch_push')) throw new Error('native-dev requires shared_dev_native_preview_on_branch_push: true');
-  if (target === 'dev') {
-    if (!s('dev_worker_name')) throw new Error('Shared Dev requires dev_worker_name (the Dev Worker identity is always verified)');
-    if (!s('app_url_dev')) throw new Error('Shared Dev requires app_url_dev (a Dev deployment without a probe is not verified)');
+  const { target, driver } = delivery;
+  if (target === 'dev' && driver === 'worker') {
+    if (!s('dev_worker_name')) throw new Error('A Dev Worker requires dev_worker_name (the Dev Worker identity is always verified)');
+    if (!s('app_url_dev')) throw new Error('A Dev Worker requires app_url_dev (a Dev deployment without a probe is not verified)');
   }
   const buildCmd = target === 'dev' ? (s('dev_build_cmd') || s('build_cmd')) : s('build_cmd');
   if (!buildCmd) throw new Error(`no build command for target ${target}`);
-  if (on('d1_migrations') && target === 'dev' && !s('dev_build_cmd')) throw new Error('Shared Dev with d1_migrations requires dev_build_cmd: the Dev build must succeed BEFORE the Dev D1 is migrated');
-  const buildEnvText = s(BUILD_ENV_INPUT[kind]);
-  const bad = foreignUrlsInBuildEnv(kind, buildEnvText, { production: s('app_url_prod'), 'persistent-dev': s('app_url_dev'), 'native-dev': s('app_url_shared_dev_native_preview') });
-  if (bad.length) throw new Error(`build environment of ${kind}: ${bad.join('; ')}; each target must be built with its own URLs`);
+  if (on('d1_migrations') && target === 'dev' && !s('dev_build_cmd')) throw new Error('Dev with d1_migrations requires dev_build_cmd: the Dev build must succeed BEFORE the Dev D1 is migrated');
+  const buildEnvText = s({ production: 'build_env_prod', preview: 'build_env_preview', dev: 'build_env_dev' }[target]);
+  const bad = foreignUrlsInBuildEnv(target, buildEnvText, { production: s('app_url_prod'), dev: s('app_url_dev') });
+  if (bad.length) throw new Error(`build environment of ${target}: ${bad.join('; ')}; each target must be built with its own URLs`);
   const parse = (name, text) => {
     const r = parseEnvLines(text, { reserved: true });
     if (r.errors.length) throw new Error(`${name}: ${r.errors.join('; ')}`);
@@ -653,46 +516,13 @@ function validateTargetConfig({ inputs, kind, target, previewSecrets }) {
   };
   return {
     buildEnv: parse('CFV2_BUILD_ENV', buildEnvText), smokeEnv: parse('CFV2_SMOKE_ENV', s('smoke_env')),
-    previewEnv: target === 'preview' && previewSecrets ? parse('CFV2_PS', previewSecrets) : null,
+    previewEnv: target !== 'production' && driver === 'native-preview' && previewSecrets ? parse('CFV2_PS', previewSecrets) : null,
   };
 }
 
-/**
- * Legacy hand-offs (no `descriptors`): the physical-D1 ownership the deploy call used, proven from the hand-off itself. Per D1 id, every
- * member kind's migration result must name the SAME owner, the owner must be one of the members, the owner's own result must name itself,
- * and each result must carry that D1 id. D1 migrations disabled -> no ownership is needed. Anything missing or conflicting fails closed:
- * ownership is never invented and never silently left empty for a D1-enabled deployment.
- */
-function legacyMigrationGroups(state, kinds, d1Of, ownerOf) {
-  const enabled = state.inputs.d1_migrations === true || state.inputs.d1_migrations === 'true';
-  if (!enabled) return [];
-  const byD1 = new Map();
-  for (const k of kinds) {
-    const id = d1Of(k);
-    if (!id) continue;
-    if (!byD1.has(id)) byD1.set(id, []);
-    byD1.get(id).push(k);
-  }
-  const resultOf = (k) => {
-    const raw = plainObject(state.migration) ? state.migration[`mj_${keyOf(k)}`] : null;
-    if (!raw) return null;
-    const m = typeof raw === 'string' ? (() => { try { return JSON.parse(raw); } catch { return null; } })() : raw;
-    return plainObject(m) ? m : null;
-  };
-  const groups = [];
-  for (const [id, members] of byD1) {
-    const owners = new Set();
-    for (const k of members) {
-      const m = resultOf(k);
-      if (!m || !m.kind) throw new Error(`legacy phase_state: no migration-owner evidence for ${k} (D1 ${id}) although d1_migrations was enabled; refusing to guess the owner`);
-      if (m.d1_id !== id) throw new Error(`legacy phase_state: the migration result of ${k} is for D1 '${m.d1_id}', not '${id}'`);
-      owners.add(String(m.kind));
-    }
-    if (owners.size !== 1) throw new Error(`legacy phase_state: conflicting migration owners [${[...owners]}] for D1 ${id}`);
-    const [owner] = owners;
-    if (!members.includes(owner)) throw new Error(`legacy phase_state: migration owner '${owner}' is not among the kinds [${members}] that use D1 ${id}`);
-    if (resultOf(owner)?.kind !== owner) throw new Error(`legacy phase_state: the owner's own migration result does not name itself (${owner})`);
-    groups.push({ databaseId: id, members, owner });
-  }
-  return groups;
-}
+/** Historical persistence slots (internal; see the header). */
+export const SLOTS = Object.values(SLOT);
+export const assertSlot = (slot) => {
+  if (!SLOTS.includes(slot)) throw new Error(`Unknown delivery slot '${slot}' (expected ${SLOTS.join(' | ')})`);
+  return slot;
+};

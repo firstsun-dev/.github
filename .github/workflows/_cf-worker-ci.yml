@@ -1,14 +1,16 @@
-name: CF Worker CI (validation)
+name: CF Worker CI (stages)
 
 # ---------------------------------------------------------------------------
-# INTERNAL — called ONLY by _cf-worker-v2.yml (one `uses:` per run). Not a public entrypoint. Contract: docs/cf-worker-v2-refactor.md
+# INTERNAL — called ONLY by _cf-worker-v2.yml (one `uses:` per run). Not a public entrypoint. Contract: docs/cf-worker-v2.md
 #
-#   Lint  Typecheck  Unit  Integration  Build Validation  E2E        six independent, PARALLEL jobs (no `needs` between them)
-#                         |
-#                  Validation Gate   the ONE aggregation: every CONFIGURED job succeeded, every unconfigured one was skipped
+#   Plan  ->  Verify tasks (matrix) || Test tasks (matrix) || E2E (matrix)  ->  Gate
 #
-# Bodies are actions/cf-ci-check (E2E has its own setup and own TEST build). None receives Cloudflare credentials and none uploads a
-# build artifact: Build Validation builds for validation only, the delivery engine builds again for its real target.
+# The caller owns the task lists (`verify_tasks`, `test_tasks`: JSON [{"id","cmd"}]); this workflow owns orchestration. Which stages run
+# is decided from the event by the Plan (actions/cf-preview/stages.mjs): push = Verify; pull_request / merge_group = Verify + Test on the
+# merge candidate; workflow_dispatch = Verify. Verify and Test tasks have NO `needs` between them, so they run concurrently. The Gate is
+# the ONE aggregation: every expected job succeeded, every unexpected one was skipped, the plan succeeded - otherwise red.
+# Credential-free: no Cloudflare secret is ever passed here and no build artifact leaves this workflow (the delivery engine rebuilds for
+# its real target). A fork PR runs ONLY on the approved GitHub-hosted runner (ubuntu-24.04, a constant of this repository - not a caller input), never on `runner`.
 # No workflow-level `concurrency` here (the public workflow owns the run-level group; reusing it would deadlock).
 # ---------------------------------------------------------------------------
 
@@ -27,21 +29,14 @@ on:
       runner:
         type: string
         default: linux
-      lint_cmd:
+      verify_tasks:
+        description: 'JSON array of {"id","cmd"}: fast checks (lint, check, build, unit, fast integration, ...). Runs on every eligible push and PR.'
         type: string
         default: ''
-      typecheck_cmd:
+      test_tasks:
+        description: 'JSON array of {"id","cmd"}: costly checks (heavy integration, contract, ...). Runs on pull_request and merge_group only. Empty is valid.'
         type: string
         default: ''
-      test_unit_cmd:
-        type: string
-        default: ''
-      test_integration_cmd:
-        type: string
-        default: ''
-      build_cmd:
-        type: string
-        required: true
       ci_env:
         type: string
         default: ''
@@ -55,10 +50,6 @@ on:
         type: string
         default: ''
       build_env_dev:
-        type: string
-        default: ''
-      ci_target_env:
-        description: prod | dev | preview - which build env the validation commands import (resolved by the caller from event/ref/dispatch_target)
         type: string
         default: ''
       test_e2e_cmd:
@@ -78,7 +69,7 @@ on:
         default: ''
     outputs:
       validation:
-        description: passed ONLY when every configured validation job succeeded (the Validation Gate); empty otherwise
+        description: passed ONLY when the Gate passed (every expected job succeeded); empty otherwise
         value: ${{ jobs.gate.outputs.validation }}
 
 permissions:
@@ -92,107 +83,93 @@ env:
   PLAYWRIGHT_BROWSERS_PATH: /opt/playwright-browsers
 
 jobs:
-  lint:
-    name: Lint
-    if: inputs.lint_cmd != ''
-    runs-on: ${{ inputs.runner }}
+  # Plan - pure data, no checkout, no credentials. Validates the task lists (malformed -> red before any command runs) and routes the event.
+  plan:
+    name: Plan
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || inputs.runner }}
+    timeout-minutes: 5
+    outputs:
+      stages: ${{ steps.plan.outputs.stages }}
+      runner: ${{ steps.plan.outputs.runner }}
+      target_env: ${{ steps.plan.outputs.target_env }}
+      run_verify: ${{ steps.plan.outputs.run_verify }}
+      run_test: ${{ steps.plan.outputs.run_test }}
+      run_e2e: ${{ steps.plan.outputs.run_e2e }}
+      verify_tasks: ${{ steps.plan.outputs.verify_tasks }}
+      test_tasks: ${{ steps.plan.outputs.test_tasks }}
+    steps:
+      - uses: $/actions/cf-tools
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+          VERIFY_TASKS: ${{ inputs.verify_tasks }}
+          TEST_TASKS: ${{ inputs.test_tasks }}
+          E2E_CMD: ${{ inputs.test_e2e_cmd }}
+          RUNNER: ${{ inputs.runner }}
+        run: node "$TOOLS_DIR/stages.mjs" plan | tee -a "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify (${{ matrix.task.id }})
+    needs: [plan]
+    if: needs.plan.outputs.run_verify == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        task: ${{ fromJSON(needs.plan.outputs.verify_tasks) }}
+    runs-on: ${{ needs.plan.outputs.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: $/actions/cf-ci-check
         with:
-          title: Lint
-          cmd: ${{ inputs.lint_cmd }}
+          title: Verify ${{ matrix.task.id }}
+          cmd: ${{ matrix.task.cmd }}
           app_path: ${{ inputs.app_path }}
           build_env_prod: ${{ inputs.build_env_prod }}
           build_env_preview: ${{ inputs.build_env_preview }}
           build_env_dev: ${{ inputs.build_env_dev }}
-          target_env: ${{ inputs.ci_target_env }}
-          ci_env: ${{ inputs.ci_env }}
-          app_version: ${{ inputs.app_version }}
-  typecheck:
-    name: Typecheck
-    if: inputs.typecheck_cmd != ''
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-      - uses: $/actions/cf-ci-check
-        with:
-          title: Typecheck
-          cmd: ${{ inputs.typecheck_cmd }}
-          app_path: ${{ inputs.app_path }}
-          build_env_prod: ${{ inputs.build_env_prod }}
-          build_env_preview: ${{ inputs.build_env_preview }}
-          build_env_dev: ${{ inputs.build_env_dev }}
-          target_env: ${{ inputs.ci_target_env }}
-          ci_env: ${{ inputs.ci_env }}
-          app_version: ${{ inputs.app_version }}
-  unit:
-    name: Unit Tests
-    if: inputs.test_unit_cmd != ''
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-      - uses: $/actions/cf-ci-check
-        with:
-          title: Unit Tests
-          cmd: ${{ inputs.test_unit_cmd }}
-          app_path: ${{ inputs.app_path }}
-          build_env_prod: ${{ inputs.build_env_prod }}
-          build_env_preview: ${{ inputs.build_env_preview }}
-          build_env_dev: ${{ inputs.build_env_dev }}
-          target_env: ${{ inputs.ci_target_env }}
+          target_env: ${{ needs.plan.outputs.target_env }}
           ci_env: ${{ inputs.ci_env }}
           app_version: ${{ inputs.app_version }}
           use_mailpit: ${{ inputs.use_mailpit }}
-  integration:
-    name: Integration Tests
-    if: inputs.test_integration_cmd != ''
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
+
+  test:
+    name: Test (${{ matrix.task.id }})
+    needs: [plan]
+    if: needs.plan.outputs.run_test == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        task: ${{ fromJSON(needs.plan.outputs.test_tasks) }}
+    runs-on: ${{ needs.plan.outputs.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
       - uses: $/actions/cf-ci-check
         with:
-          title: Integration Tests
-          cmd: ${{ inputs.test_integration_cmd }}
+          title: Test ${{ matrix.task.id }}
+          cmd: ${{ matrix.task.cmd }}
           app_path: ${{ inputs.app_path }}
           build_env_prod: ${{ inputs.build_env_prod }}
           build_env_preview: ${{ inputs.build_env_preview }}
           build_env_dev: ${{ inputs.build_env_dev }}
-          target_env: ${{ inputs.ci_target_env }}
+          target_env: ${{ needs.plan.outputs.target_env }}
           ci_env: ${{ inputs.ci_env }}
           app_version: ${{ inputs.app_version }}
           use_mailpit: ${{ inputs.use_mailpit }}
-  build:
-    name: Build Validation
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-      - uses: $/actions/cf-ci-check
-        with:
-          title: Build Validation
-          cmd: ${{ inputs.build_cmd }}
-          app_path: ${{ inputs.app_path }}
-          build_env_prod: ${{ inputs.build_env_prod }}
-          build_env_preview: ${{ inputs.build_env_preview }}
-          build_env_dev: ${{ inputs.build_env_dev }}
-          target_env: ${{ inputs.ci_target_env }}
-          ci_env: ${{ inputs.ci_env }}
-          app_version: ${{ inputs.app_version }}
 
   # E2E — own setup and own TEST build (local URLs, mock services); never reused for a deployment.
   e2e:
     name: E2E
-    if: inputs.test_e2e_cmd != ''
+    needs: [plan]
+    if: needs.plan.outputs.run_e2e == 'true'
     strategy:
       fail-fast: false
       matrix:
         e2e: ${{ fromJSON(inputs.test_e2e_variants) }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ needs.plan.outputs.runner }}
     timeout-minutes: 45
     env:
       E2E_ENV: ${{ inputs.test_e2e_env }}
@@ -203,8 +180,8 @@ jobs:
         run: node "$TOOLS_DIR/parse-env.mjs" E2E_ENV "$GITHUB_ENV"
       - uses: $/actions/setup
         with:
-          setup-node: 'false'
-          setup-pnpm: 'false'
+          setup-node: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
+          setup-pnpm: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
       - name: Start Mailpit
         if: inputs.use_mailpit
         uses: $/actions/mailpit
@@ -238,43 +215,26 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
-  # Validation Gate — fail closed. A configured job must be `success`; an unconfigured one must be `skipped`; anything else (failure,
-  # cancelled, an unexpected skip) fails the gate. `always()` makes the gate run (and fail) even when a job it needs failed, so the
-  # called workflow's conclusion is never a skipped-looking green.
+  # Gate - fail closed (logic and its tests: actions/cf-preview/stages.mjs gateVerdict). `always()` makes it run (and fail) even when a job it
+  # needs failed or was cancelled, so the called workflow's conclusion is never a skipped-looking green.
   gate:
-    name: Validation Gate
-    needs: [lint, typecheck, unit, integration, build, e2e]
+    name: Gate
+    needs: [plan, verify, test, e2e]
     if: always()
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || inputs.runner }}
     timeout-minutes: 5
     outputs:
       validation: ${{ steps.gate.outputs.validation }}
     steps:
+      - uses: $/actions/cf-tools
       - id: gate
-        name: Every configured validation job succeeded
+        name: Every expected job succeeded, every other one was skipped
         env:
-          LINT: ${{ needs.lint.result }}
-          LINT_CONFIGURED: ${{ inputs.lint_cmd != '' }}
-          TYPECHECK: ${{ needs.typecheck.result }}
-          TYPECHECK_CONFIGURED: ${{ inputs.typecheck_cmd != '' }}
-          UNIT: ${{ needs.unit.result }}
-          UNIT_CONFIGURED: ${{ inputs.test_unit_cmd != '' }}
-          INTEGRATION: ${{ needs.integration.result }}
-          INTEGRATION_CONFIGURED: ${{ inputs.test_integration_cmd != '' }}
-          BUILD: ${{ needs.build.result }}
-          BUILD_CONFIGURED: 'true'
+          PLAN: ${{ needs.plan.result }}
+          VERIFY: ${{ needs.verify.result }}
+          TEST: ${{ needs.test.result }}
           E2E: ${{ needs.e2e.result }}
-          E2E_CONFIGURED: ${{ inputs.test_e2e_cmd != '' }}
-        run: |
-          bad=0
-          for j in LINT TYPECHECK UNIT INTEGRATION BUILD E2E; do
-            r="${j}"; c="${j}_CONFIGURED"
-            if [ "${!c}" = true ]; then
-              [ "${!r}" = success ] || { echo "::error::$j finished '${!r}' (configured: must succeed)"; bad=1; }
-            else
-              [ "${!r}" = skipped ] || { echo "::error::$j is not configured but finished '${!r}'"; bad=1; }
-            fi
-          done
-          [ "$bad" = 0 ] || exit 1
-          echo "validation=passed" >> "$GITHUB_OUTPUT"
-          echo "Validation Gate passed."
+          RUN_VERIFY: ${{ needs.plan.outputs.run_verify }}
+          RUN_TEST: ${{ needs.plan.outputs.run_test }}
+          RUN_E2E: ${{ needs.plan.outputs.run_e2e }}
+        run: node "$TOOLS_DIR/stages.mjs" gate | tee -a "$GITHUB_OUTPUT"

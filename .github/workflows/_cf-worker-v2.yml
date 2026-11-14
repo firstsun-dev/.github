@@ -1,97 +1,72 @@
 name: CF Worker Pipeline v2
 
 # ---------------------------------------------------------------------------
-# Cloudflare Worker CI/CD v2 — thin workflow, ONE reusable delivery engine.
-# OpenSpec: openspec/changes/refactor-cloudflare-worker-cicd-v2 (PR #57), openspec/changes/add-cloudflare-shared-dev-channel.
-# Interface / migration guide: docs/cf-worker-v2-refactor.md
+# Cloudflare Worker CI/CD v2 — stage-based CI, ONE target-driven delivery engine.
+# OpenSpec: openspec/changes/simplify-cf-ci-stages-and-dev-delivery. Interface / migration guide: docs/cf-worker-v2.md
 #
-#   CI  (_cf-worker-ci.yml)   Lint | Typecheck | Unit | Integration | Build Validation | E2E in parallel -> Validation Gate (fail closed)
-#         |
-#   Plan                      enabled targets, ONE physical D1, the migration owner (pure data; runs only when CI passed)
-#         |
-#   Migrate                  ONE job: a READ-ONLY D1 precheck first. Nothing pending -> a verified no-op, NO build here. Pending -> read-only
-#         |                   safety checks (target build, effective-config audit, exact D1 binding), then the migration is applied ONCE.
-#   Delivery x enabled kinds  _cf-worker-delivery.yml, one call per kind: Deploy -> Smoke -> conditional Rollback, independent per kind
-#         |
-#   Release                   optional, main only, only after a VERIFIED Production delivery with no rollback
+#   CI    (_cf-worker-ci.yml)   Plan -> [Verify tasks || Test tasks || E2E] -> Gate (fail closed). The CALLER owns the task lists.
+#     |                         push = Verify; pull_request / merge_group = Verify + Test on the merge candidate; main push = Verify
+#   Plan                        ONE delivery for the event, or none: target production | preview | dev x driver worker | native-preview (pure data)
+#     |                           push main -> production | same-repo PR (preview_policy pr) -> preview | dispatch (approved ref) -> dev
+#   Migrate                     production / dev only (a Preview never migrates): a READ-ONLY D1 precheck first; nothing pending -> verified no-op,
+#     |                         NO build; pending -> audit + exact D1 binding, then the migration is applied ONCE
+#   Delivery                    _cf-worker-delivery.yml: Deploy -> Smoke -> conditional Rollback (the only variation is the driver)
+#     |
+#   Release                     optional, main only, only after a VERIFIED Production delivery with no rollback
 #
-# Event handlers outside that DAG: `lifecycle` (_cf-worker-lifecycle.yml: PR comment / branch delete) and `config-guard`.
-# The Hybrid protected manual dispatch of persistent Dev is NOT a separate path: it only selects the `persistent-dev` kind in the Plan, then runs this same DAG.
-# One pipeline migrates at most one physical D1: distinct databases among the enabled targets are rejected by the plan, before any mutation.
-# The run-level concurrency group below spans the whole run. Interface, design record and measurements: docs/cf-worker-v2-refactor.md.
+# Outside that DAG: `lifecycle` (same-repo PR closed -> retire the PR Preview ledger; the Preview is kept).
+# One run delivers at most ONE target. A feature push never deploys; a manual dispatch can only promote an approved ref to Dev and can never
+# deploy Production. The run-level concurrency group below spans the whole run.
 #
 # Shared actions / nested workflow: `uses: $/actions/<name>` and `uses: $/.github/workflows/...` (GitHub self-repository syntax,
-# needs runner >= 2.336.0; observed: org `linux` runners 2.338.0, GitHub-hosted 2.338.2) resolve to THIS repository at the exact commit of the running workflow, with no checkout into the caller's
-# workspace (a plain `./` would resolve against the CALLER's). Version coupling is therefore exact by construction.
-# Scripts are located relative to their action (`$GITHUB_ACTION_PATH/../cf-preview`, or actions/cf-tools).
+# needs runner >= 2.336.0) resolve to THIS repository at the exact commit of the running workflow, with no checkout into the caller's workspace.
 #
-# Caller MUST trigger on: push (all branches), pull_request, delete, workflow_dispatch.
-# `delete` only fires from the DEFAULT branch's workflow file.
+# Caller MUST trigger on: push (all branches), pull_request (opened, synchronize, reopened, closed), workflow_dispatch (with a `target` input
+# passed as dispatch_target when Dev is enabled), and `merge_group` where a merge queue is required.
 # ---------------------------------------------------------------------------
 
 on:
   workflow_call:
     outputs:
+      deploy_target:
+        description: production | preview | dev (the one target this run delivered); empty when nothing was delivered
+        value: ${{ jobs.plan.outputs.target }}
+      deploy_driver:
+        description: worker | native-preview; empty when nothing was delivered
+        value: ${{ jobs.plan.outputs.driver }}
       deploy_url:
-        description: URL that was published (Preview URL or app_url_prod); empty when nothing was deployed. May be published-but-unverified or rolled back - gate on deploy_verified_url
-        value: ${{ fromJSON((jobs.plan.outputs.on_production == 'true' && jobs.delivery_production.outputs.handoff) || (jobs.plan.outputs.on_native_branch == 'true' && jobs.delivery_native_branch.outputs.handoff) || '{}').url }}
+        description: URL that was published; empty when nothing was deployed. May be published-but-unverified or rolled back - gate on deploy_verified_url
+        value: ${{ fromJSON(jobs.delivery.outputs.handoff || '{}').url }}
       deploy_verified_url:
         description: Same URL, only when the Smoke passed content-level verification; empty for Access-liveness-only, failed, rolled-back, smoke_mode=skip or skipped deployments
-        value: ${{ fromJSON((jobs.plan.outputs.on_production == 'true' && jobs.delivery_production.outputs.smoke_json) || (jobs.plan.outputs.on_native_branch == 'true' && jobs.delivery_native_branch.outputs.smoke_json) || '{}').verified_url }}
+        value: ${{ fromJSON(jobs.delivery.outputs.smoke_json || '{}').verified_url }}
       deploy_published_unverified:
         description: true when the deployment is reachable but NOT content-verified (Access liveness only, or smoke_mode=skip)
-        value: ${{ fromJSON((jobs.plan.outputs.on_production == 'true' && jobs.delivery_production.outputs.smoke_json) || (jobs.plan.outputs.on_native_branch == 'true' && jobs.delivery_native_branch.outputs.smoke_json) || '{}').published_unverified }}
+        value: ${{ fromJSON(jobs.delivery.outputs.smoke_json || '{}').published_unverified }}
       deploy_verified:
         description: true ONLY when this run published its own SHA and its Smoke passed at content level
-        value: ${{ fromJSON((jobs.plan.outputs.on_production == 'true' && jobs.delivery_production.outputs.smoke_json) || (jobs.plan.outputs.on_native_branch == 'true' && jobs.delivery_native_branch.outputs.smoke_json) || '{}').deployed_and_verified }}
+        value: ${{ fromJSON(jobs.delivery.outputs.smoke_json || '{}').deployed_and_verified }}
       deploy_smoke_level:
         description: skipped | liveness | content | content-sha (verification level of the Smoke; empty when it did not run)
-        value: ${{ fromJSON((jobs.plan.outputs.on_production == 'true' && jobs.delivery_production.outputs.smoke_json) || (jobs.plan.outputs.on_native_branch == 'true' && jobs.delivery_native_branch.outputs.smoke_json) || '{}').smoke_level }}
-      deploy_target:
-        description: prod | preview (the Production / per-branch Native Preview delivery)
-        value: ${{ jobs.plan.outputs.on_production == 'true' && 'prod' || jobs.plan.outputs.on_native_branch == 'true' && 'preview' || '' }}
+        value: ${{ fromJSON(jobs.delivery.outputs.smoke_json || '{}').smoke_level }}
       version_id:
-        description: Production Worker version id (prod only)
-        value: ${{ fromJSON((jobs.plan.outputs.on_production == 'true' && jobs.delivery_production.outputs.handoff) || (jobs.plan.outputs.on_native_branch == 'true' && jobs.delivery_native_branch.outputs.handoff) || '{}').version_id }}
+        description: Production Worker version id (production only)
+        value: ${{ fromJSON(jobs.delivery.outputs.handoff || '{}').version_id }}
       previous_version_id:
-        description: Production Worker version that was live before this run's publish (prod only; the rollback target)
-        value: ${{ fromJSON((jobs.plan.outputs.on_production == 'true' && jobs.delivery_production.outputs.handoff) || (jobs.plan.outputs.on_native_branch == 'true' && jobs.delivery_native_branch.outputs.handoff) || '{}').previous_version_id }}
+        description: Production Worker version that was live before this run's publish (production only; the rollback target)
+        value: ${{ fromJSON(jobs.delivery.outputs.handoff || '{}').previous_version_id }}
       migration_status:
-        description: applied | failed | none - the result of the single Migration job (none when d1_migrations is false, a read-only precheck verified nothing pending, or on a pipeline_phase verify call)
+        description: applied | failed | none - the result of the single Migration job (none when there is no migration, a read-only precheck verified nothing pending, or on a pipeline_phase verify call)
         value: ${{ jobs.migration.outputs.migration_status || 'none' }}
       rollback_result:
-        description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed | no_known_good; empty when no rollback ran. Anything but empty is a FAILED run (first kind of the run that rolled back)
-        value: ${{ (jobs.plan.outputs.on_production == 'true' && jobs.delivery_production.outputs.rollback_result) || (jobs.plan.outputs.on_native_branch == 'true' && jobs.delivery_native_branch.outputs.rollback_result) || (jobs.plan.outputs.on_native_dev == 'true' && jobs.delivery_native_dev.outputs.rollback_result) || (jobs.plan.outputs.on_persistent_dev == 'true' && jobs.delivery_persistent_dev.outputs.rollback_result) || '' }}
-      dev_url:
-        description: persistent-dev (separate Dev Worker) URL that was published (app_url_dev); empty when it did not deploy. May be published-but-unverified - gate on dev_verified_url
-        value: ${{ fromJSON((jobs.plan.outputs.on_persistent_dev == 'true' && jobs.delivery_persistent_dev.outputs.handoff) || '{}').url }}
-      dev_verified_url:
-        description: persistent-dev URL only when content-level verification passed
-        value: ${{ fromJSON((jobs.plan.outputs.on_persistent_dev == 'true' && jobs.delivery_persistent_dev.outputs.smoke_json) || '{}').verified_url }}
-      dev_published_unverified:
-        description: true when persistent-dev published a reachable but NOT content-verified deployment (Access liveness only, or smoke_mode=skip)
-        value: ${{ fromJSON((jobs.plan.outputs.on_persistent_dev == 'true' && jobs.delivery_persistent_dev.outputs.smoke_json) || '{}').published_unverified }}
-      native_dev_url:
-        description: Native Dev Preview URL that was published; empty when Native Dev did not deploy. May be published-but-unverified - gate on native_dev_verified_url
-        value: ${{ fromJSON((jobs.plan.outputs.on_native_dev == 'true' && jobs.delivery_native_dev.outputs.handoff) || '{}').url }}
-      native_dev_verified_url:
-        description: Native Dev URL only when content-level verification passed
-        value: ${{ fromJSON((jobs.plan.outputs.on_native_dev == 'true' && jobs.delivery_native_dev.outputs.smoke_json) || '{}').verified_url }}
-      native_dev_published_unverified:
-        description: true when Native Dev published a reachable but NOT content-verified deployment (Access liveness only, or smoke_mode=skip)
-        value: ${{ fromJSON((jobs.plan.outputs.on_native_dev == 'true' && jobs.delivery_native_dev.outputs.smoke_json) || '{}').published_unverified }}
-      native_dev_verified:
-        description: true ONLY when this run published its own SHA to Native Dev and its Smoke passed at content level
-        value: ${{ fromJSON((jobs.plan.outputs.on_native_dev == 'true' && jobs.delivery_native_dev.outputs.smoke_json) || '{}').deployed_and_verified }}
-      native_dev_smoke_level:
-        description: skipped | liveness | content | content-sha for Native Dev; empty when its Smoke did not run
-        value: ${{ fromJSON((jobs.plan.outputs.on_native_dev == 'true' && jobs.delivery_native_dev.outputs.smoke_json) || '{}').smoke_level }}
+        description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed; empty when no rollback ran (always for Preview and Dev, which are fixed forward). Anything but empty is a FAILED run
+        value: ${{ jobs.delivery.outputs.rollback_result }}
       deploy_gate_blocked:
         description: true when the cross-service gate (upstream_gate) blocked a verification - the deployment is published but NOT verified and was not rolled back (pipeline_phase verify)
-        value: ${{ fromJSON(jobs.delivery_production.outputs.smoke_json || '{}').gate_blocked == 'true' || fromJSON(jobs.delivery_native_branch.outputs.smoke_json || '{}').gate_blocked == 'true' || fromJSON(jobs.delivery_native_dev.outputs.smoke_json || '{}').gate_blocked == 'true' || fromJSON(jobs.delivery_persistent_dev.outputs.smoke_json || '{}').gate_blocked == 'true' }}
+        value: ${{ fromJSON(jobs.delivery.outputs.smoke_json || '{}').gate_blocked == 'true' }}
       phase_state:
-        description: pipeline_phase deploy - the validated hand-off (inputs, enabled kinds, per-kind Deploy / Migration results, concurrency group, target descriptors) for the verify call. Pass it unchanged as phase_state
-        value: ${{ format('{{"inputs":{0},"kinds":{1},"deploy":{2},"migration":{3},"group":{4},"descriptors":{5}}}', toJSON(inputs), toJSON(fromJSON(jobs.plan.outputs.kinds || '[]')), format('{{"h_production":{0},"h_native_branch":{1},"h_native_dev":{2},"h_persistent_dev":{3}}}', toJSON(jobs.delivery_production.outputs.handoff), toJSON(jobs.delivery_native_branch.outputs.handoff), toJSON(jobs.delivery_native_dev.outputs.handoff), toJSON(jobs.delivery_persistent_dev.outputs.handoff)), format('{{"mj_production":{0},"mj_native_branch":{1},"mj_native_dev":{2},"mj_persistent_dev":{3}}}', toJSON(jobs.delivery_production.outputs.migration_used), toJSON(jobs.delivery_native_branch.outputs.migration_used), toJSON(jobs.delivery_native_dev.outputs.migration_used), toJSON(jobs.delivery_persistent_dev.outputs.migration_used)), toJSON(jobs.plan.outputs.group || format('cfv2-run-{0}', github.run_id)), toJSON(fromJSON(jobs.plan.outputs.descriptors || '{}'))) }}
+        description: pipeline_phase deploy - the validated hand-off (effective inputs, descriptor, deploy result, migration result, concurrency group) for the verify call. Pass it unchanged as phase_state
+        value: ${{ format('{{"inputs":{0},"descriptor":{1},"handoff":{2},"migration":{3},"group":{4}}}', jobs.plan.outputs.inputs_json || '{}', jobs.plan.outputs.descriptor || 'null', toJSON(jobs.delivery.outputs.handoff), toJSON(jobs.delivery.outputs.migration_used), toJSON(jobs.plan.outputs.group || format('cfv2-run-{0}', github.run_id))) }}
     inputs:
       app_name:
         description: Unique deployment/identity name (e.g. www, heaven-id). Part of the Preview identity (Worker scope).
@@ -103,28 +78,26 @@ on:
       app_version:
         type: string
         default: ''
-      deployment_strategy:
-        description: production-preview | hybrid | production-only
+      preview_policy:
+        description: >
+          none | pr. `pr` = a same-repository PR gets ONE Native Preview `pr-<number>` after its CI Gate passed (fork PRs never deploy; the PR never migrates a remote D1). none = no Preview.
         type: string
-        default: production-preview
-      preview_on_branch_push:
-        description: Feature Native Preview — one stable Preview URL per non-main branch. Independent of shared_dev_on_branch_push.
-        type: boolean
-        default: true
-      shared_dev_on_branch_push:
+        default: none
+      dev_driver:
         description: >
-          Shared Dev — every non-main branch push deploys the ONE configured Dev Worker (app_url_dev); the last
-          verified deployment wins. Independent of preview_on_branch_push. Rejected with production-only.
-        type: boolean
-        default: false
-      shared_dev_native_preview_on_branch_push:
+          none | native-preview | worker. The stable Dev: a Native Preview named `dev`, or a real `env.dev` Worker (required for Queue consumers / Cron triggers). Updated ONLY by an approved manual promotion.
+        type: string
+        default: none
+      approved_dev_ref:
         description: >
-          Native Dev — every non-main branch push updates the ONE stable, named Native Preview `dev` (host Worker =
-          preview_worker_name or app_name, `[previews]` bindings; NOT a Wrangler [env.dev] Worker). The last verified
-          deployment of ANY branch wins; pushes are serialized per Worker. Independent of preview_on_branch_push; conflicts
-          with shared_dev_on_branch_push (two automatic Dev channels). Rejected with production-only.
-        type: boolean
-        default: false
+          Branch ref (refs/heads/...) a manual Dev promotion may deliver. Required when dev_driver is not none; any other ref is rejected before any mutation. Protect the `<app>/dev` (or `<app>/native-dev`) GitHub Environment with required reviewers.
+        type: string
+        default: ''
+      dispatch_target:
+        description: >
+          Pass github.event.inputs.target from the caller; empty or "dev". "dev" selects the manual Dev promotion of a workflow_dispatch. Any other value, or a value on another event, fails the Plan before any mutation.
+        type: string
+        default: ''
       preview_worker_name:
         description: >
           Host Native Previews under this existing Worker instead of the config's `name`
@@ -136,17 +109,13 @@ on:
         description: Source Wrangler config path relative to app_path
         type: string
         default: wrangler.toml
-      # ---- CI (one job; these are steps) ----
-      lint_cmd:
+      # ---- CI stages (caller-owned task lists) ----
+      verify_tasks:
+        description: 'JSON array of {"id","cmd"} - fast checks (lint, check, build, unit, fast integration ...). Runs on every eligible push and PR. Ids are unique, lowercase, dashes allowed.'
         type: string
         default: ''
-      typecheck_cmd:
-        type: string
-        default: ''
-      test_unit_cmd:
-        type: string
-        default: ''
-      test_integration_cmd:
+      test_tasks:
+        description: 'JSON array of {"id","cmd"} - costly checks (heavy integration, contract ...). Runs on pull_request and merge_group only. Empty is valid.'
         type: string
         default: ''
       build_cmd:
@@ -163,7 +132,6 @@ on:
         description: Start Mailpit for integration/E2E tests
         type: boolean
         default: false
-      # ---- E2E (own setup and own test build) ----
       test_e2e_cmd:
         description: E2E command. Empty = no E2E job (an intentional skip never blocks Migration/Deploy).
         type: string
@@ -183,7 +151,7 @@ on:
         description: Extra env vars for E2E, one KEY=VALUE per line
         type: string
         default: ''
-      # ---- Deploy ----
+      # ---- Delivery ----
       build_env_prod:
         description: Build-time env for the Production build, one KEY=VALUE per line (VITE_APP_ENV/VERSION are set automatically)
         type: string
@@ -192,15 +160,8 @@ on:
         description: Build-time env for the Preview build, one KEY=VALUE per line
         type: string
         default: ''
-      build_env_shared_dev_native_preview:
-        description: Build-time env for the Native Dev build, one KEY=VALUE per line (never falls back to build_env_preview / build_env_prod / build_env_dev; each target compiles its own URLs)
-        type: string
-        default: ''
-      app_url_shared_dev_native_preview:
-        description: >
-          Optional canonical URL of the Native Dev Preview, known before the build. When set it is exported to the build as
-          CFV2_TARGET_URL and the URL Cloudflare returns after the publish MUST equal it (otherwise the publish is rejected: the
-          build embeds the wrong URL). Also used as the smoke target.
+      build_env_dev:
+        description: Build-time env for the Dev build (either driver), one KEY=VALUE per line (never falls back to the Preview or Production env)
         type: string
         default: ''
       preview_url_suffix:
@@ -215,17 +176,13 @@ on:
         description: >
           full (default: built-in HTTP probe + smoke_cmd, current behaviour) | basic (content-level HTTP/health verification
           only, no smoke_cmd) | skip (no request at all: the deployment is Published/Unverified - never Verified, never
-          known-good, never released). Applies to every delivery kind unless smoke_mode_overrides names it.
+          known-good, never released). Applies to every target unless smoke_mode_overrides names it.
         type: string
         default: full
       smoke_mode_overrides:
-        description: 'Optional JSON object keyed by delivery kind (production | native-branch | native-dev | persistent-dev), e.g. {"native-dev":"basic"}; values full | basic | skip. Unknown keys / values fail the plan.'
+        description: 'Optional JSON object keyed by target (production | preview | dev), e.g. {"dev":"basic"}; values full | basic | skip. Unknown keys / values fail the plan.'
         type: string
         default: '{}'
-      build_env_dev:
-        description: Build-time env for the Shared Dev build, one KEY=VALUE per line (never falls back to the Preview or Production env)
-        type: string
-        default: ''
       smoke_cmd:
         description: Smoke command from app_path (both targets); receives TARGET_URL, EXPECTED_SHA, DEPLOY_TARGET. Default is an HTTP 2xx probe.
         type: string
@@ -285,9 +242,8 @@ on:
       # ---- Migration ----
       d1_migrations:
         description: >
-          The Worker has remote D1 migrations; enables the Migration STEP of the delivery engine (after the build and
-          config audit, before the publish). Production, Preview and Shared Dev apply the same project-owned SQL to
-          their own D1. Leave false for D1-less Workers.
+          The Worker has remote D1 migrations; enables the Migration job (before the publish) for Production and Dev. A Preview NEVER migrates a
+          remote D1 (schema changes from an arbitrary PR are not applied to a shared database; test SQL locally or on an isolated DB). Leave false for D1-less Workers.
         type: boolean
         default: false
       d1_binding:
@@ -317,25 +273,23 @@ on:
         description: Optional main-only release command (e.g. semantic-release), run after a verified Production deploy
         type: string
         default: ''
-      # ---- Hybrid persistent Dev ----
-      persistent_dev_ref:
-        description: Approved ref (refs/heads/...) allowed to deploy persistent Dev via dispatch
-        type: string
-        default: ''
+      # ---- Dev ----
       dev_smoke_cmd:
-        description: Dev smoke command (persistent-dev and Shared Dev); Shared Dev also receives TARGET_URL=app_url_dev, EXPECTED_SHA, DEPLOY_TARGET=dev
+        description: Dev smoke command; receives TARGET_URL, EXPECTED_SHA, DEPLOY_TARGET=dev
         type: string
         default: ''
       app_url_dev:
-        description: Stable Shared Dev URL (environment URL, smoke target). Required when shared_dev_on_branch_push is true.
+        description: >
+          Canonical URL of the stable Dev (environment URL, smoke target). Required for dev_driver worker. For dev_driver native-preview it is optional:
+          when set it is exported to the build as CFV2_TARGET_URL and the URL Cloudflare returns after the publish MUST equal it.
         type: string
         default: ''
       dev_build_cmd:
-        description: Dev build from app_path (with build_env_dev), build only; falls back to build_cmd when empty. REQUIRED with d1_migrations (the Dev build must succeed before the Dev D1 is migrated). Required by the persistent-dev kind (automatic and manual dispatch alike).
+        description: Dev build from app_path (with build_env_dev); falls back to build_cmd when empty. REQUIRED with d1_migrations (the Dev build must succeed before the Dev D1 is migrated).
         type: string
         default: ''
       dev_wrangler_env:
-        description: Named Wrangler environment of the Shared Dev Worker (exported as CLOUDFLARE_ENV; its D1 is env.<name>.d1_databases)
+        description: Named Wrangler environment of the Dev Worker (dev_driver worker) (exported as CLOUDFLARE_ENV; its D1 is env.<name>.d1_databases)
         type: string
         default: dev
       dev_binding_allow:
@@ -352,20 +306,17 @@ on:
         type: string
         default: ''
       dev_worker_name:
-        description: Expected Worker name of the Shared Dev deployment; the Astro/adapter-generated effective Wrangler config must match it (e.g. blog-preview)
+        description: Expected Worker name of the Dev Worker deployment (dev_driver worker); the Astro/adapter-generated effective Wrangler config must match it (e.g. blog-preview)
         type: string
         default: ''
-      dispatch_target:
-        description: Pass github.event.inputs.target from the caller; empty (default) or "persistent-dev". "persistent-dev" only SELECTS the persistent-dev delivery kind for a workflow_dispatch of the approved persistent_dev_ref (hybrid); the run is the standard CI -> Plan -> Migrate -> Deploy -> Smoke -> Rollback pipeline. Any other value, or an unapproved ref, fails the Plan before any mutation.
-        type: string
-        default: ''
+      # ---- Deferred verification (opt-in, e.g. a cross-service smoke that must wait for another Worker) ----
       pipeline_phase:
         description: >
           all (default) | deploy | verify. Opt-in split for a Worker whose Smoke must wait for ANOTHER Worker's job (a job
           inside a reusable workflow cannot `needs` a job of a different call). `deploy` = CI/E2E, Migration, Deploy
-          and Shared Dev publish; NO smoke, rollback or release; its `phase_state` output is the hand-off. `verify` = a
+          and a Dev publish; NO smoke, rollback or release; its `phase_state` output is the hand-off. `verify` = a
           SECOND call (same workflow, `needs` the deploy call and the other Worker's call) that runs only Smoke,
-          Rollback, Shared Dev smoke / recovery and Release. The default `all` is the unchanged single call.
+          Rollback, Smoke / recovery and Release. The default `all` is the unchanged single call.
         type: string
         default: all
       phase_state:
@@ -386,7 +337,7 @@ on:
       CLOUDFLARE_ACCOUNT_ID:
         required: false
       PREVIEW_SECRETS:
-        description: Optional KEY=VALUE lines of Preview-only secrets exported to the Preview build and smoke
+        description: ACCEPTED BUT UNUSED (kept so existing callers do not break) - a Preview's application code (build and smoke command) never receives a secret. Remove it from the caller.
         required: false
       SMOKE_USERNAME:
         required: false
@@ -396,28 +347,19 @@ on:
         description: Token for release_cmd (exported as GH_TOKEN); defaults to nothing, GITHUB_TOKEN is NOT used for releases
         required: false
 
-# One run-level concurrency group per piece of shared mutable state (GitHub `concurrency` cannot span two jobs, so the whole RUN is the
-# unit; CI and E2E still run in parallel inside a run). `queue: max` keeps FIFO instead of cancelling an older pending run (beyond 100
-# GitHub cancels the extra run: fail-closed, it deploys nothing). The identity is the RESOURCE, not the app: `d1_lock_scope` replaces
-# app_name so apps that share one physical D1 share one group, and Production and non-Production are always different groups:
-#   main                               -> cfv2-prod-<d1_lock_scope|app_name>
-#   branch, d1_migrations, a non-main channel enabled (Preview and/or Shared Dev, strategy != production-only)
-#                                      -> cfv2-nonprod-d1-<d1_lock_scope|app_name>   (Preview AND Shared Dev D1)
-#   branch, Shared Dev on, no D1 lock  -> cfv2-shared-dev-<app_name>                  (the ONE Dev Worker)
-#   branch, both channels off          -> cfv2-<app_name>-preview-<branch>            (CI-only: no shared D1 serialization)
-#   workflow_dispatch target=persistent-dev (any approved ref, main included) -> the SAME group as the automatic Shared Dev push
-#                                      (cfv2-nonprod-d1-<scope> with d1_migrations, else cfv2-shared-dev-<app>): never the Production group
-#   PR / delete / any other event      -> a private group (never queues behind a deploy)
+# One run-level concurrency group per piece of shared mutable state (GitHub `concurrency` cannot span two jobs, so the whole RUN is the unit; CI and
+# E2E still run in parallel inside a run). `queue: max` keeps FIFO instead of cancelling an older pending run. The identity is the RESOURCE:
+#   main push                          -> cfv2-prod-<d1_lock_scope|app_name>
+#   workflow_dispatch target=dev       -> cfv2-nonprod-d1-<scope> with d1_migrations, else cfv2-shared-dev-<app_name> (never the Production group)
+#   same-repo PR with preview_policy pr -> cfv2-<app_name>-pr-<number>
+#   anything else                      -> a private per-run group (never queues behind a deploy)
 # The `cfv2-` prefix is static on purpose: never reuse it (or ${{ github.workflow }}) in a CALLER group, or caller and callee deadlock.
-# A repo-local group does NOT protect a D1 shared with another repository. `queue` is unknown to actionlint 1.7.12: .github/actionlint.yaml.
-#
-# GitHub evaluates this BEFORE any job, so it cannot read a Plan output: this is the one calculation that must live in YAML. Its canonical
-# twin is runLockGroup() in actions/cf-preview/delivery.mjs (the Plan emits it as `group`; test-workflow-contract.py renders this expression
-# and compares both over a scenario matrix). A verify call (pipeline_phase=verify) schedules under the group its DEPLOY call recorded in
-# phase_state; the Plan job then proves, before any mutation, that it equals runLockGroup() of the deploy call's own inputs - a wrong or
-# forged value fails the run there, it can never mutate under another lock.
+# GitHub evaluates this BEFORE any job, so it cannot read a Plan output: this is the one calculation that must live in YAML. Its canonical twin
+# is runLockGroup() in actions/cf-preview/delivery.mjs (the Plan emits it as `group`; the unit tests pin the JS twin and the Plan proves a verify
+# call's group before any mutation). A verify call (pipeline_phase=verify) schedules under the group its DEPLOY call recorded in phase_state.
+# `queue` is unknown to actionlint 1.7.12: .github/actionlint.yaml.
 concurrency:
-  group: ${{ inputs.pipeline_phase == 'verify' && (fromJSON(inputs.phase_state).group || format('cfv2-run-{0}', github.run_id)) || ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref_type == 'branch') && ((github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev') && (inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || format('cfv2-shared-dev-{0}', inputs.app_name)) || github.ref == 'refs/heads/main' && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.preview_on_branch_push || inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (inputs.deployment_strategy != 'production-only' && (inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push) && format('cfv2-shared-dev-{0}', inputs.app_name) || format('cfv2-{0}-preview-{1}', inputs.app_name, github.ref_name)))) || format('cfv2-run-{0}', github.run_id) }}
+  group: ${{ inputs.pipeline_phase == 'verify' && (fromJSON(inputs.phase_state).group || format('cfv2-run-{0}', github.run_id)) || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'dev') && (inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || format('cfv2-shared-dev-{0}', inputs.app_name)) || (github.event_name == 'push' && github.ref == 'refs/heads/main') && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && inputs.preview_policy == 'pr') && format('cfv2-{0}-pr-{1}', inputs.app_name, github.event.pull_request.number) || format('cfv2-run-{0}', github.run_id) }}
   queue: max
 
 permissions:
@@ -435,37 +377,25 @@ env:
 
 jobs:
   # -------------------------------------------------------------------------
-  # CI — ONE call of _cf-worker-ci.yml (six parallel checks + the fail-closed Validation Gate). Credential-free; fork PRs run it, same-repo
-  # PRs are covered by the push run of the same SHA. Its verdict is the only upstream condition of the Plan.
-  # -------------------------------------------------------------------------
-  # CI — ONE call of _cf-worker-ci.yml: Lint, Typecheck, Unit, Integration, Build Validation and E2E as six independent, parallel jobs,
-  # then the fail-closed Validation Gate. Credential-free; fork PRs run it, same-repo PRs are covered by the push run of the same SHA.
-  # Its result is the only upstream condition of the Plan.
+  # CI — ONE call of _cf-worker-ci.yml: Plan, the Verify / Test task matrices and E2E in parallel, then the fail-closed Gate. Credential-free. The event
+  # decides the stages (push = Verify; pull_request / merge_group = Verify + Test on the merge candidate). Its Gate is an upstream condition of every Migrate / Deploy (not of the Plan or the Build, which run concurrently with it).
   # -------------------------------------------------------------------------
   ci:
     name: CI
-    if: github.event_name != 'delete' && inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
+    if: github.event_name != 'delete' && inputs.pipeline_phase != 'verify' && !(github.event_name == 'pull_request' && github.event.action == 'closed')
     uses: $/.github/workflows/_cf-worker-ci.yml
     with:
       app_name: ${{ inputs.app_name }}
       app_path: ${{ inputs.app_path }}
       app_version: ${{ inputs.app_version }}
       runner: ${{ inputs.runner }}
-      lint_cmd: ${{ inputs.lint_cmd }}
-      typecheck_cmd: ${{ inputs.typecheck_cmd }}
-      test_unit_cmd: ${{ inputs.test_unit_cmd }}
-      test_integration_cmd: ${{ inputs.test_integration_cmd }}
-      build_cmd: ${{ inputs.build_cmd }}
+      verify_tasks: ${{ inputs.verify_tasks }}
+      test_tasks: ${{ inputs.test_tasks }}
       ci_env: ${{ inputs.ci_env }}
       use_mailpit: ${{ inputs.use_mailpit }}
       build_env_prod: ${{ inputs.build_env_prod }}
       build_env_preview: ${{ inputs.build_env_preview }}
       build_env_dev: ${{ inputs.build_env_dev }}
-      # The CI environment follows the INTENDED deployment target, not only the ref: a persistent-dev dispatch (even from `main`) and an
-      # automatic push whose ONLY target is Shared Dev are validated against the Dev build env (never Production env vars); several kinds
-      # at once keep the Preview contract. Pure event/input resolution (CI runs before the Plan; the Plan stays
-      # the authorization gate). JS twin: delivery.mjs ciTargetEnv.
-      ci_target_env: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'persistent-dev' && 'dev' || (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main' && inputs.dispatch_target == '' && inputs.deployment_strategy != 'production-only' && inputs.shared_dev_on_branch_push && !inputs.preview_on_branch_push && !inputs.shared_dev_native_preview_on_branch_push && 'dev' || github.ref == 'refs/heads/main' && 'prod' || 'preview' }}
       test_e2e_cmd: ${{ inputs.test_e2e_cmd }}
       test_e2e_setup_cmd: ${{ inputs.test_e2e_setup_cmd }}
       test_e2e_build_cmd: ${{ inputs.test_e2e_build_cmd }}
@@ -473,33 +403,36 @@ jobs:
       test_e2e_env: ${{ inputs.test_e2e_env }}
 
   # -------------------------------------------------------------------------
-  # Plan — pure data, no Cloudflare credentials: the enabled delivery kinds of THIS event, the ONE physical D1 they share (distinct
-  # databases fail the plan) and its migration owner, the per-kind `on_<kind>` switches and target `descriptors`, the canonical lock `group`.
-  # Runs only after a passed CI, so every job below that needs the plan is implicitly gated by CI. A verify call plans from phase_state.
+  # Plan — pure data and the ONLY Cloudflare read before the build: THE delivery of this event (or none), its descriptor, the physical D1 to migrate, the canonical
+  # lock `group` and the canonical target URL (a Preview's URL comes from Cloudflare, so one step - that runs only this repository's tooling, never application code
+  # - gets the token). It does NOT wait for CI: the Build runs concurrently with Verify / Test, and every mutation below waits for the CI Gate. Runs only for an event
+  # that can deliver (main push, same-repo PR with preview_policy pr, dispatch), so a feature push does not pay for it. A verify call plans from phase_state. An
+  # explicit but unservable dispatch_target always reaches the Plan, which then ALWAYS fails (resolveDelivery): such a run is red instead of silently green.
   # -------------------------------------------------------------------------
   plan:
     name: Plan
-    needs: [ci]
-    # The last clause makes an explicit but unservable request (a dispatch_target on a tag / PR / push / delete event) reach the Plan even
-    # without a passed CI: the Plan then ALWAYS fails (resolveDeliveryTargets), so such a run is red instead of silently green, and it
-    # can never emit a target (no downstream job runs).
-    if: always() && (inputs.pipeline_phase == 'verify' || (needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed' && github.ref_type == 'branch' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) || (inputs.dispatch_target != '' && (github.event_name != 'workflow_dispatch' || github.ref_type != 'branch')))
+    if: inputs.pipeline_phase == 'verify' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && inputs.preview_policy == 'pr') || github.event_name == 'workflow_dispatch' || inputs.dispatch_target != ''
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     outputs:
-      kinds: ${{ steps.plan.outputs.kinds }}
-      descriptors: ${{ steps.plan.outputs.descriptors }}
-      has_targets: ${{ steps.plan.outputs.has_targets }}
+      has_delivery: ${{ steps.plan.outputs.has_delivery }}
+      target: ${{ steps.plan.outputs.target }}
+      driver: ${{ steps.plan.outputs.driver }}
+      descriptor: ${{ steps.plan.outputs.descriptor }}
+      inputs_json: ${{ steps.plan.outputs.inputs_json }}
       has_migrations: ${{ steps.plan.outputs.has_migrations }}
       migration: ${{ steps.plan.outputs.migration }}
-      on_production: ${{ steps.plan.outputs.on_production }}
-      on_native_branch: ${{ steps.plan.outputs.on_native_branch }}
-      on_native_dev: ${{ steps.plan.outputs.on_native_dev }}
-      on_persistent_dev: ${{ steps.plan.outputs.on_persistent_dev }}
       group: ${{ steps.plan.outputs.group }}
+      slot: ${{ steps.plan.outputs.slot }}
+      preview_name: ${{ steps.plan.outputs.preview_name }}
+      url_host: ${{ steps.plan.outputs.url_host }}
+      artifact_base: ${{ steps.plan.outputs.artifact_base }}
+      url_explicit: ${{ steps.plan.outputs.url_explicit }}
+      target_url: ${{ steps.url.outputs.target_url }}
     steps:
+      # Only a Production / Dev plan reads the project's Wrangler config (the D1 to migrate); a PR (untrusted code) is never checked out here.
       - uses: actions/checkout@v6
-        if: inputs.pipeline_phase != 'verify'
+        if: inputs.pipeline_phase != 'verify' && github.event_name != 'pull_request'
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -515,25 +448,87 @@ jobs:
           PHASE_STATE: ${{ inputs.pipeline_phase == 'verify' && inputs.phase_state || '{}' }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           PHASE: ${{ inputs.pipeline_phase }}
+          IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+          PR_ACTION: ${{ github.event.action }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          node "$TOOLS_DIR/cli.mjs" plan --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" --phase "$PHASE" --run-id "$GITHUB_RUN_ID" --app-dir "$GITHUB_WORKSPACE/${{ inputs.app_path }}" | tee -a "$GITHUB_OUTPUT"
+          node "$TOOLS_DIR/cli.mjs" plan --event "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" --phase "$PHASE" --run-id "$GITHUB_RUN_ID" --fork "$IS_FORK" --pr-action "$PR_ACTION" --pr-number "$PR_NUMBER" --app-dir "$GITHUB_WORKSPACE/${{ inputs.app_path }}" | tee -a "$GITHUB_OUTPUT"
+      # The canonical URL, resolved BEFORE the build (a Preview's comes from the host Worker's Cloudflare-reported suffix; read-only). Build and Publish both
+      # require the artifact and the published URL to equal it.
+      - id: url
+        if: steps.plan.outputs.has_delivery == 'true' && inputs.pipeline_phase != 'verify'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SLOT: ${{ steps.plan.outputs.slot }}
+          NAME: ${{ steps.plan.outputs.preview_name }}
+          HOST: ${{ steps.plan.outputs.url_host }}
+          EXPLICIT: ${{ steps.plan.outputs.url_explicit }}
+          URL_SUFFIX: ${{ inputs.preview_url_suffix }}
+          HOST_CHECK: ${{ inputs.preview_host_check }}
+        run: |
+          node "$TOOLS_DIR/cli.mjs" resolve-url --kind "$SLOT" --name "$NAME" --host-worker "$HOST" --explicit "$EXPLICIT" --suffix "$URL_SUFFIX" --host-check "$HOST_CHECK" | sed -n 's/^target_url=/target_url=/p' | tee -a "$GITHUB_OUTPUT"
+
+  # -------------------------------------------------------------------------
+  # Build — the UNPRIVILEGED target build (stage build of the delivery engine). It runs the application's dependency install and build for the planned target,
+  # audits the effective config, bundles it offline and uploads ONE artifact. No Cloudflare credential, no write token, no environment: the only job that runs
+  # application build code. A pull request builds the merge candidate CI tests, on an ephemeral GitHub-hosted runner that never shares a host with a credential-bearing
+  # job. It needs only the Plan, so it runs concurrently with Verify / Test; nothing it produces is used before the CI Gate passes.
+  # -------------------------------------------------------------------------
+  build:
+    name: Build
+    needs: [plan]
+    if: needs.plan.result == 'success' && needs.plan.outputs.has_delivery == 'true' && inputs.pipeline_phase != 'verify'
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || inputs.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      # ONE identity: <plan's repo/app/slot base>-<run_id>-<attempt>. Migration and Publish read it from here; the upload below uses the same value.
+      artifact_name: ${{ format('{0}-{1}-{2}', needs.plan.outputs.artifact_base, github.run_id, github.run_attempt) }}
+      artifact_attempt: ${{ github.run_attempt }}
+    env:
+      ARTIFACT_NAME: ${{ format('{0}-{1}-{2}', needs.plan.outputs.artifact_base, github.run_id, github.run_attempt) }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: engine
+        uses: $/actions/cf-deploy
+        with:
+          target: ${{ fromJSON(needs.plan.outputs.descriptor).engine_target }}
+          descriptor: ${{ needs.plan.outputs.descriptor }}
+          kind: ${{ fromJSON(needs.plan.outputs.descriptor).slot }}
+          stage: build
+          artifact_dir: ${{ runner.temp }}/cfv2-artifact
+          target_url: ${{ needs.plan.outputs.target_url }}
+          inputs_json: ${{ needs.plan.outputs.inputs_json }}
+          d1_expected_id: ${{ fromJSON(needs.plan.outputs.descriptor).d1_expected_id }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/cfv2-artifact
+          if-no-files-found: error
+          retention-days: 7
 
   # =========================================================================
-  # Migration — the ONE job that mutates a database; there is no separate Preflight stage. Its steps run in this order and a failing step
-  # stops the job, so every read-only check precedes the single remote mutation:
-  #   0. precheck (stage precheck): two read-only SELECTs on the owner's exact physical D1 (identity checked against the plan first). NOTHING
-  #      pending -> steps 1-2 are skipped, no target is built here, and the result carries `precheck: verified_no_pending` bound to the owner,
-  #      the D1 id and this commit (the Delivery gate accepts it like an applied migration; a skipped / failed / stale job never carries it).
-  #      A failing or unreadable query fails the job (never read as "nothing pending"). Pending, or anything it cannot prove -> steps 1-2.
-  #   1. each enabled target that is not the owner: target build, effective-config audit, exact D1 binding (stage preflight)
-  #   2. the owner: target build, audit, exact D1 binding, stale-SHA guard, then the migration (stage migrate)
-  # The plan picked the owner and its Environment (main -> <app>/prod with its approvals; else the shared Preview/Dev D1). Skipped (Delivery
-  # proceeds) without d1_migrations; never on pull_request, delete or a verify call. The D1 schema is never rolled back automatically.
+  # Migration — the ONE job that mutates a database (production and dev only; a Preview never migrates). Its steps run in order and a failing step stops the
+  # job, so every read-only check precedes the single remote mutation:
+  #   0. precheck: two read-only SELECTs on the planned physical D1 (identity checked against the plan first). NOTHING pending -> step 1 is skipped, no
+  #      target is built here, and the result carries `precheck: verified_no_pending` bound to the D1 id and this commit (the Delivery gate accepts it like an
+  #      applied migration; a skipped / failed / stale job never carries it). A failing or unreadable query fails the job (never "nothing pending").
+  #   1. target build, effective-config audit, exact D1 binding, stale-SHA guard, then the migration (stage migrate)
+  # The plan picked the Environment (main -> <app>/prod with its approvals; dev -> the Dev Environment). Skipped (Delivery proceeds) when there is no migration;
+  # never on pull_request, delete or a verify call. The D1 schema is never rolled back automatically.
   # =========================================================================
   migration:
     name: Migrate
-    needs: [plan]
-    if: always() && inputs.pipeline_phase != 'verify' && inputs.d1_migrations && needs.plan.result == 'success' && needs.plan.outputs.has_migrations == 'true'
+    needs: [plan, ci, build]
+    if: always() && inputs.pipeline_phase != 'verify' && needs.plan.result == 'success' && needs.plan.outputs.has_migrations == 'true' && needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed' && needs.build.result == 'success'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     environment:
@@ -543,7 +538,7 @@ jobs:
       deployment: false
     permissions:
       contents: read
-      deployments: read # Preview identity guard reads the ledger owner (no ledger entry is written here)
+      deployments: read
     outputs:
       migration_json: ${{ steps.precheck.outputs.precheck == 'pending' && toJSON(steps.migrate.outputs) || toJSON(steps.precheck.outputs) }}
       migration_status: ${{ steps.result.outputs.status }}
@@ -557,52 +552,34 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      # Read-only first: when the owner's physical D1 has NOTHING pending, no target is built here (each Deploy still builds, audits and checks
-      # its D1 binding before it publishes, and its gate requires this verified result). Pending -> the full path below, unchanged.
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: ${{ runner.temp }}/cfv2-artifact
       - id: precheck
         name: Check pending D1 migrations (read-only, no build)
         uses: $/actions/cf-deploy
         with:
-          target: ${{ fromJSON(needs.plan.outputs.descriptors)[fromJSON(needs.plan.outputs.migration).kind].target }}
-          descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)[fromJSON(needs.plan.outputs.migration).kind]) }}
-          kind: ${{ fromJSON(needs.plan.outputs.migration).kind }}
+          target: ${{ fromJSON(needs.plan.outputs.descriptor).engine_target }}
+          descriptor: ${{ needs.plan.outputs.descriptor }}
+          kind: ${{ fromJSON(needs.plan.outputs.descriptor).slot }}
           stage: precheck
-          inputs_json: ${{ toJSON(inputs) }}
+          inputs_json: ${{ needs.plan.outputs.inputs_json }}
           d1_expected_id: ${{ fromJSON(needs.plan.outputs.migration).d1_id }}
-      - name: Verify native-dev build and D1 binding
-        if: steps.precheck.outputs.precheck == 'pending' && needs.plan.outputs.on_native_dev == 'true' && fromJSON(needs.plan.outputs.migration).kind != 'native-dev'
-        uses: $/actions/cf-deploy
-        with:
-          target: ${{ fromJSON(needs.plan.outputs.descriptors)['native-dev'].target }}
-          descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-dev']) }}
-          kind: native-dev
-          stage: preflight
-          inputs_json: ${{ toJSON(inputs) }}
-          d1_expected_id: ${{ fromJSON(needs.plan.outputs.descriptors)['native-dev'].d1_expected_id }}
-          preview_secrets: ${{ fromJSON(needs.plan.outputs.descriptors)['native-dev'].target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
-      - name: Verify persistent-dev build and D1 binding
-        if: steps.precheck.outputs.precheck == 'pending' && needs.plan.outputs.on_persistent_dev == 'true' && fromJSON(needs.plan.outputs.migration).kind != 'persistent-dev'
-        uses: $/actions/cf-deploy
-        with:
-          target: ${{ fromJSON(needs.plan.outputs.descriptors)['persistent-dev'].target }}
-          descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
-          kind: persistent-dev
-          stage: preflight
-          inputs_json: ${{ toJSON(inputs) }}
-          d1_expected_id: ${{ fromJSON(needs.plan.outputs.descriptors)['persistent-dev'].d1_expected_id }}
-          preview_secrets: ${{ fromJSON(needs.plan.outputs.descriptors)['persistent-dev'].target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
       - id: migrate
         name: Apply pending D1 migrations (once)
         if: steps.precheck.outputs.precheck == 'pending'
         uses: $/actions/cf-deploy
         with:
-          target: ${{ fromJSON(needs.plan.outputs.descriptors)[fromJSON(needs.plan.outputs.migration).kind].target }}
-          descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)[fromJSON(needs.plan.outputs.migration).kind]) }}
-          kind: ${{ fromJSON(needs.plan.outputs.migration).kind }}
+          target: ${{ fromJSON(needs.plan.outputs.descriptor).engine_target }}
+          descriptor: ${{ needs.plan.outputs.descriptor }}
+          kind: ${{ fromJSON(needs.plan.outputs.descriptor).slot }}
           stage: migrate
-          inputs_json: ${{ toJSON(inputs) }}
+          artifact_dir: ${{ runner.temp }}/cfv2-artifact
+          artifact_attempt: ${{ needs.build.outputs.artifact_attempt }}
+          target_url: ${{ needs.plan.outputs.target_url }}
+          inputs_json: ${{ needs.plan.outputs.inputs_json }}
           d1_expected_id: ${{ fromJSON(needs.plan.outputs.migration).d1_id }}
-          preview_secrets: ${{ fromJSON(needs.plan.outputs.descriptors)[fromJSON(needs.plan.outputs.migration).kind].target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
       # The one deterministic public status: applied | none (nothing was pending / superseded) when the job succeeded, failed otherwise
       # (also when a validation step stopped the job before the migrate step ran).
       - id: result
@@ -613,101 +590,47 @@ jobs:
         run: echo "status=$([ "$JOB_STATUS" = success ] && echo "${STATE:-none}" || echo failed)" >> "$GITHUB_OUTPUT"
 
   # =========================================================================
-  # Delivery — ONE call per enabled kind of _cf-worker-delivery.yml (deploy -> smoke -> conditional rollback). A kind needs only the plan and
-  # the single Migration job (success, or skipped when nothing is migrated) and is never touched by another kind's Deploy / Smoke / Rollback.
+  # Delivery — ONE call of _cf-worker-delivery.yml (deploy -> smoke -> conditional rollback) for the planned target. It needs the plan and the single
+  # Migration job (success, or skipped when nothing is migrated). The driver (worker | native-preview) is the only thing that differs.
   # =========================================================================
-  delivery_production:
-    name: production
-    needs: [plan, migration]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_production == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
+  delivery:
+    name: ${{ needs.plan.outputs.target || 'delivery' }}
+    needs: [plan, ci, build, migration]
+    # Every remote mutation waits for: a plan, the CI Gate (not for a deferred verify call: its CI ran in the deploy call), the Build's artifact, and the Migration.
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.has_delivery == 'true' && (inputs.pipeline_phase == 'verify' || (needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed' && needs.build.result == 'success')) && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
     uses: $/.github/workflows/_cf-worker-delivery.yml
-    permissions: &delivery_permissions
+    permissions:
       contents: read
       deployments: write
       pull-requests: write
     with:
-      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['production']) }}
+      descriptor: ${{ needs.plan.outputs.descriptor }}
+      artifact_name: ${{ needs.build.outputs.artifact_name }}
+      artifact_attempt: ${{ needs.build.outputs.artifact_attempt }}
+      target_url: ${{ needs.plan.outputs.target_url }}
       runner: ${{ inputs.runner }}
-      inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
+      inputs_json: ${{ needs.plan.outputs.inputs_json }}
       call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
       phase: ${{ inputs.pipeline_phase }}
       migration_result: ${{ needs.migration.result }}
       migration_json: ${{ needs.migration.outputs.migration_json }}
-      handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_production || '' }}
-      migration_json_in: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).migration.mj_production || '' }}
+      handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).handoff || '' }}
+      migration_json_in: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).migration || '' }}
       upstream_gate: ${{ inputs.pipeline_phase == 'verify' && inputs.upstream_gate || '' }}
-    secrets: &delivery_secrets
+    secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      PREVIEW_SECRETS: ${{ secrets.PREVIEW_SECRETS }}
       SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
       SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
 
-  delivery_native_branch:
-    name: native-branch
-    needs: [plan, migration]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_native_branch == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
-    uses: $/.github/workflows/_cf-worker-delivery.yml
-    permissions: *delivery_permissions
-    with:
-      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-branch']) }}
-      runner: ${{ inputs.runner }}
-      inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
-      call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
-      phase: ${{ inputs.pipeline_phase }}
-      migration_result: ${{ needs.migration.result }}
-      migration_json: ${{ needs.migration.outputs.migration_json }}
-      handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_native_branch || '' }}
-      migration_json_in: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).migration.mj_native_branch || '' }}
-      upstream_gate: ${{ inputs.pipeline_phase == 'verify' && inputs.upstream_gate || '' }}
-    secrets: *delivery_secrets
-
-  delivery_native_dev:
-    name: native-dev
-    needs: [plan, migration]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_native_dev == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
-    uses: $/.github/workflows/_cf-worker-delivery.yml
-    permissions: *delivery_permissions
-    with:
-      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['native-dev']) }}
-      runner: ${{ inputs.runner }}
-      inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
-      call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
-      phase: ${{ inputs.pipeline_phase }}
-      migration_result: ${{ needs.migration.result }}
-      migration_json: ${{ needs.migration.outputs.migration_json }}
-      handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_native_dev || '' }}
-      migration_json_in: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).migration.mj_native_dev || '' }}
-      upstream_gate: ${{ inputs.pipeline_phase == 'verify' && inputs.upstream_gate || '' }}
-    secrets: *delivery_secrets
-
-  delivery_persistent_dev:
-    name: persistent-dev
-    needs: [plan, migration]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.on_persistent_dev == 'true' && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
-    uses: $/.github/workflows/_cf-worker-delivery.yml
-    permissions: *delivery_permissions
-    with:
-      descriptor: ${{ toJSON(fromJSON(needs.plan.outputs.descriptors)['persistent-dev']) }}
-      runner: ${{ inputs.runner }}
-      inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(fromJSON(inputs.phase_state).inputs) || toJSON(inputs) }}
-      call_inputs_json: ${{ inputs.pipeline_phase == 'verify' && toJSON(inputs) || '' }}
-      phase: ${{ inputs.pipeline_phase }}
-      migration_result: ${{ needs.migration.result }}
-      migration_json: ${{ needs.migration.outputs.migration_json }}
-      handoff_json: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).deploy.h_persistent_dev || '' }}
-      migration_json_in: ${{ inputs.pipeline_phase == 'verify' && fromJSON(inputs.phase_state).migration.mj_persistent_dev || '' }}
-      upstream_gate: ${{ inputs.pipeline_phase == 'verify' && inputs.upstream_gate || '' }}
-    secrets: *delivery_secrets
-
   # -------------------------------------------------------------------------
-  # Release — optional, main only, only after THIS run deployed its own SHA to Production, the Production Smoke verified it at
-  # content level (smoke_mode skip / liveness never qualify) and no Rollback ran. It reads ONLY the Production delivery call.
+  # Release — optional, main push only, only after THIS run deployed its own SHA to Production, the Production Smoke verified it at content level
+  # (smoke_mode skip / liveness never qualify) and no Rollback ran.
   # -------------------------------------------------------------------------
   release:
     name: Release
-    needs: [delivery_production]
-    if: always() && inputs.release_cmd != '' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && inputs.dispatch_target != 'persistent-dev' && inputs.pipeline_phase != 'deploy' && needs.delivery_production.result == 'success' && fromJSON(needs.delivery_production.outputs.smoke_json || '{}').deployed_and_verified == 'true' && needs.delivery_production.outputs.rollback_result == ''
+    needs: [plan, delivery]
+    if: always() && inputs.release_cmd != '' && github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.plan.outputs.target == 'production' && inputs.pipeline_phase != 'deploy' && needs.delivery.result == 'success' && fromJSON(needs.delivery.outputs.smoke_json || '{}').deployed_and_verified == 'true' && needs.delivery.outputs.rollback_result == ''
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 20
     permissions:
@@ -729,26 +652,11 @@ jobs:
         run: bash -c "$CMD"
 
   # -------------------------------------------------------------------------
-  # Config guard — a production-only Worker must never expose a Dev deployment, and the two automatic Dev channels conflict. Fails the run
-  # on ANY event so a misconfigured caller is visible. (production-only keeps ignoring preview_on_branch_push=true, for compatibility.)
-  # -------------------------------------------------------------------------
-  config-guard:
-    name: Guard
-    if: inputs.pipeline_phase != 'verify' && ((inputs.deployment_strategy == 'production-only' && (inputs.shared_dev_on_branch_push || inputs.shared_dev_native_preview_on_branch_push)) || (inputs.shared_dev_on_branch_push && inputs.shared_dev_native_preview_on_branch_push))
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 2
-    steps:
-      - run: |
-          echo "::error::Invalid Dev channel configuration: production-only cannot be combined with shared_dev_on_branch_push / shared_dev_native_preview_on_branch_push (a production-only Worker must not expose a Dev deployment), and the separate persistent Dev Worker and the Native Dev Preview are conflicting automatic Dev channels - enable only one."
-          exit 1
-
-  # -------------------------------------------------------------------------
-  # Event handlers outside the delivery DAG, one small reusable workflow each: `lifecycle` (same-repo PR -> comment the verified Preview URL;
-  # branch delete -> retire the ledger, the Preview is KEPT).
+  # Lifecycle — a same-repo PR with a Preview was closed: retire its ledger (the Preview is kept).
   # -------------------------------------------------------------------------
   lifecycle:
     name: lifecycle
-    if: inputs.pipeline_phase != 'verify' && inputs.deployment_strategy != 'production-only' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'delete' && github.event.ref_type == 'branch'))
+    if: inputs.pipeline_phase != 'verify' && inputs.preview_policy == 'pr' && github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository
     uses: $/.github/workflows/_cf-worker-lifecycle.yml
     permissions:
       contents: read
@@ -757,5 +665,4 @@ jobs:
     with:
       app_name: ${{ inputs.app_name }}
       preview_worker_name: ${{ inputs.preview_worker_name }}
-      reserve_native_dev: ${{ inputs.shared_dev_native_preview_on_branch_push }}
       runner: ${{ inputs.runner }}

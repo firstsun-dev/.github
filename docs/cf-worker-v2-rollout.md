@@ -1,5 +1,7 @@
 # CF Worker v2 — `v2` tag promotion: preconditions, procedure, rollback
 
+> **Superseded (2026-11-13).** This record describes the four-kind (`production / native-branch / native-dev / persistent-dev`) model replaced by the stage/target design in [cf-worker-v2.md](cf-worker-v2.md) and `openspec/changes/simplify-cf-ci-stages-and-dev-delivery`. Kept as history; its inputs no longer exist.
+
 Status at the time of writing (2026-11-03): **PR #89 is ready to merge; the floating `v2` tag is NOT ready to be promoted.** This document does not move any tag. Promotion needs a separate, explicit authorization.
 
 | Item | Value |

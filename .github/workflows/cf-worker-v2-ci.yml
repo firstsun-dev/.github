@@ -1,68 +1,75 @@
-name: CF Worker v2 contract tests
+name: CF Worker v2 pipeline tests
+
+# Self-tests of the shared Cloudflare Worker pipeline: three independent suites in parallel, ONE stable required check (`Pipeline Gate`).
+#   static  actionlint, shellcheck, workflow / action structure       unit    pure logic (tasks, routing, planning, gates, CLI contract)
+#   safety  engine scenarios with stub wrangler / gh / curl (no provider side effects)
+# No `paths` filter: a required check must exist for every PR. Read-only; nothing is deployed or migrated from here.
+# Real GitHub scheduling / permissions / reusable-workflow calls are proven by the canary on cf-v2-scratch-caller, not emulated here.
 
 on:
   pull_request:
-    paths:
-      - '.github/workflows/_cf-worker-v2.yml'
-      - '.github/workflows/_cf-worker-ci.yml'
-      - '.github/workflows/_cf-worker-delivery.yml'
-      - '.github/workflows/_cf-worker-lifecycle.yml'
-      - 'actions/cf-tools/**'
-      - '.github/workflows/cf-worker-v2-ci.yml'
-      - '.github/actionlint.yaml'
-      - 'actions/cf-preview/**'
-      - 'actions/cf-preview-gc/**'
-      - '.github/workflows/_cf-worker-preview-gc.yml'
-      - 'actions/cf-deploy/**'
-      - 'actions/cf-ci-check/**'
-      - 'scripts/cf-preview/**'
   push:
     branches: [main]
-    paths:
-      - '.github/workflows/_cf-worker-v2.yml'
-      - '.github/workflows/_cf-worker-ci.yml'
-      - '.github/workflows/_cf-worker-delivery.yml'
-      - '.github/workflows/_cf-worker-lifecycle.yml'
-      - 'actions/cf-tools/**'
-      - '.github/actionlint.yaml'
-      - 'actions/cf-preview/**'
-      - 'actions/cf-preview-gc/**'
-      - '.github/workflows/_cf-worker-preview-gc.yml'
-      - 'actions/cf-deploy/**'
-      - 'actions/cf-ci-check/**'
-      - 'scripts/cf-preview/**'
 
 permissions:
   contents: read
 
-# Validation only (read-only, no deployment or migration is ever started from here): a newer PR commit supersedes the
-# older run. main pushes are never cancelled. Deployment/migration concurrency lives in the called workflows.
 concurrency:
-  group: cf-v2-contract-${{ github.event.pull_request.number || github.ref }}
+  group: cf-v2-pipeline-tests-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  contract:
+  static:
+    name: Static
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - name: Install tooling deps
-        run: cd actions/cf-preview && npm ci --ignore-scripts --no-audit --no-fund
-      - name: Python deps
-        run: pip install --quiet pyyaml==6.0.1
-      - name: FAST profile (contract, unit, stub shell tests) - fails early, before the expensive chain
-        run: LOGDIR="$RUNNER_TEMP/cf-v2-tests" scripts/cf-preview/test.sh fast
-      - name: FULL profile remainder - real Migration -> Deploy -> Smoke -> Rollback chains, Shared/persistent Dev, deferred verify (groups run in parallel)
-        run: LOGDIR="$RUNNER_TEMP/cf-v2-tests" scripts/cf-preview/test.sh chain
-      - name: shellcheck (warnings and above)
+      - run: pip install --quiet pyyaml==6.0.1
+      - name: Install actionlint
+        run: bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12 "$RUNNER_TEMP" && echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - run: scripts/cf-preview/test.sh static
+
+  unit:
+    name: Unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: cd actions/cf-preview && npm ci --ignore-scripts --omit=optional --no-audit --no-fund
+      - run: scripts/cf-preview/test.sh unit
+
+  safety:
+    name: Safety
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: cd actions/cf-preview && npm ci --ignore-scripts --omit=optional --no-audit --no-fund
+      - run: scripts/cf-preview/test.sh safety
+
+  # Fail closed: every suite must have SUCCEEDED; failure, cancellation and a skip all fail the gate.
+  gate:
+    name: Pipeline Gate
+    needs: [static, unit, safety]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - env:
+          STATIC: ${{ needs.static.result }}
+          UNIT: ${{ needs.unit.result }}
+          SAFETY: ${{ needs.safety.result }}
         run: |
-          shellcheck -x -S warning -P SCRIPTDIR actions/cf-preview/*.sh scripts/cf-preview/*.sh
-          python3 scripts/cf-preview/shellcheck-actions.py
-      - name: actionlint
-        run: |
-          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
-          ./actionlint -color .github/workflows/_cf-worker-v2.yml .github/workflows/_cf-worker-ci.yml .github/workflows/_cf-worker-delivery.yml .github/workflows/_cf-worker-lifecycle.yml .github/workflows/_cf-worker-preview-gc.yml .github/workflows/cf-worker-v2-ci.yml
+          bad=0
+          for s in STATIC UNIT SAFETY; do [ "${!s}" = success ] || { echo "::error::$s finished '${!s}' (must succeed)"; bad=1; }; done
+          exit "$bad"

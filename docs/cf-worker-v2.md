@@ -1,208 +1,120 @@
-# Cloudflare Worker CI/CD v2
+# Cloudflare Worker CI/CD v2 — stages and targets
 
-> **Lifecycle — supported v2, maintenance-only (2026-10-21).** This page documents the **currently shipped** `@v2` behavior and remains valid for existing v2 consumers. New CI/CD refactor work and unfinished consumer migrations move to [vNext OpenSpec (PR #57)](https://github.com/firstsun-dev/.github/pull/57); see the [v2 OpenSpec handoff](../openspec/changes/redesign-cloudflare-worker-cicd-v2/tasks.md). **Do not assume vNext is implemented or released.** v1/v2 contracts stay supported until an explicitly reviewed migration.
+Reusable workflow `.github/workflows/_cf-worker-v2.yml` (+ `actions/cf-preview`). OpenSpec: `openspec/changes/simplify-cf-ci-stages-and-dev-delivery`.
+v1 (`_cf-worker-template.yml`, `@v1`) is independent and unchanged. This page replaces the previous v2 guide; the older design records
+(`cf-worker-v2-refactor.md`, `-unified-delivery.md`, `-rollout.md`) describe the superseded four-kind model and are kept as history only.
 
+## Model
 
-Opt-in reusable workflow `.github/workflows/_cf-worker-v2.yml` plus `actions/cf-preview` tooling.
-v1 (`_cf-worker-template.yml`, `@v1`, `@v1.5.x`) is unchanged and independent.
-Spec: `openspec/changes/redesign-cloudflare-worker-cicd-v2`; tracking issue #43.
+Three logical **stages**; the caller chooses the commands, the platform owns orchestration, gates and delivery.
 
-## What it does
+| Stage | What | Parallelism |
+| --- | --- | --- |
+| **Verify** | `verify_tasks`: fast checks (lint, check, build, unit, fast integration, ...) | one matrix leg per task |
+| **Test** | `test_tasks` (+ optional E2E): costly checks (heavy integration, contract, E2E, ...) | one matrix leg per task, concurrent with Verify |
+| **Delivery** | Plan → Migrate → Deploy → Smoke → conditional Rollback → Release | one **target**, one **driver** |
 
-* Every push to a non-`main` branch publishes (or updates) **that branch's own Native Preview** with a stable URL — no PR needed.
-* `main` pushes go through the Production path (Migration → Deploy → Smoke Tests → Revert on Verify Failure, see docs/cf-worker-v2-refactor.md).
-* A Preview is **never** deployed to a shared Dev Worker. Preview, Dev and Production share one account credential pair; isolation is by target Environment, Worker identity and binding guardrails.
-* Strategies: `production-preview` (default), `hybrid` (adds a protected persistent Dev for Cron/Queue), `production-only` (CI only, no Preview — e.g. `anas-mcp`).
+```text
+CI:        Plan -> [Verify tasks || Test tasks || E2E] -> Gate (fail closed)        (no `needs` between Verify and Test)
+Delivery:  Plan ---------> Build (unprivileged) ---+            (Plan and Build run concurrently with CI; nothing is mutated before the CI Gate)
+           CI Gate -------------------------------+--> Migrate (production/dev only) -> Deploy -> Smoke -> Rollback? -> Release (main only)
+```
 
-## Versions and pinning
+Targets: `production`, `preview`, `dev`. Drivers: `worker` (production, or a real `env.dev` Worker) and `native-preview` (PR Preview, stable Dev).
+`production → worker`, `preview → native-preview`, `dev → native-preview | worker`. An event selects **at most one** delivery.
 
-| Ref | Meaning |
-|---|---|
-| `@v2` | floating major tag (same convention as `@v1`); always the latest compatible 2.x |
-| `@v2.x.y` | immutable release |
+## Events
 
-The shared actions and nested workflows are referenced with the self-repository syntax `$/`, i.e. at the **same commit as the workflow you pin in `uses:`** - nothing to keep in sync. `tools_ref` has been removed from the v2 workflow-call interface; callers must delete that obsolete input before adopting the updated workflow. The runner must be **>= 2.336.0** (the org `linux` runners are 2.338.0).
+| Event | Verify | Test | Delivery |
+| --- | --- | --- | --- |
+| feature push | yes | no | none |
+| same-repo PR (opened / synchronize / reopened) | yes, on the merge candidate | yes | `preview` (only with `preview_policy: pr`), after the CI Gate |
+| fork PR | only on the approved GitHub-hosted runner `ubuntu-24.04` (a constant, not an input) | same | never |
+| `merge_group` | yes | yes | none |
+| push to `main` | yes | no (ran pre-merge; protect `main` with the PR Gate) | `production` |
+| `workflow_dispatch`, `dispatch_target: dev`, ref == `approved_dev_ref` | yes | no | `dev` (the configured `dev_driver`) |
+| PR closed | no | no | lifecycle: retire the PR Preview ledger (the Preview is kept) |
 
-| Release | Change |
-|---|---|
-| v2.0.0 | first release (pilot: heaven-www) |
-| v2.1.0 | E2E matrix, Mailpit, `build_env_*`, `preview_smoke_env`; split test jobs behind one `Tests` gate |
-| v2.2.0 | `preview_worker_name` |
-| v2.3.0 | status-aware smoke probe (requires explicit 2xx; recognises Access-protected Previews) |
-| v2.5.0 | Preview name = plain branch slug; deleting a branch keeps its Preview |
-| v2.5.1 | **fix:** Preview/Production were silently skipped when optional test jobs were skipped (use ≥ 2.5.1) |
-| v2.6.0 | the CI job shows the Preview URL (`environment.url`) |
+A manual dispatch can never deploy Production; no automatic event ever reaches the stable Dev. Caller triggers: `push`, `pull_request`
+(`opened, synchronize, reopened, closed`), `workflow_dispatch` (when Dev is enabled), `merge_group` (when a merge queue is required).
 
-## Contract
-
-| Event | production-preview | hybrid | production-only |
-|---|---|---|---|
-| push, non-main | tests → **branch Native Preview** | same; never touches persistent Dev | tests only |
-| pull_request | attach the existing Preview URL (never deploys) | same | tests |
-| fork PR | no secrets, no deploy | same | same |
-| delete (branch) | **Preview is kept**; GitHub ledger retired (optional [Preview GC](cf-worker-preview-gc.md) removes it after 7 days) | same | – |
-| PR closed / merged | Preview kept | same | – |
-| `workflow_dispatch` `target=persistent-dev` on `persistent_dev_ref` | – | protected Dev deploy | – |
-| push main | Production | Production | Production |
-
-### Preview identity and URL
-
-* Name = the normalised branch name: `feat/Solar_Term` → `feat-solar-term`. No prefix, no hash, no commit SHA.
-* URL = `https://<slug>-<worker>.<subdomain>.workers.dev`, e.g. `https://feat-solar-term-blog-preview.firstsun.workers.dev`. One stable URL per branch for the life of the branch; pushes never change it. (Cloudflare also creates a per-deployment URL `<id>-<worker>…`; it is never advertised.)
-* The slug is truncated so `<slug>-<host worker>` fits a 63-character DNS label. An 8-hex slug gets a `b-` prefix so it never resembles a per-deployment URL.
-* Normalisation is lossy (`Feat/A` and `feat-a` → `feat-a`). The GitHub Deployment ledger records which **full branch ref** owns a name; if another ref already owns it, the run **fails in Plan, before any tests**, naming the owner. Rename the branch, or delete that Preview and its ledger.
-* The URL is read only from `wrangler preview --json` → `.preview.urls[0]`; it is never constructed.
-
-### Where to find the URL
-
-* On the **CI job**: `Branch Preview` declares `environment: <app_name>/preview` with the URL → *View deployment* in the Actions graph and run page.
-* Run annotation "Preview URL" and the run summary.
-* Deployments tab, per-branch ledger `<app>/preview/<slug>`; PR comment when a PR is open.
-* Reusable-workflow output `preview_url`.
-
-## Caller
-
-The workflow file that handles `delete` must be on the **default branch**. Branches that still carry an older workflow file keep running that older file on push.
+## Inputs that define behavior
 
 ```yaml
-name: CI/CD
-on:
-  push:                 # no `paths:` filter — every branch push must produce a URL
-  pull_request:
-  delete:
-  workflow_dispatch:
-    inputs:
-      target: { type: choice, options: [none, persistent-dev], default: none }
-permissions:
-  contents: read
-  deployments: write
-  pull-requests: write
-jobs:
-  cf:
-    uses: firstsun-dev/.github/.github/workflows/_cf-worker-v2.yml@v2
-    with:
-      app_name: www
-      build_cmd: pnpm run build
-      deployment_strategy: production-preview
-      app_url_prod: https://example.com
-    secrets:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+with:
+  app_name: blog
+  verify_tasks: >-
+    [{"id":"lint","cmd":"pnpm run lint"},{"id":"check","cmd":"pnpm run check"},
+     {"id":"build","cmd":"pnpm run build"},{"id":"unit","cmd":"pnpm run test:unit"}]
+  test_tasks: >-
+    [{"id":"integration","cmd":"pnpm run test:integration"}]
+  test_e2e_cmd: pnpm run test:e2e:ci        # optional E2E executor (own setup/build, browser variants, report artifact)
+  build_cmd: pnpm run build                  # the DELIVERY build (target URL / env), independent of Verify
+  preview_policy: pr                         # none | pr
+  dev_driver: native-preview                 # none | native-preview | worker
+  approved_dev_ref: refs/heads/main          # required with dev_driver
+  dispatch_target: ${{ github.event.inputs.target }}   # '' | dev
 ```
 
-Notes
+* **Tasks**: `{"id","cmd"}` only; ids unique per stage (`[a-z0-9-]`, ≤ 40 chars), commands non-empty, ≤ 12 tasks. Malformed lists fail the CI Plan before any command runs.
+  An empty list is valid (an empty Test stage still yields a passing Gate). Commands run from `app_path`.
+* **Gate**: job `Gate` (appears as `<caller job> / CI / Gate`). Every expected job must `success`, every unexpected one must be `skipped`, the Plan must succeed;
+  failure, cancellation, unexpected skip or a missing result is red. Make **the Gate of the CI call** the required check; the caller job id keeps it unique per app in a monorepo.
+* **Preview** (`preview_policy: pr`): one Native Preview `pr-<number>` per same-repo PR, delivering the PR head commit after CI passed. A Preview **never migrates a remote D1**
+  (`d1_migrations` is ignored for it); test SQL locally. URL = what Cloudflare publishes (`<name>-<worker>.<subdomain>.workers.dev`), never guessed.
+* **Dev**: a stable `dev` Native Preview, or (`dev_driver: worker`) a real `env.dev` Worker — required for Queue consumers / Cron triggers. Updated only by an approved manual promotion;
+  protect the `<app>/dev` / `<app>/native-dev` GitHub Environment with required reviewers. Dev settings: `app_url_dev`, `build_env_dev`, `dev_build_cmd`, `dev_smoke_cmd`,
+  `dev_worker_name`, `dev_wrangler_env`, `dev_binding_allow`, `dev_deny_resources`.
+* `smoke_mode_overrides` is keyed by target (`production|preview|dev`).
 
-* Preview uses the same `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` as Production and Dev (owner decision). The old `CLOUDFLARE_PREVIEW_*` secrets no longer exist: callers must stop passing them (GitHub rejects undeclared secrets) and there is no fallback.
-* Monorepos: one caller job per Worker (`app_name`, `app_path`), each guarded by a changed-path filter; the `delete` event must run **all** caller jobs (retiring the ledger is idempotent).
-* Run `lint`/typecheck before the shared pipeline in the caller, as usual, and make the `pipeline` job depend on them.
+Removed (no compatibility shim): `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `test_integration_cmd`, `deployment_strategy`, `preview_on_branch_push`,
+`shared_dev_on_branch_push`, `shared_dev_native_preview_on_branch_push`, `persistent_dev_ref`, `build_env_shared_dev_native_preview`,
+`app_url_shared_dev_native_preview`, the per-kind outputs (`dev_*`, `native_dev_*`). Outputs now describe the one delivery:
+`deploy_target`, `deploy_driver`, `deploy_url`, `deploy_verified_url`, `deploy_published_unverified`, `deploy_verified`, `deploy_smoke_level`,
+`version_id`, `previous_version_id`, `migration_status`, `rollback_result`, `deploy_gate_blocked`, `phase_state` (opt-in `pipeline_phase`).
 
-## Inputs worth knowing
+## Build / Publish trust boundary
 
-| Input | Purpose |
-|---|---|
-| `test_unit_cmd`, `test_integration_cmd`, `test_e2e_cmd` (+ `test_e2e_setup_cmd`, `test_e2e_env`, `test_e2e_variants`, `use_mailpit`) | run as parallel jobs behind one `Tests` gate; leave empty to skip |
-| `build_env_preview`, `build_env_prod` | build-time `KEY=VALUE` lines (`VITE_APP_ENV=preview` / `prod` are set automatically) |
-| `preview_smoke_cmd`, `preview_smoke_env`, `preview_sha_path` | smoke on the **exact** Preview URL (`TARGET_URL`, `EXPECTED_SHA`, `PREVIEW_ACCESS_PROTECTED`) |
-| `preview_binding_allow`, `preview_deny_resources` | explicit approvals / forbidden Production resources for the binding audit |
-| `preview_worker_name` | host Previews under another existing Worker (see below) |
-| `production_rollback_policy` | `automatic` \| `manual` \| `disabled` |
-| `pipeline_phase` | `all` (default, unchanged single call) \| `deploy` \| `verify`. Opt-in two-call split for a Smoke that must wait for another Worker's job; see *Deferred verification* in docs/cf-worker-v2-refactor.md |
-| `phase_state` | verify call only: the deploy call's `phase_state` output, passed unchanged (validated data) |
-| `upstream_gate` | verify call only: `needs.<other>.result`; `success`/`skipped` satisfy it, anything else blocks the verification (no smoke, no rollback, Release blocked) |
-| `preview_provision_cmd`, `preview_migrate_cmd` | optional hooks run before publish (resources must be Preview-only) |
-| `preview_cleanup_cmd` | **deprecated and ignored** |
-
-## Hosting Previews under another Worker (`preview_worker_name`)
-
-Native Preview URLs need the **Worker-level** `previews_enabled` setting. Verified: a Worker with
-`{enabled:false, previews_enabled:false}` returns `preview.urls: []`; `{enabled:false, previews_enabled:true}` gets a URL.
-If the production Worker keeps workers.dev / Preview URLs off on purpose (enabling them would expose every uploaded
-Production Version, bound to Production resources), set `preview_worker_name` to an existing dev Worker that has
-`previews_enabled` (Blog uses `blog-preview`). `wrangler preview --worker-name` is used for publish and recovery.
-
-## Preview configuration rules
-
-* Top-level `previews` block (may be `{}`) and a project-local Wrangler ≥ 4.135.0 (the workflow refuses to fall back to Dev/Production).
-* Every Production storage / queue / service binding needs a Preview counterpart on a **different, non-production** resource.
-* **Every Preview binding needs an explicit resource id.** Native Previews do not auto-provision; Cloudflare rejects an id-less binding with API error 10021.
-  Adapters can add bindings at build time (the Astro Cloudflare adapter adds a `SESSION` KV), so preflight audits both the source config and the build-generated (redirected) config.
-* `services`, `hyperdrive`, `secrets_store_secrets` in `previews` need an explicit `preview_binding_allow` entry (e.g. `services:ID`): Preview service bindings reach the target's **Production** deployment.
-* To deliberately share one Production storage resource (R2, KV, Vectorize, Analytics Engine) with Previews, add an exact `preview_binding_allow` entry `kind:BINDING=identity` (e.g. `r2_buckets:CACHE=my-bucket`), the same grammar as `dev_binding_allow`. It waives the Production-collision and `preview_deny_resources` checks for that binding and resource only; a different resource or binding still fails, and a Production D1 can never be shared. Isolation inside the shared resource (e.g. a key prefix) is the caller's responsibility.
-* A Production **Secrets Store secret** can be shared the same way with the exact entry `secrets_store_secrets:BINDING=<store_id>/<secret_name>` (e.g. `secrets_store_secrets:FATSECRET_CLIENT_ID=<store_id>/FATSECRET_CLIENT_ID`). It waives the Production-collision and `preview_deny_resources` checks and the high-risk allow requirement for that one binding+identity only. A bare `secrets_store_secrets:BINDING` entry only satisfies the high-risk check (a Preview-only secret) and never waives the collision; a different store/secret/binding still fails. Shared Dev (`dev_binding_allow`) is unchanged and does not support secrets.
-* No `routes`, `triggers` or queue consumers in `previews`; `assets` and `compatibility_*` stay top-level.
-* Preview secrets are **not** inherited from Production: `wrangler preview base-config secret put <NAME>`.
-
-## Shared Preview resources (accepted trade-off)
-
-Preview resources are durable, non-production resources **shared by all branch Previews** (no per-branch D1/R2).
-
-> **v2 implementation note:** the currently released v2 may run migration hooks from different branches; it has not proven cross-branch schema concurrency safety. vNext instead requires an **independent Migration job** plus whole Migration-to-Deploy coordination. This is a future requirement, not a present v2 guarantee.
-Consequences accepted by the owner: branches share state; migrations that the caller runs against the shared Preview
-database (Blog runs `db:migrate:dev` before publishing) run from any branch and can race or disturb another branch's Preview.
-Per-branch resources (`preview_provision_cmd`) remain possible but are not the supported default.
-
-## Smoke semantics
-
-The built-in probe (`actions/cf-preview/probe.sh`) requires an explicit `2xx` from `<preview-url>/`; plain redirects
-and 4xx/5xx fail (`curl -f` would accept any 3xx). A redirect to `https://*.cloudflareaccess.com/` is accepted as
-**access-protected**: the Preview exists and is not public, but content and SHA are unverified. This is reported in the run
-summary and exported as `PREVIEW_ACCESS_PROTECTED=true` to `preview_smoke_cmd`, which can then assert the protection
-(Blog) or use Access service-token headers (`CF-Access-Client-Id` / `CF-Access-Client-Secret`) for content checks.
-
-## Failure semantics
-
-* Test / preflight / hook / build failure → `wrangler preview` is never invoked; the prior Preview is unchanged.
-* Smoke failure after publish → Deployment marked `failure` ("unverified"), then **recovery**: redeploy the newest earlier
-  GitHub Deployment in state `success` (checkout that SHA, rebuild with the same Preview env, publish, probe). The run stays red.
-  No Native Preview rollback command is assumed. Shared-database schema changes are not rolled back.
-* No earlier good deployment → explicit manual-recovery summary (push a fix, or delete the Preview).
-* Name collision → fails in Plan (see *Preview identity*).
-* Production: `production_rollback_policy` (`automatic` runs the fail-closed *Revert on Verify Failure* job after a failed *Smoke Tests* job; `d1_rollback_compat` gates it when D1 migrations were applied; see docs/cf-worker-v2-refactor.md). The failed run stays red and Release stays blocked. A Worker rollback never reverts D1 migrations or external side effects.
-
-## Branch deletion keeps the Preview (owner decision)
-
-Deleting a branch does **not** delete its Native Preview. Cloudflare cannot remove only the stable URL: Preview `urls`
-is read-only (a `PATCH` is accepted but ignored) and `wrangler preview delete` removes the Preview with all deployments.
-The `delete` run only marks the GitHub Deployments `inactive` (never deletes them) and prints the manual command:
-
-```bash
-wrangler preview delete --name <slug> --worker-name <worker> --skip-confirmation
+```text
+ untrusted code ──► Build job (no Cloudflare token, no write token, no Environment; ephemeral hosted runner for PRs)
+                      deps + target build + config audit + `wrangler deploy --dry-run --outdir` + package
+                      └─► artifact  (manifest.json · wrangler.json[main→worker/, no_bundle, no `build`] · worker/ · assets/)
+                                       │  actions/upload-artifact (this run only)
+ trusted tooling ──► Migrate / Deploy jobs (credentials; Environment approvals)
+                      download ─► verify identity + digest + structure ─► re-audit resource bindings ─► stale check ─► pinned Wrangler publishes ONLY the artifact
+                      (no application dependency install, no application build, no checkout of PR code)
 ```
 
-There is no automatic reclaim; Previews accumulate until removed manually. A repeated delete returns
-`Preview not found [code: 10025]` (already gone). With several Cloudflare accounts, set `CLOUDFLARE_ACCOUNT_ID`.
+* Publisher inputs it trusts: its own Plan descriptor, GitHub context, caller inputs and the event payload - never the manifest's claims. The manifest is cross-checked
+  (repository, app, target, driver, slot, run id + attempt, `source_sha`, `tested_sha`, `artifact_sha == tested_sha`, canonical URL). The Preview host Worker, Preview name and
+  Worker name for Dev are set by the publisher. The digest detects corruption and mix-ups, **not** a malicious Build: the defence is that the Build holds no credential and
+  the publisher re-audits the packaged config (`preview_binding_allow` / `preview_deny_resources`, Dev / Production audits, structural rules) before anything runs on Cloudflare.
+* The Build receives **no secret**: `PREVIEW_SECRETS` is not passed to it (a PR's build command could read it); build-time values must be non-secret `build_env_*`. Audit / publish mode
+  (flat vs a Dev Worker's named environment), the Production Worker name and the Preview host Worker are derived by the publisher, never from the manifest. A packaged config may not
+  carry `build`, `site`, `containers`, `alias`, `tsconfig`, `find_additional_modules`, `base_dir`, `dev`; the artifact may contain only `manifest.json`, `wrangler.json`, `worker/**`, `assets/**` (no hidden files).
+* The artifact name and attempt come from the Build job's outputs, so "Re-run failed jobs" keeps using the artifact of the attempt that built it.
+* Application code (`smoke_cmd`) never receives GitHub or Cloudflare tokens; the credential-bearing Production rollback re-smokes with the built-in probe only and installs no application dependency.
+* **Revision contract**: `source_sha` = PR head, `tested_sha` = the merge candidate CI tested, `artifact_sha` = what the Build checked out (must equal `tested_sha`), `deployed_sha` = recorded
+  in the ledger = `tested_sha`. A PR Preview is built from and published as the tested merge candidate. Publish proceeds only while the PR is open, its head is still `source_sha` and
+  GitHub's merge candidate is still `tested_sha` (a newer synchronization or a moved base makes the run stale). Main / Dev publish the pushed / approved commit under the existing branch-tip guard.
+* Non-production has **no automatic recovery** (decision pending owner acceptance): redeploying an older Preview / Dev would require rebuilding it in a credential-bearing job, and no verified artifact is retained. A failed Smoke marks it UNVERIFIED; fix forward.
+* A Preview's `smoke_cmd` (PR-controlled) runs only in the separate credential-free `app-smoke` job; the credential-bearing Smoke job runs the trusted probe and requires its result. Production rollback
+  re-deploys a stored Worker version (no build) and never reverts D1.
 
-## Security
+## Safety invariants (kept)
 
-* Production and Dev jobs use the same `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` pair by owner decision. Preview uses the same pair too. Dev still uses its own `<app>/dev` Environment, Worker identity and binding guardrails.
-* Fork PRs get no deployment job and no secrets.
-* `production-only` never creates a Preview (use for `anas-mcp`: its authentication depends on Cloudflare Access at the custom domain).
-* Native Preview hostnames may sit behind Cloudflare Access (Blog's do): anonymous requests see only the Access login.
+Failed CI never deploys · Preview/Dev can never bind Production D1/R2/Queue (audit + deny lists) · the migration runs against the audited physical D1, a failed, stale or
+mismatched migration never authorizes a publish (read-only precheck first; no pending → verified no-op without a build) · stale runs never overwrite newer revisions (A→B→A) ·
+Smoke verifies the exact published URL; an Access redirect is liveness only (`published_unverified`, no Release, never known-good) · rollback is target-owned and guarded, a Worker
+rollback never reverts D1 · Release only after a verified Production delivery · fork PRs never reach a privileged runner or secrets · Required Checks cannot pass through an unexpected skip.
 
-## State ledger
+## Internal persistence slot
 
-GitHub Deployments, environment `<app_name>/preview/<slug>`, payload `{branch_ref, preview_name, worker}`. Used for name
-ownership, last-good recovery and PR URL lookup. Retired (`inactive`), never deleted, on branch deletion. It is separate from the
-job environment `<app_name>/preview`, which only exists to show the URL on the CI job.
+The engine keys GitHub Environments (`<app>/prod`, `<app>/preview`, `<app>/native-dev`, `<app>/dev`) and the known-good ledger by a slot derived from target × driver
+(`delivery.mjs` `SLOT`). It is not a public input or output; it exists so existing Environment protection rules and known-good records survive the cutover.
+A PR Preview ledger is `<app>/preview/pr-<number>`.
 
-## Troubleshooting
+## Pipeline self-tests
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `Wrangler X < 4.135.0` | project-local Wrangler too old | upgrade `wrangler` (latest); remove stale pnpm overrides such as a pinned `miniflare` |
-| `preview.urls: []` | Worker `previews_enabled` is false | enable it, or set `preview_worker_name` to a Worker that has it |
-| API `10021 … must have a namespace_id` | Preview binding without an id (often an adapter-added KV `SESSION`) | give it a Preview resource id, or disable the binding for Preview builds |
-| Plan fails: "Preview name … already used by …" | two branches normalise to the same slug | rename one, or delete the old Preview + ledger |
-| Run green but no Preview / no Production deploy | optional test jobs skipped on an old release | use `>= v2.5.1` |
-| Smoke says `access-protected` | URL is behind Cloudflare Access | expected; use a service token for content checks |
-| Branch pushes show the old Dev flow | that branch still has the old workflow file | rebase / merge `main` |
-| `delete` did nothing | caller workflow not on the default branch | merge it to `main` |
-
-## Verified vs not yet verified
-
-Verified on real Cloudflare (heaven-www, Blog): first/second push keep one URL; independent branches; PR attach without a second deployment;
-PR close keeps the Preview; branch delete keeps the Preview and retires the ledger; name-collision fail-closed; Production
-versions upload/deploy; smoke-failure recovery; Access-protected smoke; `preview_worker_name`.
-
-Not yet verified: concurrent pushes and force-push ordering, fork-PR credential isolation, Hybrid persistent Dev, stateful
-bindings beyond Blog's shared D1/R2, quota limits, and an automatic sweep of old Previews (not implemented).
+`scripts/cf-preview/test.sh [static|unit|safety|full]` — three parallel suites, one `Pipeline Gate` (`.github/workflows/cf-worker-v2-ci.yml`).
+No GitHub-expression or scheduler emulation: GitHub's real behavior is proven by the canary on `cf-v2-scratch-caller` against the candidate SHA.
