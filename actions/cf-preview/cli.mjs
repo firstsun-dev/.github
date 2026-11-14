@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 // CLI used by _cf-worker-v2.yml. stdout carries ONLY key=value records (it is piped into $GITHUB_OUTPUT / captured by the shell); every
 // diagnostic and workflow annotation (::error:: / ::warning:: / ::notice:: / ::add-mask::) goes to stderr. Failure = non-zero exit.
-import { packageArtifact, verifyArtifact } from './artifact.mjs';
+import { artifactBase, packageArtifact, verifyArtifact } from './artifact.mjs';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import {
   assertWranglerSupported, auditDevConfig, previewHostReadiness, auditPreviewConfig, auditProdConfig, extractPreviewUrl,
-  isStale, migrationPlan, workerName, classifyMigrationSql, previewIdentity, readConfig, rebindSha, artifactDigest, checkDeployedD1, sharedPreviewDevD1,
+  migrationPlan, workerName, classifyMigrationSql, previewIdentity, readConfig, checkDeployedD1,
 } from './lib.mjs';
 import {
   assertSlot, canonicalOrigin, checkBuildEnvOrigins, foreignUrlsInBuildEnv, planMigration, resolveCanonicalUrl, resolveDelivery, resolveSmokeMode,
-  buildDescriptor, parseDescriptor, resolveMigrationUsed, parseD1Rows, pendingMigrations, classifyMigrationEntries, verificationOutcome, prodRollbackBlock, nonProdRecoveryBlock, rollbackVerdict,
+  buildDescriptor, parseDescriptor, resolveMigrationUsed, parseD1Rows, pendingMigrations, classifyMigrationEntries, verificationOutcome, prodRollbackBlock, rollbackVerdict,
   restoreDescriptor, validateInit, runLockGroup, TARGETS,
 } from './delivery.mjs';
 
@@ -60,16 +60,6 @@ try {
       out({ preflight: 'ok' });
       break;
     }
-    case 'rebind-env': {
-      // stdout = rewritten text of environment variable --var (raw); the count goes to stderr.
-      const r = rebindSha(process.env[opt('var')] ?? '', opt('from'), opt('to'));
-      process.stdout.write(r.text);
-      console.error(`rebound ${r.replacements} commit reference(s) in ${opt('var')}`);
-      break;
-    }
-    case 'artifact-digest':
-      out({ artifact_digest: artifactDigest(opt('config')) });
-      break;
     case 'd1-consistency': {
       // The D1 the audited/published config binds must be the exact database the migration targets.
       let deployed = readConfig(opt('config'));
@@ -78,10 +68,6 @@ try {
         binding: opt('binding'), devEnv: opt('dev-env', 'dev'), mode: opt('mode', 'effective'),
       });
       out({ d1_binding: r.binding, d1_id: r.databaseId });
-      break;
-    }
-    case 'd1-shared': {
-      out({ shared: String(sharedPreviewDevD1(readConfig(opt('config')), { binding: opt('binding'), devEnv: opt('dev-env', 'dev') })) });
       break;
     }
     case 'dev-config-check': {
@@ -143,7 +129,7 @@ try {
       // PRIVILEGED jobs: the artifact must match what THIS job expects (its own trusted data), before any audit or publish.
       const e = process.env;
       const { manifest, mode } = verifyArtifact(resolve(opt('dir')), {
-        repository: e.GITHUB_REPOSITORY, app: e.CFV2_APP, target: e.CFV2_TARGET, driver: e.CFV2_DRIVER, slot: e.CFV2_SLOT, runId: e.GITHUB_RUN_ID, runAttempt: e.GITHUB_RUN_ATTEMPT,
+        repository: e.GITHUB_REPOSITORY, app: e.CFV2_APP, target: e.CFV2_TARGET, driver: e.CFV2_DRIVER, slot: e.CFV2_SLOT, runId: e.GITHUB_RUN_ID, runAttempt: e.CFV2_RUN_ATTEMPT, currentAttempt: e.GITHUB_RUN_ATTEMPT,
         sourceSha: e.CFV2_SOURCE_SHA, testedSha: e.CFV2_TESTED_SHA, targetUrl: e.CFV2_TARGET_URL ?? '', workerName: e.CFV2_WORKER_NAME ?? '', devEnv: e.CFV2_DEV_ENV || 'dev',
       });
       out({ artifact_digest: manifest.files_digest, artifact_sha: manifest.artifact_sha, config_mode: mode, worker_name: manifest.worker_name });
@@ -272,18 +258,12 @@ try {
       };
       out({
         ...urlArgs,
+        artifact_base: descriptor ? artifactBase({ repository: repo, app: str('app_name'), slot: descriptor.slot }) : '',
         has_delivery: String(Boolean(descriptor)), target: descriptor?.target ?? '', driver: descriptor?.driver ?? '', group,
         descriptor: descriptor ? JSON.stringify(descriptor) : '', inputs_json: JSON.stringify(effective),
         has_migrations: String(Boolean(descriptor?.d1_expected_id)),
         migration: descriptor?.d1_expected_id ? JSON.stringify({ environment: descriptor.environment, d1_id: descriptor.d1_expected_id }) : '',
       });
-      break;
-    }
-    case 'descriptor-check': { // --target T --d1 ID (descriptor JSON in env DESCRIPTOR): the stage's own bindings must match the record
-      const d = parseDescriptor(process.env.DESCRIPTOR ?? '');
-      if (d.engine_target !== opt('target')) throw new Error(`delivery descriptor engine target '${d.engine_target}' differs from the stage's '${opt('target')}'`);
-      if (d.d1_expected_id !== opt('d1')) throw new Error('delivery descriptor D1 id differs from the stage\'s expected D1');
-      out({ descriptor: 'ok', smoke_mode: d.smoke_mode });
       break;
     }
     case 'migration-gate': { // publish stage; env: DESCRIPTOR, MIGRATION_RESULT / MIGRATION_JSON (needs.migration.result / outputs.migration_json)
@@ -306,19 +286,10 @@ try {
       out({ block_code: b ? b.code : '', block_why: b ? b.why : '' });
       break;
     }
-    case 'recovery-guard': { // non-Production recovery; env: D1_MIGRATIONS MIGRATION_JSON D1_EXPECT D1_COMPAT
-      const e = process.env;
-      let migration = null;
-      try { migration = JSON.parse(e.MIGRATION_JSON || 'null'); } catch { migration = null; }
-      const b = nonProdRecoveryBlock({ d1Migrations: e.D1_MIGRATIONS === 'true', migration, expectedId: e.D1_EXPECT ?? '', d1Compat: e.D1_COMPAT ?? '' });
-      out({ block_code: b ? b.code : '', block_why: b ? b.why : '' });
-      break;
-    }
-    case 'rollback-verdict': { // env: TARGET RB_RESULT RB_VERIFY RB_LEVEL GOOD_SHA RECOVERED VERIFIED SMOKE_LEVEL
+    case 'rollback-verdict': { // Production only; env: RB_RESULT RB_VERIFY RB_LEVEL
       const e = process.env;
       const v = rollbackVerdict({
-        target: e.TARGET, rbResult: e.RB_RESULT ?? '', rbVerify: e.RB_VERIFY ?? '', rbLevel: e.RB_LEVEL ?? '', goodSha: e.GOOD_SHA ?? '',
-        recovered: e.RECOVERED ?? '', verified: e.VERIFIED ?? '', smokeLevel: e.SMOKE_LEVEL ?? '',
+        rbResult: e.RB_RESULT ?? '', rbVerify: e.RB_VERIFY ?? '', rbLevel: e.RB_LEVEL ?? '',
       });
       out({ result: v.result, level: v.level, ok: String(v.ok) });
       break;
@@ -339,11 +310,8 @@ try {
       out({ kind: r.slot, smoke_mode: r.smokeMode });
       break;
     }
-    case 'stale':
-      out({ stale: String(isStale({ runSha: opt('sha'), branchTipSha: opt('tip') })) });
-      break;
     default:
-      console.error('usage: cli.mjs identity|wrangler-check|extract-url|preview-host-check|rebind-env|artifact-digest|d1-consistency|d1-shared|dev-config-check|preflight|migration-config|effective-config|audit-prod|worker-name|migration-pending|migration-scan|resolve-url|plan|descriptor-check|migration-gate|verification-outcome|rollback-guard|recovery-guard|rollback-verdict|init-checks|stale');
+      console.error('usage: cli.mjs identity|wrangler-check|extract-url|preview-host-check|d1-consistency|dev-config-check|preflight|migration-config|effective-config|audit-prod|worker-name|migration-pending|migration-scan|resolve-url|plan|migration-gate|verification-outcome|rollback-guard|rollback-verdict|init-checks');
       process.exit(2);
   }
 } catch (e) {

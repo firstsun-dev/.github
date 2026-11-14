@@ -4,7 +4,7 @@ import {
   TARGETS, DRIVERS, assertDelivery, slotOf, engineTarget, environmentName, resolveDelivery, resolveSmokeMode, parseSmokeOverrides, planMigration,
   canonicalOrigin, previewUrlFromSuffix, resolveCanonicalUrl, checkBuildEnvOrigins, foreignUrlsInBuildEnv, sameUrl,
   targetDescriptor, validateDescriptor, buildDescriptor, parseDescriptor, resolveMigrationUsed, parseD1Rows, pendingMigrations, classifyMigrationEntries, VERIFIED_NO_PENDING,
-  isContentLevel, verificationOutcome, prodRollbackBlock, nonProdRecoveryBlock, rollbackVerdict, restoreDescriptor, validateInit, runLockGroup,
+  isContentLevel, verificationOutcome, prodRollbackBlock, rollbackVerdict, restoreDescriptor, validateInit, runLockGroup,
 } from '../../actions/cf-preview/delivery.mjs';
 
 const PROD = { target: 'production', driver: 'worker' };
@@ -406,8 +406,8 @@ test('production rollback guard: never replaces a deployment that is no longer o
   assert.match(prodRollbackBlock({ ...RB, live: '' }).why, /'unknown'/);
 });
 
-test('rollback verdict (production): restored_verified only after a content-level re-smoke of the rolled-back version', () => {
-  const P = (o) => rollbackVerdict({ target: 'prod', ...o });
+test('rollback verdict (Production only; Preview / Dev are fixed forward): restored_verified only after a content-level re-smoke of the rolled-back version', () => {
+  const P = (o) => rollbackVerdict(o);
   assert.deepEqual(P({ rbResult: 'rolled_back', rbVerify: 'success', rbLevel: 'content-sha' }), { result: 'restored_verified', level: 'content-sha', ok: true });
   assert.equal(P({ rbResult: 'rolled_back', rbVerify: 'success', rbLevel: 'liveness' }).result, 'restored_unverified');
   assert.equal(P({ rbResult: 'rolled_back', rbVerify: 'success', rbLevel: '' }).ok, false);
@@ -415,37 +415,6 @@ test('rollback verdict (production): restored_verified only after a content-leve
   assert.equal(P({ rbResult: 'rolled_back', rbVerify: '' }).result, 'restored_unhealthy');
   assert.equal(P({ rbResult: 'blocked' }).result, 'blocked');
   for (const r of ['failed', '', 'weird']) assert.deepEqual(P({ rbResult: r, rbVerify: 'success', rbLevel: 'content' }), { result: 'failed', level: '', ok: false });
-});
-
-test('rollback verdict (Preview / Dev): known-good recovery must be rebuilt AND re-verified at content level', () => {
-  const R = (o) => rollbackVerdict({ target: 'preview', goodSha: 'abc1234', recovered: 'success', verified: 'success', smokeLevel: 'content', ...o });
-  assert.deepEqual(R({}), { result: 'restored_verified', level: 'content', ok: true });
-  assert.equal(R({ smokeLevel: 'liveness' }).result, 'restored_unverified');
-  assert.equal(R({ goodSha: '' }).result, 'no_known_good');
-  assert.equal(R({ goodSha: '', recovered: 'success' }).ok, false);
-  assert.equal(R({ recovered: 'failure' }).result, 'failed');
-  assert.equal(R({ verified: 'failure' }).result, 'failed');
-  assert.equal(R({ recovered: '' }).result, 'failed');
-  assert.equal(rollbackVerdict({ target: 'dev', goodSha: 'x', recovered: 'success', verified: 'success', smokeLevel: 'content-sha' }).ok, true);
-});
-
-test('nonProdRecoveryBlock: non-Production recovery is fail-closed against the migration result of the same pipeline', () => {
-  const M = { migration: 'applied', schema_changed: 'true', d1_scan: 'additive', kind: 'persistent-dev', d1_id: 'D1' };
-  const b = (o) => nonProdRecoveryBlock({ d1Migrations: true, migration: M, expectedId: 'D1', d1Compat: 'expand-contract', ...o });
-  assert.equal(nonProdRecoveryBlock({ d1Migrations: false, migration: null }), null, 'no D1 migrations: allowed');
-  assert.equal(b({ migration: { ...M, schema_changed: 'false', d1_scan: 'none' }, d1Compat: '' }), null, 'no schema change: allowed without attestation');
-  assert.equal(b({}), null, 'additive + attested: allowed');
-  assert.equal(b({ d1Compat: '' }).code, 'd1_unattested');
-  assert.equal(b({ d1Compat: 'none' }).code, 'd1_unattested');
-  for (const scan of ['non-additive', 'unknown', '', 'none']) assert.equal(b({ migration: { ...M, d1_scan: scan } }).code, 'd1_not_additive', `scan ${scan}`);
-  for (const bad of [null, {}, [], 'x', { ...M, migration: 'failed' }, { ...M, migration: 'none' }]) assert.equal(b({ migration: bad }).code, 'migration_result_missing');
-  assert.equal(b({ migration: { ...M, d1_id: 'OTHER' } }).code, 'd1_identity_mismatch');
-  assert.equal(b({ expectedId: '' }).code, 'd1_identity_mismatch');
-  for (const v of ['', undefined, 'maybe', 'TRUE']) assert.equal(b({ migration: { ...M, schema_changed: v } }).code, 'migration_result_invalid');
-  // identical D1 rule as Production
-  assert.equal(prodRollbackBlock({ policy: 'automatic', previous: 'a', current: 'b', worker: 'w', d1Pending: true, d1Compat: '', d1Scan: 'additive' }).code, 'd1_unattested');
-  assert.equal(rollbackVerdict({ target: 'dev', rbResult: 'blocked', goodSha: 'abc' }).result, 'blocked');
-  assert.equal(rollbackVerdict({ target: 'dev', rbResult: 'blocked', goodSha: '' }).ok, false);
 });
 
 const rows = (results, success = true) => JSON.stringify([{ results, success, meta: {} }]);
@@ -465,14 +434,6 @@ test('pendingMigrations: unrecorded files are pending; a missing table means eve
   assert.throws(() => pendingMigrations({ files, tableExists: true, applied: [{ id: 1 }] }), /without a name/);
   assert.throws(() => pendingMigrations({ files: [], tableExists: true, applied: [] }), /no \.sql files/);
 });
-const VNP = (o = {}) => JSON.stringify({ precheck: VERIFIED_NO_PENDING, kind: 'native-branch', d1_id: 'DB1', precheck_sha: 'abc1234', ...o });
-test('nonProdRecoveryBlock: a verified no-pending result is a known D1 state (schema unchanged); an unmarked none is not', () => {
-  const g = (m) => nonProdRecoveryBlock({ d1Migrations: true, migration: m, expectedId: 'DB1', d1Compat: '' });
-  assert.equal(g({ migration: 'none', precheck: VERIFIED_NO_PENDING, kind: 'native-branch', d1_id: 'DB1', schema_changed: 'false', d1_scan: 'none' }), null);
-  assert.equal(g({ migration: 'none', kind: 'native-branch', d1_id: 'DB1', schema_changed: 'false' }).code, 'migration_result_missing');
-  assert.equal(g({ migration: 'none', precheck: VERIFIED_NO_PENDING, kind: 'native-branch', d1_id: 'OTHER', schema_changed: 'false' }).code, 'd1_identity_mismatch');
-});
-
 test('classifyMigrationEntries: every name Wrangler discovers via *.sql is kept as-is (spaces, Unicode); anything uncertain is reported, never dropped', () => {
   const f = (name) => ({ name, file: true });
   const r = classifyMigrationEntries([f('0001_init.sql'), f('0002_add status.sql'), f('0003_調整.sql'), f('0004_é.sql'), f('README.md'), f('notes.sql.bak'), { name: 'sub', file: false }]);

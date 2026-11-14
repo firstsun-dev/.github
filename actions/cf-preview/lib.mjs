@@ -1,8 +1,7 @@
 // Pure helpers for Cloudflare Worker CI/CD v2 (branch-owned Native Previews).
 // No I/O except readConfig(); everything else is deterministic and unit-tested.
-import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { dirname, join, resolve as resolvePath, relative } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 import { parse as parseJsonc } from 'jsonc-parser';
 import { DEV_SHAREABLE_KINDS } from './dev-policy.mjs';
@@ -251,11 +250,6 @@ export function auditPreviewConfig(cfg, { allow = [], denyResources = [] } = {})
   return { errors, warnings };
 }
 
-/** Is `candidateSha` still the tip of the branch? Guards stale/out-of-order runs. */
-export function isStale({ runSha, branchTipSha }) {
-  return !branchTipSha || runSha !== branchTipSha;
-}
-
 /** D1 bindings the given target will use, straight from the project's SOURCE Wrangler config. */
 export function d1ForTarget(cfg, target, { devEnv = 'dev' } = {}) {
   if (target === 'prod') return cfg.d1_databases ?? [];
@@ -308,14 +302,6 @@ export function migrationPlan(cfg, target, { binding = '', migrationsDirAbs, dev
   };
 }
 
-/** Do the Preview and Shared Dev targets name the same physical D1? (Previews not declared => false.) */
-export function sharedPreviewDevD1(cfg, { binding = '', devEnv = 'dev' } = {}) {
-  const pick = (list) => (binding ? list.filter((b) => b.binding === binding) : list);
-  const prev = pick(d1ForTarget(cfg, 'preview'));
-  const dev = pick(d1ForTarget(cfg, 'dev', { devEnv }));
-  return dev.some((d) => prev.some((p) => (d.database_id && d.database_id === p.database_id) || (d.database_name && d.database_name === p.database_name)));
-}
-
 export { auditDevConfig, parseDevAllow, DEV_SHAREABLE_KINDS } from './dev-policy.mjs';
 
 /** Resource ids declared at the top level of a config, per binding kind (flat set). */
@@ -354,20 +340,6 @@ export function auditProdConfig(effective, source, { allow = [] } = {}) {
 }
 
 /**
- * Rebind commit identity in caller-provided text (e.g. build_env_dev, which the caller expanded with the FAILED
- * run's SHA) to the SHA being restored. Replaces the full SHA and standalone 7-char short SHAs. Returns the new
- * text and how many replacements were made.
- */
-export function rebindSha(text, from, to) {
-  if (!/^[0-9a-f]{7,40}$/i.test(from) || !/^[0-9a-f]{7,40}$/i.test(to)) throw new Error('rebindSha needs hex SHAs');
-  let n = 0;
-  const swap = (re, rep) => { text = text.replace(re, () => { n += 1; return rep; }); };
-  swap(new RegExp(from, 'gi'), to);
-  swap(new RegExp(`\\b${from.slice(0, 7)}\\b`, 'gi'), to.slice(0, 7));
-  return { text, replacements: n };
-}
-
-/**
  * The D1 the DEPLOYED Worker will bind must be the exact physical database the migration targets.
  * `deployedCfg` is the audited config that will be published (adapter-generated effective config, or the source
  * config when mode is 'source'); `source` is the project's source config used for migration targeting.
@@ -383,39 +355,6 @@ export function checkDeployedD1(deployedCfg, source, target, { binding = '', dev
     throw new Error(`D1 mismatch: migrations target ${plan.databaseName} (${plan.databaseId}) but the deployed config binds ${plan.binding} to ${hit.database_name ?? '?'} (${hit.database_id}); refusing to migrate DB-A and deploy a Worker connected to DB-B`);
   }
   return { binding: plan.binding, databaseId: plan.databaseId };
-}
-
-/**
- * Cheap fingerprint of the audited deployable: the config file itself, the Worker entry directory and the static
- * assets directory it names (path + size + content hash per file; mtime is ignored, only a real change counts). Used to prove that a caller-supplied publish command
- * did not rebuild or replace what the audit approved.
- */
-export function artifactDigest(configPath) {
-  const h = createHash('sha256');
-  const cfgFile = resolvePath(configPath);
-  h.update('config\0'); h.update(readFileSync(cfgFile));
-  const cfg = readConfig(cfgFile);
-  const base = dirname(cfgFile);
-  const roots = [];
-  if (cfg.assets?.directory) roots.push(resolvePath(base, cfg.assets.directory));
-  if (cfg.main) roots.push(dirname(resolvePath(base, cfg.main)));
-  const walk = (dir, out) => {
-    if (!existsSync(dir)) return;
-    for (const name of readdirSync(dir).sort()) {
-      if (name === 'node_modules' || name === '.wrangler') continue;
-      const p = join(dir, name);
-      const st = statSync(p);
-      if (st.isDirectory()) walk(p, out);
-      else out.push(`${p}\0${st.size}\0${createHash('sha256').update(readFileSync(p)).digest('hex')}`);
-    }
-  };
-  for (const r of [...new Set(roots)].sort()) {
-    const files = [];
-    walk(r, files);
-    h.update(`root\0${relative(base, r)}\0`);
-    for (const f of files) h.update(f.replace(r, '') + '\n');
-  }
-  return h.digest('hex');
 }
 
 /** Worker name of an (audited) config; refuses anything that is not a plain Workers script name. */

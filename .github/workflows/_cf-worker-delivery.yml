@@ -8,7 +8,7 @@ name: CF Worker delivery (one target)
 # native-preview), reusing the audited engine (actions/cf-deploy -> actions/cf-preview/engine.sh). A call handles exactly ONE target,
 # so every `needs.<job>.outputs.*` below is unambiguous: there is no matrix, no shared output key, no completion-order merge.
 #
-#   deploy -> smoke -> conditional rollback of THIS delivery
+#   deploy -> [app-smoke, Preview only] -> smoke -> conditional rollback of THIS delivery (Production only; Preview / Dev are fixed forward)
 #   (pipeline_phase deploy = deploy only; verify = smoke + rollback from the handed-over deploy result)
 #
 # The trigger (push or protected workflow_dispatch) never selects a different implementation: a manual persistent-dev dispatch is planned,
@@ -94,14 +94,12 @@ on:
         description: success | failure | none (nothing published, so nothing was smoked)
         value: ${{ jobs.smoke.outputs.smoke_status }}
       rollback_result:
-        description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed | no_known_good; empty when no rollback ran
+        description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed; empty when no rollback ran (always empty for Preview and Dev, which are fixed forward)
         value: ${{ jobs.rollback.outputs.rollback_result }}
     secrets:
       CLOUDFLARE_API_TOKEN:
         required: false
       CLOUDFLARE_ACCOUNT_ID:
-        required: false
-      PREVIEW_SECRETS:
         required: false
       SMOKE_USERNAME:
         required: false
@@ -175,13 +173,47 @@ jobs:
           d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
 
   # -------------------------------------------------------------------------
+  # App Smoke — PREVIEW ONLY. The application's smoke command is PR-controlled code, so it runs here and nowhere else: an ephemeral GitHub-hosted runner, no
+  # Environment, NO secret of any kind (no GitHub write token, no Cloudflare credential, no smoke credential, no preview secret, no Access service token), the
+  # token of this job is read-only contents. The job can only pass or fail; its result is consumed by the Smoke job through `needs`. Production / Dev
+  # (protected revisions) run their application command in the Smoke job, as before.
+  # -------------------------------------------------------------------------
+  app-smoke:
+    name: App Smoke (no credentials)
+    needs: [deploy]
+    if: always() && inputs.phase != 'deploy' && fromJSON(inputs.descriptor).target == 'preview' && fromJSON((inputs.phase == 'verify' && inputs.handoff_json || needs.deploy.outputs.handoff) || '{}').published == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: $/actions/cf-deploy
+        with:
+          target: ${{ fromJSON(inputs.descriptor).engine_target }}
+          descriptor: ${{ inputs.descriptor }}
+          kind: ${{ fromJSON(inputs.descriptor).slot }}
+          stage: app-smoke
+          inputs_json: ${{ inputs.inputs_json }}
+          call_inputs_json: ${{ inputs.call_inputs_json }}
+          d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
+          deploy_outputs: ${{ inputs.phase == 'verify' && inputs.handoff_json || needs.deploy.outputs.handoff }}
+
+  # -------------------------------------------------------------------------
   # Smoke — verifies THIS kind's deployment only (stage verify, no Cloudflare credentials): smoke_mode full | basic | skip.
   # Starts the moment THIS kind's deploy is done. A kind that published nothing (stale / superseded / failed) has nothing to
   # verify: smoke_status=none and no verification is claimed.
   # -------------------------------------------------------------------------
   smoke:
     name: Smoke Tests
-    needs: [deploy]
+    needs: [deploy, app-smoke]
     if: always() && inputs.phase != 'deploy'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
@@ -221,8 +253,9 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/deployments/$id/statuses" -f state=inactive -f log_url="${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/${GITHUB_RUN_ID:-0}" \
             -f description="Superseded by a newer push before publish; nothing deployed" >/dev/null \
             || echo "::warning::could not mark the superseded $ENV_NAME deployment inactive"
+      # A Preview's source is PR-controlled: this credential-bearing job never checks it out or installs it (the app-smoke job does, without secrets).
       - uses: actions/checkout@v6
-        if: steps.go.outputs.go == 'true'
+        if: steps.go.outputs.go == 'true' && fromJSON(inputs.descriptor).target != 'preview'
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -237,9 +270,9 @@ jobs:
           inputs_json: ${{ inputs.inputs_json }}
           call_inputs_json: ${{ inputs.call_inputs_json }}
           d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
-          preview_secrets: ${{ fromJSON(inputs.descriptor).engine_target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
-          smoke_username: ${{ secrets.SMOKE_USERNAME }}
-          smoke_password: ${{ secrets.SMOKE_PASSWORD }}
+          smoke_username: ${{ fromJSON(inputs.descriptor).target != 'preview' && secrets.SMOKE_USERNAME || '' }}
+          smoke_password: ${{ fromJSON(inputs.descriptor).target != 'preview' && secrets.SMOKE_PASSWORD || '' }}
+          app_smoke_result: ${{ needs.app-smoke.result }}
           deploy_outputs: ${{ env.HANDOFF }}
           upstream_gate: ${{ inputs.phase == 'verify' && inputs.upstream_gate || '' }}
       - id: res
@@ -262,16 +295,17 @@ jobs:
           retention-days: 7
 
   # -------------------------------------------------------------------------
-  # Revert on Verify Failure — runs ONLY for THIS kind, ONLY when its Smoke FAILED on a deployment this run published (never
-  # after a blocked cross-service gate, never after smoke_mode=skip). Another kind's failure or success cannot reach it.
-  #   production : policy `automatic` only; fail closed (recorded previous version, additive D1 change, failed version still live)
-  #   other kinds: redeploy the last known-good deployment of THAT target, unless a newer deployment of it has started
+  # Revert on Verify Failure — PRODUCTION ONLY, ONLY when its Smoke FAILED on a deployment this run published (never after a blocked cross-service gate, never
+  # after smoke_mode=skip), policy `automatic`; fail closed (recorded previous version, additive D1 change, failed version still live).
+  #   Preview / Dev have NO automatic recovery: they are fixed forward (the Smoke job marks them UNVERIFIED and says so). Redeploying an older revision would need
+  #   its build, which no credential-bearing job may run, and no verified artifact of it is retained (a retained-artifact recovery needs cross-run artifact
+  #   orchestration, deliberately not built). So this job never checks out or runs application code.
   # The job is green ONLY when the previous deployment was restored and content-verified. D1 is never rolled back.
   # -------------------------------------------------------------------------
   rollback:
     name: Revert on Verify Failure
     needs: [deploy, smoke]
-    if: always() && inputs.phase != 'deploy' && needs.smoke.outputs.smoke_status == 'failure' && (fromJSON(inputs.descriptor).target != 'production' || fromJSON(inputs.inputs_json).production_rollback_policy == 'automatic') && fromJSON(needs.smoke.outputs.smoke_json || '{}').gate_blocked != 'true'
+    if: always() && inputs.phase != 'deploy' && needs.smoke.outputs.smoke_status == 'failure' && fromJSON(inputs.descriptor).target == 'production' && fromJSON(inputs.inputs_json).production_rollback_policy == 'automatic' && fromJSON(needs.smoke.outputs.smoke_json || '{}').gate_blocked != 'true'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     concurrency:
@@ -299,7 +333,7 @@ jobs:
       - id: go
         name: Did the Smoke of ${{ fromJSON(inputs.descriptor).target }} fail on a deployment this run published?
         env:
-          POLICY_OK: ${{ fromJSON(inputs.descriptor).target != 'production' || fromJSON(inputs.inputs_json).production_rollback_policy == 'automatic' }}
+          POLICY_OK: ${{ fromJSON(inputs.descriptor).target == 'production' && fromJSON(inputs.inputs_json).production_rollback_policy == 'automatic' }}
         run: |
           h="${HANDOFF:-}"; [ -n "$h" ] || h='{}'; k="${SMOKEJSON:-}"; [ -n "$k" ] || k='{}'
           pub="$(printf '%s' "$h" | jq -r '.published == "true"')"
@@ -322,7 +356,6 @@ jobs:
           inputs_json: ${{ inputs.inputs_json }}
           call_inputs_json: ${{ inputs.call_inputs_json }}
           d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
-          preview_secrets: ${{ fromJSON(inputs.descriptor).engine_target == 'preview' && secrets.PREVIEW_SECRETS || '' }}
           smoke_username: ${{ secrets.SMOKE_USERNAME }}
           smoke_password: ${{ secrets.SMOKE_PASSWORD }}
           deploy_outputs: ${{ env.HANDOFF }}

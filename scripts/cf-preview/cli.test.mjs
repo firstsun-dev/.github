@@ -15,21 +15,6 @@ const records = (out) => out.split('\n').filter(Boolean);
 const PROD = { target: 'production', driver: 'worker' };
 const DEV_N = { target: 'dev', driver: 'native-preview' };
 
-test('invalid descriptor: non-zero exit, annotation on stderr, stdout empty (cannot corrupt $GITHUB_OUTPUT)', () => {
-  const r = run(['descriptor-check', '--target', 'prod', '--d1', ''], { DESCRIPTOR: '{"v":1,"kind":"production"}' });
-  assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /^::error::delivery descriptor keys/m);
-  assert.equal(r.stdout, '');
-});
-
-test('valid descriptor: unchanged output records on stdout, nothing on stderr', () => {
-  const d = targetDescriptor({ delivery: PROD, app: 'app', runId: 1, smokeMode: 'skip' });
-  const r = run(['descriptor-check', '--target', 'prod', '--d1', ''], { DESCRIPTOR: JSON.stringify(d) });
-  assert.equal(r.status, 0);
-  assert.equal(r.stdout, 'descriptor=ok\nsmoke_mode=skip\n');
-  assert.equal(r.stderr, '');
-});
-
 const planCli = (args, env) => run(['plan', '--run-id', '9', ...args], { GITHUB_REPOSITORY: 'o/r', ...env });
 const out2obj = (stdout) => Object.fromEntries(records(stdout).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
 
@@ -140,24 +125,12 @@ const pending = (names, applied, { table = true, setup = () => {}, appliedText }
   const r = run(['migration-pending', '--dir', dir, '--exists', ex, ...(table ? ['--applied', ap] : [])]);
   return { status: r.status, out: r.stdout, stderr: r.stderr };
 };
-test('migration-pending: standard file recorded remotely -> nothing pending', () => {
-  assert.equal(pending(['0001_init.sql'], ['0001_init.sql']).out, 'pending=false\npending_count=0\n');
-});
-test('migration-pending: a file with a space that is not recorded is PENDING', () => {
-  assert.equal(pending(['0001_init.sql', '0002_add status.sql'], ['0001_init.sql']).out, 'pending=true\npending_count=1\n');
-});
-test('migration-pending: a Unicode file name that is not recorded is PENDING', () => {
-  assert.equal(pending(['0001_init.sql', '0003_調整.sql'], ['0001_init.sql']).out, 'pending=true\npending_count=1\n');
-});
-test('migration-pending: several files, only the standard names recorded -> pending', () => {
-  assert.equal(pending(['0001_init.sql', '0002_add status.sql', '0003_調整.sql', '0004_plain.sql'], ['0001_init.sql', '0004_plain.sql']).out, 'pending=true\npending_count=2\n');
-});
-test('migration-pending: every file recorded (spaces and Unicode included) -> verified nothing pending', () => {
+// The decision rules (pendingMigrations / classifyMigrationEntries) are unit-tested in delivery.test.mjs; here only the CLI contract: it reads a REAL directory the way Wrangler discovers it.
+test('migration-pending: reads a real directory (spaces, Unicode, non-.sql files, a missing table) and prints the verdict records', () => {
   const all = ['0001_init.sql', '0002_add status.sql', '0003_調整.sql'];
   assert.equal(pending(all, all).out, 'pending=false\npending_count=0\n');
-});
-test('migration-pending: non-.sql files are not migrations; a missing migrations table means everything pending', () => {
-  assert.equal(pending(['0001.sql', 'README.md'], ['0001.sql']).out, 'pending=false\npending_count=0\n');
+  assert.equal(pending([...all, 'README.md'], all).out, 'pending=false\npending_count=0\n');
+  assert.equal(pending(all, ['0001_init.sql']).out, 'pending=true\npending_count=2\n');
   assert.equal(pending(['0001.sql'], [], { table: false }).out, 'pending=true\npending_count=1\n');
 });
 test('migration-pending: a directory, symlink, dotfile or .SQL entry the precheck cannot place with certainty -> pending=true, reported on stderr, never dropped', () => {

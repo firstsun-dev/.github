@@ -10,9 +10,14 @@ description: >
     migrate   Migration job (prod | dev; a Preview never migrates): verify the artifact, exact D1 binding, stale check, migrate (ONCE per run). Publishes nothing.
     publish   Deploy job: verify the artifact (identity, digest, structure) and audit ITS config against the caller's resource policy, stale check, publish ONLY that
               artifact with the pinned Wrangler of this repository. Installs no application dependency and runs no application build. Runs no smoke.
-    verify    Smoke job (prod | preview | dev): smoke the published URL; mark verified | unverified. NO Cloudflare credentials.
-    rollback  Rollback job: prod = fail-closed re-deploy of the previous stored Worker VERSION + re-smoke (no build). preview | dev = blocked (fail closed): an older
-              deployment would have to be rebuilt, which no credential-bearing job may do.
+    verify    Smoke job (prod | preview | dev): smoke the published URL; mark verified | unverified. NO Cloudflare credentials. prod | dev (protected revisions) run
+              the application smoke command here, with the smoke secrets. A PREVIEW never does: its smoke command is PR-controlled code, so this job runs only the
+              trusted probe / SHA check (with any smoke_env Access token) and requires the result of the app-smoke stage for the application command. It checks out and
+              installs nothing of the PR.
+    app-smoke Preview only, its own job: the application's PR-controlled smoke command on an ephemeral GitHub-hosted runner with NO secret of any kind (no GitHub token,
+              no Cloudflare credential, no smoke credential, no preview secret, no smoke_env Access token / PROBE_HEADERS). It can only pass or fail.
+    rollback  Rollback job, PRODUCTION ONLY: fail-closed re-deploy of the previous stored Worker VERSION + re-smoke (no build). Preview / Dev have no automatic recovery: they
+              are fixed forward (a recovery would have to rebuild an older revision, which no credential-bearing job may do, and no verified artifact is retained).
   Jobs share only validated DATA (deploy_outputs / migration_outputs / smoke_outputs) and the artifact, never runner files. The CALLER job owns the Environment,
   permissions, concurrency and which Cloudflare credentials exist (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID in the job env). It references this action as
   `$/actions/cf-deploy` (this repository at the running workflow's commit); the engine scripts are found next to it, in `../cf-preview`.
@@ -33,7 +38,7 @@ inputs:
     description: Internal persistence slot of the delivery (production | native-branch | native-dev | persistent-dev), DERIVED from the descriptor's target x driver; must equal descriptor.slot.
     default: ''
   stage:
-    description: build | precheck | migrate | publish | verify | rollback (see description).
+    description: build | precheck | migrate | publish | verify | app-smoke | rollback (see description).
     default: all
   inputs_json:
     description: toJSON(inputs) of the calling workflow (data only; never interpolated into a script)
@@ -54,6 +59,9 @@ inputs:
   smoke_outputs:
     description: toJSON(needs.smoke.outputs) - hand-off to the rollback stage
     default: '{}'
+  app_smoke_result:
+    description: verify stage of a Preview only - needs.app-smoke.result (success | failure | cancelled | skipped). The application smoke command of a Preview runs in that separate credential-free job; a configured command whose job did not succeed fails this stage.
+    default: ''
   d1_expected_id:
     description: Physical D1 database id the plan resolved for this kind. Every build of this kind must bind exactly it (migrate, publish); empty = no D1.
     default: ''
@@ -146,7 +154,7 @@ outputs:
     description: precheck stage only - the commit the verified_no_pending verdict is bound to
     value: ${{ steps.precheck.outputs.precheck_sha }}
   rollback_result:
-    description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed | no_known_good (rollback stage)
+    description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed (rollback stage, Production only)
     value: ${{ steps.rbfinal.outputs.result }}
   smoke_mode:
     description: full | basic | skip - the smoke mode resolved for this delivery kind
@@ -187,7 +195,7 @@ runs:
       run: 'echo "smoke_mode=$(cat "${STATE_DIR:-$RUNNER_TEMP/cfv2}/smoke_mode")" >> "$GITHUB_OUTPUT"'
     - name: Hand-off from the previous jobs (validated data)
       id: hydrate
-      if: inputs.stage == 'verify' || inputs.stage == 'rollback'
+      if: inputs.stage == 'verify' || inputs.stage == 'app-smoke' || inputs.stage == 'rollback'
       shell: bash
       env:
         HANDOFF_DEPLOY: ${{ inputs.deploy_outputs }}
@@ -221,7 +229,8 @@ runs:
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" guard start'
     - name: Setup dependencies
-      if: env.STALE != 'true' && env.CFV2_DEPS != 'done' && (inputs.stage == 'build' || inputs.stage == 'verify')
+      # A Preview's Smoke job never installs PR dependencies (only the app-smoke job does, without any secret).
+      if: env.STALE != 'true' && env.CFV2_DEPS != 'done' && (inputs.stage == 'build' || inputs.stage == 'app-smoke' || (inputs.stage == 'verify' && inputs.target != 'preview'))
       uses: $/actions/setup
       env:
         # Dependency lifecycle scripts run application code: they get no GitHub token and no Cloudflare / smoke secret (the Build has none anyway).
@@ -290,8 +299,16 @@ runs:
         PUBLISHED_URL: ${{ steps.publish.outputs.url || steps.hydrate.outputs.url }}
         SMOKE_USERNAME: ${{ inputs.smoke_username }}
         SMOKE_PASSWORD: ${{ inputs.smoke_password }}
+        APP_SMOKE_RESULT: ${{ inputs.app_smoke_result }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" smoke | tee -a "$GITHUB_OUTPUT"'
     # The ONLY place deployed_and_verified becomes true: this run published its own SHA and its smoke passed at content level.
+    - name: Application smoke command of a Preview (no credentials of any kind)
+      id: appsmoke
+      if: env.STALE != 'true' && inputs.stage == 'app-smoke'
+      shell: bash
+      env:
+        PUBLISHED_URL: ${{ steps.hydrate.outputs.url }}
+      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" app-smoke | tee -a "$GITHUB_OUTPUT"'
     - name: Mark deployed and verified
       id: verified
       if: env.STALE != 'true' && steps.smoke.outcome == 'success'
@@ -331,13 +348,6 @@ runs:
         VERSION_ID: ${{ steps.publish.outputs.version_id || steps.hydrate.outputs.version_id }}
         PREVIOUS_VERSION_ID: ${{ steps.publish.outputs.previous_version_id || steps.hydrate.outputs.previous_version_id }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" unverified'
-    # ---- Preview / Shared Dev recovery: redeploy the last KNOWN-GOOD deployment of the SAME target (never a
-    # Production version). stage all (Shared Dev): runs inside the failed job; stage rollback (Preview): its own job.
-    - name: Recovery - find the last known-good deployment of this target
-      id: good
-      if: (success() && inputs.stage == 'rollback' && inputs.target != 'prod')
-      shell: bash
-      run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" recover-find | tee -a "$GITHUB_OUTPUT"'
     # ---- Production rollback (stage rollback): policy, previous version, D1 compatibility and "still our
     # deployment" are all checked BEFORE anything is changed; the restored deployment is smoked again.
     - name: Rollback - restore the previous Production version (fail-closed)
@@ -360,10 +370,9 @@ runs:
       if: '!cancelled() && inputs.stage == ''rollback'''
       shell: bash
       env:
-        RB_RESULT: ${{ steps.prodrb.outputs.rollback_result || (steps.good.outputs.blocked == 'true' && 'blocked' || '') }}
+        RB_RESULT: ${{ steps.prodrb.outputs.rollback_result }}
         RB_VERIFY: ${{ steps.prodverify.outcome }}
         RB_LEVEL: ${{ steps.prodverify.outputs.smoke_level }}
-        GOOD_SHA: ${{ steps.good.outputs.sha }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" rollback-finish | tee -a "$GITHUB_OUTPUT"'
     # A rollback never turns a failed deployment green: the job is red unless the previous deployment was restored AND
     # content-verified (the Smoke job is red in every case).

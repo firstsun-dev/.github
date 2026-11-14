@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { packageArtifact, verifyArtifact, rewriteConfig, structuralProblems, filesDigest, bundleEntryFor, configMode } from '../../actions/cf-preview/artifact.mjs';
+import { artifactBase, artifactName, packageArtifact, verifyArtifact, rewriteConfig, structuralProblems, filesDigest, bundleEntryFor, configMode } from '../../actions/cf-preview/artifact.mjs';
 
 const SHA = (c) => c.repeat(40);
 const ID = { repository: 'o/r', app: 'blog', target: 'preview', driver: 'native-preview', slot: 'native-branch', run_id: '77', run_attempt: '1',
@@ -114,4 +114,26 @@ test('verify: the Production Worker name is pinned by the privileged side', () =
   const f = fixture(); pack(f);
   assert.doesNotThrow(() => verifyArtifact(f.dest, { ...EXPECT, workerName: 'blog' }));
   assert.throws(() => verifyArtifact(f.dest, { ...EXPECT, workerName: 'other-prod-worker' }), /Worker name 'blog' is not the expected/);
+});
+
+test('artifact name: unique per repository, application and slot; one contract for Build / Migration / Publish', () => {
+  const n = (o = {}) => artifactName(artifactBase({ repository: 'o/r', app: 'blog', slot: 'native-branch', ...o }), 77, 2);
+  assert.match(n(), /^cfv2-o-r-blog-native-branch-[0-9a-f]{10}-77-2$/);
+  const names = [n(), n({ app: 'shop' }), n({ slot: 'production' }), n({ repository: 'o/other' }), n({ app: 'blo/g' }), n({ app: 'blo-g' })];
+  assert.equal(new Set(names).size, names.length, 'two applications of one monorepo (or two kinds of one app) in the same run never share a name');
+  assert.match(n({ app: 'a/b c' }), /^[A-Za-z0-9._-]+$/, 'only characters GitHub accepts in an artifact name');
+  assert.ok(n({ app: 'x'.repeat(500) }).length < 120);
+});
+test('verify: a partial re-run may use the artifact of an EARLIER attempt of this run, never a later one, an unrelated run or a non-attempt', () => {
+  const f = fixture(); pack(f, { ...ID, run_attempt: '1' });
+  const E = { ...EXPECT, runAttempt: '1', currentAttempt: '3' };
+  assert.equal(verifyArtifact(f.dest, E).manifest.run_attempt, '1');
+  assert.equal(verifyArtifact(f.dest, { ...E, currentAttempt: '1' }).manifest.run_attempt, '1');
+  assert.throws(() => verifyArtifact(f.dest, { ...E, runAttempt: '2' }), /run_attempt/, 'manifest attempt differs from the attempt the Build job reports');
+  const g = fixture(); pack(g, { ...ID, run_attempt: '4' });
+  assert.throws(() => verifyArtifact(g.dest, { ...EXPECT, runAttempt: '4', currentAttempt: '3' }), /not an attempt/, 'an artifact from a LATER attempt cannot exist');
+  for (const bad of ['0', 'x', '1.5', '']) assert.throws(() => verifyArtifact(f.dest, { ...E, runAttempt: bad }), /run_attempt|not an attempt/, bad);
+  assert.throws(() => verifyArtifact(f.dest, { ...E, runId: '78' }), /run_id/, 'another run');
+  assert.throws(() => verifyArtifact(f.dest, { ...E, app: 'other' }), /app/, 'another application');
+  assert.throws(() => verifyArtifact(f.dest, { ...E, testedSha: SHA('c') }), /tested_sha/, 'another revision');
 });

@@ -42,7 +42,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: cd actions/cf-preview && npm ci --ignore-scripts --no-audit --no-fund
+      - run: cd actions/cf-preview && npm ci --ignore-scripts --omit=optional --no-audit --no-fund
       - run: scripts/cf-preview/test.sh unit
 
   safety:
@@ -54,7 +54,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: cd actions/cf-preview && npm ci --ignore-scripts --no-audit --no-fund
+      - run: cd actions/cf-preview && npm ci --ignore-scripts --omit=optional --no-audit --no-fund
       - run: scripts/cf-preview/test.sh safety
 
   # Fail closed: every suite must have SUCCEEDED; failure, cancellation and a skip all fail the gate.

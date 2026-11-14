@@ -133,9 +133,9 @@ Native Branch (mutually exclusive by event: `main` vs. other branches); `dev_*` 
 * **Native Dev.** Fixed name `dev`, own ledger environment `<app>/native-dev/dev`, own GitHub Environment `<app>/native-dev`, never
   advertised on PRs. The name `dev` is reserved: with Native Dev on, a branch named `dev` gets Preview `b-dev`; Preview GC never collects `dev`.
 * **Smoke / recovery.** `skip`: no request, `deployed_and_verified=false`, `verified_url` empty, `smoke_level=skipped`, ledger `inactive`
-  (never known-good), no rollback, no Release. `basic`: Access-redirect = liveness only = Published/Unverified. Recovery is target-owned and runs
-  only in the failing kind's call: `native-dev` / `persistent-dev` redeploy the last known-good deployment of the same ledger unless a newer one
-  exists; Production keeps its fail-closed policy; a blocked cross-service gate never rolls back.
+  (never known-good), no rollback, no Release. `basic`: Access-redirect = liveness only = Published/Unverified. Only
+  **Production** has an automatic rollback (fail-closed, stored Worker version, no build). **Preview / Dev have no automatic recovery - they are fixed
+  forward** (G1 review decision, see below); a failed Smoke marks them UNVERIFIED. A blocked cross-service gate never rolls back.
 * **Release** requires the Production Smoke to be content-verified and no Rollback to have run; it reads only `delivery_production`.
 * **`pipeline_phase`.** `deploy` runs the Migration job and each call's Deploy only; the `phase_state` output carries each kind's own Deploy
   result, its migration result and D1 id, the kinds, the inputs and the concurrency group. `verify` (second call) runs only each kind's Smoke and
@@ -378,14 +378,25 @@ identical to a feature-branch Shared Dev push. The delivery workflow has exactly
 
 Concurrency: the run-level group of a persistent-dev dispatch is the same as for the automatic Shared Dev push (`cfv2-nonprod-d1-<scope>` with `d1_migrations`, else `cfv2-shared-dev-<app>`; never the Production group, even from `main`), so the Migrate job cannot race a feature-branch Dev push. Deploy and Revert keep the descriptor's job-level group `cfv2-dev-<repo>-<scope|app>` (a different name, so no nested-group deadlock).
 
-Behaviour changes versus the old manual path: it now runs CI, Plan and the dedicated Migrate job; a failed Smoke triggers the same conditional recovery to the last known-good Dev deployment (it previously had none); D1 is still never rolled back. `dev_deploy_cmd` is removed: the engine is the only publisher, callers build in `dev_build_cmd` (see `docs/cf-worker-v2-refactor.md`).
+Behaviour changes versus the old manual path: it now runs CI, Plan and the dedicated Migrate job; a failed Smoke marks Dev UNVERIFIED (no automatic recovery: fixed forward, see the G1 review section); D1 is never rolled back. `dev_deploy_cmd` is removed: the engine is the only publisher, callers build in `dev_build_cmd` (see `docs/cf-worker-v2-refactor.md`).
 
 ## Final rules (PR #93)
 
 - **One audited publisher.** The engine alone publishes: build (`dev_build_cmd` or `build_cmd`) -> audit the effective Wrangler config -> publish that config (`wrangler deploy --config <audited>`, plus `--env <dev env>` only for an audited *source* config) -> Smoke. There is no caller-supplied publish command: `dev_deploy_cmd` is a removed input; a stale caller that still passes it is rejected by GitHub at workflow validation (fail-closed).
 - **CI environment follows the intended target** (`ci_target_env`, JS twin `ciTargetEnv`): `dev` when the run's only target is Persistent Dev (manual dispatch from any ref, `main` included, or an automatic push where Shared Dev is the only enabled channel); `prod` for `main`; `preview` otherwise (Native Branch, Native Dev, several kinds at once, PRs). With several kinds the shared validation keeps the Preview contract and each kind's own build and audit still validate its actual configuration. Exactly one build env is imported; `ci_env` applies afterwards; no Cloudflare credentials in CI.
 - **`dispatch_target` fails closed**: valid only for `workflow_dispatch` and only as exactly `persistent-dev`; unapproved ref, tag, missing `persistent_dev_ref`, non-hybrid strategy or any other value fails the Plan, including for tag / PR / push / delete events (the Plan `if:` runs for an explicit target so the run is red, never green without deploying).
-- **Non-Production recovery D1 guard** (`nonProdRecoveryBlock`, same rule as Production via `d1SchemaBlock`): last-known-good code is redeployed only when this pipeline's migration result is present, for this target's D1, and either unchanged or additive with `d1_rollback_compat: expand-contract`; otherwise recovery is blocked, the deployment is UNVERIFIED and the summary gives the reason and manual steps. D1 is never reverted.
+- **Non-Production recovery was removed** (G1 review; the old `nonProdRecoveryBlock` D1 guard is gone with it). See the next section.
+
+## G1 review fixes (PR #98 review)
+
+- **Preview Smoke credential boundary.** A Preview's `smoke_cmd` is PR-controlled code. It runs ONLY in the delivery workflow's `app-smoke` job: ephemeral GitHub-hosted runner, no Environment, `contents: read`, and no secret of any kind
+  (no GitHub write token, Cloudflare credential, `SMOKE_USERNAME` / `SMOKE_PASSWORD`, `PREVIEW_SECRETS`, nor the `CF_ACCESS_CLIENT_*` token or `PROBE_HEADERS` of `smoke_env`; the engine strips those names). It can only pass or fail. The credential-bearing `Smoke Tests` job
+  never checks out or installs a Preview's source and never runs the command: it performs the trusted probe / SHA check (using any `smoke_env` Access token or `PROBE_HEADERS` - authenticated content probes by platform tooling) and requires `needs.app-smoke.result == success` whenever a command is configured. Production and approved Dev
+  (protected revisions) still run `smoke_cmd` in the Smoke job with the smoke secrets, unchanged. Consequence: a Preview smoke command cannot log in with `SMOKE_USERNAME` / `SMOKE_PASSWORD`; authenticated checks of a Preview belong to the platform probe. `PREVIEW_SECRETS` is accepted but unused.
+- **Artifact identity.** One contract: `<plan artifact_base>-<run_id>-<run_attempt>` where `artifact_base = cfv2-<repo>-<app>-<slot>-<sha256(repo,app,slot)[:10]>` (`artifact.mjs` `artifactBase`). Build uploads it; Migration and Publish download it by the Build job's `artifact_name` output. Two applications of one monorepo, or two kinds of one application, never share a name.
+- **Partial re-run.** The privileged jobs expect the manifest `run_attempt` to equal the attempt the Build job reports (`artifact_attempt`, `CFV2_RUN_ATTEMPT`); `verify-artifact` previously compared it with `GITHUB_RUN_ATTEMPT`, which broke legitimately reused artifacts. It must be an integer `1..GITHUB_RUN_ATTEMPT` of the same run; unrelated runs, revisions, applications and modified (digest) artifacts are still refused.
+- **Non-production recovery: manual fix-forward (decision requiring owner acceptance).** Recovery would have to rebuild an older revision (forbidden in a credential-bearing job) and no verified artifact of the last known-good deployment is retained (retaining one means cross-run artifact orchestration, deliberately not built).
+  The unconditional `no_retained_artifact` stage and its dead code (`recover-find`, `nonProdRecoveryBlock`, `recovery-guard`, `last-good*` ledger lookups) were removed; the Revert job is Production only. Preview / Dev: a failed Smoke -> ledger `failure`, UNVERIFIED, summary says "fix forward". `rollback_result` is empty for them.
 
 
 ## Read-only D1 precheck: the Migration job builds nothing when nothing is pending

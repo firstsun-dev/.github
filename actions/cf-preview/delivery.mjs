@@ -369,29 +369,6 @@ export function d1SchemaBlock({ d1Pending = false, d1Compat = '', d1Scan = '' })
 }
 
 /**
- * Non-Production recovery (Native Branch / Native Dev / Persistent Dev): may the last known-good code be redeployed?
- * Fails closed on everything it cannot prove, using the migration result of THIS pipeline.
- *   d1Migrations false            -> allowed (no D1 involved)
- *   migration result missing/bad  -> blocked (state of D1 unknown)
- *   result for another D1         -> blocked
- *   schema_changed not true/false -> blocked; false -> allowed; true -> d1SchemaBlock
- * `migration` = the parsed hand-off of the Migration job (or null). null = allowed.
- */
-export function nonProdRecoveryBlock({ d1Migrations = false, migration = null, expectedId = '', d1Compat = '' }) {
-  if (!d1Migrations) return null;
-  const verifiedEmpty = migration !== null && typeof migration === 'object' && migration.precheck === VERIFIED_NO_PENDING && migration.migration === 'none';
-  if (migration === null || typeof migration !== 'object' || Array.isArray(migration) || (migration.migration !== 'applied' && !verifiedEmpty)) {
-    return { code: 'migration_result_missing', why: 'D1 migrations are enabled but this pipeline handed over no valid applied-migration result: the D1 schema state is unknown, so older code cannot be proven compatible.' };
-  }
-  if (!expectedId || migration.d1_id !== expectedId) {
-    return { code: 'd1_identity_mismatch', why: `The migration result is for D1 '${migration.d1_id || 'unknown'}', not this target's D1 '${expectedId || 'unknown'}'.` };
-  }
-  const changed = String(migration.schema_changed ?? '');
-  if (changed !== 'true' && changed !== 'false') return { code: 'migration_result_invalid', why: `The migration result has no valid schema_changed value ('${changed || 'missing'}').` };
-  return d1SchemaBlock({ d1Pending: changed === 'true', d1Compat, d1Scan: String(migration.d1_scan ?? '') });
-}
-
-/**
  * Production automatic rollback: why it must NOT happen (null = allowed so far). Checked in this order, fail closed.
  * `live` = the version Cloudflare reports as live; pass undefined to skip that last, observation-based check.
  * A Worker rollback never reverts D1: after an applied migration the previous version must be PROVEN to cope.
@@ -410,19 +387,15 @@ export function prodRollbackBlock({ policy, previous = '', current = '', worker 
 }
 
 /**
- * Final verdict of the Rollback job. restored_verified only when the restored deployment was re-smoked at CONTENT level.
- * Production: facts = rolled back? post-rollback smoke? level. Preview/Dev: known-good found? recovered? re-verified? level.
+ * Final verdict of the Rollback job (PRODUCTION only; Preview / Dev are fixed forward, they have no rollback job).
+ * restored_verified only when the restored deployment was re-smoked at CONTENT level.
  */
-export function rollbackVerdict({ target, rbResult = '', rbVerify = '', rbLevel = '', goodSha = '', recovered = '', verified = '', smokeLevel = '' }) {
+export function rollbackVerdict({ rbResult = '', rbVerify = '', rbLevel = '' }) {
   let result;
   let level = '';
-  if (target === 'prod') {
-    if (rbResult === 'rolled_back') {
-      if (rbVerify === 'success') { result = isContentLevel(rbLevel) ? 'restored_verified' : 'restored_unverified'; level = rbLevel; } else result = 'restored_unhealthy';
-    } else result = rbResult === 'blocked' ? 'blocked' : 'failed';
-  } else if (rbResult === 'blocked') result = 'blocked';
-  else if (!goodSha) result = 'no_known_good';
-  else if (recovered === 'success' && verified === 'success') { result = isContentLevel(smokeLevel) ? 'restored_verified' : 'restored_unverified'; level = smokeLevel; } else result = 'failed';
+  if (rbResult === 'rolled_back') {
+    if (rbVerify === 'success') { result = isContentLevel(rbLevel) ? 'restored_verified' : 'restored_unverified'; level = rbLevel; } else result = 'restored_unhealthy';
+  } else result = rbResult === 'blocked' ? 'blocked' : 'failed';
   return { result, level, ok: result === 'restored_verified' };
 }
 
@@ -486,7 +459,7 @@ export function restoreDescriptor(state, { repo, runId = '0', event = '', ref = 
 // Engine initialisation (pure): every check of `engine.sh init`, evaluated once over the validated inputs. Throws (fail closed, BEFORE any
 // mutation) with the message the operator sees. Credentials stay a shell check.
 // ---------------------------------------------------------------------------------------------------------------------
-const STAGES = ['build', 'precheck', 'migrate', 'publish', 'verify', 'rollback'];
+const STAGES = ['build', 'precheck', 'migrate', 'publish', 'verify', 'app-smoke', 'rollback'];
 
 export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expect = '', descriptor = '', callInputs = '', event, ref, isFork = false, prAction = '', previewSecrets = '' }) {
   if (inputs === null || typeof inputs !== 'object' || Array.isArray(inputs)) throw new Error('inputs_json is not an object');

@@ -59,7 +59,7 @@ on:
         description: applied | failed | none - the result of the single Migration job (none when there is no migration, a read-only precheck verified nothing pending, or on a pipeline_phase verify call)
         value: ${{ jobs.migration.outputs.migration_status || 'none' }}
       rollback_result:
-        description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed | no_known_good; empty when no rollback ran. Anything but empty is a FAILED run
+        description: restored_verified | restored_unverified | restored_unhealthy | blocked | failed; empty when no rollback ran (always for Preview and Dev, which are fixed forward). Anything but empty is a FAILED run
         value: ${{ jobs.delivery.outputs.rollback_result }}
       deploy_gate_blocked:
         description: true when the cross-service gate (upstream_gate) blocked a verification - the deployment is published but NOT verified and was not rolled back (pipeline_phase verify)
@@ -337,7 +337,7 @@ on:
       CLOUDFLARE_ACCOUNT_ID:
         required: false
       PREVIEW_SECRETS:
-        description: Optional KEY=VALUE lines of Preview-only secrets exported to the Preview build and smoke
+        description: ACCEPTED BUT UNUSED (kept so existing callers do not break) - a Preview's application code (build and smoke command) never receives a secret. Remove it from the caller.
         required: false
       SMOKE_USERNAME:
         required: false
@@ -426,6 +426,7 @@ jobs:
       slot: ${{ steps.plan.outputs.slot }}
       preview_name: ${{ steps.plan.outputs.preview_name }}
       url_host: ${{ steps.plan.outputs.url_host }}
+      artifact_base: ${{ steps.plan.outputs.artifact_base }}
       url_explicit: ${{ steps.plan.outputs.url_explicit }}
       target_url: ${{ steps.url.outputs.target_url }}
     steps:
@@ -483,9 +484,11 @@ jobs:
     permissions:
       contents: read
     outputs:
-      artifact_name: ${{ format('cfv2-artifact-{0}-{1}', github.run_id, github.run_attempt) }}
+      # ONE identity: <plan's repo/app/slot base>-<run_id>-<attempt>. Migration and Publish read it from here; the upload below uses the same value.
+      artifact_name: ${{ format('{0}-{1}-{2}', needs.plan.outputs.artifact_base, github.run_id, github.run_attempt) }}
       artifact_attempt: ${{ github.run_attempt }}
     env:
+      ARTIFACT_NAME: ${{ format('{0}-{1}-{2}', needs.plan.outputs.artifact_base, github.run_id, github.run_attempt) }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
       PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
       PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -507,7 +510,7 @@ jobs:
           d1_expected_id: ${{ fromJSON(needs.plan.outputs.descriptor).d1_expected_id }}
       - uses: actions/upload-artifact@v7
         with:
-          name: cfv2-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ env.ARTIFACT_NAME }}
           path: ${{ runner.temp }}/cfv2-artifact
           if-no-files-found: error
           retention-days: 7
@@ -617,7 +620,6 @@ jobs:
     secrets:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      PREVIEW_SECRETS: ${{ secrets.PREVIEW_SECRETS }}
       SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
       SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
 

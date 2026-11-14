@@ -132,6 +132,51 @@ if "ubuntu-24.04" not in open(".github/workflows/_cf-worker-ci.yml").read():
 if re.search(r"fork_runner", open(".github/workflows/_cf-worker-v2.yml").read()):
     errors.append("fork_runner is a caller-supplied runner label and must not exist")
 
+# ---- Preview Smoke boundary (G1 review P0): PR-controlled smoke code runs ONLY in a job without any secret; the credential-bearing Smoke job never runs it ----
+asmk = dlv.get("app-smoke")
+if not asmk:
+    errors.append("delivery workflow has no credential-free `app-smoke` job")
+else:
+    atext = yaml.dump(asmk)
+    for bad in ("secrets.", "GH_TOKEN", "github.token", "CLOUDFLARE", "SMOKE_USERNAME", "SMOKE_PASSWORD", "PREVIEW_SECRETS", "deployments", "pull-requests"):
+        if bad in atext:
+            errors.append(f"app-smoke job must not reference '{bad}'")
+    if "environment" in asmk:
+        errors.append("app-smoke job must not use a deployment environment")
+    if asmk.get("permissions") != {"contents": "read"}:
+        errors.append("app-smoke job permissions must be exactly {contents: read}")
+    if "ubuntu-24.04" not in str(asmk.get("runs-on")):
+        errors.append("app-smoke job must run on the ephemeral hosted runner, never a shared / self-hosted one")
+    if "'preview'" not in str(asmk.get("if", "")):
+        errors.append("app-smoke job must be limited to the Preview target")
+sm = dlv["smoke"]
+if "app-smoke" not in (sm.get("needs") or []):
+    errors.append("the Smoke job must need app-smoke (it requires its result)")
+for st in sm.get("steps", []):
+    blob = yaml.dump(st)
+    if str(st.get("uses", "")).startswith("actions/checkout") and "!= 'preview'" not in str(st.get("if", "")):
+        errors.append("the Smoke job must not check out a Preview's PR code")
+    if "PREVIEW_SECRETS" in blob:
+        errors.append("the Smoke job must not receive PREVIEW_SECRETS")
+    if "SMOKE_USERNAME" in blob and "!= 'preview'" not in blob:
+        errors.append("the Smoke job must not pass smoke credentials for a Preview")
+for st in act:
+    cond = str(st.get("if", ""))
+    if str(st.get("uses", "")).startswith("$/actions/setup") and "'verify'" in cond and "!= 'preview'" not in cond:
+        errors.append("the credential-bearing verify stage must not install a Preview's dependencies")
+rb = dlv["rollback"]
+if "== 'production'" not in str(rb.get("if", "")) or any(str(st.get("uses", "")).startswith("$/actions/setup") for st in rb.get("steps", [])):
+    errors.append("the rollback job is Production only and runs no application setup (Preview / Dev are fixed forward)")
+# ---- artifact identity: ONE name contract (repository / app / slot from the Plan, run id, attempt) shared by Build, Migration and Publish ----
+bname = str((b or {}).get("outputs", {}).get("artifact_name", ""))
+if "artifact_base" not in bname or "run_id" not in bname or "run_attempt" not in bname:
+    errors.append("the artifact name must be <plan artifact_base>-<run_id>-<run_attempt>")
+for st in (b or {}).get("steps", []):
+    if str(st.get("uses", "")).startswith("actions/upload-artifact") and str(st["with"].get("name")) != "${{ env.ARTIFACT_NAME }}":
+        errors.append("the Build upload must use the job's ARTIFACT_NAME (same expression as the artifact_name output)")
+if str((b or {}).get("env", {}).get("ARTIFACT_NAME", "")) != bname:
+    errors.append("the Build job's ARTIFACT_NAME must equal its artifact_name output")
+
 for e in errors:
     print("FAIL", e)
 print(f"workflow structure: {len(WF)} workflows, {'FAILED' if errors else 'clean'}")

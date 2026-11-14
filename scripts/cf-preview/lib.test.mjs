@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  assertWranglerSupported, auditPreviewConfig, PREVIEW_NAME_RE, extractPreviewUrl, isStale, previewIdentity,
+  assertWranglerSupported, auditPreviewConfig, PREVIEW_NAME_RE, extractPreviewUrl, previewIdentity,
   classifyMigrationSql, workerName,
 } from '../../actions/cf-preview/lib.mjs';
 
@@ -41,14 +41,6 @@ test('main and non-branch refs rejected', () => {
   assert.throws(() => id('refs/heads/main'));
   assert.throws(() => id('refs/pull/1/merge'));
 });
-test('extractPreviewUrl validates shape', () => {
-  assert.equal(extractPreviewUrl({ preview: { urls: ['https://a.b.workers.dev'] } }), 'https://a.b.workers.dev');
-  assert.equal(extractPreviewUrl('log line\n{"preview":{"urls":["https://x.dev/"]}}'), 'https://x.dev');
-  assert.throws(() => extractPreviewUrl({}));
-  assert.throws(() => extractPreviewUrl({ preview: { urls: [] } }));
-  assert.throws(() => extractPreviewUrl({ preview: { urls: ['http://insecure.dev'] } }));
-  assert.throws(() => extractPreviewUrl({ preview: { urls: ['nope'] } }));
-});
 test('wrangler version gate', () => {
   assertWranglerSupported('4.135.0');
   assertWranglerSupported('4.200.1');
@@ -56,12 +48,6 @@ test('wrangler version gate', () => {
   assert.throws(() => assertWranglerSupported('4.134.9'));
   assert.throws(() => assertWranglerSupported('3.99.0'));
   assert.throws(() => assertWranglerSupported(''));
-});
-
-test('stale-SHA guard', () => {
-  assert.equal(isStale({ runSha: 'a', branchTipSha: 'a' }), false);
-  assert.equal(isStale({ runSha: 'a', branchTipSha: 'b' }), true);
-  assert.equal(isStale({ runSha: 'a', branchTipSha: '' }), true);
 });
 
 const good = () => ({
@@ -176,7 +162,7 @@ test('preflight: Preview binding without id is an error (Cloudflare 10021)', () 
 });
 
 // ---- v2 refactor: target resolution, migration target, production audit, env import ----
-import { previewHostReadiness, rebindSha, auditDevConfig, auditProdConfig, d1ForTarget, migrationPlan, sharedPreviewDevD1 } from '../../actions/cf-preview/lib.mjs';
+import { previewHostReadiness, auditDevConfig, auditProdConfig, d1ForTarget, migrationPlan } from '../../actions/cf-preview/lib.mjs';
 import { parseEnvLines } from '../../actions/cf-preview/parse-env.mjs';
 
 
@@ -369,13 +355,6 @@ test('Preview policy is independent: a Dev exception does not weaken Native Prev
   // The Dev audit takes only its own denylist, so a Preview-only deny entry is irrelevant to an approved Dev share.
   assert.deepEqual(audit(devCfg(R2('prod-b')), { allow: SHARE, denyResources: ['some-preview-only-thing'] }), []);
 });
-test('sharedPreviewDevD1: same physical D1 detected; distinct or undeclared Preview is not shared', () => {
-  assert.equal(sharedPreviewDevD1(DEVCFG), true);
-  assert.equal(sharedPreviewDevD1({ ...DEVCFG, previews: {} }), false);
-  assert.equal(sharedPreviewDevD1({ ...DEVCFG, env: { dev: { d1_databases: [{ binding: 'DB', database_name: 'other', database_id: 'X' }] } } }), false);
-  assert.equal(sharedPreviewDevD1({ ...DEVCFG, env: {} }), false);
-});
-
 test('extractPreviewUrl: fails closed on every unusable payload (the empty-URL incident)', () => {
   assert.equal(extractPreviewUrl('{"preview":{"urls":["https://a-blog.x.workers.dev"]}}'), 'https://a-blog.x.workers.dev');
   assert.equal(extractPreviewUrl('log line\n{"preview":{"urls":["https://a.example.com/"]}}'), 'https://a.example.com');
@@ -406,19 +385,9 @@ test('previewHostReadiness: blocks only on a definitive previews_enabled=false',
   assert.equal((await previewHostReadiness(apiRes(200, { result: {} }), a)).level, 'unknown');
   assert.equal((await previewHostReadiness(apiRes(200, {}), { ...a, token: '' })).level, 'unknown');
 });
-test('rebindSha: failed SHA (full and short) becomes the restored SHA', () => {
-  const r = rebindSha('A=abcdef1234567890\nB=abcdef1\nC=keep', 'abcdef1234567890', '1111111222222233');
-  assert.equal(r.text, 'A=1111111222222233\nB=1111111\nC=keep');
-  assert.equal(r.replacements, 2);
-  assert.throws(() => rebindSha('x', 'zz', '1111111'), /hex/);
-});
-
-// ---- PR #64 refactor: protected control variables, exact D1 consistency, same-artifact fingerprint ----
-import { checkDeployedD1, artifactDigest } from '../../actions/cf-preview/lib.mjs';
+// ---- protected control variables and exact D1 consistency ----
+import { checkDeployedD1 } from '../../actions/cf-preview/lib.mjs';
 import { RESERVED } from '../../actions/cf-preview/parse-env.mjs';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 
 test('parseEnvLines (reserved): deployment-control and verification names cannot be set by application env', () => {
   for (const n of ['TARGET', 'DEV_ENV', 'GH_TOKEN', 'EXPECTED_SHA', 'RUN_SHA', 'GOOD_SHA', 'D1_BINDING', 'STATE_DIR', 'APP_DIR', 'BRANCH_REF', 'STALE',
@@ -458,28 +427,6 @@ test('checkDeployedD1: the deployed config must bind the exact physical D1 the m
   assert.equal(checkDeployedD1(SRC, SRC, 'dev', { mode: 'source' }).databaseId, 'DEV-ID');
 });
 
-test('artifactDigest: stable for an unchanged deployable; changes when the config, entry or assets change', () => {
-  const d = mkdtempSync(join(tmpdir(), 'digest-'));
-  mkdirSync(join(d, 'dist', 'assets'), { recursive: true });
-  writeFileSync(join(d, 'dist', 'index.js'), 'export default {}');
-  writeFileSync(join(d, 'dist', 'assets', 'a.css'), 'a{}');
-  const cfg = join(d, 'dist', 'wrangler.json');
-  const write = (o) => writeFileSync(cfg, JSON.stringify({ name: 'app-dev', main: 'index.js', assets: { directory: 'assets' }, ...o }));
-  write({});
-  const base = artifactDigest(cfg);
-  assert.equal(artifactDigest(cfg), base);
-  write({ name: 'app-prod' });
-  assert.notEqual(artifactDigest(cfg), base, 'config change');
-  write({});
-  assert.equal(artifactDigest(cfg), base);
-  writeFileSync(join(d, 'dist', 'index.js'), 'export default {};//rebuilt');
-  assert.notEqual(artifactDigest(cfg), base, 'Worker entry replaced');
-  writeFileSync(join(d, 'dist', 'index.js'), 'export default {}');
-  writeFileSync(join(d, 'dist', 'assets', 'b.css'), 'b{}');
-  assert.notEqual(artifactDigest(cfg), base, 'asset added');
-});
-
-// ---- Production rollback: D1 compatibility of the previous Worker version (Expand / Contract), fail closed
 test('migration scan: additive statements only -> additive', () => {
   const sql = `-- add notes
     CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT);

@@ -10,13 +10,12 @@
 #   anything else               -> FAIL
 # Only content / content-sha count as "verified" (engine.sh); liveness is published-but-unverified.
 # Env: TARGET_URL DEPLOY_TARGET(prod|preview|dev) [SMOKE_ENV_FILE] EXPECTED_SHA [ABSENT_SHA: post-rollback, EXPECTED_SHA empty] TOOLS_DIR [SHA_PATH] [SMOKE_CMD] [ACCESS_TARGETS]
-#      [SMOKE_CWD=.] [PREVIEW_ENV_FILE] [SHA_ATTEMPTS=6] [SHA_SLEEP=5]
+#      [SMOKE_CWD=.] [SHA_ATTEMPTS=6] [SHA_SLEEP=5]
 set -euo pipefail
 : "${DEPLOY_TARGET:?}" "${TOOLS_DIR:?}"
 [ -n "${TARGET_URL:-}" ] || { echo "::error::no URL to smoke-test ($DEPLOY_TARGET): set app_url_prod / a deploy URL; a deployment without a probe is not verified" >&2; exit 1; }
 # shellcheck source=envfile.sh
 . "$TOOLS_DIR/envfile.sh"
-[ "$DEPLOY_TARGET" != preview ] || load_env_file "${PREVIEW_ENV_FILE:-}"
 # Smoke-only variables live in their own file and are exported ONLY here (never into GITHUB_ENV), so they cannot
 # overwrite the target build environment of a later step such as a recovery rebuild.
 load_env_file "${SMOKE_ENV_FILE:-}"

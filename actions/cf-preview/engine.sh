@@ -162,7 +162,7 @@ case "$PHASE" in
     # Prod, Preview and Dev all use the one account credential pair (CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID). The stages that RUN APPLICATION CODE
     # - the Build and the Smoke - never receive Cloudflare credentials; the stages that hold them (migrate, publish, rollback) never run an application build.
     case "$(rd stage)" in
-      verify|build)
+      verify|build|app-smoke)
         if [ -n "${CLOUDFLARE_API_TOKEN:-}${CLOUDFLARE_ACCOUNT_ID:-}" ]; then die "the $(rd stage) stage must not receive Cloudflare credentials"; fi;;
       *) [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || die "$(rd target) credentials not provided (set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID)";;
     esac;;
@@ -345,7 +345,7 @@ case "$PHASE" in
     fi
     [ -z "$H_PUBSHA" ] || [ "$H_PUBSHA" = "$RUN_SHA" ] || die "hand-off was published from $H_PUBSHA, this run is $RUN_SHA; refusing to act on another deployment"
     [ "$TARGET" = prod ] || [ -n "$H_URL" ] || die "$TARGET hand-off has no published URL"
-    # The Migration job's validated result, kept for the non-Production recovery guard (recover-find). Absent when none was handed over.
+    # The Migration job's validated result, kept for the Production rollback guard. Absent when none was handed over.
     if [ -n "${HANDOFF_MIGRATION:-}" ] && [ "$HANDOFF_MIGRATION" != '{}' ]; then printf '%s' "$M" > "$S/migration.json"; else rm -f "$S/migration.json"; fi
     printf '%s' "$H_LEDGER" > "$S/ledger_id"; printf '%s' "$H_PNAME" > "$S/preview_name"
     case "$KIND" in native-branch) printf '%s' "$APP_NAME/preview/$H_PNAME" > "$S/ledger_env";; native-dev) printf '%s' "$APP_NAME/native-dev/dev" > "$S/ledger_env";; persistent-dev) printf '%s' "$APP_NAME/dev/shared" > "$S/ledger_env";; esac
@@ -380,10 +380,38 @@ case "$PHASE" in
       echo "smoke_level=skipped"; exit 0
     fi
     URL="$(target_url)"; [ "$TARGET" != preview ] || URL="${PUBLISHED_URL:-}"
-    TARGET_URL="$URL" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="$RUN_SHA" SMOKE_CMD="$(kind_smoke_cmd)" SMOKE_CWD="$APP_DIR" SHA_PATH="$(inp sha_path)" \
+    # A Preview's application command is PR-controlled code: it NEVER runs in this job (which holds the GitHub token, the smoke secrets and the Access service
+    # token). It runs in the separate credential-free app-smoke job; here only its RESULT is required, next to the trusted probe / SHA check.
+    CMD="$(kind_smoke_cmd)"
+    if [ "$TARGET" = preview ]; then
+      if [ -n "$CMD" ] && [ "${APP_SMOKE_RESULT:-}" != success ]; then
+        die "the Preview's application smoke command did not pass (app-smoke job: '${APP_SMOKE_RESULT:-not run}'); the Preview is not verified"
+      fi
+      CMD=""
+    fi
+    TARGET_URL="$URL" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="$RUN_SHA" SMOKE_CMD="$CMD" SMOKE_CWD="$APP_DIR" SHA_PATH="$(inp sha_path)" \
       PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" \
-      ACCESS_TARGETS="$(inp access_protected_targets)" SMOKE_ENV_FILE="$S/smoke.env" PREVIEW_ENV_FILE="$S/preview.env" NO_PROXY='*' \
+      ACCESS_TARGETS="$(inp access_protected_targets)" SMOKE_ENV_FILE="$S/smoke.env" NO_PROXY='*' \
       env -u GH_TOKEN -u GITHUB_TOKEN -u CLOUDFLARE_API_TOKEN -u CLOUDFLARE_ACCOUNT_ID "$TOOLS_DIR/smoke.sh";;
+
+  app-smoke) # Preview only, UNPRIVILEGED job (no secret of any kind): the application's own PR-controlled smoke command and nothing else.
+    ctx
+    [ "$TARGET" = preview ] || die "app-smoke is the Preview stage; $TARGET runs its application smoke in the Smoke job (protected revision)"
+    CMD="$(kind_smoke_cmd)"
+    if [ "$(smoke_mode)" != full ] || [ -z "$CMD" ]; then echo "::notice::no application smoke command for this Preview" >&2; echo "app_smoke=none"; exit 0; fi
+    URL="${PUBLISHED_URL:-}"; [ -n "$URL" ] || die "no published Preview URL to smoke"
+    # Readiness only (anonymous, trusted script, no auth header); the verdict on content / SHA belongs to the Smoke job.
+    TARGET_URL="$URL" PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" TOOLS_DIR="$TOOLS_DIR" \
+      env -u PROBE_HEADERS -u CF_ACCESS_CLIENT_ID -u CF_ACCESS_CLIENT_SECRET "$TOOLS_DIR/probe.sh" >&2 || die "the Preview $URL is not reachable for the application smoke command"
+    # smoke_env is caller data, but the platform's own credentials in it are for the trusted probe ONLY: they never reach the PR command.
+    (
+      . "$TOOLS_DIR/envfile.sh"; load_env_file "$S/smoke.env"
+      cd "$APP_DIR"
+      TARGET_URL="$URL" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="$RUN_SHA" NO_PROXY='*' \
+        exec env -u GH_TOKEN -u GITHUB_TOKEN -u CLOUDFLARE_API_TOKEN -u CLOUDFLARE_ACCOUNT_ID -u SMOKE_USERNAME -u SMOKE_PASSWORD -u PREVIEW_SECRETS \
+        -u PROBE_HEADERS -u CF_ACCESS_CLIENT_ID -u CF_ACCESS_CLIENT_SECRET bash -c "$CMD"
+    ) >&2
+    echo "app_smoke=passed";;
 
   verified) # smoke passed: published; "verified" only at content level (liveness = Access login reachable only)
     ctx
@@ -451,6 +479,7 @@ case "$PHASE" in
     if [ "$TARGET" != prod ]; then
       "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" failure "$URL" "Smoke failed — $TARGET UNVERIFIED"
       summary "### ❌ $TARGET smoke failed — $URL is **unverified** (serves $RUN_SHA)."
+      summary "- No automatic recovery for Preview / Dev (by design): nothing was redeployed, and no retained verified artifact exists to redeploy. **Fix forward** - push a corrected commit; the next verified deployment replaces this one. D1 migrations were not reverted."
     else
       POLICY="$(inp production_rollback_policy)"
       summary "### ❌ Production smoke FAILED — $URL is **unverified** (serves $RUN_SHA, version \`${VERSION_ID:-?}\`). Release is blocked."
@@ -463,18 +492,6 @@ case "$PHASE" in
     fi
     # The Environment deployment GitHub created for the Deploy job is "success" (it published). Record that it is NOT verified.
     "$TOOLS_DIR/gh.sh" mark-env-deployment "$(gh_env)" "$RUN_SHA" failure "Smoke failed — UNVERIFIED (served $RUN_SHA)" || echo "::warning::could not annotate the Environment deployment as unverified" >&2;;
-
-  recover-find) # non-Production recovery. A recovery would REBUILD the last known-good revision, and no credential-bearing job may build application code:
-    ctx           # it is therefore blocked (fail closed) until a verified artifact is retained for it. Production never rebuilds: it re-deploys a stored Worker VERSION.
-    BC=no_retained_artifact
-    BW="redeploying an older $TARGET deployment needs its retained, verified artifact; none is kept, and a credential-bearing job must not rebuild application code."
-    echo "::error::Automatic recovery of $TARGET is BLOCKED ($BC): $BW" >&2
-    summary "### 🛑 Automatic recovery of $TARGET **blocked** (\`$BC\`) — $TARGET serves \`$RUN_SHA\`, which FAILED its smoke, and is **UNVERIFIED**."
-    summary "- Why: $BW"
-    summary "- Nothing was redeployed and the D1 schema was NOT reverted. Required manual recovery: push a forward fix (preferred)."
-    [ -z "$LEDGER_ID" ] || "$TOOLS_DIR/gh.sh" status "$LEDGER_ID" failure "" "Smoke failed for $RUN_SHA; recovery blocked ($BC) — $TARGET UNVERIFIED" || true
-    "$TOOLS_DIR/gh.sh" mark-env-deployment "$(gh_env)" "$RUN_SHA" failure "Smoke failed, recovery blocked ($BC) — UNVERIFIED (served $RUN_SHA)" || echo "::warning::could not annotate the Environment deployment as unverified" >&2
-    echo "sha="; echo "url="; echo "blocked=true"; echo "block_code=$BC";;
 
   prod-rollback) # Rollback job, Production: fail-closed. Prints rollback_result=rolled_back|blocked|failed (always exits 0)
     ctx
@@ -518,22 +535,20 @@ case "$PHASE" in
     echo "previous_commit=$PREV_SHA"
     TARGET_URL="$(target_url)" DEPLOY_TARGET=prod TEST_ENV=prod EXPECTED_SHA="$PREV_SHA" ABSENT_SHA="$RUN_SHA" SMOKE_CMD="" SMOKE_CWD="$APP_DIR" SHA_PATH="$(inp sha_path)" \
       PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" ACCESS_TARGETS="$(inp access_protected_targets)" \
-      SMOKE_ENV_FILE="$S/smoke.env" PREVIEW_ENV_FILE="$S/preview.env" NO_PROXY='*' env -u GH_TOKEN -u GITHUB_TOKEN -u CLOUDFLARE_API_TOKEN -u CLOUDFLARE_ACCOUNT_ID "$TOOLS_DIR/smoke.sh";;
+      SMOKE_ENV_FILE="$S/smoke.env" NO_PROXY='*' env -u GH_TOKEN -u GITHUB_TOKEN -u CLOUDFLARE_API_TOKEN -u CLOUDFLARE_ACCOUNT_ID "$TOOLS_DIR/smoke.sh";;
 
-  rollback-finish) # final, target-independent verdict of the Rollback job (ok=true only when restored AND content-verified)
+  rollback-finish) # final verdict of the Rollback job (Production only; ok=true only when restored AND content-verified)
     ctx
-    RV="$(env TARGET="$TARGET" RB_RESULT="${RB_RESULT:-}" RB_VERIFY="${RB_VERIFY:-}" RB_LEVEL="${RB_LEVEL:-}" GOOD_SHA="${GOOD_SHA:-}" RECOVERED="${RECOVERED:-}" VERIFIED="${VERIFIED:-}" \
-      SMOKE_LEVEL="${SMOKE_LEVEL:-}" node "$TOOLS_DIR/cli.mjs" rollback-verdict)"   # delivery.mjs rollbackVerdict
+    [ "$TARGET" = prod ] || die "only Production has an automatic rollback; $TARGET is fixed forward"
+    RV="$(env RB_RESULT="${RB_RESULT:-}" RB_VERIFY="${RB_VERIFY:-}" RB_LEVEL="${RB_LEVEL:-}" node "$TOOLS_DIR/cli.mjs" rollback-verdict)"   # delivery.mjs rollbackVerdict
     R="$(printf '%s\n' "$RV" | sed -n 's/^result=//p')"; LEVEL="$(printf '%s\n' "$RV" | sed -n 's/^level=//p')"
-    if [ "$TARGET" = prod ]; then
-      case "$R" in
+    case "$R" in
         restored_verified)
           summary "### ♻️ Production rolled back to \`${PREVIOUS_VERSION_ID:-?}\` and verified ($LEVEL). The run stays **FAILED** for $RUN_SHA and Release is blocked. D1 migrations (if any) were NOT reverted."
           "$TOOLS_DIR/gh.sh" mark-env-deployment "$(gh_env)" "$RUN_SHA" inactive "Rolled back to ${PREVIOUS_VERSION_ID:-previous} after a failed smoke" || true;;
         restored_unverified) summary "### ⚠️ Production rolled back to \`${PREVIOUS_VERSION_ID:-?}\` but only liveness could be observed (${LEVEL:-no level}): the restored deployment is NOT content-verified. Run FAILED.";;
         restored_unhealthy) summary "### 🚨 Production was rolled back to \`${PREVIOUS_VERSION_ID:-?}\` but the post-rollback smoke FAILED — Production may be unhealthy. Investigate now. Run FAILED.";;
-      esac
-    fi
+    esac
     echo "result=$R"; echo "level=$LEVEL"; echo "ok=$([ "$R" = restored_verified ] && echo true || echo false)";;
 
   cleanup)

@@ -97,7 +97,8 @@ Removed (no compatibility shim): `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `
 * **Revision contract**: `source_sha` = PR head, `tested_sha` = the merge candidate CI tested, `artifact_sha` = what the Build checked out (must equal `tested_sha`), `deployed_sha` = recorded
   in the ledger = `tested_sha`. A PR Preview is built from and published as the tested merge candidate. Publish proceeds only while the PR is open, its head is still `source_sha` and
   GitHub's merge candidate is still `tested_sha` (a newer synchronization or a moved base makes the run stale). Main / Dev publish the pushed / approved commit under the existing branch-tip guard.
-* Non-production recovery is **blocked** (fail closed): redeploying an older Preview / Dev would require rebuilding it in a credential-bearing job. Fix forward. Production rollback
+* Non-production has **no automatic recovery** (decision pending owner acceptance): redeploying an older Preview / Dev would require rebuilding it in a credential-bearing job, and no verified artifact is retained. A failed Smoke marks it UNVERIFIED; fix forward.
+* A Preview's `smoke_cmd` (PR-controlled) runs only in the separate credential-free `app-smoke` job; the credential-bearing Smoke job runs the trusted probe and requires its result. Production rollback
   re-deploys a stored Worker version (no build) and never reverts D1.
 
 ## Safety invariants (kept)

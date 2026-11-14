@@ -24,6 +24,19 @@ export const MANIFEST_KEYS = [
   'config_mode', 'worker_name', 'files_digest',
 ];
 const SHA_RE = /^[0-9a-f]{40}$/;
+
+/**
+ * ONE identity contract for the artifact NAME (Build uploads it, Migration and Publish download it): cfv2-<repo>-<app>-<slot>-<hash>-<run_id>-<attempt>.
+ * `base` (everything before the run) is computed once by the Plan job from the repository, the application and the delivery slot, so two applications of
+ * one monorepo (or two kinds of one application) deploying in the same run can never share a name. The trailing hash is over the RAW identity, so
+ * names that sanitize to the same text still differ. Only [A-Za-z0-9._-] appear (GitHub forbids `/` and other characters in artifact names).
+ */
+export function artifactBase({ repository, app, slot }) {
+  const slug = (v, n) => String(v).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, n) || 'x';
+  const hash = createHash('sha256').update(`${repository}\0${app}\0${slot}`).digest('hex').slice(0, 10);
+  return `cfv2-${slug(repository, 40)}-${slug(app, 40)}-${slug(slot, 20)}-${hash}`;
+}
+export const artifactName = (base, runId, attempt) => `${base}-${runId}-${attempt}`;
 /** Config keys with local side effects or that select behaviour of the publisher host: never allowed in a packaged config (root or any environment). */
 export const FORBIDDEN_KEYS = ['build', 'site', 'containers', 'alias', 'tsconfig', 'find_additional_modules', 'base_dir', 'dev'];
 const ALLOWED_TOP = (f) => f === 'manifest.json' || f === 'wrangler.json' || /^worker\//.test(f) || /^assets\//.test(f);
@@ -140,7 +153,7 @@ export function validateManifestShape(m) {
 
 /**
  * Privileged-side verification. `expect` is derived by the PRIVILEGED job from its own trusted data (descriptor, GitHub context, inputs, event):
- *   { repository, app, target, driver, slot, runId, runAttempt, sourceSha, testedSha, targetUrl, workerName (expected name or '' to skip, e.g. prod
+ *   { repository, app, target, driver, slot, runId, runAttempt, currentAttempt, sourceSha, testedSha, targetUrl, workerName (expected name or '' to skip, e.g. prod
  *     takes the audited source name), allowMissingUrl }
  * Throws on the first violation - the artifact is then never published. Returns { manifest, config } for the audits that follow.
  */
@@ -156,6 +169,11 @@ export function verifyArtifact(dir, expect) {
   eq('slot', m.slot, expect.slot);
   eq('run_id', m.run_id, expect.runId);
   eq('run_attempt', m.run_attempt, expect.runAttempt);
+  // A partial re-run legitimately reuses the artifact of an EARLIER attempt of THIS run (never a later one, never a non-number).
+  if (expect.currentAttempt !== undefined) {
+    const a = Number(expect.runAttempt); const c = Number(expect.currentAttempt);
+    if (!Number.isInteger(a) || !Number.isInteger(c) || a < 1 || a > c) throw new Error(`artifact run_attempt '${expect.runAttempt}' is not an attempt (1..${expect.currentAttempt}) of this run; refusing to publish`);
+  }
   eq('source_sha', m.source_sha, expect.sourceSha);
   eq('tested_sha', m.tested_sha, expect.testedSha);
   eq('artifact_sha', m.artifact_sha, expect.testedSha); // the code that was built is exactly the code that passed CI
