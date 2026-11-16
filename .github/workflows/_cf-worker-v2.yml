@@ -521,6 +521,7 @@ jobs:
           name: ${{ env.ARTIFACT_NAME }}
           path: ${{ runner.temp }}/cfv2-artifact
           if-no-files-found: error
+          include-hidden-files: true # assets/<n>/.assetsignore is part of the digest; any other hidden file already failed packaging
           retention-days: 7
 
   # =========================================================================
