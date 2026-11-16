@@ -151,6 +151,10 @@ case "$PHASE" in
     [ "$S" != "${RUNNER_TEMP:-}/cfv2" ] || rm -rf -- "$S"
     mkdir -p "$S"; chmod 700 "$S"; umask 077
     printf '%s' "${INPUTS_JSON:?}" > "$IN"
+    # The app-smoke stage runs PR-controlled code in the same runner user: caller env data (smoke_env, build_env_*) must not even exist on its disk.
+    if [ "${ENGINE_STAGE:-}" = app-smoke ]; then
+      jq -c 'with_entries(select(.key != "smoke_env" and (.key | startswith("build_env") | not)))' "$IN" > "$IN.tmp" && mv "$IN.tmp" "$IN"
+    fi
     # ONE Node process validates everything pure (target/kind/stage/mode binding, descriptor, strategy and policy enums, enabled kind of
     # this event, per-target requirements, URL isolation, env data) and writes the validated state files. Nothing is mutated if it fails.
     node "$TOOLS_DIR/cli.mjs" init-checks --state "$S" --inputs "$IN" | { grep -v '^kind=\|^smoke_mode=' || true; }
@@ -403,13 +407,13 @@ case "$PHASE" in
     # Readiness only (anonymous, trusted script, no auth header); the verdict on content / SHA belongs to the Smoke job.
     TARGET_URL="$URL" PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" \
       env -u PROBE_HEADERS -u CF_ACCESS_CLIENT_ID -u CF_ACCESS_CLIENT_SECRET "$TOOLS_DIR/probe.sh" >&2 || die "the Preview $URL is not reachable for the application smoke command"
-    # smoke_env is caller data, but the platform's own credentials in it are for the trusted probe ONLY: they never reach the PR command.
+    # The general smoke_env (Access tokens, PROBE_HEADERS, any application secret such as INTERNAL_API_KEY) belongs to the trusted Smoke job ONLY: it is
+    # NEVER loaded here, because this command is PR-controlled and cannot be told apart from an exfiltration attempt. Only the explicit, non-sensitive
+    # execution context below is passed (everything else is dropped with env -i).
     (
-      . "$TOOLS_DIR/envfile.sh"; load_env_file "$S/smoke.env"
       cd "$APP_DIR"
-      TARGET_URL="$URL" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="$RUN_SHA" NO_PROXY='*' \
-        exec env -u GH_TOKEN -u GITHUB_TOKEN -u CLOUDFLARE_API_TOKEN -u CLOUDFLARE_ACCOUNT_ID -u SMOKE_USERNAME -u SMOKE_PASSWORD -u PREVIEW_SECRETS \
-        -u PROBE_HEADERS -u CF_ACCESS_CLIENT_ID -u CF_ACCESS_CLIENT_SECRET bash -c "$CMD"
+      exec env -i PATH="$PATH" HOME="${HOME:-/tmp}" LANG="${LANG:-C.UTF-8}" CI=true \
+        TARGET_URL="$URL" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="$RUN_SHA" NO_PROXY='*' bash -c "$CMD"
     ) >&2
     echo "app_smoke=passed";;
 

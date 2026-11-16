@@ -287,7 +287,8 @@ jobs:
         if: failure()
         continue-on-error: true
         with:
-          name: smoke-report-${{ fromJSON(inputs.descriptor).target }}-${{ github.run_id }}
+          # Same identity contract as the Build artifact (cfv2-<repo>-<app>-<slot>-<hash>-<run>-<attempt>): two apps / slots in one run never collide.
+          name: smoke-report-${{ inputs.artifact_name }}-${{ github.run_attempt }}
           path: |
             playwright-report/
             test-results/

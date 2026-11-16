@@ -176,6 +176,13 @@ for st in (b or {}).get("steps", []):
         errors.append("the Build upload must use the job's ARTIFACT_NAME (same expression as the artifact_name output)")
 if str((b or {}).get("env", {}).get("ARTIFACT_NAME", "")) != bname:
     errors.append("the Build job's ARTIFACT_NAME must equal its artifact_name output")
+# Smoke Report names carry the same app / slot identity (the Build artifact name) + run attempt, so two apps of one run can never collide.
+for jn, job in dlv["jobs"].items() if "jobs" in dlv else dlv.items():
+    for st in job.get("steps", []) if isinstance(job, dict) else []:
+        if str(st.get("uses", "")).startswith("actions/upload-artifact") and "smoke-report" in str(st["with"].get("name")):
+            n = str(st["with"]["name"])
+            if "inputs.artifact_name" not in n or "run_attempt" not in n:
+                errors.append(f"{jn}: the smoke report name must embed inputs.artifact_name (app + slot identity) and github.run_attempt: {n}")
 
 for e in errors:
     print("FAIL", e)
