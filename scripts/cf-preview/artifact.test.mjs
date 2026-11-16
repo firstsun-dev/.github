@@ -137,3 +137,32 @@ test('verify: a partial re-run may use the artifact of an EARLIER attempt of thi
   assert.throws(() => verifyArtifact(f.dest, { ...E, app: 'other' }), /app/, 'another application');
   assert.throws(() => verifyArtifact(f.dest, { ...E, testedSha: SHA('c') }), /tested_sha/, 'another revision');
 });
+
+test('package: assets/<n>/.assetsignore survives packaging, is in the digest and verifies; any other hidden file fails packaging', () => {
+  const f = fixture();
+  writeFileSync(join(f.ws, 'dist/client/.assetsignore'), '_worker.js\n_routes.json');
+  pack(f);
+  assert.equal(readFileSync(join(f.dest, 'assets/0/.assetsignore'), 'utf8'), '_worker.js\n_routes.json', 'served exclusions are kept verbatim');
+  assert.equal(verifyArtifact(f.dest, EXPECT).manifest.files_digest, filesDigest(f.dest));
+  for (const hidden of ['.env', '.well-known/x', 'sub/.assetsignore']) {
+    const g = fixture();
+    mkdirSync(join(g.ws, 'dist/client', hidden.split('/').slice(0, -1).join('/') || '.'), { recursive: true });
+    writeFileSync(join(g.ws, 'dist/client', hidden), 'x');
+    assert.throws(() => pack(g), /hidden files that are never published/, hidden);
+  }
+});
+test('rewrite: only an adapter-style local-dev `dev` block is stripped; every other dev content, and every other forbidden key, is kept and rejected', () => {
+  const opts = { configDir: '/ws/app', bundleEntry: 'i.js', workspace: '/ws/app' };
+  const base = { name: 'a', main: 'src/i.ts', d1_databases: [{ binding: 'DB', database_name: 'd', database_id: 'ID1' }], vars: { A: '1' }, compatibility_flags: ['nodejs_compat'] };
+  const inert = { ip: 'localhost', local_protocol: 'http', upstream_protocol: 'http', enable_containers: true, generate_types: false };
+  const ok = rewriteConfig({ ...base, dev: inert }, opts).config;
+  assert.equal('dev' in ok, false, 'verified-inert dev block removed');
+  assert.deepEqual([ok.d1_databases, ok.vars, ok.compatibility_flags], [base.d1_databases, base.vars, base.compatibility_flags], 'bindings and settings are retained');
+  assert.equal(structuralProblems({ ...ok, no_bundle: true, main: 'worker/i.js' }, ['worker/i.js']).length, 0);
+  const odd = rewriteConfig({ ...base, dev: { ...inert, something_new: 1 } }, opts).config;
+  assert.ok('dev' in odd && structuralProblems({ ...odd, no_bundle: true, main: 'worker/i.js' }, ['worker/i.js']).some((p) => /'dev'/.test(p)), 'an unknown dev key is not silently dropped');
+  for (const k of ['containers', 'alias', 'tsconfig', 'find_additional_modules', 'base_dir']) {
+    const c = rewriteConfig({ ...base, [k]: k === 'containers' ? [] : 'x' }, opts).config;
+    assert.ok(k in c && structuralProblems({ ...c, no_bundle: true, main: 'worker/i.js' }, ['worker/i.js']).some((p) => p.includes(`'${k}'`)), k);
+  }
+});

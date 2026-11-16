@@ -40,6 +40,15 @@ export const artifactName = (base, runId, attempt) => `${base}-${runId}-${attemp
 /** Config keys with local side effects or that select behaviour of the publisher host: never allowed in a packaged config (root or any environment). */
 export const FORBIDDEN_KEYS = ['build', 'site', 'containers', 'alias', 'tsconfig', 'find_additional_modules', 'base_dir', 'dev'];
 const ALLOWED_TOP = (f) => f === 'manifest.json' || f === 'wrangler.json' || /^worker\//.test(f) || /^assets\//.test(f);
+/**
+ * Hidden files are never published (a stray `.env` must not ship), with ONE exception: Wrangler's own asset-exclusion list `assets/<n>/.assetsignore`
+ * (Astro's Cloudflare adapter emits it; it only lists files wrangler must NOT upload as assets, e.g. `_worker.js`). Dropping it would change what is served.
+ */
+const ALLOWED_HIDDEN = /^assets\/\d+\/\.assetsignore$/;
+export const hiddenFiles = (files) => files.filter((f) => f.split('/').some((seg) => seg.startsWith('.')) && !ALLOWED_HIDDEN.test(f));
+/** `dev` sub-keys that only configure `wrangler dev` locally (no effect on a deploy). A `dev` block with any other key is NOT stripped and is rejected. */
+const DEV_INERT_KEYS = new Set(['ip', 'port', 'inspector_port', 'host', 'local_protocol', 'upstream_protocol', 'enable_containers', 'generate_types']);
+const isInertDev = (d) => d !== null && typeof d === 'object' && !Array.isArray(d) && Object.keys(d).every((k) => DEV_INERT_KEYS.has(k));
 const SAFE_REL = /^[A-Za-z0-9._@+-]+(\/[A-Za-z0-9._@+-]+)*$/;
 
 /** Every regular file below dir (sorted relative POSIX paths). Symlinks, sockets and other special files are refused: an artifact is plain files only. */
@@ -88,6 +97,7 @@ export function rewriteConfig(cfg, { configDir, bundleEntry, workspace }) {
   for (const s of sections(c)) {
     delete s.build;
     delete s.site;
+    if (isInertDev(s.dev)) delete s.dev; // adapter-generated local-dev block only; anything else stays and is rejected by FORBIDDEN_KEYS
     if (typeof s.main === 'string') s.main = `worker/${bundleEntry}`;
     if (s.assets && typeof s.assets === 'object' && typeof s.assets.directory === 'string') {
       const abs = resolve(configDir, s.assets.directory);
@@ -131,7 +141,8 @@ export function packageArtifact({ cfg, configDir, workspace, bundleDir, dest, ma
     cpSync(a.from, join(dest, a.to), { recursive: true, dereference: false });
   }
   writeFileSync(join(dest, 'wrangler.json'), `${JSON.stringify(config, null, 2)}\n`);
-  listFiles(dest); // refuses symlinks / special files copied from the build tree
+  const hidden = hiddenFiles(listFiles(dest)); // also refuses symlinks / special files copied from the build tree
+  if (hidden.length) throw new Error(`artifact contains hidden files that are never published: ${hidden.join(', ')}`);
   const m = { v: MANIFEST_VERSION, ...manifest, files_digest: filesDigest(dest) };
   validateManifestShape(m);
   writeFileSync(join(dest, 'manifest.json'), `${JSON.stringify(m, null, 2)}\n`);
@@ -188,7 +199,7 @@ export function verifyArtifact(dir, expect) {
 /** Rules every packaged config must satisfy, whatever the target (the target-specific resource audit runs after this). */
 export function structuralProblems(cfg, files, expect = {}) {
   const bad = [];
-  for (const f of files) if (!ALLOWED_TOP(f) || f.split('/').some((seg) => seg.startsWith('.'))) bad.push(`unexpected file '${f}' (only manifest.json, wrangler.json, worker/**, assets/** without hidden files)`);
+  for (const f of files) if (!ALLOWED_TOP(f) || hiddenFiles([f]).length) bad.push(`unexpected file '${f}' (only manifest.json, wrangler.json, worker/**, assets/** without hidden files except assets/<n>/.assetsignore)`);
   if (cfg === null || typeof cfg !== 'object' || Array.isArray(cfg)) return ['wrangler.json is not an object'];
   if (cfg.no_bundle !== true) bad.push('no_bundle must be true (the publisher never bundles)');
   const names = [];
