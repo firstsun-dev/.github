@@ -8,6 +8,8 @@ Baseline: `firstsun-dev/.github` `main` at `6fb04eb86b52a2f4d290db8f7bdfd82e190d
 
 This audit records which repository and consumer sources were used to derive the current-state OpenSpec. The specifications describe implemented contracts; they do not silently redesign inconsistent or imperfect behavior discovered during the audit.
 
+This is a point-in-time audit from 2026-09-15. On 2026-11-16, the v1 Worker template and CodeGraph workflow were retired after organization-wide searches found no current callers; their capability specifications now record that retirement.
+
 ## Included executable sources
 
 ### Organization GitHub surface
