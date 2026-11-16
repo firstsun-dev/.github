@@ -418,7 +418,7 @@ jobs:
   # explicit but unservable dispatch_target always reaches the Plan, which then ALWAYS fails (resolveDelivery): such a run is red instead of silently green.
   # -------------------------------------------------------------------------
   plan:
-    name: Plan
+    name: Delivery Plan
     if: inputs.pipeline_phase == 'verify' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && inputs.preview_policy == 'pr') || github.event_name == 'workflow_dispatch' || inputs.dispatch_target != ''
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
