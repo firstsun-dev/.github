@@ -85,7 +85,7 @@ env:
 jobs:
   # Plan - pure data, no checkout, no credentials. Validates the task lists (malformed -> red before any command runs) and routes the event.
   plan:
-    name: Plan
+    name: Stage Selection
     runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || inputs.runner }}
     timeout-minutes: 5
     outputs:
