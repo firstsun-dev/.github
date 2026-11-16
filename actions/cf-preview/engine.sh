@@ -150,10 +150,12 @@ case "$PHASE" in
     # Only the engine's own default state dir (<runner temp>/cfv2) is ever wiped - never a path an earlier step could have redirected.
     [ "$S" != "${RUNNER_TEMP:-}/cfv2" ] || rm -rf -- "$S"
     mkdir -p "$S"; chmod 700 "$S"; umask 077
-    printf '%s' "${INPUTS_JSON:?}" > "$IN"
-    # The app-smoke stage runs PR-controlled code in the same runner user: caller env data (smoke_env, build_env_*) must not even exist on its disk.
+    # The app-smoke stage runs PR-controlled code as the same runner user: caller env data (smoke_env, build_env_*) is filtered BEFORE anything is
+    # written, so it never exists on disk (not even transiently).
     if [ "${ENGINE_STAGE:-}" = app-smoke ]; then
-      jq -c 'with_entries(select(.key != "smoke_env" and (.key | startswith("build_env") | not)))' "$IN" > "$IN.tmp" && mv "$IN.tmp" "$IN"
+      printf '%s' "${INPUTS_JSON:?}" | jq -c 'with_entries(select(.key != "smoke_env" and (.key | startswith("build_env") | not)))' > "$IN" || die "app-smoke: could not sanitize the inputs"
+    else
+      printf '%s' "${INPUTS_JSON:?}" > "$IN"
     fi
     # ONE Node process validates everything pure (target/kind/stage/mode binding, descriptor, strategy and policy enums, enabled kind of
     # this event, per-target requirements, URL isolation, env data) and writes the validated state files. Nothing is mutated if it fails.

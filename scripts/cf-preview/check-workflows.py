@@ -181,8 +181,12 @@ for jn, job in dlv["jobs"].items() if "jobs" in dlv else dlv.items():
     for st in job.get("steps", []) if isinstance(job, dict) else []:
         if str(st.get("uses", "")).startswith("actions/upload-artifact") and "smoke-report" in str(st["with"].get("name")):
             n = str(st["with"]["name"])
-            if "inputs.artifact_name" not in n or "run_attempt" not in n:
-                errors.append(f"{jn}: the smoke report name must embed inputs.artifact_name (app + slot identity) and github.run_attempt: {n}")
+            if "artifact_name" in n or "descriptor).environment" not in n or "descriptor).slot" not in n or "run_attempt" not in n:
+                errors.append(f"{jn}: the smoke report name must come from the validated descriptor (environment + slot) and github.run_attempt, never the Build artifact name (empty on a deferred verify): {n}")
+            # two apps (and two slots) of one run, deferred verify included, yield distinct names
+            nm = lambda env, slot: f"smoke-report-{env.replace('/', '-')}-{slot}-1"  # noqa: E731  (the workflow expression, evaluated)
+            if len({nm("blog/preview", "native-branch"), nm("www/preview", "native-branch"), nm("blog/dev", "persistent-dev")}) != 3:
+                errors.append(f"{jn}: smoke report names are not unique per app and slot")
 
 for e in errors:
     print("FAIL", e)

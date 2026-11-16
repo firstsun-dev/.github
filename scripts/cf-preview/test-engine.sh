@@ -85,11 +85,23 @@ senv app-smoke GH_TOKEN=ghsecret SMOKE_USERNAME=u SMOKE_PASSWORD=p CLOUDFLARE_AP
 if grep -qE 'ghsecret|=u$|=p$|=cf$|=ps$|csecret|cid|psecret|INTERNAL_API_KEY|internal-secret-value|CF_ACCESS|PROBE_HEADERS|SMOKE_(USERNAME|PASSWORD)|GH_TOKEN|CLOUDFLARE' "$T/mark"; then bad "app-smoke: the PR command must see NO credential"; grep -E 'secret|CF_ACCESS|SMOKE_|GH_TOKEN|CLOUDFLARE|PROBE' "$T/mark" | sed 's/=.*/=<redacted>/'; else ok "app-smoke: the PR command sees no GitHub / Cloudflare / smoke credential, Access token or PROBE_HEADERS"; fi
 grep -q '^TARGET_URL=https://pr-4-blog' "$T/mark" && grep -q '^EXPECTED_SHA=' "$T/mark" && ok "app-smoke: the explicit execution context (TARGET_URL, EXPECTED_SHA) is provided" || bad "app-smoke: execution context"
 grep -q 'APP_FLAG\|INTERNAL_API_KEY' "$T/mark" && bad "app-smoke: the general smoke_env (any name, e.g. INTERNAL_API_KEY) must never reach the PR command" || ok "app-smoke: no smoke_env variable of any name (INTERNAL_API_KEY, APP_FLAG) reaches the PR command"
-grep -rqs 'internal-secret-value\|csecret' "$T/s-app-smoke" && bad "app-smoke: smoke_env must not be written to the job's state dir" || ok "app-smoke: smoke_env is not on the app-smoke job's disk"
+grep -rqs 'internal-secret-value\|csecret' "$T/s-app-smoke" "$T/rt" && bad "app-smoke: smoke_env must not be written to the job's state dir" || ok "app-smoke: smoke_env is not on the app-smoke job's disk"
 rm -f "$T"/mark*
 senv verify APP_SMOKE_RESULT=failure PUBLISHED_URL=https://pr-4-blog.x.workers.dev "$ENGINE" smoke >/dev/null 2>"$T/err" && bad "smoke: a failed app-smoke must fail the Preview" || { grep -q "application smoke command did not pass" "$T/err" && ok "smoke: a Preview whose app-smoke did not succeed is not verified"; }
 senv verify APP_SMOKE_RESULT= PUBLISHED_URL=https://pr-4-blog.x.workers.dev "$ENGINE" smoke >/dev/null 2>/dev/null && bad "smoke: a missing app-smoke result must fail closed" || ok "smoke: a missing / skipped app-smoke result fails closed"
 senv verify APP_SMOKE_RESULT=success CF_ACCESS_CLIENT_ID= PUBLISHED_URL=https://pr-4-blog.x.workers.dev "$ENGINE" smoke 2>"$T/err" | grep -q '^smoke_level=content$' && [ ! -e "$T/mark.ran" ] \
   && ok "smoke: with a passing app-smoke the credential-bearing job verifies by probe and NEVER runs the PR command" || { bad "smoke: Preview verifies without running the PR command"; cat "$T/err"; }
+
+# A legitimately skipped app-smoke (no smoke_cmd, or smoke_mode=basic) must not fail the trusted Smoke; a required one still fails closed (above).
+DESCB="$(node --input-type=module -e "import {targetDescriptor} from '$TOOLS/delivery.mjs'; console.log(JSON.stringify(targetDescriptor({delivery:{target:'preview',driver:'native-preview'},app:'blog',runId:1,smokeMode:'basic'})))")"
+NOCMD='{"app_name":"blog","build_cmd":"true","production_rollback_policy":"manual","preview_policy":"pr"}'
+skipped_ok() { # <label> <inputs json> <descriptor>
+  senv "v-$1" INPUTS_JSON="$2" ENGINE_TARGET=preview ENGINE_KIND=native-branch ENGINE_STAGE=verify ENGINE_DESCRIPTOR="$3" ENGINE_D1_EXPECT= CFV2_PR_ACTION=synchronize "$ENGINE" init >/dev/null 2>"$T/err" || { bad "$1 init"; cat "$T/err"; }
+  senv "v-$1" HANDOFF_DEPLOY="$HANDOFF" "$ENGINE" hydrate >/dev/null 2>"$T/err" || { bad "$1 hydrate"; cat "$T/err"; }
+  senv "v-$1" APP_SMOKE_RESULT=skipped CF_ACCESS_CLIENT_ID= PUBLISHED_URL=https://pr-4-blog.x.workers.dev "$ENGINE" smoke 2>"$T/err" | grep -q '^smoke_level=content$' \
+    && ok "smoke: a skipped app-smoke ($1) does not fail the trusted Smoke" || { bad "smoke: a skipped app-smoke ($1) must not fail the trusted Smoke"; cat "$T/err"; }
+}
+skipped_ok nocmd "$NOCMD" "$DESC"
+skipped_ok basic "$SMK" "$DESCB"
 
 [ "$fail" = 0 ] && echo "ALL PASSED" || { echo "FAILURES"; exit 1; }

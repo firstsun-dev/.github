@@ -181,7 +181,7 @@ jobs:
   app-smoke:
     name: App Smoke (no credentials)
     needs: [deploy]
-    if: always() && inputs.phase != 'deploy' && fromJSON(inputs.descriptor).target == 'preview' && fromJSON((inputs.phase == 'verify' && inputs.handoff_json || needs.deploy.outputs.handoff) || '{}').published == 'true'
+    if: always() && inputs.phase != 'deploy' && fromJSON(inputs.descriptor).target == 'preview' && fromJSON(inputs.descriptor).smoke_mode == 'full' && fromJSON(inputs.inputs_json).smoke_cmd != '' && fromJSON((inputs.phase == 'verify' && inputs.handoff_json || needs.deploy.outputs.handoff) || '{}').published == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -287,8 +287,9 @@ jobs:
         if: failure()
         continue-on-error: true
         with:
-          # Same identity contract as the Build artifact (cfv2-<repo>-<app>-<slot>-<hash>-<run>-<attempt>): two apps / slots in one run never collide.
-          name: smoke-report-${{ inputs.artifact_name }}-${{ github.run_attempt }}
+          # Identity from the validated descriptor (environment = <app>/<slot suffix>), never from the Build artifact name: that is empty when a deferred
+          # verification (pipeline_phase=verify) skips the Build, and two apps of one run must still never collide.
+          name: smoke-report-${{ replace(fromJSON(inputs.descriptor).environment, '/', '-') }}-${{ fromJSON(inputs.descriptor).slot }}-${{ github.run_attempt }}
           path: |
             playwright-report/
             test-results/
