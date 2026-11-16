@@ -28,8 +28,9 @@ Fixed Dev publication SHALL require an approved revision, ref and protected auth
 - **AND** both Pushes MAY independently produce their configured fast verification results.
 
 #### Scenario: Authorized Dev promotion
-- **WHEN** an approved operator selects an allowed revision/ref and the protected GitHub Environment permits the deployment
-- **THEN** exactly one fixed Dev target SHALL be planned and audited
+- **WHEN** an operator dispatches `workflow_dispatch` with `target=dev` on exactly the caller-configured `approved_dev_ref` (a `refs/heads/...` branch ref; any other ref or target is rejected by the Plan before any mutation) for an application whose `dev_driver` is not `none`, and the protected GitHub Environment (`<app>/dev` or `<app>/native-dev`, with required reviewers) permits the deployment
+- **THEN** the revision SHALL be the commit `GITHUB_SHA` of that dispatch; the CI Gate, the Build artifact (`source_sha = tested_sha = artifact_sha`) and the published version SHALL all refer to that one SHA, and the Migrate/Deploy jobs SHALL verify this identity against their own GitHub context rather than trust the artifact manifest
+- **AND** exactly one fixed Dev target SHALL be planned and audited
 - **AND** its migration/build/publish/smoke SHALL use the ordinary Delivery Engine with its selected driver
 - **AND** it SHALL NOT deploy Production.
 
@@ -103,6 +104,31 @@ Smoke SHALL test the exact published target. Results SHALL distinguish content-v
 - **WHEN** Heaven ID / Checkin / Test Client each pass their local smoke but their deployed login flow fails
 - **THEN** the cohort verification and dependent Release Gate SHALL fail
 - **AND** prior per-app smoke success SHALL NOT mask this cross-service defect.
+
+### Requirement: Production SHALL roll back; Preview and Dev SHALL be fixed forward
+
+When a Production Smoke fails on a deployment published by the same run, and the caller's `production_rollback_policy` is `automatic`, the Delivery Engine SHALL attempt a guarded rollback to the recorded previous version (fail closed when the previous version is unknown, the D1 change is not additive, the failed version is no longer live, or a newer deployment exists). Preview and Dev SHALL have no automatic recovery: a failed or unverified Preview/Dev SHALL be marked unverified and corrected by a new revision (fix-forward). Redeploying an older revision to Preview/Dev is out of scope because it would require a credentialed rebuild of old source. A Worker rollback SHALL NOT be described as reverting D1 migrations or external side effects.
+
+#### Scenario: Production smoke fails
+- **WHEN** Production Smoke fails on this run's deployment under policy `automatic`
+- **THEN** a guarded rollback SHALL be attempted and re-smoked with the built-in probe only.
+
+#### Scenario: Preview or Dev smoke fails
+- **WHEN** a Preview or Dev Smoke fails or is unverified
+- **THEN** no rollback or redeploy of an older revision SHALL occur
+- **AND** the target SHALL be reported unverified, never known-good, until a new revision is verified.
+
+### Requirement: A Preview's application smoke SHALL run outside every credential boundary
+
+A Preview's `smoke_cmd` is PR-controlled code. It SHALL run only in a separate job that holds no Cloudflare credential, no GitHub write credential, no Preview secret and no smoke credential, and SHALL receive only an explicit non-sensitive execution context (`TARGET_URL`, `DEPLOY_TARGET`, `TEST_ENV`, `EXPECTED_SHA`, `CI`). The general `smoke_env` (Access tokens, `PROBE_HEADERS`, and any application secret under any name) and `build_env_*` data SHALL NOT be loaded into that command nor written to that job's disk. Authenticated probing and SHA/content verification SHALL remain in the trusted Smoke job, which SHALL require the application job's result and SHALL fail closed when it is missing, skipped or failed. Production and Dev run their application smoke in the trusted Smoke job against the protected revision.
+
+#### Scenario: A Preview smoke command prints its environment
+- **WHEN** `smoke_env` contains `INTERNAL_API_KEY`, an Access service token and `PROBE_HEADERS`
+- **THEN** none of them SHALL be visible to the Preview's `smoke_cmd`, while the trusted probe still authenticates with them.
+
+#### Scenario: The application smoke result is absent
+- **WHEN** the Preview application smoke did not succeed or did not run
+- **THEN** the Preview SHALL NOT be verified.
 
 ### Requirement: Preview lifecycle SHALL be non-destructive until approved cleanup
 
