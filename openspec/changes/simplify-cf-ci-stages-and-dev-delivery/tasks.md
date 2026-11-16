@@ -1,6 +1,6 @@
 # Implementation tasks: stage-based CI and unified Dev delivery
 
-> **Not started.** This OpenSpec change is documentation-only. Do not mark runtime tasks complete because the specification PR was merged. Target: **one OpenSpec commit** and one draft review PR now; implementation later as coordinated, separately reviewed repository PRs (prefer one focused PR / squash commit per affected repository). No permanent legacy-mode workflow.
+> **Not started.** This OpenSpec change is documentation-only. Do not mark runtime tasks complete because the specification PR was merged. The single-commit preference applies **only to this OpenSpec documentation stage** (one OpenSpec commit, one draft review PR). Implementation follows later as coordinated, separately reviewed repository PRs with no commit-count or merge-method restriction. No permanent legacy-mode workflow.
 
 ## G0 — Review and freeze design (spec-only PR)
 
@@ -62,7 +62,7 @@
 
 - [ ] Freeze shared new input/output contract and consumer refs; run full static/unit/safety checks, scratch canary and one representative real path per app.
 - [ ] Prepare backup record of old `@v2` SHA and each caller's original commit, Required Check mappings and deployment state. Do not claim cross-repo atomicity.
-- [ ] Coordinate repo PR merging in a controlled window using immutable candidate SHA pins. Prefer squash merge; do not merge an incompatible caller against an unverified floating tag.
+- [ ] Coordinate repo PR merging in a controlled window using immutable candidate SHA pins. Do not merge an incompatible caller against an unverified floating tag.
 - [ ] Update per-repo Required Checks/rulesets only where permissions allow; when API access is unavailable, record manual verification steps and block completion until confirmed.
 - [ ] Validate one real feature Push, one same-repo PR, appropriate fork/merge_group case, one authorized Dev promotion and one protected Production deployment as permitted; inspect actual GitHub Checks and Cloudflare target histories.
 - [ ] Only once all supported callers are ready, advance `@v2` to the frozen verified engine SHA. Monitor unexpected CI fanout, Dev overwrites, D1 migrations, Smoke, Rollback and release outcomes.

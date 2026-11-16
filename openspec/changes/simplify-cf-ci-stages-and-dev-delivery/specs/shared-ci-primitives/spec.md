@@ -52,6 +52,12 @@ A Verify Gate SHALL require success from every expected configured Verify task. 
 - **THEN** a PR SHALL still report the PR Gate against the merge candidate
 - **AND** the Gate SHALL depend on passing Verify rather than pretending an omitted Test failed.
 
+#### Scenario: A stage is intentionally empty (Verify or Test)
+- **WHEN** a caller configures an empty `verify_tasks` and/or `test_tasks` list
+- **THEN** that is an accepted, valid configuration: the stage runs no matrix and its Gate contribution SHALL be success, not skipped
+- **AND** the Gate SHALL still be reported and SHALL still fail for any configured task that fails, is cancelled or is unexpectedly skipped
+- **AND** an empty Verify stage SHALL NOT be treated as an error or as a reason to block Test or Delivery.
+
 #### Scenario: The app has no affected files
 - **WHEN** trusted changed-path detection identifies the app as truly unaffected
 - **THEN** an explicitly named No-op decision MAY satisfy that app's stable required gate
