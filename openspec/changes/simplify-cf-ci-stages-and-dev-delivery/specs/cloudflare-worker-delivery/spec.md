@@ -120,11 +120,12 @@ When a Production Smoke fails on a deployment published by the same run, and the
 
 ### Requirement: A Preview's application smoke SHALL run outside every credential boundary
 
-A Preview's `smoke_cmd` is PR-controlled code. It SHALL run only in a separate job that holds no Cloudflare credential, no GitHub write credential, no Preview secret and no smoke credential, and SHALL receive only an explicit non-sensitive execution context (`TARGET_URL`, `DEPLOY_TARGET`, `TEST_ENV`, `EXPECTED_SHA`, `CI`). The general `smoke_env` (Access tokens, `PROBE_HEADERS`, and any application secret under any name) and `build_env_*` data SHALL NOT be loaded into that command nor written to that job's disk. Authenticated probing and SHA/content verification SHALL remain in the trusted Smoke job, which SHALL require the application job's result and SHALL fail closed when it is missing, skipped or failed. Production and Dev run their application smoke in the trusted Smoke job against the protected revision.
+A Preview's `smoke_cmd` is PR-controlled code. It SHALL run only in a separate job that holds no Cloudflare credential, no GitHub write credential, no Preview secret and no smoke credential, and SHALL receive only an explicit non-sensitive execution context (`TARGET_URL`, `DEPLOY_TARGET`, `TEST_ENV`, `EXPECTED_SHA`, `CI`). Sensitive smoke configuration (Access service token, `PROBE_HEADERS`, and any application credential under any name) SHALL be supplied only as an explicit GitHub Actions secret (`SMOKE_ENV`) that is passed solely to the trusted Smoke job (and the Production rollback re-probe) and masked per value; it SHALL NOT be a public workflow input and SHALL NOT appear in `toJSON(inputs)`, `inputs_json`, Plan outputs, job logs, artifacts or any untrusted job's environment or disk. Non-sensitive smoke data uses a separate public `smoke_vars` input, which refuses credential-looking names and is the only caller data the Preview command receives. `build_env_*` data SHALL NOT be written to the App Smoke job's disk. Authenticated probing and SHA/content verification SHALL remain in the trusted Smoke job, which SHALL require the application job's result and SHALL fail closed when it is missing, skipped or failed. Production and Dev run their application smoke in the trusted Smoke job against the protected revision.
 
 #### Scenario: A Preview smoke command prints its environment
-- **WHEN** `smoke_env` contains `INTERNAL_API_KEY`, an Access service token and `PROBE_HEADERS`
-- **THEN** none of them SHALL be visible to the Preview's `smoke_cmd`, while the trusted probe still authenticates with them.
+- **WHEN** the `SMOKE_ENV` secret contains `INTERNAL_API_KEY`, an Access service token and `PROBE_HEADERS`
+- **THEN** none of them SHALL be visible to the Preview's `smoke_cmd`, to the Plan/Build/Deploy/App Smoke jobs or in any log, while the trusted probe still authenticates with them
+- **AND** a credential-looking name in the public `smoke_vars` input SHALL be refused at initialisation.
 
 #### Scenario: The application smoke result is absent
 - **WHEN** the Preview application smoke did not succeed or did not run
