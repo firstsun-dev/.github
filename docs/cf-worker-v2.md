@@ -67,6 +67,8 @@ with:
   `dev_worker_name`, `dev_wrangler_env`, `dev_binding_allow`, `dev_deny_resources`.
 * `smoke_mode_overrides` is keyed by target (`production|preview|dev`).
 
+* **Smoke configuration**: `smoke_vars` is a PUBLIC, non-sensitive input (`KEY=VALUE` lines; credential-looking names such as `*_KEY`, `*_TOKEN`, `*SECRET*`, `*PASSWORD*`, `PROBE_HEADERS`, `CF_ACCESS_*` are refused at init). Credentials (Cloudflare Access service token, `PROBE_HEADERS`, anything the application smoke needs to authenticate) go in the **`SMOKE_ENV` secret**
+  (`KEY=VALUE` lines), which only the trusted Smoke job (and the Production rollback re-probe) receives and masks per value: it is never part of `inputs`, `inputs_json`, Plan outputs, Build, Deploy or a Preview's PR-controlled App Smoke. The former `smoke_env` input is removed.
 Removed (no compatibility shim): `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `test_integration_cmd`, `deployment_strategy`, `preview_on_branch_push`,
 `shared_dev_on_branch_push`, `shared_dev_native_preview_on_branch_push`, `persistent_dev_ref`, `build_env_shared_dev_native_preview`,
 `app_url_shared_dev_native_preview`, the per-kind outputs (`dev_*`, `native_dev_*`). Outputs now describe the one delivery:

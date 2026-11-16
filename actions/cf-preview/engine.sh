@@ -21,7 +21,7 @@
 #
 # State ($STATE_DIR, default $RUNNER_TEMP/cfv2, 0700): inputs.json, target, build.env / smoke.env /
 # preview.env (validated KEY=VALUE data), config.* and artifact.digest (from build.sh), ledger_id, preview_name, ...
-# Application env (build_env_*, smoke_env, preview secrets) is only ever loaded inside the process that needs it and
+# Application env (build_env_*, the SMOKE_ENV secret, smoke_vars, preview secrets) is only ever loaded inside the process that needs it and
 # can never set a reserved control variable (parse-env.mjs RESERVED). The target is bound ONCE in `init` (from the
 # composite input, not from the environment) and re-read from state by every phase.
 set -euo pipefail
@@ -150,7 +150,7 @@ case "$PHASE" in
     # Only the engine's own default state dir (<runner temp>/cfv2) is ever wiped - never a path an earlier step could have redirected.
     [ "$S" != "${RUNNER_TEMP:-}/cfv2" ] || rm -rf -- "$S"
     mkdir -p "$S"; chmod 700 "$S"; umask 077
-    # The app-smoke stage runs PR-controlled code as the same runner user: caller env data (smoke_env, build_env_*) is filtered BEFORE anything is
+    # The app-smoke stage runs PR-controlled code as the same runner user: caller env data (smoke_env if ever present, build_env_*) is filtered BEFORE anything is
     # written, so it never exists on disk (not even transiently).
     if [ "${ENGINE_STAGE:-}" = app-smoke ]; then
       printf '%s' "${INPUTS_JSON:?}" | jq -c 'with_entries(select(.key != "smoke_env" and (.key | startswith("build_env") | not)))' > "$IN" || die "app-smoke: could not sanitize the inputs"
@@ -409,12 +409,14 @@ case "$PHASE" in
     # Readiness only (anonymous, trusted script, no auth header); the verdict on content / SHA belongs to the Smoke job.
     TARGET_URL="$URL" PROBE_PATH="$(inp probe_path)" PROBE_EXPECT_STATUS="$(inp probe_expect_status)" \
       env -u PROBE_HEADERS -u CF_ACCESS_CLIENT_ID -u CF_ACCESS_CLIENT_SECRET "$TOOLS_DIR/probe.sh" >&2 || die "the Preview $URL is not reachable for the application smoke command"
-    # The general smoke_env (Access tokens, PROBE_HEADERS, any application secret such as INTERNAL_API_KEY) belongs to the trusted Smoke job ONLY: it is
-    # NEVER loaded here, because this command is PR-controlled and cannot be told apart from an exfiltration attempt. Only the explicit, non-sensitive
-    # execution context below is passed (everything else is dropped with env -i).
+    # The sensitive smoke configuration (the SMOKE_ENV secret: Access token, PROBE_HEADERS, any application credential such as INTERNAL_API_KEY) never reaches
+    # this job at all: the workflow does not pass it, and init refuses it for this stage. The command gets the explicit non-sensitive context below plus the
+    # PUBLIC, credential-name-checked `smoke_vars` (everything else is dropped with env -i).
+    pub=()
+    [ ! -s "$S/smoke_vars.env" ] || mapfile -t pub < "$S/smoke_vars.env"
     (
       cd "$APP_DIR"
-      exec env -i PATH="$PATH" HOME="${HOME:-/tmp}" LANG="${LANG:-C.UTF-8}" CI=true \
+      exec env -i PATH="$PATH" HOME="${HOME:-/tmp}" LANG="${LANG:-C.UTF-8}" CI=true "${pub[@]}" \
         TARGET_URL="$URL" DEPLOY_TARGET="$TARGET" TEST_ENV="$TARGET" EXPECTED_SHA="$RUN_SHA" NO_PROXY='*' bash -c "$CMD"
     ) >&2
     echo "app_smoke=passed";;
@@ -434,7 +436,7 @@ case "$PHASE" in
     echo "deployed_and_verified=$V"; echo "smoke_level=$LEVEL"; echo "url=$URL"; echo "published_url=$URL"
     if [ "$V" = true ]; then echo "verified_url=$URL"; echo "published_unverified=false"
     else echo "verified_url="; echo "published_unverified=true"
-      echo "::warning::$KIND $URL is published but NOT content-verified (smoke_level='$LEVEL'); no Release, no known-good record. Provide an authenticated probe (smoke_env PROBE_HEADERS) for content verification." >&2
+      echo "::warning::$KIND $URL is published but NOT content-verified (smoke_level='$LEVEL'); no Release, no known-good record. Provide an authenticated probe (the SMOKE_ENV secret, PROBE_HEADERS) for content verification." >&2
     fi
     case "$KIND" in
       native-dev)

@@ -56,7 +56,7 @@ if [ "$result" = "probe=access-protected" ]; then
   esac
   level=liveness
   export PREVIEW_ACCESS_PROTECTED=true
-  echo "::notice::Target is protected by Cloudflare Access (approved for $DEPLOY_TARGET): liveness only; content/SHA NOT verified (configure an authenticated probe via smoke_env PROBE_HEADERS for content verification)" >&2
+  echo "::notice::Target is protected by Cloudflare Access (approved for $DEPLOY_TARGET): liveness only; content/SHA NOT verified (configure an authenticated probe via the SMOKE_ENV secret (PROBE_HEADERS) for content verification)" >&2
 elif [ -n "${SHA_PATH:-}" ] && [ -z "${EXPECTED_SHA:-}" ] && [ -n "${ABSENT_SHA:-}" ]; then
   # Post-rollback verification when the restored commit is unknown: the endpoint must stop serving the FAILED
   # commit. Only content level - it cannot prove which commit is live now.

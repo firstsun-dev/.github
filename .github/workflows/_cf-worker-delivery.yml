@@ -105,6 +105,8 @@ on:
         required: false
       SMOKE_PASSWORD:
         required: false
+      SMOKE_ENV:
+        required: false
 
 permissions:
   contents: read
@@ -272,6 +274,7 @@ jobs:
           d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
           smoke_username: ${{ fromJSON(inputs.descriptor).target != 'preview' && secrets.SMOKE_USERNAME || '' }}
           smoke_password: ${{ fromJSON(inputs.descriptor).target != 'preview' && secrets.SMOKE_PASSWORD || '' }}
+          smoke_env: ${{ secrets.SMOKE_ENV }}
           app_smoke_result: ${{ needs.app-smoke.result }}
           deploy_outputs: ${{ env.HANDOFF }}
           upstream_gate: ${{ inputs.phase == 'verify' && inputs.upstream_gate || '' }}
@@ -369,6 +372,7 @@ jobs:
           d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
           smoke_username: ${{ secrets.SMOKE_USERNAME }}
           smoke_password: ${{ secrets.SMOKE_PASSWORD }}
+          smoke_env: ${{ secrets.SMOKE_ENV }}
           deploy_outputs: ${{ env.HANDOFF }}
           migration_outputs: ${{ env.MIGJSON }}
           smoke_outputs: ${{ env.SMOKEJSON }}

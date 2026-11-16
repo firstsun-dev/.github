@@ -187,8 +187,11 @@ on:
         description: Smoke command from app_path (both targets); receives TARGET_URL, EXPECTED_SHA, DEPLOY_TARGET. Default is an HTTP 2xx probe.
         type: string
         default: ''
-      smoke_env:
-        description: Extra env vars for smoke_cmd, one KEY=VALUE per line
+      smoke_vars:
+        description: >
+          NON-SENSITIVE extra env vars for smoke_cmd, one KEY=VALUE per line. This is a public input (it is printed in job logs and a Preview's PR-controlled smoke
+          command receives it): a credential-looking name (KEY, TOKEN, SECRET, PASSWORD, AUTH, PROBE_HEADERS, CF_ACCESS_*) is refused. Put credentials in the
+          SMOKE_ENV secret instead.
         type: string
         default: ''
       access_protected_targets:
@@ -196,7 +199,7 @@ on:
           Space-separated targets (preview and/or prod) where a redirect to Cloudflare Access counts as LIVENESS only
           (published but NOT content/SHA-verified: no Release, not a known-good deployment). Any target not listed fails
           smoke on an Access redirect. For content verification of an Access-protected target, send service-token
-          headers through smoke_env PROBE_HEADERS so the probe reaches the application itself.
+          headers through the SMOKE_ENV secret (PROBE_HEADERS) so the probe reaches the application itself.
         type: string
         default: preview
       probe_path:
@@ -342,6 +345,11 @@ on:
       SMOKE_USERNAME:
         required: false
       SMOKE_PASSWORD:
+        required: false
+      SMOKE_ENV:
+        description: >
+          SENSITIVE smoke configuration, KEY=VALUE lines (Cloudflare Access service token CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET, PROBE_HEADERS, any application
+          credential smoke_cmd needs). Only the trusted Smoke job (and the Production rollback re-probe) receives it - never Plan, Build, Deploy or a Preview's App Smoke.
         required: false
       RELEASE_TOKEN:
         description: Token for release_cmd (exported as GH_TOKEN); defaults to nothing, GITHUB_TOKEN is NOT used for releases
@@ -622,6 +630,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
       SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
+      SMOKE_ENV: ${{ secrets.SMOKE_ENV }}
 
   # -------------------------------------------------------------------------
   # Release — optional, main push only, only after THIS run deployed its own SHA to Production, the Production Smoke verified it at content level

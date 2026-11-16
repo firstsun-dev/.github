@@ -176,6 +176,24 @@ for st in (b or {}).get("steps", []):
         errors.append("the Build upload must use the job's ARTIFACT_NAME (same expression as the artifact_name output)")
 if str((b or {}).get("env", {}).get("ARTIFACT_NAME", "")) != bname:
     errors.append("the Build job's ARTIFACT_NAME must equal its artifact_name output")
+# ---- sensitive smoke configuration contract: the SMOKE_ENV secret (never a public input, never inputs_json) reaches ONLY the trusted Smoke / Rollback jobs ----
+v2 = WF[".github/workflows/_cf-worker-v2.yml"]
+if "smoke_env" in call(v2).get("inputs", {}) or "smoke_vars" not in call(v2).get("inputs", {}):
+    errors.append("_cf-worker-v2.yml: `smoke_env` must not be a (public) workflow input; the non-sensitive `smoke_vars` input replaces it")
+if "SMOKE_ENV" not in (call(v2).get("secrets") or {}) or "SMOKE_ENV" not in (call(WF[".github/workflows/_cf-worker-delivery.yml"]).get("secrets") or {}):
+    errors.append("the SMOKE_ENV secret must be declared by the v2 and delivery workflows")
+for path, d in WF.items():
+    for jn, job in d["jobs"].items():
+        uses_it = "secrets.SMOKE_ENV" in str(job)
+        in_delivery = path.endswith("_cf-worker-delivery.yml")
+        if uses_it and not ((in_delivery and jn in ("smoke", "rollback")) or (path.endswith("_cf-worker-v2.yml") and jn == "delivery")):
+            errors.append(f"{path}: job '{jn}' must not receive the SMOKE_ENV secret (only the trusted Smoke / Rollback jobs do)")
+        if jn == "app-smoke" and in_delivery and re.search(r"secrets\.|smoke_env|smoke_username|smoke_password|preview_secrets", str(job)):
+            errors.append("the app-smoke job (PR-controlled code) must not reference any secret or smoke credential")
+    for ln in open(path).read().split("\n"):
+        if re.search(r"smoke_env\s*:\s*\$\{\{\s*(inputs|toJSON)", ln):
+            errors.append(f"{path}: smoke credentials must not be taken from a public input: {ln.strip()}")
+
 # Smoke Report names: built from the validated descriptor (environment + slot) and run_attempt in a step of the same job, never from the Build artifact name
 # (empty on a deferred verify). Two apps / slots of one run, deferred verify included, must yield distinct names.
 for jn, job in dlv.items():

@@ -69,14 +69,17 @@ node -e 'const m=require(process.argv[1]);const ok=m.source_sha==="a".repeat(40)
 mkdir -p "$T/curlbin"
 printf '#!/usr/bin/env bash\nprintf "200 "\n' > "$T/curlbin/curl"; chmod +x "$T/curlbin/curl"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$T/curlbin/gh"; chmod +x "$T/curlbin/gh"
-SMK='{"app_name":"blog","build_cmd":"true","production_rollback_policy":"manual","preview_policy":"pr","smoke_cmd":"env > MARKPATH; touch MARKPATH.ran","smoke_env":"CF_ACCESS_CLIENT_ID=cid\nCF_ACCESS_CLIENT_SECRET=csecret\nPROBE_HEADERS=X-Probe: psecret\nAPP_FLAG=visible\nINTERNAL_API_KEY=internal-secret-value"}'
+SMK='{"app_name":"blog","build_cmd":"true","production_rollback_policy":"manual","preview_policy":"pr","smoke_cmd":"env > MARKPATH; touch MARKPATH.ran","smoke_vars":"APP_FLAG=visible"}'
+# The SENSITIVE smoke configuration is the SMOKE_ENV secret: only the trusted stages' init receives it (CFV2_SMOKE_SECRETS), never inputs_json.
+SECRET_TXT=$'CF_ACCESS_CLIENT_ID=cid\nCF_ACCESS_CLIENT_SECRET=csecret\nPROBE_HEADERS=X-Probe: psecret\nINTERNAL_API_KEY=internal-secret-value'
 SMK="${SMK//MARKPATH/$T/mark}"
 echo "$SMK" > "$T/in.json"
 HANDOFF='{"published":"true","kind":"native-branch","url":"https://pr-4-blog.x.workers.dev","preview_name":"pr-4","published_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ledger_id":"7"}'
 senv() { env -i PATH="$T/curlbin:$PATH" HOME="$T" RUNNER_TEMP="$T/rt" STATE_DIR="$T/s-$1" TOOLS_DIR="$TOOLS" GITHUB_WORKSPACE="$T/ws" "${PRENV[@]}" MARK="$T/mark" PROBE_ATTEMPTS=1 PROBE_SLEEP=0 \
   NO_PROXY='*' "${@:2}"; }
 for st in app-smoke verify; do
-  senv "$st" INPUTS_JSON="$SMK" ENGINE_TARGET=preview ENGINE_KIND=native-branch ENGINE_STAGE="$st" ENGINE_DESCRIPTOR="$DESC" ENGINE_D1_EXPECT= CFV2_PR_ACTION=synchronize "$ENGINE" init >/dev/null 2>"$T/err" || { bad "$st init"; cat "$T/err"; }
+  sec=""; [ "$st" != verify ] || sec="$SECRET_TXT"
+  senv "$st" CFV2_SMOKE_SECRETS="$sec" INPUTS_JSON="$SMK" ENGINE_TARGET=preview ENGINE_KIND=native-branch ENGINE_STAGE="$st" ENGINE_DESCRIPTOR="$DESC" ENGINE_D1_EXPECT= CFV2_PR_ACTION=synchronize "$ENGINE" init >/dev/null 2>"$T/err" || { bad "$st init"; cat "$T/err"; }
   senv "$st" HANDOFF_DEPLOY="$HANDOFF" "$ENGINE" hydrate >/dev/null 2>"$T/err" || { bad "$st hydrate"; cat "$T/err"; }
 done
 rm -f "$T"/mark*
@@ -84,8 +87,19 @@ senv app-smoke GH_TOKEN=ghsecret SMOKE_USERNAME=u SMOKE_PASSWORD=p CLOUDFLARE_AP
   && [ -f "$T/mark.ran" ] && ok "app-smoke: runs the application smoke command" || { bad "app-smoke: runs the application smoke command"; cat "$T/err"; }
 if grep -qE 'ghsecret|=u$|=p$|=cf$|=ps$|csecret|cid|psecret|INTERNAL_API_KEY|internal-secret-value|CF_ACCESS|PROBE_HEADERS|SMOKE_(USERNAME|PASSWORD)|GH_TOKEN|CLOUDFLARE' "$T/mark"; then bad "app-smoke: the PR command must see NO credential"; grep -E 'secret|CF_ACCESS|SMOKE_|GH_TOKEN|CLOUDFLARE|PROBE' "$T/mark" | sed 's/=.*/=<redacted>/'; else ok "app-smoke: the PR command sees no GitHub / Cloudflare / smoke credential, Access token or PROBE_HEADERS"; fi
 grep -q '^TARGET_URL=https://pr-4-blog' "$T/mark" && grep -q '^EXPECTED_SHA=' "$T/mark" && ok "app-smoke: the explicit execution context (TARGET_URL, EXPECTED_SHA) is provided" || bad "app-smoke: execution context"
-grep -q 'APP_FLAG\|INTERNAL_API_KEY' "$T/mark" && bad "app-smoke: the general smoke_env (any name, e.g. INTERNAL_API_KEY) must never reach the PR command" || ok "app-smoke: no smoke_env variable of any name (INTERNAL_API_KEY, APP_FLAG) reaches the PR command"
-grep -rqs 'internal-secret-value\|csecret' "$T/s-app-smoke" "$T/rt" && bad "app-smoke: smoke_env must not be written to the job's state dir" || ok "app-smoke: smoke_env is not on the app-smoke job's disk"
+grep -q '^APP_FLAG=visible' "$T/mark" && ok "app-smoke: the PUBLIC smoke_vars reach the command" || bad "app-smoke: public smoke_vars"
+grep -q 'INTERNAL_API_KEY' "$T/mark" && bad "app-smoke: a credential of any name (INTERNAL_API_KEY) must never reach the PR command" || ok "app-smoke: no SMOKE_ENV credential of any name (INTERNAL_API_KEY) reaches the PR command"
+grep -rqs 'internal-secret-value\|csecret\|psecret' "$T/s-app-smoke" "$T/rt" && bad "app-smoke: the SMOKE_ENV secret must not be on the app-smoke job's disk" || ok "app-smoke: the SMOKE_ENV secret is not on the app-smoke job's disk"
+grep -q 'internal-secret-value\|csecret' "$T/s-app-smoke/inputs.json" && bad "inputs_json must carry no credential" || ok "inputs_json carries no smoke credential (the secret is not part of the public input contract)"
+grep -q 'internal-secret-value' "$T/s-verify/smoke.env" && ok "verify: the trusted Smoke stage has the SMOKE_ENV secret (authenticated probing is preserved)" || bad "verify: trusted smoke.env"
+# Negative contract: a credential-named PUBLIC smoke_vars, or the secret handed to a non-trusted stage, is refused (never silently ignored).
+senv neg1 CFV2_SMOKE_SECRETS= INPUTS_JSON='{"app_name":"blog","build_cmd":"true","production_rollback_policy":"manual","preview_policy":"pr","smoke_vars":"INTERNAL_API_KEY=oops"}' ENGINE_TARGET=preview ENGINE_KIND=native-branch ENGINE_STAGE=app-smoke ENGINE_DESCRIPTOR="$DESC" ENGINE_D1_EXPECT= CFV2_PR_ACTION=synchronize "$ENGINE" init >/dev/null 2>"$T/err" \
+  && bad "a credential-named smoke_vars (INTERNAL_API_KEY) must be refused" || { grep -q "looks like a credential" "$T/err" && ok "smoke_vars: a credential-looking name (INTERNAL_API_KEY) is refused with the SMOKE_ENV hint"; }
+senv neg2 CFV2_SMOKE_SECRETS="$SECRET_TXT" INPUTS_JSON="$SMK" ENGINE_TARGET=preview ENGINE_KIND=native-branch ENGINE_STAGE=app-smoke ENGINE_DESCRIPTOR="$DESC" ENGINE_D1_EXPECT= CFV2_PR_ACTION=synchronize "$ENGINE" init >/dev/null 2>"$T/err" \
+  && bad "SMOKE_ENV handed to app-smoke must be refused" || { grep -q "must not reach the 'app-smoke' stage" "$T/err" && ok "init: SMOKE_ENV handed to the app-smoke stage is refused"; }
+senv neg3 CFV2_SMOKE_SECRETS="$SECRET_TXT" INPUTS_JSON="$SMK" ENGINE_TARGET=preview ENGINE_KIND=native-branch ENGINE_STAGE=build ENGINE_DESCRIPTOR="$DESC" ENGINE_D1_EXPECT= CFV2_PR_ACTION=synchronize "$ENGINE" init >/dev/null 2>"$T/err" \
+  && bad "SMOKE_ENV handed to Build must be refused" || ok "init: SMOKE_ENV handed to the Build stage is refused"
+grep -q 'internal-secret-value' "$T/err" && bad "the secret value must never be echoed in an error" || ok "errors never echo the secret value"
 rm -f "$T"/mark*
 senv verify APP_SMOKE_RESULT=failure PUBLISHED_URL=https://pr-4-blog.x.workers.dev "$ENGINE" smoke >/dev/null 2>"$T/err" && bad "smoke: a failed app-smoke must fail the Preview" || { grep -q "application smoke command did not pass" "$T/err" && ok "smoke: a Preview whose app-smoke did not succeed is not verified"; }
 senv verify APP_SMOKE_RESULT= PUBLISHED_URL=https://pr-4-blog.x.workers.dev "$ENGINE" smoke >/dev/null 2>/dev/null && bad "smoke: a missing app-smoke result must fail closed" || ok "smoke: a missing / skipped app-smoke result fails closed"

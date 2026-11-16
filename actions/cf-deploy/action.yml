@@ -12,10 +12,10 @@ description: >
               artifact with the pinned Wrangler of this repository. Installs no application dependency and runs no application build. Runs no smoke.
     verify    Smoke job (prod | preview | dev): smoke the published URL; mark verified | unverified. NO Cloudflare credentials. prod | dev (protected revisions) run
               the application smoke command here, with the smoke secrets. A PREVIEW never does: its smoke command is PR-controlled code, so this job runs only the
-              trusted probe / SHA check (with any smoke_env Access token) and requires the result of the app-smoke stage for the application command. It checks out and
+              trusted probe / SHA check (with the SMOKE_ENV secret (Access token)) and requires the result of the app-smoke stage for the application command. It checks out and
               installs nothing of the PR.
     app-smoke Preview only, its own job: the application's PR-controlled smoke command on an ephemeral GitHub-hosted runner with NO secret of any kind (no GitHub token,
-              no Cloudflare credential, no smoke credential, no preview secret, no smoke_env Access token / PROBE_HEADERS). It can only pass or fail.
+              no Cloudflare credential, no smoke credential, no preview secret, no SMOKE_ENV secret (Access token / PROBE_HEADERS)). It can only pass or fail.
     rollback  Rollback job, PRODUCTION ONLY: fail-closed re-deploy of the previous stored Worker VERSION + re-smoke (no build). Preview / Dev have no automatic recovery: they
               are fixed forward (a recovery would have to rebuild an older revision, which no credential-bearing job may do, and no verified artifact is retained).
   Jobs share only validated DATA (deploy_outputs / migration_outputs / smoke_outputs) and the artifact, never runner files. The CALLER job owns the Environment,
@@ -49,6 +49,9 @@ inputs:
   smoke_username:
     default: ''
   smoke_password:
+    default: ''
+  smoke_env:
+    description: The SMOKE_ENV secret (KEY=VALUE lines). Passed ONLY by the trusted Smoke / Rollback jobs; read only by the verify / rollback stages (any other stage refuses it).
     default: ''
   deploy_outputs:
     description: toJSON(needs.deploy.outputs) - hand-off to the verify / rollback stages (validated as data)
@@ -186,6 +189,7 @@ runs:
         INPUTS_JSON: ${{ inputs.inputs_json }}
         CALL_INPUTS_JSON: ${{ inputs.call_inputs_json }}
         PREVIEW_SECRETS: ${{ inputs.target == 'preview' && inputs.preview_secrets || '' }}
+        CFV2_SMOKE_SECRETS: ${{ inputs.smoke_env }}
         CFV2_IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         CFV2_PR_ACTION: ${{ github.event.action }}
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" init'

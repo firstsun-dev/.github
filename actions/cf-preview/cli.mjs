@@ -299,14 +299,16 @@ try {
       const r = validateInit({
         inputs: JSON.parse(readFileSync(opt('inputs'), 'utf8')), target: e.ENGINE_TARGET, kind: e.ENGINE_KIND ?? '', stage: e.ENGINE_STAGE || 'all',
         d1Expect: e.ENGINE_D1_EXPECT ?? '', descriptor: e.ENGINE_DESCRIPTOR ?? '', callInputs: e.CALL_INPUTS_JSON ?? '', event: e.GITHUB_EVENT_NAME, ref: e.GITHUB_REF,
-        isFork: e.CFV2_IS_FORK === 'true', prAction: e.CFV2_PR_ACTION ?? '', previewSecrets: e.PREVIEW_SECRETS ?? '',
+        isFork: e.CFV2_IS_FORK === 'true', prAction: e.CFV2_PR_ACTION ?? '', previewSecrets: e.PREVIEW_SECRETS ?? '', smokeSecrets: e.CFV2_SMOKE_SECRETS ?? '',
       });
       const dir = opt('state');
       const put = (name, text) => writeFileSync(resolve(dir, name), text, { mode: 0o600 });
       const env = (name, pairs) => { if (pairs?.length) appendFileSync(resolve(dir, name), pairs.map(([k, v]) => `${k}=${v}`).join('\n') + '\n', { mode: 0o600 }); };
       put('kind', r.slot); put('delivery_target', r.delivery.target); put('driver', r.delivery.driver); put('smoke_mode', r.smokeMode); put('stage', r.stage); put('d1_expect', r.d1Expect); put('target', r.target);
-      env('build.env', r.buildEnv); env('smoke.env', r.smokeEnv); env('preview.env', r.previewEnv);
-      for (const [, v] of r.previewEnv ?? []) if (v) console.error(`::add-mask::${v}`);
+      env('build.env', r.buildEnv); env('preview.env', r.previewEnv);
+      env('smoke_vars.env', r.smokeVars);                          // public, non-sensitive: the only smoke data the untrusted app-smoke command may get
+      if (r.stage !== 'app-smoke') env('smoke.env', [...r.smokeVars, ...r.smokeSecretEnv]);     // trusted Smoke / Rollback-probe only (the secret part exists only there)
+      for (const [, v] of [...(r.previewEnv ?? []), ...r.smokeSecretEnv]) if (v) console.error(`::add-mask::${v}`);
       out({ kind: r.slot, smoke_mode: r.smokeMode });
       break;
     }

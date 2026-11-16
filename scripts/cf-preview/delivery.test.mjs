@@ -450,3 +450,13 @@ test('pendingMigrations: names with spaces / Unicode are compared exactly', () =
   assert.deepEqual(pendingMigrations({ files, tableExists: true, applied: rec('0001_init.sql', '0003_調整.sql') }), ['0002_add status.sql']);
   assert.deepEqual(pendingMigrations({ files, tableExists: true, applied: rec(...files) }), []);
 });
+
+import { smokeVars } from '../../actions/cf-preview/delivery.mjs';
+test('smoke_vars is public: credential-looking names are refused (use the SMOKE_ENV secret), ordinary data passes', () => {
+  assert.deepEqual(smokeVars('APP_FLAG=visible\nREGION=eu'), [['APP_FLAG', 'visible'], ['REGION', 'eu']]);
+  for (const n of ['INTERNAL_API_KEY', 'API_TOKEN', 'DB_PASSWORD', 'CF_ACCESS_CLIENT_ID', 'PROBE_HEADERS', 'SERVICE_SECRET', 'AUTH_HEADER']) {
+    assert.throws(() => smokeVars(`${n}=x`), /looks like a credential/, n);
+  }
+  assert.throws(() => smokeVars('TARGET_URL=https://evil'), /may not be set/); // engine-owned control names stay reserved
+  assert.deepEqual(smokeVars(''), []);
+});

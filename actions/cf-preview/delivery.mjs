@@ -461,7 +461,7 @@ export function restoreDescriptor(state, { repo, runId = '0', event = '', ref = 
 // ---------------------------------------------------------------------------------------------------------------------
 const STAGES = ['build', 'precheck', 'migrate', 'publish', 'verify', 'app-smoke', 'rollback'];
 
-export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expect = '', descriptor = '', callInputs = '', event, ref, isFork = false, prAction = '', previewSecrets = '' }) {
+export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expect = '', descriptor = '', callInputs = '', event, ref, isFork = false, prAction = '', previewSecrets = '', smokeSecrets = '' }) {
   if (inputs === null || typeof inputs !== 'object' || Array.isArray(inputs)) throw new Error('inputs_json is not an object');
   const s = (k) => (inputs[k] == null ? '' : String(inputs[k]));
   if (!descriptor) throw new Error('a delivery descriptor is required');
@@ -491,11 +491,27 @@ export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expec
     });
     if (!planned || planned.target !== d.target || planned.driver !== d.driver) throw new Error(`delivery mismatch (this event plans '${planned ? `${planned.target}/${planned.driver}` : 'nothing'}', engine '${d.target}/${d.driver}'); refusing to deploy`);
   }
-  return { slot: d.slot, delivery, stage, target, smokeMode: d.smoke_mode, d1Expect, ...validateTargetConfig({ inputs, delivery, previewSecrets }) };
+  // The sensitive smoke configuration (the SMOKE_ENV secret: Access service token, PROBE_HEADERS, any application credential) belongs to the trusted
+  // Smoke / Rollback-probe stages ONLY. Any other stage that is handed one is a wiring defect: refuse, never ignore.
+  if (smokeSecrets && !['verify', 'rollback'].includes(stage)) throw new Error(`the sensitive smoke configuration (SMOKE_ENV) must not reach the '${stage}' stage`);
+  return { slot: d.slot, delivery, stage, target, smokeMode: d.smoke_mode, d1Expect, ...validateTargetConfig({ inputs, delivery, previewSecrets, smokeSecrets }) };
+}
+
+/**
+ * `smoke_vars` is a PUBLIC workflow input: it is serialized into inputs_json, printed in job logs and handed to the untrusted Preview App Smoke command.
+ * It is therefore for NON-SENSITIVE data only; a credential-looking name is refused (use the SMOKE_ENV secret, which only the trusted Smoke job receives).
+ */
+export const SENSITIVE_NAME = /(KEY|TOKEN|SECRET|PASSW|PASSWD|CREDENTIAL|AUTH|COOKIE|SESSION|PRIVATE|PROBE_HEADERS|^CF_ACCESS)/i;
+export function smokeVars(text) {
+  const r = parseEnvLines(text, { reserved: true });
+  const bad = r.pairs.map(([k]) => k).filter((k) => SENSITIVE_NAME.test(k));
+  const errors = [...r.errors, ...bad.map((k) => `${k} looks like a credential; smoke_vars is public and reaches the untrusted Preview smoke command - provide it through the SMOKE_ENV secret`)];
+  if (errors.length) throw new Error(`smoke_vars: ${errors.join('; ')}`);
+  return r.pairs;
 }
 
 /** Per-target requirements and the validated KEY=VALUE env data each target builds/smokes with (a build env never falls back to another target's). */
-function validateTargetConfig({ inputs, delivery, previewSecrets }) {
+function validateTargetConfig({ inputs, delivery, previewSecrets, smokeSecrets = '' }) {
   const s = (k) => (inputs[k] == null ? '' : String(inputs[k]));
   const on = (k) => s(k) === 'true';
   const { target, driver } = delivery;
@@ -515,7 +531,7 @@ function validateTargetConfig({ inputs, delivery, previewSecrets }) {
     return r.pairs;
   };
   return {
-    buildEnv: parse('CFV2_BUILD_ENV', buildEnvText), smokeEnv: parse('CFV2_SMOKE_ENV', s('smoke_env')),
+    buildEnv: parse('CFV2_BUILD_ENV', buildEnvText), smokeVars: smokeVars(s('smoke_vars')), smokeSecretEnv: smokeSecrets ? parse('CFV2_SMOKE_SECRET', smokeSecrets) : [],
     previewEnv: target !== 'production' && driver === 'native-preview' && previewSecrets ? parse('CFV2_PS', previewSecrets) : null,
   };
 }
