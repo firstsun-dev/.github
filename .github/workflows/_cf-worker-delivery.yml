@@ -281,15 +281,24 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           GO: ${{ steps.go.outputs.go }}
         run: echo "status=$([ "$GO" = true ] && echo "$JOB_STATUS" || echo none)" >> "$GITHUB_OUTPUT"
-      # Failure-only evidence with short retention; never a delivery dependency.
+      # Failure-only evidence with short retention; never a delivery dependency. Its name comes from the validated DESCRIPTOR (environment = <app>/<slot suffix>,
+      # slot), never from the Build artifact name: that is empty when a deferred verification (pipeline_phase=verify) skips the Build, and two apps of one run
+      # must still never collide. (Actions expressions have no string replace; `/` is not allowed in an artifact name.)
+      - name: Smoke report name
+        id: report
+        if: failure()
+        env:
+          DESCRIPTOR: ${{ inputs.descriptor }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          env_name="$(jq -r .environment <<<"$DESCRIPTOR")"; slot="$(jq -r .slot <<<"$DESCRIPTOR")"
+          echo "name=smoke-report-${env_name//\//-}-${slot}-${ATTEMPT}" >> "$GITHUB_OUTPUT"
       - name: Upload smoke report (failure only)
         uses: actions/upload-artifact@v7
         if: failure()
         continue-on-error: true
         with:
-          # Identity from the validated descriptor (environment = <app>/<slot suffix>), never from the Build artifact name: that is empty when a deferred
-          # verification (pipeline_phase=verify) skips the Build, and two apps of one run must still never collide.
-          name: smoke-report-${{ replace(fromJSON(inputs.descriptor).environment, '/', '-') }}-${{ fromJSON(inputs.descriptor).slot }}-${{ github.run_attempt }}
+          name: ${{ steps.report.outputs.name }}
           path: |
             playwright-report/
             test-results/
