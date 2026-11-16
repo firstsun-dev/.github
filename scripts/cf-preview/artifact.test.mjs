@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, symlinkSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { artifactBase, artifactName, packageArtifact, verifyArtifact, rewriteConfig, structuralProblems, filesDigest, bundleEntryFor, configMode } from '../../actions/cf-preview/artifact.mjs';
@@ -165,4 +165,46 @@ test('rewrite: only an adapter-style local-dev `dev` block is stripped; every ot
     const c = rewriteConfig({ ...base, [k]: k === 'containers' ? [] : 'x' }, opts).config;
     assert.ok(k in c && structuralProblems({ ...c, no_bundle: true, main: 'worker/i.js' }, ['worker/i.js']).some((p) => p.includes(`'${k}'`)), k);
   }
+});
+
+// ---- assets-only Workers (static sites: the adapter's flattened config has `assets` and no `main`) ----
+const assetsOnly = () => {
+  const f = fixture();
+  delete f.cfg.main; // static Astro build: dist/client/wrangler.json carries assets + bindings, no Worker entry
+  rmSync(join(f.ws, 'bundle'), { recursive: true, force: true }); // `wrangler deploy --dry-run --outdir` writes no JS for an assets-only Worker
+  return f;
+};
+const packAssetsOnly = (f, manifest = ID) => packageArtifact({ cfg: f.cfg, configDir: join(f.ws, 'dist/server'), workspace: f.ws, bundleDir: join(f.ws, 'bundle'), dest: f.dest, manifest, effectiveMain: undefined });
+
+test('assets-only: packages config + assets without a bundle, forces no_bundle, keeps bindings, and verifies', () => {
+  const f = assetsOnly();
+  const m = packAssetsOnly(f);
+  const cfg = JSON.parse(readFileSync(join(f.dest, 'wrangler.json'), 'utf8'));
+  assert.deepEqual([cfg.main, cfg.assets.directory, cfg.no_bundle, cfg.d1_databases[0].database_id], [undefined, './assets/0', true, 'ID1']);
+  assert.equal(readFileSync(join(f.dest, 'assets/0/index.html'), 'utf8'), 'hi');
+  assert.deepEqual(listFilesTop(f.dest), ['assets', 'manifest.json', 'wrangler.json'], 'no worker/ directory');
+  assert.equal(m.files_digest, filesDigest(f.dest));
+  assert.equal(verifyArtifact(f.dest, EXPECT).manifest.artifact_sha, SHA('b'));
+});
+const listFilesTop = (d) => readdirSync(d).sort();
+
+test('assets-only: a config with neither a Worker entry nor assets is refused at packaging', () => {
+  const f = assetsOnly();
+  delete f.cfg.assets;
+  assert.throws(() => packAssetsOnly(f), /neither a Worker entry .*nor an assets directory/);
+});
+
+test('assets-only: verify refuses an artifact that claims no main but ships Worker code, or has no assets', () => {
+  const base = { name: 'x', no_bundle: true, assets: { directory: './assets/0' } };
+  assert.deepEqual(structuralProblems(base, ['assets/0/index.html', 'wrangler.json']), [], 'valid assets-only');
+  assert.ok(structuralProblems(base, ['assets/0/index.html', 'worker/evil.js']).some((p) => /worker\//.test(p)), 'worker code without a main is not allowed');
+  assert.ok(structuralProblems({ name: 'x', no_bundle: true }, ['wrangler.json']).some((p) => /no bundled main and no assets directory/.test(p)), 'no main and no assets');
+  assert.ok(structuralProblems({ ...base, no_bundle: false }, ['assets/0/index.html']).some((p) => /no_bundle/.test(p)), 'still never bundles');
+  assert.ok(structuralProblems({ ...base, containers: [] }, ['assets/0/index.html']).some((p) => /'containers'/.test(p)), 'forbidden keys still rejected');
+});
+
+test('worker with a main still needs its bundle: a missing bundle directory is an error, not an assets-only fallback', () => {
+  const f = fixture();
+  rmSync(join(f.ws, 'bundle'), { recursive: true, force: true });
+  assert.throws(() => pack(f), /no bundle at/);
 });

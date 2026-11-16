@@ -83,7 +83,7 @@ const clone = (o) => JSON.parse(JSON.stringify(o));
 const sections = (cfg) => [cfg, ...Object.values(cfg.env ?? {}).filter((e) => e && typeof e === 'object')];
 
 /**
- * Rewrite a (source or adapter-generated) Wrangler config so it publishes pre-bundled files only. `configDir` = directory the original paths
+ * Rewrite a (source or adapter-generated) Wrangler config so it publishes pre-bundled files only (`bundleEntry` undefined = an assets-only Worker: no `main` anywhere). `configDir` = directory the original paths
  * are relative to. Returns { config, assetDirs } where assetDirs = [{ from: absolute dir, to: 'assets/<n>' }]. Throws on a path that escapes
  * the config's workspace or a missing asset directory. The `build` command (arbitrary shell) and `site` are dropped.
  */
@@ -98,7 +98,10 @@ export function rewriteConfig(cfg, { configDir, bundleEntry, workspace }) {
     delete s.build;
     delete s.site;
     if (isInertDev(s.dev)) delete s.dev; // adapter-generated local-dev block only; anything else stays and is rejected by FORBIDDEN_KEYS
-    if (typeof s.main === 'string') s.main = `worker/${bundleEntry}`;
+    if (typeof s.main === 'string') {
+      if (bundleEntry === undefined) throw new Error('an assets-only artifact cannot carry a `main` in any config section');
+      s.main = `worker/${bundleEntry}`;
+    }
     if (s.assets && typeof s.assets === 'object' && typeof s.assets.directory === 'string') {
       const abs = resolve(configDir, s.assets.directory);
       inside(abs, 'assets.directory');
@@ -129,13 +132,18 @@ export const configMode = (cfg, { target, driver, devEnv = 'dev' }) => (target =
 
 /** Assemble artifact/ from the audited config, the dry-run bundle and the asset directories, then write the manifest. */
 export function packageArtifact({ cfg, configDir, workspace, bundleDir, dest, manifest, effectiveMain }) {
-  if (!existsSync(bundleDir)) throw new Error(`no bundle at ${bundleDir}: the dry-run build produced nothing`);
-  const entry = bundleEntryFor(bundleDir, effectiveMain);
+  // effectiveMain undefined = an ASSETS-ONLY Worker (a static site: the flattened config has `assets` and no entry point): nothing to bundle, nothing under worker/.
+  const assetsOnly = effectiveMain === undefined;
+  if (!assetsOnly && !existsSync(bundleDir)) throw new Error(`no bundle at ${bundleDir}: the dry-run build produced nothing`);
+  const entry = assetsOnly ? undefined : bundleEntryFor(bundleDir, effectiveMain);
   const { config, assetDirs } = rewriteConfig(cfg, { configDir, bundleEntry: entry, workspace });
+  if (assetsOnly && !assetDirs.length) throw new Error('the config has neither a Worker entry (`main`) nor an assets directory: there is nothing to publish');
   rmSync(dest, { recursive: true, force: true });
   mkdirSync(dest, { recursive: true });
-  cpSync(bundleDir, join(dest, 'worker'), { recursive: true });
-  rmSync(join(dest, 'worker', 'README.md'), { force: true });
+  if (!assetsOnly) {
+    cpSync(bundleDir, join(dest, 'worker'), { recursive: true });
+    rmSync(join(dest, 'worker', 'README.md'), { force: true });
+  }
   for (const a of assetDirs) {
     if (!existsSync(a.from) || !statSync(a.from).isDirectory()) throw new Error(`assets directory ${a.from} does not exist after the build`);
     cpSync(a.from, join(dest, a.to), { recursive: true, dereference: false });
@@ -214,7 +222,13 @@ export function structuralProblems(cfg, files, expect = {}) {
       if (!/^assets\/\d+$/.test(d)) bad.push(`assets.directory '${s.assets.directory}' is not an artifact assets directory`);
     }
   }
-  if (typeof cfg.main !== 'string') bad.push('the config has no bundled main');
+  if (typeof cfg.main !== 'string') {
+    // Assets-only Worker (static site): allowed ONLY with an assets directory, no Worker code and no `main` in any section.
+    const withAssets = sections(cfg).some((s) => s.assets && typeof s.assets === 'object' && s.assets.directory !== undefined);
+    if (!withAssets) bad.push('the config has no bundled main and no assets directory');
+    if (sections(cfg).some((s) => typeof s.main === 'string')) bad.push('an assets-only config cannot also set `main` in an environment section');
+    if (files.some((f) => /^worker\//.test(f))) bad.push('Worker code under worker/ requires a bundled main (an assets-only artifact ships none)');
+  }
   if (expect.workerName !== undefined && expect.workerName !== '' && cfg.name !== expect.workerName) bad.push(`Worker name '${cfg.name}' is not the expected '${expect.workerName}'`);
   return bad;
 }
