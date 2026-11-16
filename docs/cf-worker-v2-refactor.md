@@ -1,5 +1,7 @@
 # CF Worker v2 — in-place refactor: interface, concurrency design, migration guide
 
+> **Superseded (2026-11-13).** This record describes the four-kind (`production / native-branch / native-dev / persistent-dev`) model replaced by the stage/target design in [cf-worker-v2.md](cf-worker-v2.md) and `openspec/changes/simplify-cf-ci-stages-and-dev-delivery`. Kept as history; its inputs no longer exist.
+
 > **Current interface note (2026-11-11):** The historical rollout notes below mention `tools_ref` and `dev_deploy_cmd` for context. Both retired inputs have now been removed from the v2 workflow-call declaration. Do not pass either to new consumers.
 
 `.github/workflows/_cf-worker-v2.yml` was refactored **in place** (breaking, no `v3`). Spec: `openspec/changes/refactor-cloudflare-worker-cicd-v2` (PR #57). Shipped v2.x behavior stays documented by `docs/cf-worker-v2.md` / PR #56 as the historical record; **the interface below replaces it**. The floating `@v2` tag has not moved and no consumer has been changed.
@@ -401,7 +403,7 @@ detect ─┬─ A (deploy call):   CI ‖ E2E ─► Migration ─► Deploy �
 | Strategy | `deployment_strategy` (`production-preview` \| `hybrid` \| `production-only`), `preview_on_branch_push`, `shared_dev_on_branch_push` (default `false`), `preview_worker_name` |
 | Validation | `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `test_integration_cmd`, `build_cmd` (required), `ci_env`, `use_mailpit` |
 | E2E | `test_e2e_cmd`, `test_e2e_setup_cmd`, `test_e2e_build_cmd`, `test_e2e_env`, `test_e2e_variants` |
-| Deploy | `build_env_prod`, `build_env_preview`, `smoke_cmd`, `smoke_env`, `probe_path`, `probe_expect_status`, `sha_path`, `app_url_prod`, `access_protected_targets`, `production_rollback_policy`, `preview_binding_allow`, `preview_deny_resources` |
+| Deploy | `build_env_prod`, `build_env_preview`, `smoke_cmd`, `smoke_vars`, secret `SMOKE_ENV`, `probe_path`, `probe_expect_status`, `sha_path`, `app_url_prod`, `access_protected_targets`, `production_rollback_policy`, `preview_binding_allow`, `preview_deny_resources` |
 | Migration | `d1_migrations`, `d1_binding`, `d1_lock_scope` (names the shared-D1 concurrency group; no command override) |
 | Release | `release_cmd` (+ secret `RELEASE_TOKEN`) |
 | Hybrid | `persistent_dev_ref`, `dev_smoke_cmd`, `dispatch_target` |
@@ -419,7 +421,7 @@ Outputs: `deploy_url`, `deploy_target`, `version_id` (prod only), `dev_url` (Sha
 | `preview_build_cmd` | one `build_cmd`; targets differ via `build_env_prod` / `build_env_preview` |
 | `preview_provision_cmd`, `preview_cleanup_cmd` (already ignored) | removed: shared durable Preview resources with explicit `previews` bindings |
 | `preview_migrate_cmd`, `migrate_cmd_prod` | `d1_migrations: true` (the engine's Migration step). **No command override**: a custom command could skip the target-D1 check, so the built-in `wrangler d1 migrations` path is the only one |
-| `preview_smoke_cmd`, `preview_smoke_env`, `verify_cmd` | `smoke_cmd`, `smoke_env` (both targets; `TARGET_URL`, `EXPECTED_SHA`, `DEPLOY_TARGET`, `TEST_ENV`) |
+| `preview_smoke_cmd`, `preview_smoke_env`, `verify_cmd` | `smoke_cmd`, `smoke_vars` (public) + secret `SMOKE_ENV` (both targets; `TARGET_URL`, `EXPECTED_SHA`, `DEPLOY_TARGET`, `TEST_ENV`) |
 | `preview_sha_path` | `sha_path` |
 | `test_e2e_setup_cmd` doing the build | `test_e2e_setup_cmd` + `test_e2e_build_cmd` |
 | output `preview_url` | `deploy_url` (+ `deploy_target`) |
@@ -514,7 +516,7 @@ The first live Blog run published a Native Preview with **no URL**, then ran smo
 * **Host readiness:** before the build, `build.sh` calls the read-only Workers subdomain API (`GET /accounts/{id}/workers/scripts/{worker}/subdomain`) for the host Worker and refuses when `previews_enabled` is `false`, explaining how to enable Preview URLs. It never changes the Worker. An unreadable answer (token scope, 404, network) only warns and the strict post-publish validation applies. Custom-domain Preview hosting cannot be derived from this flag: set `preview_host_check: false` there.
 * **Ledger identity:** Preview ledger records now carry `repo` and `host_worker`. `gh.sh last-good-preview` only returns a deployment whose repository, application, branch ref and **host Worker** match, whose latest status is `success` and whose recorded URL is a valid https URL; legacy records without `host_worker` are never eligible (a Preview hosted by `blog-preview` is not a recovery source for one hosted by `blog`). History is kept.
 * **Preview recovery:** rebuilds with the Preview build environment restored from `build_env_preview` (failed SHA rebound to the last-good SHA, same for `app_version`), checks the host Worker, requires the redeployed URL to equal the recorded last-good URL, runs the configured `smoke_cmd` (with `sha_path` against the last-good SHA) and records the outcome: content-level verified, Access-liveness only (reported as **not** verified), or failed. D1 is never rolled back; the run is always red.
-* **Smoke env isolation:** `smoke_env` is staged in `SMOKE_ENV_FILE` and loaded only inside `smoke.sh`; it is never merged into the job environment, so Production-oriented smoke values can no longer overwrite the target build environment (e.g. `SITE_NOINDEX`) for a later rebuild.
+* **Smoke env isolation:** `SMOKE_ENV` (secret) is staged in `SMOKE_ENV_FILE` and loaded only inside `smoke.sh`; it is never merged into the job environment, so Production-oriented smoke values can no longer overwrite the target build environment (e.g. `SITE_NOINDEX`) for a later rebuild.
 
 ## Migration, concurrency, release and secrets
 
@@ -523,7 +525,7 @@ The first live Blog run published a Native Preview with **no URL**, then ran smo
 * **Pending-only, no-op safe.** `wrangler d1 migrations list` must exit 0 (state readable, target reachable) and `apply` is itself pending-only. The "No migrations to apply" text only skips a no-op `apply`; correctness does not depend on parsing it.
 * **Order inside the Migration job (Shared Dev: inside its single job):** `init` (target bound, credentials) → stale check → `prepare` (Wrangler version, Preview identity and **ledger ownership**, source binding policy) → **build + audit of the effective config** → exact D1 target check (read-only; the deployed D1 must be the migrated D1) → stale check → **`migrate.sh`** → stale check → publish. Schema is never changed before a deployable build and a valid target configuration exist; a deleted/superseded branch applies nothing, and a push that lands *during* a long migration is detected by the final stale check so old code is not published over a newer deployment.
 * Failed migration ⇒ the job fails and nothing is published or verified (so Release cannot run); PRs never reach it; Worker recovery never rolls D1 back. Production, Preview and Dev apply the same project-owned SQL to their own D1.
-* **The target cannot be redirected by application env.** `migrate.sh` is invoked by the engine with the target bound from the composite `target` input and the state written at `init`; `build_env_*`, `smoke_env` and `PREVIEW_SECRETS` are parsed with `--reserved`, which rejects every deployment-control name (`TARGET`, `DEV_ENV`, `GH_TOKEN`, `EXPECTED_SHA`, `RUN_SHA`, `D1_BINDING`, `STATE_DIR`, `BUILD_CMD`, `PUBLISH_CMD`, `INPUTS_JSON`, `CF_AUDITED_CONFIG`, `VITE_APP_ENV`/`VERSION`, ... see `parse-env.mjs` `RESERVED`) in addition to the credential/loader names; application env is loaded only inside the process that needs it and is never written to `GITHUB_ENV`. A build command that itself appends `TARGET=prod` to `GITHUB_ENV` still cannot move the migration (tested).
+* **The target cannot be redirected by application env.** `migrate.sh` is invoked by the engine with the target bound from the composite `target` input and the state written at `init`; `build_env_*`, `smoke_vars` and `PREVIEW_SECRETS` are parsed with `--reserved`, which rejects every deployment-control name (`TARGET`, `DEV_ENV`, `GH_TOKEN`, `EXPECTED_SHA`, `RUN_SHA`, `D1_BINDING`, `STATE_DIR`, `BUILD_CMD`, `PUBLISH_CMD`, `INPUTS_JSON`, `CF_AUDITED_CONFIG`, `VITE_APP_ENV`/`VERSION`, ... see `parse-env.mjs` `RESERVED`) in addition to the credential/loader names; application env is loaded only inside the process that needs it and is never written to `GITHUB_ENV`. A build command that itself appends `TARGET=prod` to `GITHUB_ENV` still cannot move the migration (tested).
 * **Not implemented (do not assume):** SQL checksum/drift detection or rejection of incompatible histories when several branches share the Preview D1. A branch that edits an already-applied migration, or two branches adding conflicting schema, is not detected; forward-compatible schema changes remain a convention.
 
 ### Concurrency (final)
@@ -576,7 +578,7 @@ Fail-closed (`smoke.sh`): no URL ⇒ fail; the probe requests `probe_path` (defa
 | --- | --- | --- | --- | --- |
 | *(no smoke / smoke failed)* | published, unverified | `false` | `failure` / `error` | no |
 | `liveness` | only the Cloudflare Access login redirect answered (target listed in `access_protected_targets`) | `false`, `published_unverified=true` | `inactive` (description says unverified) | **no** |
-| `content` | the application itself answered 2xx (directly, or through an authenticated probe: service-token headers via `smoke_env` `PROBE_HEADERS`) | `true` | `success … (content)` | yes |
+| `content` | the application itself answered 2xx (directly, or through an authenticated probe: service-token headers via the `SMOKE_ENV` secret `PROBE_HEADERS`) | `true` | `success … (content)` | yes |
 | `content-sha` | content verified **and** `sha_path` served the expected commit | `true` | `success … (content-sha)` | yes |
 
 * Under an Access redirect `smoke_cmd`/`sha_path` cannot raise the level: an unauthenticated command may be reading the login page.

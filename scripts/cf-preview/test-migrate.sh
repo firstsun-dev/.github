@@ -19,6 +19,8 @@ for i in "$@"; do [ -f "$i" ] && grep -o '"database_id": "[^"]*"' "$i" >> "$STUB
 exit 0
 STUB
 chmod +x "$T/bin/pnpm"
+# migrate.sh runs the pinned tooling Wrangler ($WRANGLER), not the application's: a shim onto the same recording stub.
+printf '#!/usr/bin/env bash\nexec pnpm exec wrangler "$@"\n' > "$T/bin/wrangler"; chmod +x "$T/bin/wrangler"; export WRANGLER="$T/bin/wrangler"
 cat > "$T/app/wrangler.toml" <<'TOML'
 name = "x"
 [[d1_databases]]

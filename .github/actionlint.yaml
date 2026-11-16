@@ -1,7 +1,7 @@
 # actionlint 1.7.12 predates two GitHub features this pipeline uses; ONLY these messages are ignored, everything else is still linted.
 #  * `concurrency.queue` (GitHub changelog 2026-05-07), reported as an unknown key; only the shared Worker workflow uses it.
 #  * the self-repository reference `uses: $/...` (GitHub changelog 2026-07-30, runner >= 2.336.0): actionlint still demands
-#    `owner/repo@ref` for actions and `owner/repo/path.yml@ref` for reusable workflows. The contract test (test-workflow-contract.py)
+#    `owner/repo@ref` for actions and `owner/repo/path.yml@ref` for reusable workflows. scripts/cf-preview/check-workflows.py
 #    validates every `$/` reference itself: static, no @ref, the target exists in this repository. Drop these entries once actionlint
 #    learns `$/`.
 paths:

@@ -60,8 +60,9 @@ runs:
         node "$GITHUB_ACTION_PATH/../cf-preview/parse-env.mjs" CI_ENV "$GITHUB_ENV"
     - uses: $/actions/setup
       with:
-        setup-node: 'false'
-        setup-pnpm: 'false'
+        # A GitHub-hosted runner (every fork PR) has no baked-in Node / pnpm; the organization's self-hosted runners do.
+        setup-node: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
+        setup-pnpm: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
     - if: inputs.use_mailpit == 'true'
       uses: $/actions/mailpit
     - name: ${{ inputs.title }}
