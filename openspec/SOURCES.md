@@ -8,9 +8,18 @@ Baseline: `firstsun-dev/.github` `main` at `6fb04eb86b52a2f4d290db8f7bdfd82e190d
 
 This audit records which repository and consumer sources were used to derive the current-state OpenSpec. The specifications describe implemented contracts; they do not silently redesign inconsistent or imperfect behavior discovered during the audit.
 
-This is a point-in-time audit from 2026-09-15. On 2026-11-16, the v1 Worker template and CodeGraph workflow were retired after organization-wide searches found no current callers; their capability specifications now record that retirement.
+This document preserves the source inventory and evidence reviewed for the 2026-09-15 baseline. The inventory below is historical: a file listed there is not thereby claimed to exist or remain supported today. Current status for capabilities changed since that audit is summarized next.
 
-## Included executable sources
+## Current support update (2026-11-16)
+
+| Capability | Current status | Current specification and executable sources |
+| --- | --- | --- |
+| Cloudflare Worker delivery | The supported shared interface is v2. The v1 workflow and branch-alias action were retired after organization-wide searches found no current callers. | Current contract index: [Cloudflare Worker Delivery capability spec](./specs/cloudflare-worker-delivery/spec.md). Shipped v2 baseline: [v2 baseline delta specification](./changes/redesign-cloudflare-worker-cicd-v2/specs/cloudflare-worker-delivery/spec.md). The simplification, refactor, and target-unification changes are follow-on contracts, not silent replacements of shipped behavior. Executable engine: `.github/workflows/_cf-worker-v2.yml` and internal `_cf-worker-ci.yml`, `_cf-worker-delivery.yml`, `_cf-worker-lifecycle.yml`, `_cf-worker-preview-gc.yml`, with `actions/cf-preview/`. Operator guide: [docs/cf-worker-v2.md](../docs/cf-worker-v2.md). |
+| CodeGraph Index CI | The reusable workflow was retired after an organization-wide search found no current callers. | [Retired capability status](./specs/codegraph-index-ci/spec.md). |
+
+The inventory below retains the audit meaning of the 2026-09-15 snapshot; references there to `_cf-worker-template.yml` and `_codegraph.yml` are historical source evidence, not currently supported executable sources.
+
+## Historical executable source inventory
 
 ### Organization GitHub surface
 
@@ -77,7 +86,7 @@ The split between release metadata and release-asset build/provenance is part of
 - `packages/tsconfig/package.json`
 - `scripts/release.sh`
 
-## Included maintained documentation
+## Historical maintained documentation
 
 - `docs/brand-system.md`
 - `docs/infrastructure-overview.md`
@@ -87,7 +96,7 @@ The split between release metadata and release-asset build/provenance is part of
 
 These sources explain organization intent and public positioning. They do not override executable workflow/action/package behavior.
 
-## Included consumer evidence
+## Consumer evidence reviewed for the historical audit
 
 Organization code search confirms that the shared surface is consumed across multiple repositories, including:
 
@@ -100,7 +109,7 @@ Organization code search confirms that the shared surface is consumed across mul
 
 Consumer repositories are evidence of the integration contract, not owners of generic behavior implemented here.
 
-## Recent commit context reviewed
+## Recent commit context reviewed for the historical audit
 
 Recent changes were used as intent/compatibility context, especially:
 
@@ -113,7 +122,7 @@ Recent changes were used as intent/compatibility context, especially:
 
 Commit messages explain why a contract exists but do not supersede the executable source.
 
-## Observations deliberately not normalized
+## Historical observations deliberately not normalized
 
 ### Mixed consumer pinning
 
@@ -129,13 +138,13 @@ The current-state spec records the intended tag semantics without rewriting exis
 
 Some reusable workflows default to GitHub-hosted runner labels while the Cloudflare Worker pipeline defaults to the organization `linux` runner and skips Node/pnpm installation because that runner image provides them. These differences are current behavior and are not collapsed into one universal runner contract.
 
-## Excluded sources
+## Sources excluded from the historical audit
 
 - Secret values, private infrastructure configuration, and credentials.
 - Historical agent transcripts or generated run artifacts as normative sources.
 - Proposed behavior not represented by current executable code.
 - Product-specific deployment or application behavior owned by consumer repositories.
 
-## Reconciliation rule
+## Reconciliation rule for future audits
 
 If a future audit finds disagreement between these specs and `main`, first determine whether code changed without its corresponding OpenSpec update. Until reconciled, executable code remains the observed current behavior, while an accepted OpenSpec change remains the normative target for work in progress.
