@@ -39,9 +39,9 @@ The NAS-local host port is illustrative and must be confirmed free, accessible f
 
 - `.github`: organization ingress and onboarding invariants only.
 - `infra-config`: Terraform owns the existing Custom Domain, new exact Worker Route and path-scoped Access application, explicit Service Token, non-secret AUD outputs, scoped HTTP Workers VPC Service and NAS Ansible/Compose.
-- `grafana-mcp`: independent Worker, request validation, protocol-aware proxy, VPC binding declaration, CI/test/doc and Grafana-specific application OpenSpec.
+- `innovation-apps/apps/grafana-mcp`: independently deployed Worker, request validation, protocol-aware proxy, VPC binding declaration, tests and docs. Application OpenSpec lives in `innovation-apps/openspec/changes/add-grafana-mcp/`.
 - The Grafana project remains the official upstream container, pinned to a vetted release/digest. Do not mirror upstream tools or ship Grafana credentials inside the Worker.
-- Consumer Wrangler configuration must **not** create a competing Route or Custom Domain; production `workers_dev=false` and `preview_urls=false` (or equivalent audited disablement) are mandatory.
+- The Grafana app SHALL have its own `.github/workflows/grafana-mcp.yml` thin CI caller and workspace-aware change detector entry, without deploying Diet Manager or Notification Hub for Grafana-only changes. Consumer Wrangler configuration must **not** create a competing Route or Custom Domain; production `workers_dev=false` and `preview_urls=false` (or equivalent audited disablement) are mandatory.
 
 ## Public ingress and Cloudflare Access
 
@@ -96,7 +96,7 @@ Preflight must compare live Tunnel configuration (`remote_config`) with Terrafor
 
 1. Approve this documentation-only contract; do not provision infrastructure yet.
 2. Verify current ANAS OAuth/Service Token endpoint, Custom Domain/Route behavior, Tunnel config drift, protocol feasibility and the current Grafana API. Pin versions and choose an unused NAS-local port.
-3. Create the new `grafana-mcp` repository with its own application OpenSpec, tests and Worker. Implement JWT and transport tests before enabling public routing.
+3. Add `apps/grafana-mcp` to the existing `innovation-apps` monorepo with its own application OpenSpec, tests, Worker and independent per-app CI/change detection. Implement JWT and transport tests before enabling public routing.
 4. Add NAS official container through Ansible, create origin caller and Grafana read-only service tokens, validate local end-to-end behavior. Do not expose a public origin.
 5. Add Cloudflare Terraform resources in `infra-config`: HTTP VPC Service, distinct Access app + policies + Service Token, exact Worker Route. Review **full refreshed plan** and apply only after approval with staged cutover.
 6. Deploy the Proxy Worker with its VPC Service binding but without a routable alternate public endpoint. Enable the exact public route only when the authenticated local and private backend gates succeed.

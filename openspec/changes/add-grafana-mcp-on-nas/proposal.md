@@ -17,19 +17,19 @@ The organization already serves ANAS MCP through the `mcp.firstsun.org` Worker C
 - Reuse the **existing `firstsun-nas` Tunnel** through one narrowly scoped HTTP **Workers VPC Service** bound to a single NAS-local origin and port. Do not create a second Tunnel, public Tunnel ingress hostname, DNS record, or broad VPC Network binding.
 - Run the official upstream `grafana/mcp-grafana` image on NAS as a separate, pinned, read-only Streamable HTTP service. Do not fork or recreate the Grafana MCP tools. Use the existing Grafana API and configured Prometheus datasource.
 - Protect `/grafana/mcp` with its own Cloudflare Access application, Managed OAuth (interactive clients), and explicit Service Token authorization (approved headless clients). Give the service its **own Access AUD**. The proxy validates the Access JWT before forwarding and authenticates separately to the NAS origin.
-- Preserve application-specific GitHub ownership: one MCP service identity, one repository, one Worker, one Access application, one AUD. No general MCP Gateway, OAuth server, or multi-service proxy.
+- Preserve one MCP service identity, one independently deployed Worker, one Access application and one AUD. An individual MCP app may live in a monorepo, but each service retains an explicit owning app directory, scoped CI and independent runtime. No generic MCP Gateway, OAuth server or multi-service proxy.
 
 ## Repositories and boundaries
 
 | Owner | Future implementation | Excluded from this spec commit |
 | --- | --- | --- |
 | `firstsun-dev/.github` | Cross-repository registration, security, rollout and acceptance contract | Runtime code or Cloudflare apply |
-| `firstsun-dev/grafana-mcp` (new repository) | Proxy Worker, JWT verification, VPC binding, CI tests, protocol-preserving forwarding, operation guide | Grafana MCP tool implementation |
+| `firstsun-dev/innovation-apps` (`apps/grafana-mcp`, new app) | Proxy Worker, JWT verification, VPC binding, CI tests, protocol-preserving forwarding, app-specific documentation and per-app CI | Grafana MCP tool implementation |
 | `firstsun-dev/infra-config` | Exact Worker Route, independent Access application/policies/token, HTTP VPC Service, NAS Ansible/Compose, secret injection, plan/cutover runbook | Replacing the shared hostname or NAS Tunnel |
 | `firstsun-dev/anas-mcp` | No change | Route, auth, code and AUD migration |
-| `firstsun-dev/.github` shared CI/CD | Consume the existing supported reusable Worker workflow from the new repository | Shared workflow redesign |
+| `firstsun-dev/.github` shared CI/CD | Reuse the existing supported Worker workflow from the `innovation-apps` Grafana-only caller | Shared workflow redesign |
 
-The organization-hosted `grafana-mcp` application OpenSpec MAY live in its new repository once created; this change governs the cross-repository contract and shall not pretend to be the application's detailed implementation spec.
+The Grafana application OpenSpec SHALL live in `innovation-apps/openspec/changes/add-grafana-mcp/`; implementation code belongs in `innovation-apps/apps/grafana-mcp`. This change governs the cross-repository contract; it does not implement the application or Infra Terraform.
 
 ## Compatibility and risk
 

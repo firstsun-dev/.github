@@ -39,7 +39,7 @@ Every registered `{service}` SHALL have one documented owner and route mapping. 
 - **WHEN** `/infra/mcp` is registered and its Worker is deployed
 - **THEN** a reviewed path route SHALL select the Infra Worker ahead of the hostname's unmatched-path origin
 - **AND** ANAS and Infra SHALL have separately deployable Workers and failure handling
-- **AND** each application repository SHALL NOT create competing Terraform routing resources
+- **AND** each application or monorepo app directory SHALL NOT create competing Terraform routing resources
 
 #### Scenario: Path-based routes are not safe on this hostname
 - **WHEN** route precedence, DNS, path exactness or fallback handling cannot be verified as safe
@@ -89,7 +89,7 @@ The ANAS cutover SHALL retire bare `/anas` and keep root `/mcp` retired. Neither
 
 ### Requirement: Cross-repository ownership and release gates SHALL be explicit
 
-`.github` SHALL own the common hosting convention, `infra-config` SHALL own edge routing and Access Terraform, and each MCP repository SHALL own its handler, HTTP contract, test suite and client-facing integration documentation.
+`.github` SHALL own the common hosting convention, `infra-config` SHALL own edge routing and Access Terraform, and each MCP application's owning repository (or clearly scoped monorepo directory) SHALL own its handler, HTTP contract, test suite and client-facing documentation. Independently deployed MCP services MAY share a monorepo without sharing Workers, AUDs, routing or CI release gates.
 
 #### Scenario: A specification PR is merged
 - **WHEN** the organization-wide OpenSpec is approved

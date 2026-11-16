@@ -11,7 +11,8 @@ The change is a coordination contract. Check boxes for implementation phases rem
 
 ## Phase 1 — Preflight and repository ownership
 
-- [ ] Create `firstsun-dev/grafana-mcp` if absent; protect its default branch and add an application-specific OpenSpec/README. Do not fork Grafana's upstream MCP server.
+- [x] Adopt existing `firstsun-dev/innovation-apps` monorepo as the owner; its `openspec/changes/add-grafana-mcp/` application specification is proposed for review (innovation-apps PR #93). No Worker implementation exists yet.
+- [ ] Create `apps/grafana-mcp` as an independent app package after specification approval. Do not fork Grafana's upstream MCP server.
 - [ ] Verify Access `/anas/mcp` OAuth + headless baseline, Custom Domain, route precedence, current `firstsun-nas` Tunnel status, and its `remote_config` versus Terraform `config_src` drift.
 - [ ] Confirm NAS port availability, Docker networking to existing Grafana API, Grafana service account privileges, compatible pinned official MCP image, and Cloudflare VPC role/QUIC support.
 - [ ] If VPC HTTP streaming, Tunnel reachability or route exactness fails, stop and submit a revised design; no public Tunnel hostname workaround.
@@ -23,14 +24,14 @@ The change is a coordination contract. Check boxes for implementation phases rem
 - [ ] Provision Grafana read-only service account and separate upstream caller token in the authorized secret store. Never commit or log the secrets.
 - [ ] Prove local `initialize`, `tools/list`, Prometheus query, dashboard read and alert read. Verify write tools are absent.
 
-## Phase 3 — Grafana Proxy Worker (grafana-mcp)
+## Phase 3 — Grafana Proxy Worker (innovation-apps/apps/grafana-mcp)
 
 - [ ] Implement exact Host/path/method handling, signed Access JWT verification (JWKS, issuer, Grafana-specific AUD, exp/nbf), fail-closed 401/503 and log redaction.
 - [ ] Implement a narrowly scoped HTTP VPC Service binding; preserve Streamable HTTP request/response streaming, MCP/session headers, upstream statuses, cancellation and timeouts.
 - [ ] Strip client authorization and identity headers, `X-Grafana-*` overrides and all unapproved forwarded headers; inject only the origin caller secret.
 - [ ] Keep `workers_dev=false` and `preview_urls=false`. Do not declare Cloudflare Routes or Custom Domain in consumer Wrangler.
 - [ ] Add unit/integration tests for valid/invalid/wrong-AUD Access JWT, spoofed headers, path collisions, method constraints, origin 401, outages, streaming, session lifecycle and write attempts.
-- [ ] Add thin CI/CD invoking approved shared workflow; pin workflow reference per organization policy and ensure safe smoke/rollback behavior.
+- [ ] Add `grafana_mcp` to `scripts/ci/detect-affected.mjs` and a dedicated `.github/workflows/grafana-mcp.yml` thin caller of the approved shared workflow, with production-only deployment and no unnecessary cross-app runs, release jobs or Preview environments.
 
 ## Phase 4 — Cloudflare Terraform (infra-config)
 
