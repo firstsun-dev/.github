@@ -44,6 +44,7 @@
 - [ ] Retire redundant GitHub-expression emulation (`ghexpr.py`), job simulator (`test-jobs.py`) and count-based `run-job-groups.py` manifest **only once** their meaningful mutation-safety cases are preserved in deterministic focused tests or real-runner canaries.
 - [ ] Use `cf-v2-scratch-caller` to test real GitHub reusable call, permissions, PR checks, preview, manual Dev and no-production-side-effects on a candidate SHA.
 - [ ] Keep significant regression cases: stale A→B→A, missing/incorrect migration owner/DB, dual-bindings, smoke failed after publish, protected recovery, Access-only liveness, skipped required check and runner/fork isolation.
+- [ ] **G1 / G3 acceptance split (requires explicit approval to apply):** G1 proves the shared engine contract, security boundaries, CI gates, artifact identity, real reusable-workflow integration, real Cloudflare Preview publish + smoke, and fork-PR isolation on a safe public repository. Live Production deployment and Production rollback verification MAY be assigned to G3 only if equivalent deterministic G1 safety tests exist and the deferral is recorded and approved; until then it is neither claimed as passed nor performed.
 - [ ] Publish G1 evidence and freeze an immutable shared-engine candidate SHA. Leave floating `@v2` unchanged at G1.
 
 ## G2 — Consumer PRs, all pinned to the same frozen SHA
