@@ -95,11 +95,12 @@ on:
         default: ''
       dev_on_pr:
         description: >
-          true = a same-repository PR (opened / synchronize / reopened; never a fork, never `closed`) is delivered to the stable Dev after its CI Gate passed, exactly like an approved manual
-          promotion (same Dev driver, Environment, shared-Dev lock, migration and smoke; the Dev is last-writer-wins). Requires dev_driver != none and preview_policy none. The caller must
-          select the Dev SMOKE_ENV secret for such a PR (the engine cannot tell the Dev secret from the Production one). false (default) = a PR never reaches Dev.
+          true (default) = a same-repository PR (opened / synchronize / reopened; never a fork, never `closed`) of an application WITH a Dev (dev_driver != none) is delivered to the stable
+          Dev after its CI Gate passed, exactly like an approved manual promotion (same Dev driver, Environment, shared-Dev lock, migration and smoke; the Dev is last-writer-wins). A run
+          delivers ONE target: where preview_policy is also `pr` the Dev wins, so a caller that wants its per-PR Preview sets false. false = a PR never reaches Dev. No effect without a
+          dev_driver. The caller must select the Dev SMOKE_ENV secret for a PR (the engine cannot tell the Dev secret from the Production one).
         type: boolean
-        default: false
+        default: true
       dispatch_target:
         description: >
           Pass github.event.inputs.target from the caller; empty or "dev". "dev" selects the manual Dev promotion of a workflow_dispatch. Any other value, or a value on another event, fails the Plan before any mutation.
@@ -412,7 +413,7 @@ jobs:
       build_env_prod: ${{ inputs.build_env_prod }}
       build_env_preview: ${{ inputs.build_env_preview }}
       build_env_dev: ${{ inputs.build_env_dev }}
-      dev_on_pr: ${{ inputs.dev_on_pr }}
+      dev_on_pr: ${{ inputs.dev_on_pr && inputs.dev_driver != 'none' }}
       test_e2e_cmd: ${{ inputs.test_e2e_cmd }}
       test_e2e_setup_cmd: ${{ inputs.test_e2e_setup_cmd }}
       test_e2e_build_cmd: ${{ inputs.test_e2e_build_cmd }}
@@ -428,7 +429,7 @@ jobs:
   # -------------------------------------------------------------------------
   plan:
     name: Delivery Plan
-    if: inputs.pipeline_phase == 'verify' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && (inputs.preview_policy == 'pr' || inputs.dev_on_pr)) || github.event_name == 'workflow_dispatch' || inputs.dispatch_target != ''
+    if: inputs.pipeline_phase == 'verify' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && (inputs.preview_policy == 'pr' || (inputs.dev_on_pr && inputs.dev_driver != 'none'))) || github.event_name == 'workflow_dispatch' || inputs.dispatch_target != ''
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     outputs:
@@ -451,7 +452,7 @@ jobs:
       # here. A same-repository dev_on_pr PR is a Dev delivery that DOES migrate: its merge candidate (the revision CI tested) is checked out like the branch of a
       # manual Dev promotion, for DATA only (the config is parsed; no application code runs in this job and the tooling comes from this repository's commit).
       - uses: actions/checkout@v6
-        if: inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || (inputs.dev_on_pr && github.event.pull_request.head.repo.full_name == github.repository))
+        if: inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || (inputs.dev_on_pr && inputs.dev_driver != 'none' && github.event.pull_request.head.repo.full_name == github.repository))
         with:
           ref: ${{ github.sha }}
           persist-credentials: false

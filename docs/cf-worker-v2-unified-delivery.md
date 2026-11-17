@@ -439,17 +439,17 @@ Environment of a job cannot depend on remote state. Production behaviour is othe
 **Remaining redundancy (out of scope):** each Deploy still builds its own artifact (required: the audited artifact is what is published), CI's Build Validation builds once more as validation, and the pending path still
 builds the owner (and non-owner targets) in the Migration job and again in each Deploy. The dependency install in the Migration job is also unchanged.
 
-## PR → Dev (`dev_on_pr`)
+## PR → Dev (`dev_on_pr`, on by default)
 
-Opt-in input of `_cf-worker-v2.yml` (default `false`: a PR never reaches Dev). With `dev_on_pr: true` a **same-repository** PR (`opened` / `synchronize` / `reopened`) is delivered to the stable Dev after its CI Gate passed, through the same single delivery as an approved manual promotion: same `dev_driver`, Environment (`<app>/native-dev` or `<app>/dev`), run-level lock (`cfv2-nonprod-d1-<scope>` with `d1_migrations`, else `cfv2-shared-dev-<app>`), migration, smoke and recovery. The Dev is last-writer-wins.
+Input of `_cf-worker-v2.yml`, **default `true`**. A **same-repository** PR (`opened` / `synchronize` / `reopened`) of an application that HAS a Dev (`dev_driver != none`) is delivered to the stable Dev after its CI Gate passed, through the same single delivery as an approved manual promotion: same `dev_driver`, Environment (`<app>/native-dev` or `<app>/dev`), run-level lock (`cfv2-nonprod-d1-<scope>` with `d1_migrations`, else `cfv2-shared-dev-<app>`), migration, smoke and recovery. The Dev is last-writer-wins.
 
-| event | `dev_on_pr` | delivery |
-|---|---|---|
-| same-repo PR, not `closed` | true | `dev` (the configured driver) |
-| fork PR / `closed` PR | true | nothing (fork never deploys) |
-| any PR | false | unchanged (Preview with `preview_policy: pr`, else nothing) |
-| push (feature or main), merge_group, dispatch | any | unchanged |
+| application | PR delivery |
+|---|---|
+| `dev_driver` set (default `dev_on_pr`) | the stable Dev (a fork PR / `closed` event delivers nothing) |
+| `dev_driver: none` (e.g. the MCP apps) | nothing: no effect, never an error |
+| `dev_driver` set **and** `preview_policy: pr` | the Dev wins (a run delivers ONE target); set `dev_on_pr: false` to keep the per-PR Preview |
+| `dev_on_pr: false` | unchanged: Preview with `preview_policy: pr`, else nothing |
 
-Rules, all enforced before any mutation (`resolveDelivery`): `dev_on_pr` needs `dev_driver != none`; it cannot be combined with `preview_policy: pr` (both would claim the PR delivery); `dispatch_target` is still refused on a PR. The PR run validates against the **Dev** build env, delivers the merge candidate CI tested, and **migrates the shared Dev D1** (a PR Preview never does). `approved_dev_ref` is not consulted for a PR: the caller's opt-in plus the same-repository rule are the approval, so the caller should keep `on.pull_request.branches: [main]`.
+Push (feature or main), `merge_group` and `workflow_dispatch` are unchanged. `dispatch_target` is still refused on a PR. The PR run validates against the **Dev** build env, delivers the merge candidate CI tested, and **migrates the shared Dev D1** (a PR Preview never does). `approved_dev_ref` is not consulted for a PR: same-repository plus the Dev being configured are the approval, so a caller should keep `on.pull_request.branches: [main]`. The rule lives in `devOnPrEffective` (`delivery.mjs`) and is repeated in the workflow expressions; `check-workflows.py` fails if one of them omits the `dev_driver != 'none'` qualifier.
 
-Caller duty: select the Dev `SMOKE_ENV` secret for such a PR (the engine only receives a secret named `SMOKE_ENV` and cannot tell a Dev token from a Production one), e.g. `secrets[(github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && 'DEV_SMOKE_ENV' || 'SMOKE_ENV']` (only for a caller whose PRs deliver to Dev); a missing Dev secret must never fall back to Production's.
+Caller duty: select the Dev `SMOKE_ENV` secret for a PR (the engine only receives a secret named `SMOKE_ENV` and cannot tell a Dev token from a Production one), e.g. `secrets[(github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && 'DEV_SMOKE_ENV' || 'SMOKE_ENV']` (only for a caller whose PRs deliver to Dev). A caller whose Dev config is incomplete (`app_url_dev` / `preview_url_suffix`, `dev_build_cmd` with `d1_migrations`) now fails its PR Delivery Plan: fix the caller before taking this engine version.

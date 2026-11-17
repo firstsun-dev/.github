@@ -59,24 +59,29 @@ export function resolveSmokeMode(target, smokeMode = 'full', overridesText = '')
 }
 
 /**
+ * Whether a same-repository PR delivers to the stable Dev. `dev_on_pr` is ON by default and has an effect wherever the application HAS a Dev
+ * (dev_driver != none). A run delivers ONE target, so where preview_policy is also `pr` the Dev wins; such a caller keeps its per-PR Preview by setting
+ * `dev_on_pr: false`. The workflow expressions repeat this rule (`inputs.dev_on_pr && inputs.dev_driver != 'none'`).
+ */
+export const devOnPrEffective = ({ devOnPr = true, devDriver = 'none' } = {}) => devOnPr === true && devDriver !== '' && devDriver !== 'none';
+
+/**
  * THE event -> delivery routing. Returns null (CI only) or ONE { target, driver }. Throws (the Plan fails before any mutation) on an
  * explicit request that cannot be served, instead of silently dropping it.
  *   push main                        -> production (worker)
  *   push, any other ref              -> nothing (feature pushes never deploy)
  *   pull_request, same repo, opened/synchronize/reopened, preview_policy=pr -> preview (native-preview); fork PR / closed -> nothing
  *   merge_group, delete, schedule    -> nothing
- *   pull_request, same repo, opened/synchronize/reopened, dev_on_pr=true (dev_driver != none, preview_policy none) -> dev (the configured driver)
+ *   pull_request, same repo, opened/synchronize/reopened, dev_on_pr (default true) with a dev_driver -> dev (the configured driver; wins over preview_policy pr)
  *   workflow_dispatch dispatch_target=dev, ref == approved_dev_ref, dev_driver != none -> dev (the configured driver); anything else rejects
- * The stable Dev is reached ONLY by a manual dispatch of the approved ref or, when the caller opted in with dev_on_pr, by a same-repository PR.
+ * The stable Dev is reached ONLY by a manual dispatch of the approved ref or by a same-repository PR (dev_on_pr, on by default; a caller opts out with false).
  * No other automatic event ever reaches it (a push never does), and neither path can reach Production.
  */
-export function resolveDelivery({ event, ref = '', isFork = false, prAction = '', previewPolicy = 'none', devDriver = 'none', dispatchTarget = '', approvedDevRef = '', devOnPr = false }) {
+export function resolveDelivery({ event, ref = '', isFork = false, prAction = '', previewPolicy = 'none', devDriver = 'none', dispatchTarget = '', approvedDevRef = '', devOnPr = true }) {
   if (!PREVIEW_POLICIES.includes(previewPolicy)) throw new Error(`Unknown preview_policy '${previewPolicy}' (expected ${PREVIEW_POLICIES.join(' | ')})`);
   if (!DEV_DRIVERS.includes(devDriver)) throw new Error(`Unknown dev_driver '${devDriver}' (expected ${DEV_DRIVERS.join(' | ')})`);
   if (approvedDevRef !== '' && !String(approvedDevRef).startsWith('refs/heads/')) throw new Error(`approved_dev_ref '${approvedDevRef}' must be a branch ref (refs/heads/...)`);
   if (devDriver !== 'none' && !approvedDevRef) throw new Error('dev_driver requires approved_dev_ref (only an approved ref may be promoted to Dev)');
-  if (devOnPr && devDriver === 'none') throw new Error('dev_on_pr requires a dev_driver (this application has no Dev); nothing was changed');
-  if (devOnPr && previewPolicy === 'pr') throw new Error("dev_on_pr and preview_policy 'pr' both claim the same-repository PR delivery; choose ONE (nothing was changed)");
   if (dispatchTarget !== '' && event !== 'workflow_dispatch') throw new Error(`dispatch_target '${dispatchTarget}' is only valid for a workflow_dispatch (event: ${event || 'unknown'}); refusing to ignore it (nothing was changed)`);
   switch (event) {
     case 'workflow_dispatch':
@@ -86,7 +91,7 @@ export function resolveDelivery({ event, ref = '', isFork = false, prAction = ''
       return { target: 'dev', driver: devDriver };
     case 'pull_request':
       if (isFork || prAction === 'closed') return null;
-      if (devOnPr) return { target: 'dev', driver: devDriver };
+      if (devOnPrEffective({ devOnPr, devDriver })) return { target: 'dev', driver: devDriver };
       return previewPolicy === 'pr' ? { target: 'preview', driver: 'native-preview' } : null;
     case 'push':
       return ref === 'refs/heads/main' ? { target: 'production', driver: 'worker' } : null;
@@ -409,7 +414,7 @@ export function rollbackVerdict({ rbResult = '', rbVerify = '', rbLevel = '' }) 
 // use data available at scheduling time. This is its JavaScript twin (the workflow YAML is the tested twin of this rule).
 //   main push                    -> cfv2-prod-<d1_lock_scope|app>
 //   manual Dev promotion         -> cfv2-nonprod-d1-<scope> with d1_migrations, else cfv2-shared-dev-<app> (never the Production group)
-//   same-repo PR with dev_on_pr  -> the SAME shared-Dev group as a manual Dev promotion (one Dev, one queue)
+//   same-repo PR with a Dev (dev_on_pr, default on) -> the SAME shared-Dev group as a manual Dev promotion (one Dev, one queue)
 //   same-repo PR with Preview    -> cfv2-<app>-pr-<number>
 //   everything else              -> a private per-run group (never queues behind a deploy)
 // For a verify call the YAML applies the same rule to the DEPLOY call's inputs (phase_state.inputs), never to a caller-supplied string.
@@ -418,7 +423,7 @@ export function runLockGroup({ event, ref, inputs, runId, isFork = false, prNumb
   const s = (k) => (inputs?.[k] == null ? '' : String(inputs[k]));
   const on = (k) => inputs?.[k] === true || inputs?.[k] === 'true';
   const scope = s('d1_lock_scope') || s('app_name');
-  const devOnPr = event === 'pull_request' && !isFork && prAction !== 'closed' && on('dev_on_pr') && s('dev_driver') !== '' && s('dev_driver') !== 'none';
+  const devOnPr = event === 'pull_request' && !isFork && prAction !== 'closed' && devOnPrEffective({ devOnPr: inputs?.dev_on_pr == null ? true : on('dev_on_pr'), devDriver: s('dev_driver') });
   if ((event === 'workflow_dispatch' && s('dispatch_target') === 'dev') || devOnPr) return on('d1_migrations') ? `cfv2-nonprod-d1-${scope}` : `cfv2-shared-dev-${s('app_name')}`;
   if (event === 'push' && ref === 'refs/heads/main') return `cfv2-prod-${scope}`;
   if (event === 'pull_request' && !isFork && s('preview_policy') === 'pr' && prNumber !== '') return `cfv2-${s('app_name')}-pr-${prNumber}`;
@@ -448,7 +453,7 @@ export function restoreDescriptor(state, { repo, runId = '0', event = '', ref = 
   const planned = resolveDelivery({
     event, ref, isFork, prAction, previewPolicy: String(state.inputs.preview_policy ?? '') || 'none', devDriver: String(state.inputs.dev_driver ?? '') || 'none',
     dispatchTarget: String(state.inputs.dispatch_target ?? ''), approvedDevRef: String(state.inputs.approved_dev_ref ?? ''),
-    devOnPr: state.inputs.dev_on_pr === true || state.inputs.dev_on_pr === 'true',
+    devOnPr: state.inputs.dev_on_pr == null ? true : state.inputs.dev_on_pr === true || state.inputs.dev_on_pr === 'true',
   });
   if (!planned || planned.target !== d.target || planned.driver !== d.driver) throw new Error(`descriptor ${d.target}/${d.driver} is not the delivery the deploy inputs plan for this event (${planned ? `${planned.target}/${planned.driver}` : 'none'})`);
   if (d.phase !== 'deploy') throw new Error(`descriptor is in phase '${d.phase}'; only a deploy-phase descriptor can be verified`);
@@ -495,7 +500,7 @@ export function validateInit({ inputs, target, kind = '', stage = 'all', d1Expec
   if (d.phase !== 'verify') {
     const planned = resolveDelivery({
       event, ref, isFork, prAction, previewPolicy: s('preview_policy') || 'none', devDriver: s('dev_driver') || 'none',
-      dispatchTarget: s('dispatch_target'), approvedDevRef: s('approved_dev_ref'), devOnPr: s('dev_on_pr') === 'true',
+      dispatchTarget: s('dispatch_target'), approvedDevRef: s('approved_dev_ref'), devOnPr: s('dev_on_pr') === '' ? true : s('dev_on_pr') === 'true',
     });
     if (!planned || planned.target !== d.target || planned.driver !== d.driver) throw new Error(`delivery mismatch (this event plans '${planned ? `${planned.target}/${planned.driver}` : 'nothing'}', engine '${d.target}/${d.driver}'); refusing to deploy`);
   }

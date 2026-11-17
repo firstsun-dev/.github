@@ -227,6 +227,13 @@ for path, d in WF.items():
             if stages & {"precheck", "migrate", "publish"} and (job.get("permissions") or {}).get("pull-requests") not in ("read", "write"):
                 errors.append(f"{path}: job '{jid}' runs the delivery engine but has no pull-requests read permission (the PR stale guard needs it)")
 
+# `dev_on_pr` is on by default and only means something where the application HAS a Dev: every use in the engine workflow must be qualified by
+# `inputs.dev_driver != 'none'` (the JS twin is devOnPrEffective in delivery.mjs), so the YAML expressions and the routing cannot drift apart.
+_v2 = open(".github/workflows/_cf-worker-v2.yml").read()
+for m in re.finditer(r"inputs\.dev_on_pr", _v2):
+    if not _v2[m.end():].startswith(" && inputs.dev_driver != 'none'"):
+        errors.append(f"_cf-worker-v2.yml: `inputs.dev_on_pr` (offset {m.start()}) is not followed by `&& inputs.dev_driver != 'none'`: it would claim a PR delivery for an app without a Dev")
+
 for e in errors:
     print("FAIL", e)
 print(f"workflow structure: {len(WF)} workflows, {'FAILED' if errors else 'clean'}")
