@@ -63,7 +63,8 @@ export function ciTargetEnv({ event, ref = '', isFork = false, devOnPr = false }
 }
 
 /**
- * Untrusted code runs ONLY on the approved GitHub-hosted runner - an ephemeral VM that never shares a host with a credential-bearing job. A fork PR gets
+ * Untrusted (fork) code runs ONLY on the approved GitHub-hosted runner - an ephemeral VM that never shares a host with a credential-bearing job. (A same-repository PR is
+ * built / smoked on the caller's EPHEMERAL pool, like its Verify / Test.) A fork PR gets
  * exactly this label; it is a constant of this repository, NOT a caller input (a caller-supplied label proves nothing about isolation).
  */
 export const HOSTED_RUNNER = 'ubuntu-24.04';

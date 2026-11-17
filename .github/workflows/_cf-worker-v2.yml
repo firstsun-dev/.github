@@ -339,6 +339,9 @@ on:
         type: string
         default: ''
       runner:
+        description: >
+          Runner label of every job of the caller's own events. It MUST be an EPHEMERAL pool (one job per machine, nothing survives the job): a same-repository PR runs its Build and the
+          credential-free App Smoke on it, next to Verify / Test. Only a fork PR is pinned to a GitHub-hosted runner (the engine cannot verify that a label is ephemeral).
         type: string
         default: linux
     secrets:
@@ -499,7 +502,7 @@ jobs:
     name: Build
     needs: [plan]
     if: needs.plan.result == 'success' && needs.plan.outputs.has_delivery == 'true' && inputs.pipeline_phase != 'verify'
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || inputs.runner }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || inputs.runner }}
     timeout-minutes: 45
     permissions:
       contents: read

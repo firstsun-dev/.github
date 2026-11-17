@@ -87,8 +87,11 @@ else:
         errors.append("build job must not use a deployment environment (no protected credentials)")
     if b.get("permissions") != {"contents": "read"}:
         errors.append("build job permissions must be exactly {contents: read}")
-    if b.get("runs-on") and "ubuntu-24.04" not in str(b["runs-on"]):
-        errors.append("build job must run on the approved hosted runner for pull_request events")
+    # The PR Build of the repository's own (same-repository) PR runs on the caller's EPHEMERAL runner pool (`inputs.runner`, like Verify / Test of the same PR);
+    # only an untrusted fork PR is pinned to the GitHub-hosted runner.
+    _ro = str(b.get("runs-on", ""))
+    if not ("ubuntu-24.04" in _ro and "head.repo.full_name != github.repository" in _ro and "inputs.runner" in _ro):
+        errors.append("build job runs-on must be: hosted ubuntu-24.04 for a fork pull request (head.repo.full_name != github.repository), otherwise inputs.runner")
 if b and "PREVIEW_SECRETS" in yaml.dump(b):
     errors.append("build job must not receive PREVIEW_SECRETS (the PR's build command could exfiltrate them)")
 if b and "artifact_name" not in (b.get("outputs") or {}):
@@ -145,8 +148,9 @@ else:
         errors.append("app-smoke job must not use a deployment environment")
     if asmk.get("permissions") != {"contents": "read"}:
         errors.append("app-smoke job permissions must be exactly {contents: read}")
-    if "ubuntu-24.04" not in str(asmk.get("runs-on")):
-        errors.append("app-smoke job must run on the ephemeral hosted runner, never a shared / self-hosted one")
+    _rs = str(asmk.get("runs-on", ""))
+    if not ("ubuntu-24.04" in _rs and "head.repo.full_name != github.repository" in _rs and "inputs.runner" in _rs):
+        errors.append("app-smoke job runs-on must be: hosted ubuntu-24.04 for a fork pull request (head.repo.full_name != github.repository), otherwise inputs.runner (an EPHEMERAL pool)")
     if "'preview'" not in str(asmk.get("if", "")):
         errors.append("app-smoke job must be limited to the Preview target")
 sm = dlv["smoke"]
