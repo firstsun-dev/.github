@@ -311,6 +311,9 @@ case "$PHASE" in
     AUDITED_NAME=""
     if [ "$TARGET" = prod ]; then AUDITED_NAME="$(node "$TOOLS_DIR/cli.mjs" worker-name --config "$(rd config.path)" | sed -n 's/^worker_name=//p')"; [ -n "$AUDITED_NAME" ] || die "no safe Worker name in the audited config; refusing to publish"; fi
     COMMIT_MSG=""; [ -z "${GITHUB_EVENT_PATH:-}" ] || [ ! -f "$GITHUB_EVENT_PATH" ] || COMMIT_MSG="$(jq -r '.head_commit.message // .pull_request.title // ""' "$GITHUB_EVENT_PATH")"
+    # A workflow_dispatch payload has neither head_commit nor pull_request: take the subject of the dispatched commit from the API (best effort; the message
+    # is only a label, so a failed lookup never blocks a publish).
+    [ -n "$COMMIT_MSG" ] || COMMIT_MSG="$(gh api "repos/${GITHUB_REPOSITORY:-}/commits/${GITHUB_SHA:-}" -q '.commit.message' 2>/dev/null | head -1 || true)"
     artifact_env
     run_publish "$S/preview.json" "$(inp app_version)" "$COMMIT_MSG"
     # Reached only when publish.sh succeeded: the hand-off of this deployment to the Smoke / Rollback jobs.
