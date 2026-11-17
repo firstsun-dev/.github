@@ -220,6 +220,11 @@ for path, d in WF.items():
             missing = [k for k in ("PR_NUMBER", "PR_HEAD_REF", "PR_HEAD_SHA") if k not in (job.get("env") or {})]
             if missing:
                 errors.append(f"{path}: job '{jid}' runs the delivery engine but does not set {', '.join(missing)} at job level")
+            # ...and the stale-SHA guard of a PR run reads `pulls/<n>` with the job's own token: without pull-requests: read it dies with HTTP 403 and "cannot read pull request".
+            # (The unprivileged Build stage never runs the guard and deliberately holds contents: read only.)
+            stages = {str((st.get("with") or {}).get("stage", "")) for st in job.get("steps", []) if isinstance(st, dict) and "/actions/cf-deploy" in str(st.get("uses", ""))}
+            if stages != {"build"} and (job.get("permissions") or {}).get("pull-requests") not in ("read", "write"):
+                errors.append(f"{path}: job '{jid}' runs the delivery engine but has no pull-requests read permission (the PR stale guard needs it)")
 
 for e in errors:
     print("FAIL", e)
