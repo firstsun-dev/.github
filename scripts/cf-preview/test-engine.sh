@@ -118,4 +118,17 @@ skipped_ok() { # <label> <inputs json> <descriptor>
 skipped_ok nocmd "$NOCMD" "$DESC"
 skipped_ok basic "$SMK" "$DESCB"
 
+# ---- Dev on Native Preview (engine target `preview`, delivery target `dev`): a PROTECTED delivery. Its application smoke command runs in the trusted Smoke job
+# (the Smoke job checks the source out for it) - there is NO app-smoke job (that job is for a true Preview only), so a skipped app-smoke must not fail it. ----
+DESCD="$(node --input-type=module -e "import {targetDescriptor} from '$TOOLS/delivery.mjs'; console.log(JSON.stringify(targetDescriptor({delivery:{target:'dev',driver:'native-preview'},app:'blog',runId:1,smokeMode:'full'})))")"
+SMKD='{"app_name":"blog","build_cmd":"true","production_rollback_policy":"manual","preview_policy":"none","dev_driver":"native-preview","dev_on_pr":true,"approved_dev_ref":"refs/heads/main","app_url_dev":"https://dev-blog.x.workers.dev","dev_smoke_cmd":"env > MARKPATH; touch MARKPATH.ran","smoke_vars":"APP_FLAG=visible"}'
+SMKD="${SMKD//MARKPATH/$T/mark}"
+HANDOFFD='{"published":"true","kind":"native-dev","url":"https://dev-blog.x.workers.dev","preview_name":"dev","published_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ledger_id":"8"}'
+rm -f "$T"/mark*
+senv v-dev INPUTS_JSON="$SMKD" ENGINE_TARGET=preview ENGINE_KIND=native-dev ENGINE_STAGE=verify ENGINE_DESCRIPTOR="$DESCD" ENGINE_D1_EXPECT= CFV2_PR_ACTION=synchronize "$ENGINE" init >/dev/null 2>"$T/err" || { bad "dev verify init"; cat "$T/err"; }
+senv v-dev HANDOFF_DEPLOY="$HANDOFFD" "$ENGINE" hydrate >/dev/null 2>"$T/err" || { bad "dev verify hydrate"; cat "$T/err"; }
+senv v-dev APP_SMOKE_RESULT=skipped CF_ACCESS_CLIENT_ID= PUBLISHED_URL=https://dev-blog.x.workers.dev "$ENGINE" smoke 2>"$T/err" | grep -q '^smoke_level=content$' \
+  && ok "smoke: Dev on Native Preview is verified with a skipped app-smoke (it has none)" || { bad "smoke: Dev on Native Preview must not require the Preview-only app-smoke job"; cat "$T/err"; }
+[ -f "$T/mark.ran" ] && ok "smoke: the Dev application smoke command runs in the trusted Smoke job (protected revision)" || bad "smoke: the Dev application smoke command must run in the Smoke job"
+
 [ "$fail" = 0 ] && echo "ALL PASSED" || { echo "FAILURES"; exit 1; }

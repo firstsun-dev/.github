@@ -211,6 +211,22 @@ for jn, job in dlv.items():
             if len({nm("blog/preview", "native-branch"), nm("www/preview", "native-branch"), nm("blog/dev", "persistent-dev")}) != 3:
                 errors.append(f"{jn}: smoke report names are not unique per app and slot")
 
+# The engine (engine.sh ctx) requires PR_NUMBER / PR_HEAD_REF / PR_HEAD_SHA whenever the event is a pull_request. Every job that runs the delivery engine
+# (`$/actions/cf-deploy`) must therefore carry them at job level: a PR that delivers to Dev (dev_on_pr) runs Migrate as well, and a job without them dies in
+# `engine.sh guard start` ("PR_NUMBER: pull request number") before any migration.
+for path, d in WF.items():
+    for jid, job in d["jobs"].items():
+        if any("/actions/cf-deploy" in str(st.get("uses", "")) for st in job.get("steps", []) if isinstance(st, dict)):
+            missing = [k for k in ("PR_NUMBER", "PR_HEAD_REF", "PR_HEAD_SHA") if k not in (job.get("env") or {})]
+            if missing:
+                errors.append(f"{path}: job '{jid}' runs the delivery engine but does not set {', '.join(missing)} at job level")
+            # ...and the stale-SHA guard of a PR run reads `pulls/<n>` with the job's own token: without pull-requests: read it dies with HTTP 403 and "cannot read pull request".
+            # Only the stages the action guards (cf-deploy/action.yml: `guard start` for precheck | migrate | publish) need it; the unprivileged build and app-smoke
+            # stages never run the guard and deliberately hold contents: read only.
+            stages = {str((st.get("with") or {}).get("stage", "")) for st in job.get("steps", []) if isinstance(st, dict) and "/actions/cf-deploy" in str(st.get("uses", ""))}
+            if stages & {"precheck", "migrate", "publish"} and (job.get("permissions") or {}).get("pull-requests") not in ("read", "write"):
+                errors.append(f"{path}: job '{jid}' runs the delivery engine but has no pull-requests read permission (the PR stale guard needs it)")
+
 for e in errors:
     print("FAIL", e)
 print(f"workflow structure: {len(WF)} workflows, {'FAILED' if errors else 'clean'}")

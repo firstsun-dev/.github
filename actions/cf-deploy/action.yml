@@ -233,8 +233,9 @@ runs:
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" guard start'
     - name: Setup dependencies
-      # A Preview's Smoke job never installs PR dependencies (only the app-smoke job does, without any secret).
-      if: env.STALE != 'true' && env.CFV2_DEPS != 'done' && (inputs.stage == 'build' || inputs.stage == 'app-smoke' || (inputs.stage == 'verify' && inputs.target != 'preview'))
+      # A true Preview's Smoke job never installs PR dependencies (only the app-smoke job does, without any secret). Decided by the DELIVERY target of the
+      # descriptor: Dev on a Native Preview has engine target `preview` but is a protected delivery whose application smoke command runs in this job.
+      if: env.STALE != 'true' && env.CFV2_DEPS != 'done' && (inputs.stage == 'build' || inputs.stage == 'app-smoke' || (inputs.stage == 'verify' && fromJSON(inputs.descriptor).target != 'preview'))
       uses: $/actions/setup
       env:
         # Dependency lifecycle scripts run application code: they get no GitHub token and no Cloudflare / smoke secret (the Build has none anyway).
