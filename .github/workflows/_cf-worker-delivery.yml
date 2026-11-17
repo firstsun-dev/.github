@@ -175,7 +175,7 @@ jobs:
           d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
 
   # -------------------------------------------------------------------------
-  # App Smoke — PREVIEW ONLY. The application's smoke command is PR-controlled code, so it runs here and nowhere else: an ephemeral GitHub-hosted runner, no
+  # App Smoke — PREVIEW ONLY. The application's smoke command is PR-controlled code, so it runs here and nowhere else: on the caller's EPHEMERAL runner pool (`inputs.runner`; a fork PR would be GitHub-hosted but never delivers), no
   # Environment, NO secret of any kind (no GitHub write token, no Cloudflare credential, no smoke credential, no preview secret, no Access service token), the
   # token of this job is read-only contents. The job can only pass or fail; its result is consumed by the Smoke job through `needs`. Production / Dev
   # (protected revisions) run their application command in the Smoke job, as before.
@@ -184,7 +184,7 @@ jobs:
     name: App Smoke (no credentials)
     needs: [deploy]
     if: always() && inputs.phase != 'deploy' && fromJSON(inputs.descriptor).target == 'preview' && fromJSON(inputs.descriptor).smoke_mode == 'full' && fromJSON(inputs.inputs_json).smoke_cmd != '' && fromJSON((inputs.phase == 'verify' && inputs.handoff_json || needs.deploy.outputs.handoff) || '{}').published == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || inputs.runner }}
     timeout-minutes: 30
     permissions:
       contents: read

@@ -14,7 +14,7 @@ description: >
               the application smoke command here, with the smoke secrets. A PREVIEW never does: its smoke command is PR-controlled code, so this job runs only the
               trusted probe / SHA check (with the SMOKE_ENV secret (Access token)) and requires the result of the app-smoke stage for the application command. It checks out and
               installs nothing of the PR.
-    app-smoke Preview only, its own job: the application's PR-controlled smoke command on an ephemeral GitHub-hosted runner with NO secret of any kind (no GitHub token,
+    app-smoke Preview only, its own job: the application's PR-controlled smoke command on the caller's EPHEMERAL runner pool with NO secret of any kind (no GitHub token,
               no Cloudflare credential, no smoke credential, no preview secret, no SMOKE_ENV secret (Access token / PROBE_HEADERS)). It can only pass or fail.
     rollback  Rollback job, PRODUCTION ONLY: fail-closed re-deploy of the previous stored Worker VERSION + re-smoke (no build). Preview / Dev have no automatic recovery: they
               are fixed forward (a recovery would have to rebuild an older revision, which no credential-bearing job may do, and no verified artifact is retained).

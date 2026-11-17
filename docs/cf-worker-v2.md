@@ -78,7 +78,7 @@ Removed (no compatibility shim): `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `
 ## Build / Publish trust boundary
 
 ```text
- untrusted code ──► Build job (no Cloudflare token, no write token, no Environment; ephemeral hosted runner for PRs)
+ untrusted code ──► Build job (no Cloudflare token, no write token, no Environment; same-repository PRs: the caller's EPHEMERAL `runner` pool; fork PRs: GitHub-hosted)
                       deps + target build + config audit + `wrangler deploy --dry-run --outdir` + package
                       └─► artifact  (manifest.json · wrangler.json[main→worker/, no_bundle, no `build`] · worker/ · assets/)
                                        │  actions/upload-artifact (this run only)
