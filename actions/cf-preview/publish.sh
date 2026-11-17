@@ -54,7 +54,8 @@ if [ "$TARGET" = preview ]; then
   [[ "$WORKER_NAME" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || { echo "::error::bad preview host Worker: $WORKER_NAME" >&2; exit 1; }
   WORKER_ARGS=(--worker-name "$WORKER_NAME")
   # Stderr (progress logs) must not pollute the JSON on stdout.
-  "$WRANGLER" preview --name "$PREVIEW_NAME" "${WORKER_ARGS[@]}" "${CFG_ARGS[@]}" --json > "$OUT_FILE"
+  # --message is what the Cloudflare version list shows for this deployment (same `[<short sha>] <subject>` as Production / worker-Dev).
+  "$WRANGLER" preview --name "$PREVIEW_NAME" "${WORKER_ARGS[@]}" "${CFG_ARGS[@]}" --json --message "$MSG" > "$OUT_FILE"
   # From here on the Preview may already have been modified: a failure below is never "existing Preview unchanged".
   echo "preview_mutated=true"
   # The extractor runs on its own so its exit status is NOT swallowed by a pipeline or command substitution
