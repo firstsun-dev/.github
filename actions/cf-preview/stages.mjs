@@ -52,11 +52,13 @@ export function routeEvent({ event, ref = '' }) {
 
 /**
  * Which build env the validation commands import (and VITE_APP_ENV): the env of the intended deployment.
- * main push = prod; manual dispatch = dev (the only manual target); everything else = preview. Never prod off main.
+ * main push = prod; manual dispatch = dev (the only manual target); a same-repository PR of a dev_on_pr caller = dev (its delivery is Dev);
+ * everything else = preview. Never prod off main.
  */
-export function ciTargetEnv({ event, ref = '' }) {
+export function ciTargetEnv({ event, ref = '', isFork = false, devOnPr = false }) {
   if (event === 'push' && ref === 'refs/heads/main') return 'prod';
   if (event === 'workflow_dispatch') return 'dev';
+  if (event === 'pull_request' && devOnPr && !isFork) return 'dev';
   return 'preview';
 }
 
@@ -75,14 +77,14 @@ export function runnerFor({ event, isFork, runner }) {
 }
 
 /** Everything the CI workflow needs from its inputs, validated. Throws on any invalid configuration. */
-export function planCi({ event, ref, isFork = false, verifyTasks = '', testTasks = '', e2eCmd = '', runner = 'linux' }) {
+export function planCi({ event, ref, isFork = false, verifyTasks = '', testTasks = '', e2eCmd = '', runner = 'linux', devOnPr = false }) {
   const verify = parseTasks(verifyTasks, 'verify_tasks');
   const test = parseTasks(testTasks, 'test_tasks');
   const route = routeEvent({ event, ref });
   const picked = runnerFor({ event, isFork, runner });
   const e2e = Boolean(String(e2eCmd).trim());
   return {
-    stages: route.stages, reason: route.reason, runner: picked, target_env: ciTargetEnv({ event, ref }),
+    stages: route.stages, reason: route.reason, runner: picked, target_env: ciTargetEnv({ event, ref, isFork, devOnPr }),
     verify, test, e2e,
     run_verify: route.stages.includes('verify') && verify.length > 0,
     run_test: route.stages.includes('test') && test.length > 0,
@@ -117,7 +119,7 @@ async function main() {
     if (cmd === 'plan') {
       const p = planCi({
         event: env.EVENT, ref: env.REF, isFork: flag('IS_FORK'), verifyTasks: env.VERIFY_TASKS, testTasks: env.TEST_TASKS, e2eCmd: env.E2E_CMD,
-        runner: env.RUNNER || 'linux',
+        runner: env.RUNNER || 'linux', devOnPr: flag('DEV_ON_PR'),
       });
       const o = {
         stages: p.stages.join(','), runner: p.runner, target_env: p.target_env,

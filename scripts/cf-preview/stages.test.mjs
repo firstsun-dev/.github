@@ -43,6 +43,9 @@ test('ciTargetEnv: production env only for a main push', () => {
   assert.equal(ciTargetEnv({ event: 'push', ref: 'refs/heads/main' }), 'prod');
   assert.equal(ciTargetEnv({ event: 'push', ref: 'refs/heads/feat' }), 'preview');
   assert.equal(ciTargetEnv({ event: 'pull_request', ref: 'refs/pull/1/merge' }), 'preview');
+  assert.equal(ciTargetEnv({ event: 'pull_request', ref: 'refs/pull/1/merge', devOnPr: true }), 'dev', 'a dev_on_pr PR validates against the Dev build env');
+  assert.equal(ciTargetEnv({ event: 'pull_request', ref: 'refs/pull/1/merge', devOnPr: true, isFork: true }), 'preview', 'a fork PR never gets the Dev env');
+  assert.equal(ciTargetEnv({ event: 'push', ref: 'refs/heads/feat', devOnPr: true }), 'preview');
   assert.equal(ciTargetEnv({ event: 'workflow_dispatch', ref: 'refs/heads/main' }), 'dev');
 });
 

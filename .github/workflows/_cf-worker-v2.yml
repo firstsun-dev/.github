@@ -7,7 +7,7 @@ name: CF Worker Pipeline v2
 #   CI    (_cf-worker-ci.yml)   Plan -> [Verify tasks || Test tasks || E2E] -> Gate (fail closed). The CALLER owns the task lists.
 #     |                         push = Verify; pull_request / merge_group = Verify + Test on the merge candidate; main push = Verify
 #   Plan                        ONE delivery for the event, or none: target production | preview | dev x driver worker | native-preview (pure data)
-#     |                           push main -> production | same-repo PR (preview_policy pr) -> preview | dispatch (approved ref) -> dev
+#     |                           push main -> production | same-repo PR (preview_policy pr) -> preview | same-repo PR (dev_on_pr) or dispatch (approved ref) -> dev
 #   Migrate                     production / dev only (a Preview never migrates): a READ-ONLY D1 precheck first; nothing pending -> verified no-op,
 #     |                         NO build; pending -> audit + exact D1 binding, then the migration is applied ONCE
 #   Delivery                    _cf-worker-delivery.yml: Deploy -> Smoke -> conditional Rollback (the only variation is the driver)
@@ -93,6 +93,13 @@ on:
           Branch ref (refs/heads/...) a manual Dev promotion may deliver. Required when dev_driver is not none; any other ref is rejected before any mutation. Protect the `<app>/dev` (or `<app>/native-dev`) GitHub Environment with required reviewers.
         type: string
         default: ''
+      dev_on_pr:
+        description: >
+          true = a same-repository PR (opened / synchronize / reopened; never a fork, never `closed`) is delivered to the stable Dev after its CI Gate passed, exactly like an approved manual
+          promotion (same Dev driver, Environment, shared-Dev lock, migration and smoke; the Dev is last-writer-wins). Requires dev_driver != none and preview_policy none. The caller must
+          select the Dev SMOKE_ENV secret for such a PR (the engine cannot tell the Dev secret from the Production one). false (default) = a PR never reaches Dev.
+        type: boolean
+        default: false
       dispatch_target:
         description: >
           Pass github.event.inputs.target from the caller; empty or "dev". "dev" selects the manual Dev promotion of a workflow_dispatch. Any other value, or a value on another event, fails the Plan before any mutation.
@@ -359,6 +366,7 @@ on:
 # E2E still run in parallel inside a run). `queue: max` keeps FIFO instead of cancelling an older pending run. The identity is the RESOURCE:
 #   main push                          -> cfv2-prod-<d1_lock_scope|app_name>
 #   workflow_dispatch target=dev       -> cfv2-nonprod-d1-<scope> with d1_migrations, else cfv2-shared-dev-<app_name> (never the Production group)
+#   same-repo PR with dev_on_pr        -> the same shared-Dev group as a manual Dev promotion
 #   same-repo PR with preview_policy pr -> cfv2-<app_name>-pr-<number>
 #   anything else                      -> a private per-run group (never queues behind a deploy)
 # The `cfv2-` prefix is static on purpose: never reuse it (or ${{ github.workflow }}) in a CALLER group, or caller and callee deadlock.
@@ -367,7 +375,7 @@ on:
 # call's group before any mutation). A verify call (pipeline_phase=verify) schedules under the group its DEPLOY call recorded in phase_state.
 # `queue` is unknown to actionlint 1.7.12: .github/actionlint.yaml.
 concurrency:
-  group: ${{ inputs.pipeline_phase == 'verify' && (fromJSON(inputs.phase_state).group || format('cfv2-run-{0}', github.run_id)) || (github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'dev') && (inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || format('cfv2-shared-dev-{0}', inputs.app_name)) || (github.event_name == 'push' && github.ref == 'refs/heads/main') && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && inputs.preview_policy == 'pr') && format('cfv2-{0}-pr-{1}', inputs.app_name, github.event.pull_request.number) || format('cfv2-run-{0}', github.run_id) }}
+  group: ${{ inputs.pipeline_phase == 'verify' && (fromJSON(inputs.phase_state).group || format('cfv2-run-{0}', github.run_id)) || ((github.event_name == 'workflow_dispatch' && inputs.dispatch_target == 'dev') || (github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository && inputs.dev_on_pr && inputs.dev_driver != 'none')) && (inputs.d1_migrations && format('cfv2-nonprod-d1-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || format('cfv2-shared-dev-{0}', inputs.app_name)) || (github.event_name == 'push' && github.ref == 'refs/heads/main') && format('cfv2-prod-{0}', inputs.d1_lock_scope != '' && inputs.d1_lock_scope || inputs.app_name) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && inputs.preview_policy == 'pr') && format('cfv2-{0}-pr-{1}', inputs.app_name, github.event.pull_request.number) || format('cfv2-run-{0}', github.run_id) }}
   queue: max
 
 permissions:
@@ -404,6 +412,7 @@ jobs:
       build_env_prod: ${{ inputs.build_env_prod }}
       build_env_preview: ${{ inputs.build_env_preview }}
       build_env_dev: ${{ inputs.build_env_dev }}
+      dev_on_pr: ${{ inputs.dev_on_pr }}
       test_e2e_cmd: ${{ inputs.test_e2e_cmd }}
       test_e2e_setup_cmd: ${{ inputs.test_e2e_setup_cmd }}
       test_e2e_build_cmd: ${{ inputs.test_e2e_build_cmd }}
@@ -419,7 +428,7 @@ jobs:
   # -------------------------------------------------------------------------
   plan:
     name: Delivery Plan
-    if: inputs.pipeline_phase == 'verify' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && inputs.preview_policy == 'pr') || github.event_name == 'workflow_dispatch' || inputs.dispatch_target != ''
+    if: inputs.pipeline_phase == 'verify' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && (inputs.preview_policy == 'pr' || inputs.dev_on_pr)) || github.event_name == 'workflow_dispatch' || inputs.dispatch_target != ''
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
     outputs:
@@ -438,9 +447,11 @@ jobs:
       url_explicit: ${{ steps.plan.outputs.url_explicit }}
       target_url: ${{ steps.url.outputs.target_url }}
     steps:
-      # Only a Production / Dev plan reads the project's Wrangler config (the D1 to migrate); a PR (untrusted code) is never checked out here.
+      # Only a Production / Dev plan reads the project's Wrangler config (the D1 to migrate); a PR Preview (untrusted code, never migrates) is never checked out
+      # here. A same-repository dev_on_pr PR is a Dev delivery that DOES migrate: its merge candidate (the revision CI tested) is checked out like the branch of a
+      # manual Dev promotion, for DATA only (the config is parsed; no application code runs in this job and the tooling comes from this repository's commit).
       - uses: actions/checkout@v6
-        if: inputs.pipeline_phase != 'verify' && github.event_name != 'pull_request'
+        if: inputs.pipeline_phase != 'verify' && (github.event_name != 'pull_request' || (inputs.dev_on_pr && github.event.pull_request.head.repo.full_name == github.repository))
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -532,7 +543,7 @@ jobs:
   #      applied migration; a skipped / failed / stale job never carries it). A failing or unreadable query fails the job (never "nothing pending").
   #   1. target build, effective-config audit, exact D1 binding, stale-SHA guard, then the migration (stage migrate)
   # The plan picked the Environment (main -> <app>/prod with its approvals; dev -> the Dev Environment). Skipped (Delivery proceeds) when there is no migration;
-  # never on pull_request, delete or a verify call. The D1 schema is never rolled back automatically.
+  # never on a PR Preview, delete or a verify call (a dev_on_pr PR is a Dev delivery and migrates the shared Dev D1 like a manual promotion). The D1 schema is never rolled back automatically.
   # =========================================================================
   migration:
     name: Migrate

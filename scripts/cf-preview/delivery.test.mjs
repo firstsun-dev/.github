@@ -47,6 +47,25 @@ test('routing: a same-repo PR gets ONE Preview only with preview_policy pr; fork
   assert.equal(pr({ prAction: 'closed' }), null);
   assert.equal(pr({ previewPolicy: 'none' }), null);
 });
+test('routing: dev_on_pr delivers a same-repo PR to the stable Dev with the configured driver; fork, closed, off, no driver -> nothing / refused', () => {
+  const pr = (o) => resolveDelivery({ event: 'pull_request', ref: 'refs/pull/7/merge', prAction: 'synchronize', devOnPr: true, ...DEVCFG, ...o });
+  assert.deepEqual(pr({}), DEV_N);
+  assert.deepEqual(pr({ prAction: 'opened' }), DEV_N);
+  assert.deepEqual(pr({ prAction: 'reopened', devDriver: 'worker' }), DEV_W, 'the Dev driver is the configured one');
+  assert.equal(pr({ isFork: true }), null, 'fork PR never deploys');
+  assert.equal(pr({ prAction: 'closed' }), null);
+  assert.equal(pr({ devOnPr: false }), null, 'off by default: a PR never reaches Dev');
+  assert.throws(() => pr({ devDriver: 'none' }), /requires a dev_driver/);
+  assert.throws(() => pr({ previewPolicy: 'pr' }), /choose ONE/);
+  assert.throws(() => pr({ dispatchTarget: 'dev' }), /only valid for a workflow_dispatch/, 'dispatch_target is still refused on a PR');
+});
+test('routing: dev_on_pr changes nothing for push, merge_group or a manual dispatch', () => {
+  const cfg = { devOnPr: true, ...DEVCFG };
+  assert.equal(R({ ...cfg }), null, 'a feature push still never delivers');
+  assert.deepEqual(R({ ...cfg, ref: 'refs/heads/main' }), PROD, 'main push is still Production');
+  assert.equal(resolveDelivery({ event: 'merge_group', ref: 'refs/heads/main', ...cfg }), null);
+  assert.deepEqual(resolveDelivery({ event: 'workflow_dispatch', ref: 'refs/heads/main', dispatchTarget: 'dev', ...cfg }), DEV_N);
+});
 test('routing: merge_group, delete and other events never deliver', () => {
   for (const event of ['merge_group', 'delete', 'schedule', 'release']) assert.equal(resolveDelivery({ event, ref: 'refs/heads/main', previewPolicy: 'pr', ...DEVCFG }), null, event);
 });
@@ -273,6 +292,14 @@ test('lock identity: the run-level group follows the resource', () => {
   assert.equal(g({ event: 'pull_request', ref: 'refs/pull/5/merge', prNumber: '5', isFork: true }), 'cfv2-run-9', 'fork PR: private group');
   assert.equal(g({ event: 'pull_request', ref: 'refs/pull/5/merge', prNumber: '5' }, { preview_policy: 'none' }), 'cfv2-run-9');
   assert.equal(g({ ref: 'refs/heads/feat/x' }), 'cfv2-run-9', 'feature push: private group');
+  // dev_on_pr: a same-repo PR takes the SAME shared-Dev group as a manual promotion (one Dev, one queue); fork / closed / off keep a private group.
+  const dp = (o = {}, i = {}) => g({ event: 'pull_request', ref: 'refs/pull/5/merge', prNumber: '5', prAction: 'synchronize', ...o }, { preview_policy: 'none', dev_on_pr: true, ...i });
+  assert.equal(dp(), 'cfv2-shared-dev-app');
+  assert.equal(dp({}, { d1_migrations: true, d1_lock_scope: 's' }), 'cfv2-nonprod-d1-s', 'the shared-D1 Dev lock, identical to the manual promotion');
+  assert.equal(dp({ isFork: true }), 'cfv2-run-9');
+  assert.equal(dp({ prAction: 'closed' }), 'cfv2-run-9');
+  assert.equal(dp({}, { dev_on_pr: false }), 'cfv2-run-9');
+  assert.equal(dp({}, { dev_driver: 'none' }), 'cfv2-run-9');
   assert.equal(g({ event: 'merge_group', ref: 'refs/heads/gh-readonly-queue/main/x' }), 'cfv2-run-9');
 });
 
@@ -318,6 +345,15 @@ test('init: a PR Preview and a manual Dev promotion validate by the same rule as
   assert.equal(pr.slot, 'native-branch');
   const dev = I(DEV_N, { ev: { event: 'workflow_dispatch', ref: 'refs/heads/main' }, inputs: { dispatch_target: 'dev' } });
   assert.equal(dev.slot, 'native-dev');
+});
+test('init: a dev_on_pr PR validates as a Dev delivery; the same PR without the opt-in is a phantom delivery', () => {
+  const ev = { event: 'pull_request', ref: 'refs/pull/3/merge', prAction: 'synchronize' };
+  const on = I(DEV_N, { ev, inputs: { dev_on_pr: 'true', preview_policy: 'none' } });
+  assert.equal(on.slot, 'native-dev');
+  assert.equal(on.delivery.target, 'dev', 'the delivery is the stable Dev, not a PR Preview');
+  assert.throws(() => I(DEV_N, { ev, inputs: { preview_policy: 'none' } }), /delivery mismatch/);
+  assert.throws(() => I(DEV_N, { ev: { ...ev, isFork: true }, inputs: { dev_on_pr: 'true', preview_policy: 'none' } }), /delivery mismatch/);
+  assert.throws(() => I(DEV_N, { ev: { ...ev, prAction: 'closed' }, inputs: { dev_on_pr: 'true', preview_policy: 'none' } }), /delivery mismatch/);
 });
 test('init: a Preview can never run a migration stage', () => {
   const ev = { event: 'pull_request', ref: 'refs/pull/3/merge', prAction: 'synchronize' };
