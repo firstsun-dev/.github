@@ -66,7 +66,7 @@ grep -q "^wr cwd=artifact preview --name pr-4 --worker-name blog --config $T/art
 # The Cloudflare version list shows a deployment by its message: a Native Preview (PR Preview and the stable Dev) must carry `[<short sha>] <first line of the commit message>` like Production does.
 GITHUB_SHA=abcdef0123456789abcdef0123456789abcdef01 COMMIT_MSG=$'feat: add the thing\nsecond line' EXPECTED_URL=$URL pub preview >/dev/null 2>&1
 grep -qF -- "--json --message [abcdef0] feat: add the thing" "$STUB_LOG" && ok "preview: the deployment carries [short sha] + commit subject (Cloudflare shows it)" || { bad "preview: the deployment message is missing"; cat "$STUB_LOG"; }
-GITHUB_SHA=abcdef0123456789abcdef0123456789abcdef01 COMMIT_MSG= EXPECTED_URL=$URL pub preview >/dev/null 2>&1
+GITHUB_SHA=abcdef0123456789abcdef0123456789abcdef01 COMMIT_MSG='' EXPECTED_URL=$URL pub preview >/dev/null 2>&1
 grep -qF -- "--message [abcdef0]" "$STUB_LOG" && ok "preview: without a commit subject the message is still the short sha" || bad "preview: the message must at least carry the short sha"
 ! grep -q "^pnpm" "$STUB_LOG" && ok "publish: never invokes the application's package manager" || bad "publish: invoked pnpm"
 EXPECTED_URL=$URL WORKER_NAME='' pub preview >/dev/null 2>&1 && bad "preview: host Worker is mandatory (never taken from the artifact)" || ok "preview: host Worker is mandatory (never taken from the artifact)"
