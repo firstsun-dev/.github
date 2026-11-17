@@ -227,7 +227,7 @@ try {
         group = String(state.group ?? '');
       } else {
         const delivery = resolveDelivery({
-          ...ev, previewPolicy: str('preview_policy') || 'none', devDriver: str('dev_driver') || 'none', dispatchTarget: str('dispatch_target'), approvedDevRef: str('approved_dev_ref'), devOnPr: bool('dev_on_pr'),
+          ...ev, previewPolicy: str('preview_policy') || 'none', devDriver: str('dev_driver') || 'none', dispatchTarget: str('dispatch_target'), approvedDevRef: str('approved_dev_ref'), devOnPr: i.dev_on_pr == null ? true : bool('dev_on_pr'),
         });
         if (delivery) {
           let d1 = '';
