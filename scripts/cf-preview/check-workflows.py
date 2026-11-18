@@ -13,7 +13,7 @@ import sys
 import yaml
 
 errors = []
-WF = {p: yaml.safe_load(open(p)) for p in sorted(glob.glob(".github/workflows/_cf-worker-*.yml")) if not p.endswith(("_cf-worker-template.yml", "_cf-worker-preview-gc.yml"))}
+WF = {p: yaml.safe_load(open(p)) for p in sorted(glob.glob(".github/workflows/_cf-worker-*.yml")) if not p.endswith("_cf-worker-preview-gc.yml")}
 call = lambda d: d[True]["workflow_call"]  # noqa: E731  (PyYAML parses the key `on` as True)
 
 for path, d in WF.items():

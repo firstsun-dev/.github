@@ -1,7 +1,7 @@
 # Cloudflare Worker CI/CD v2 — stages and targets
 
-Reusable workflow `.github/workflows/_cf-worker-v2.yml` (+ `actions/cf-preview`). OpenSpec: `openspec/changes/simplify-cf-ci-stages-and-dev-delivery`.
-v1 (`_cf-worker-template.yml`, `@v1`) is independent and unchanged. This page replaces the previous v2 guide; the older design records
+Reusable workflow `.github/workflows/_cf-worker-v2.yml` (+ `actions/cf-preview`). Current contract index: `openspec/specs/cloudflare-worker-delivery/spec.md`; shipped v2 baseline: `openspec/changes/redesign-cloudflare-worker-cicd-v2/specs/cloudflare-worker-delivery/spec.md`. Follow-on v2 proposals are tracked under `openspec/changes/`.
+The legacy v1 workflow (`_cf-worker-template.yml`) and its branch-alias action were removed on 2026-11-16 after checking organization callers. This page replaces the previous v2 guide; the older design records
 (`cf-worker-v2-refactor.md`, `-unified-delivery.md`, `-rollout.md`) describe the superseded four-kind model and are kept as history only.
 
 ## Model
