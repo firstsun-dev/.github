@@ -1,0 +1,63 @@
+name: MCP smoke
+description: >
+  Access-authenticated MCP smoke (initialize + tools/list + expected tools + optional read-only tools/call) for an upstream MCP endpoint, an MCP portal,
+  or a portal in dynamic `optimize_context=search_and_execute` mode. ONE implementation: CF-Access-Client-Id / CF-Access-Client-Secret are injected here
+  (masked) from the optional inputs; credentials are never printed. Called as `uses: $/actions/mcp-smoke`; needs Node >= 20 on the runner.
+inputs:
+  mcp_url:
+    description: 'Full MCP endpoint URL (HTTPS), e.g. https://mcp.firstsun.org/anas/mcp'
+    required: true
+  mode:
+    description: upstream | portal | portal-dynamic
+    default: upstream
+  access_client_id:
+    description: CF-Access-Client-Id (service token). Pass both id and secret or neither.
+    default: ''
+  access_client_secret:
+    description: CF-Access-Client-Secret (service token).
+    default: ''
+  require_anon_reject:
+    description: 'An anonymous request must be refused (401, 403 or an Access redirect): proves there is no Bypass policy.'
+    default: 'true'
+  expect_tools:
+    description: 'Comma/newline list of tools that must be exposed (re:<regex> for a pattern). In portal-dynamic they are discovered through portal_query_tools.'
+    default: ''
+  expect_absent_tools:
+    description: 'Tools that must NOT be exposed (cross-portal exposure; per-user-OAuth tools are absent from a service-token session). Same syntax as expect_tools.'
+    default: ''
+  check_bad_credentials:
+    description: 'With credentials set, also require that a wrong service token is refused.'
+    default: 'true'
+  expect_server_name:
+    description: Optional regex for the initialize serverInfo.name
+    default: ''
+  read_calls:
+    description: 'Optional JSON array of safe read-only calls, e.g. [{"tool":"health","arguments":{},"expect":"ok"}]'
+    default: ''
+  dynamic_tools:
+    description: portal-dynamic only - the two portal tools (query, execute)
+    default: portal_query_tools,portal_execute
+  timeout_ms:
+    default: '15000'
+  label:
+    description: Heading of the job-summary section
+    default: ''
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        MCP_URL: ${{ inputs.mcp_url }}
+        MCP_MODE: ${{ inputs.mode }}
+        CF_ACCESS_CLIENT_ID: ${{ inputs.access_client_id }}
+        CF_ACCESS_CLIENT_SECRET: ${{ inputs.access_client_secret }}
+        REQUIRE_ANON_REJECT: ${{ inputs.require_anon_reject }}
+        EXPECT_TOOLS: ${{ inputs.expect_tools }}
+        EXPECT_ABSENT_TOOLS: ${{ inputs.expect_absent_tools }}
+        CHECK_BAD_CREDS: ${{ inputs.check_bad_credentials }}
+        EXPECT_SERVER_NAME: ${{ inputs.expect_server_name }}
+        READ_CALLS: ${{ inputs.read_calls }}
+        DYNAMIC_TOOLS: ${{ inputs.dynamic_tools }}
+        TIMEOUT_MS: ${{ inputs.timeout_ms }}
+        LABEL: ${{ inputs.label }}
+      run: node "$GITHUB_ACTION_PATH/mcp-smoke.mjs"

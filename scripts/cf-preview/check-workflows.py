@@ -13,7 +13,7 @@ import sys
 import yaml
 
 errors = []
-WF = {p: yaml.safe_load(open(p)) for p in sorted(glob.glob(".github/workflows/_cf-worker-*.yml")) if not p.endswith("_cf-worker-preview-gc.yml")}
+WF = {p: yaml.safe_load(open(p)) for p in sorted(glob.glob(".github/workflows/_cf-worker-*.yml") + glob.glob(".github/workflows/_mcp-*.yml")) if not p.endswith("_cf-worker-preview-gc.yml")}
 call = lambda d: d[True]["workflow_call"]  # noqa: E731  (PyYAML parses the key `on` as True)
 
 for path, d in WF.items():
@@ -238,5 +238,28 @@ for m in re.finditer(r"inputs\.dev_on_pr", _v2):
 
 for e in errors:
     print("FAIL", e)
+# ---- MCP post-deploy (additive, optional stage): production-only guard on EVERY job, no ignored failures, serialized per portal ----
+mcp = WF.get(".github/workflows/_mcp-post-deploy.yml")
+if not mcp:
+    errors.append("missing .github/workflows/_mcp-post-deploy.yml")
+else:
+    for jid, job in mcp["jobs"].items():
+        cond = str(job.get("if", ""))
+        for need in ("deploy_target == 'production'", "deploy_verified == 'true'", "rollback_result == ''", "refs/heads/main"):
+            if need not in cond:
+                errors.append(f"_mcp-post-deploy.yml job '{jid}' must be guarded by {need} (production only, never a Preview / PR)")
+        if job.get("continue-on-error"):
+            errors.append(f"_mcp-post-deploy.yml job '{jid}' must not continue-on-error (sync / smoke failures are never ignored)")
+        for st in job.get("steps", []):
+            if st.get("continue-on-error"):
+                errors.append(f"_mcp-post-deploy.yml job '{jid}' step '{st.get('name', st.get('uses'))}' must not continue-on-error")
+    conc = mcp["jobs"]["portal"].get("concurrency") or {}
+    if not str(conc.get("group", "")).startswith("mcp-portal-") or conc.get("cancel-in-progress") is not False or conc.get("queue") != "max":
+        errors.append("_mcp-post-deploy.yml portal job must serialize per portal (group mcp-portal-*, cancel-in-progress false, queue max)")
+    sync_i = next((i for i, s in enumerate(mcp["jobs"]["portal"]["steps"]) if "mcp-portal-sync" in str(s.get("uses", ""))), -1)
+    smoke_i = next((i for i, s in enumerate(mcp["jobs"]["portal"]["steps"]) if "mcp-smoke" in str(s.get("uses", ""))), -1)
+    if not (0 <= sync_i < smoke_i):
+        errors.append("_mcp-post-deploy.yml: the capability sync must run BEFORE the portal smoke")
+
 print(f"workflow structure: {len(WF)} workflows, {'FAILED' if errors else 'clean'}")
 sys.exit(1 if errors else 0)
