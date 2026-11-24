@@ -8,6 +8,10 @@ paths:
   .github/workflows/_cf-worker-v2.yml:
     ignore:
       - 'unexpected key "queue" for "concurrency" section'
+  .github/workflows/_mcp-post-deploy.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'
+      - 'specifying action "\$/[a-z/-]+" in invalid format because ref is missing'
   .github/workflows/_cf-worker-*.yml:
     ignore:
       - 'specifying action "\$/[a-z/-]+" in invalid format because ref is missing'

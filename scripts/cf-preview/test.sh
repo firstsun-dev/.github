@@ -26,13 +26,13 @@ static() {
     run "shellcheck actions" python3 scripts/cf-preview/shellcheck-actions.py || rc=1
   else echo "FAIL missing tool 'shellcheck'" >&2; rc=1; fi
   if command -v actionlint >/dev/null 2>&1; then
-    run "actionlint" actionlint -color .github/workflows/_cf-worker-v2.yml .github/workflows/_cf-worker-ci.yml .github/workflows/_cf-worker-delivery.yml .github/workflows/_cf-worker-lifecycle.yml .github/workflows/_cf-worker-preview-gc.yml .github/workflows/cf-worker-v2-ci.yml || rc=1
+    run "actionlint" actionlint -color .github/workflows/_cf-worker-v2.yml .github/workflows/_cf-worker-ci.yml .github/workflows/_cf-worker-delivery.yml .github/workflows/_cf-worker-lifecycle.yml .github/workflows/_cf-worker-preview-gc.yml .github/workflows/_mcp-post-deploy.yml .github/workflows/cf-worker-v2-ci.yml || rc=1
   else echo "FAIL missing tool 'actionlint' (install it; CI does)" >&2; rc=1; fi
   return "$rc"
 }
 unit() {
   local rc=0
-  run "node unit" node --test scripts/cf-preview/lib.test.mjs scripts/cf-preview/delivery.test.mjs scripts/cf-preview/stages.test.mjs scripts/cf-preview/artifact.test.mjs scripts/cf-preview/cli.test.mjs scripts/cf-preview-gc/gc.test.mjs || rc=1
+  run "node unit" node --test scripts/cf-preview/lib.test.mjs scripts/cf-preview/delivery.test.mjs scripts/cf-preview/stages.test.mjs scripts/cf-preview/artifact.test.mjs scripts/cf-preview/cli.test.mjs scripts/cf-preview-gc/gc.test.mjs scripts/mcp/mcp-smoke.test.mjs || rc=1
   run "parse-env" scripts/cf-preview/test-parse-env.sh || rc=1
   return "$rc"
 }

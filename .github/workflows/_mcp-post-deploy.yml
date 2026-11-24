@@ -1,0 +1,186 @@
+name: MCP post-deploy verification
+
+# ---------------------------------------------------------------------------
+# Reusable, OPTIONAL post-deploy stage for MCP Workers. OpenSpec: openspec/changes/add-mcp-portal-post-deploy. Guide: docs/mcp-post-deploy.md
+#
+#   caller:  Detect Changes -> pipeline (_cf-worker-v2.yml: CI -> build/test -> deploy -> engine smoke -> rollback) -> THIS workflow
+#   here:    upstream-smoke (Access service token, tools/list, read-only calls)
+#              -> portal (ONE job, serialized per portal): capability sync -> portal smoke -> dynamic portal smoke
+#
+# It does not change _cf-worker-v2.yml: a consumer adds ONE job `needs: [pipeline]` that passes the pipeline outputs through. Every stage runs ONLY
+# for a verified PRODUCTION delivery of a push to main that was not rolled back; a Preview / Dev / PR run, an unverified delivery, a rollback and a
+# skipped pipeline all make every job here skip, so a PR Preview can never be synced into (or smoked through) a production portal.
+# Each stage is optional by its inputs (empty mcp_url / portal_server_ids / portal_url = that stage is skipped), so non-MCP callers are unaffected.
+#
+# Credentials: CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET (Access service token that the `allow-firstsun-mcp-smoke` policy admits; no Bypass anywhere)
+# are optional and injected, masked, by actions/mcp-smoke. CLOUDFLARE_API_TOKEN needs `MCP Portals Write` (sync only). Neither is printed.
+# `$/actions/...` is the self-repository syntax (same commit as this workflow, runner >= 2.336.0), as in _cf-worker-v2.yml.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: MCP app name (labels only; also the portal lock when portal_key is empty)
+        type: string
+        required: true
+      deploy_target:
+        description: needs.<pipeline>.outputs.deploy_target. Only `production` runs anything here.
+        type: string
+        required: true
+      deploy_verified:
+        description: needs.<pipeline>.outputs.deploy_verified. Only `true` (this run's SHA, content-verified) runs anything here.
+        type: string
+        required: true
+      rollback_result:
+        description: needs.<pipeline>.outputs.rollback_result. Anything but empty skips every stage.
+        type: string
+        default: ''
+      # ---- upstream smoke ----
+      mcp_url:
+        description: Upstream MCP endpoint (e.g. https://mcp.firstsun.org/anas/mcp). Empty = no upstream smoke.
+        type: string
+        default: ''
+      expect_tools:
+        description: Comma/newline list of tools the upstream must expose (`re:<regex>` for a pattern)
+        type: string
+        default: ''
+      expect_server_name:
+        description: Optional regex for the upstream initialize serverInfo.name
+        type: string
+        default: ''
+      read_calls:
+        description: 'Optional safe read-only tools/call list (JSON), e.g. [{"tool":"health","arguments":{},"expect":"ok"}]'
+        type: string
+        default: ''
+      require_anon_reject:
+        description: An anonymous request to every endpoint must be refused (no Bypass policy). Set false only for an intentionally public endpoint.
+        type: boolean
+        default: true
+      # ---- portal sync + smoke ----
+      portal_server_ids:
+        description: Cloudflare MCP server ids to sync after the deploy (comma/space/newline). Empty = no capability sync.
+        type: string
+        default: ''
+      portal_url:
+        description: Portal MCP URL (e.g. https://mcp.firstsun.org/mcp). Empty = no portal smoke.
+        type: string
+        default: ''
+      portal_key:
+        description: Portal identity for the concurrency group (default app_name). Every app that syncs into the same portal MUST pass the same value so simultaneous deployments are serialized.
+        type: string
+        default: ''
+      portal_expect_tools:
+        description: Tools the portal must expose (`re:<regex>` for a pattern; portal tool names may be server-prefixed - confirm live)
+        type: string
+        default: ''
+      portal_read_calls:
+        description: Safe read-only tools/call list (JSON) run through the portal (and through portal_execute in dynamic mode)
+        type: string
+        default: ''
+      portal_dynamic_smoke:
+        description: Also smoke `?optimize_context=search_and_execute` (portal_query_tools + portal_execute)
+        type: boolean
+        default: true
+      portal_dynamic_tools:
+        description: The two dynamic-mode portal tools (query, execute). Cloudflare's reference names them portal_query_tools / portal_execute (the changelog says query / execute).
+        type: string
+        default: portal_query_tools,portal_execute
+      runner:
+        type: string
+        default: linux
+    secrets:
+      CF_ACCESS_CLIENT_ID:
+        description: Access service token id (optional; without it only the anonymous-refusal check can pass)
+        required: false
+      CF_ACCESS_CLIENT_SECRET:
+        required: false
+      CLOUDFLARE_API_TOKEN:
+        description: Token with `MCP Portals Write` (capability sync only)
+        required: false
+      CLOUDFLARE_ACCOUNT_ID:
+        required: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Upstream smoke — the freshly deployed Worker itself, authenticated with the smoke service token.
+  # -------------------------------------------------------------------------
+  upstream-smoke:
+    name: MCP upstream smoke
+    if: inputs.mcp_url != '' && inputs.deploy_target == 'production' && inputs.deploy_verified == 'true' && inputs.rollback_result == '' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: $/actions/mcp-smoke
+        with:
+          mcp_url: ${{ inputs.mcp_url }}
+          mode: upstream
+          access_client_id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          access_client_secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          require_anon_reject: ${{ inputs.require_anon_reject }}
+          expect_tools: ${{ inputs.expect_tools }}
+          expect_server_name: ${{ inputs.expect_server_name }}
+          read_calls: ${{ inputs.read_calls }}
+          label: ${{ inputs.app_name }} upstream smoke
+
+  # -------------------------------------------------------------------------
+  # Portal — capability sync, then the portal smoke, in ONE job so the per-portal lock covers "sync + verify" as a unit. Several MCP apps deploying at
+  # once queue FIFO (`queue: max`: never drop a pending sync) instead of racing each other's registration. A failed upstream smoke blocks the sync
+  # (a broken Worker is never published to the portal); a skipped one (no mcp_url) does not. Every step fails the job: nothing is ignored.
+  # -------------------------------------------------------------------------
+  portal:
+    name: MCP portal sync + smoke
+    needs: [upstream-smoke]
+    if: always() && (needs.upstream-smoke.result == 'success' || needs.upstream-smoke.result == 'skipped') && (inputs.portal_server_ids != '' || inputs.portal_url != '') && inputs.deploy_target == 'production' && inputs.deploy_verified == 'true' && inputs.rollback_result == '' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    concurrency:
+      group: mcp-portal-${{ inputs.portal_key || inputs.app_name }}
+      cancel-in-progress: false
+      queue: max # unknown to actionlint 1.7.12: .github/actionlint.yaml
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Sync portal capabilities
+        if: inputs.portal_server_ids != ''
+        uses: $/actions/mcp-portal-sync
+        with:
+          server_ids: ${{ inputs.portal_server_ids }}
+          cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Portal smoke
+        if: inputs.portal_url != ''
+        uses: $/actions/mcp-smoke
+        with:
+          mcp_url: ${{ inputs.portal_url }}
+          mode: portal
+          access_client_id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          access_client_secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          require_anon_reject: ${{ inputs.require_anon_reject }}
+          expect_tools: ${{ inputs.portal_expect_tools }}
+          read_calls: ${{ inputs.portal_read_calls }}
+          label: ${{ inputs.app_name }} portal smoke
+      - name: Dynamic portal smoke
+        if: inputs.portal_url != '' && inputs.portal_dynamic_smoke
+        uses: $/actions/mcp-smoke
+        with:
+          mcp_url: ${{ inputs.portal_url }}
+          mode: portal-dynamic
+          access_client_id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          access_client_secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          require_anon_reject: ${{ inputs.require_anon_reject }}
+          expect_tools: ${{ inputs.portal_expect_tools }}
+          read_calls: ${{ inputs.portal_read_calls }}
+          dynamic_tools: ${{ inputs.portal_dynamic_tools }}
+          label: ${{ inputs.app_name }} dynamic portal smoke

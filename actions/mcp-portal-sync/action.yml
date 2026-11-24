@@ -1,0 +1,23 @@
+name: MCP portal capability sync
+description: >
+  Sync the capabilities (tools/prompts) of registered Cloudflare MCP portal servers: POST /accounts/{id}/access/ai-controls/mcp/servers/{server}/sync
+  (token permission `MCP Portals Write`). Fails loudly unless every server reports `ready`; nothing is ignored. Production only: the caller decides
+  when to run it (see _mcp-post-deploy.yml). Called as `uses: $/actions/mcp-portal-sync`; needs Node >= 20.
+inputs:
+  server_ids:
+    description: Cloudflare MCP server ids (comma / space / newline separated)
+    required: true
+  cloudflare_api_token:
+    description: Token with `MCP Portals Write`
+    required: true
+  cloudflare_account_id:
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        MCP_SERVER_IDS: ${{ inputs.server_ids }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.cloudflare_api_token }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
+      run: node "$GITHUB_ACTION_PATH/sync.mjs"
