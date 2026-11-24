@@ -284,6 +284,14 @@ case "$PHASE" in
     [ "$(inp d1_migrations)" = true ] || exit 0
     # The migration target is the engine-bound target; a mismatch with the composite-bound one is fatal.
     [ "${ENGINE_TARGET:?}" = "$TARGET" ] || die "target mismatch at migration (state '$TARGET', step '$ENGINE_TARGET')"
+    # No build and no artifact here: the database is the one the SOURCE config names for this target and it must be exactly the physical D1 the plan expects. (The Deploy
+    # job's publish stage additionally proves that the BUILT config binds that same D1 before it publishes anything.)
+    MC="$(cd "$APP_DIR" && node "$TOOLS_DIR/cli.mjs" migration-config --config "$WRANGLER_CONFIG" --target "$TARGET" --binding "$D1_BINDING" --dev-env "$DEV_ENV" --out "$S/migrate-check.json")" \
+      || die "the migration target is invalid; nothing was migrated"
+    M_ID="$(printf '%s\n' "$MC" | sed -n 's/^d1_id=//p')"
+    [ -n "$M_ID" ] && [ -n "$(rd d1_expect)" ] && [ "$M_ID" = "$(rd d1_expect)" ] \
+      || die "the source config binds D1 '${M_ID:-none}' for $KIND but the plan expects '$(rd d1_expect)'; refusing to migrate"
+    printf '%s' "$M_ID" > "$S/d1_id"
     OUT="$(TARGET="$TARGET" APP_DIR="$APP_DIR" WRANGLER_CONFIG="$WRANGLER_CONFIG" D1_BINDING="$D1_BINDING" DEV_ENV="$DEV_ENV" "$TOOLS_DIR/migrate.sh")"
     printf '%s\n' "$OUT"
     PENDING="$(printf '%s\n' "$OUT" | sed -n 's/^pending=//p')"

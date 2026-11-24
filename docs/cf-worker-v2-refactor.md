@@ -567,7 +567,7 @@ Fail-closed (`smoke.sh`): no URL ⇒ fail; the probe requests `probe_path` (defa
 * Fork PRs: CI/E2E only, no secrets, no migrate/deploy/lifecycle.
 * Injection: env inputs are data (`parse-env.mjs`, reserved names rejected for the engine); commands come from `env:` via `bash -c "$CMD"`; no `${{ }}` inside any `run:` of the workflow or the composite actions (contract-tested); deploy checkouts use `persist-credentials: false`.
 * Bindings: Preview source preflight before the first remote command; **effective generated config audited** after the build for both targets.
-* Artifacts: none cross jobs; the only upload is the E2E report on failure, retention 3 days.
+* Artifacts (superseded by the stage-based engine, see `docs/cf-worker-v2.md`): none cross jobs any more (Deploy builds locally); the only uploads are failure-only E2E / Smoke reports, retention 1 day.
 * Residual: callers' commands are trusted code; Preview migration can still break other branches' code.
 
 ## Verification levels

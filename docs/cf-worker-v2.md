@@ -12,12 +12,12 @@ Three logical **stages**; the caller chooses the commands, the platform owns orc
 | --- | --- | --- |
 | **Verify** | `verify_tasks`: fast checks (lint, check, build, unit, fast integration, ...) | one matrix leg per task |
 | **Test** | `test_tasks` (+ optional E2E): costly checks (heavy integration, contract, E2E, ...) | one matrix leg per task, concurrent with Verify |
-| **Delivery** | Plan → Migrate → Deploy → Smoke → conditional Rollback → Release | one **target**, one **driver** |
+| **Delivery** | Plan → Migrate → Deploy (builds locally) → Smoke → conditional Rollback → Release | one **target**, one **driver** |
 
 ```text
 CI:        Plan -> [Verify tasks || Test tasks || E2E] -> Gate (fail closed)        (no `needs` between Verify and Test)
-Delivery:  Plan ---------> Build (unprivileged) ---+            (Plan and Build run concurrently with CI; nothing is mutated before the CI Gate)
-           CI Gate -------------------------------+--> Migrate (production/dev only) -> Deploy -> Smoke -> Rollback? -> Release (main only)
+Delivery:  Plan ---------------------------------+            (Plan runs concurrently with CI; nothing is mutated before the CI Gate)
+           CI Gate -------------------------------+--> Migrate (production/dev only) -> Deploy (build + publish) -> Smoke -> Rollback? -> Release (main only)
 ```
 
 Targets: `production`, `preview`, `dev`. Drivers: `worker` (production, or a real `env.dev` Worker) and `native-preview` (PR Preview, stable Dev).
@@ -78,13 +78,13 @@ Removed (no compatibility shim): `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `
 ## Build / Publish trust boundary
 
 ```text
- untrusted code ──► Build job (no Cloudflare token, no write token, no Environment; ephemeral hosted runner for PRs)
+ untrusted code ──► Deploy job, `build` step (no Cloudflare token / write token in its env; ephemeral hosted runner for PRs)
                       deps + target build + config audit + `wrangler deploy --dry-run --outdir` + package
-                      └─► artifact  (manifest.json · wrangler.json[main→worker/, no_bundle, no `build`] · worker/ · assets/)
-                                       │  actions/upload-artifact (this run only)
- trusted tooling ──► Migrate / Deploy jobs (credentials; Environment approvals)
-                      download ─► verify identity + digest + structure ─► re-audit resource bindings ─► stale check ─► pinned Wrangler publishes ONLY the artifact
-                      (no application dependency install, no application build, no checkout of PR code)
+                      └─► local bundle in $RUNNER_TEMP, NOT uploaded  (manifest.json · wrangler.json[main→worker/, no_bundle, no `build`] · worker/ · assets/)
+                                       │  same job, later steps
+ trusted tooling ──► publish / migrate steps (step-level credentials; Environment approvals)
+                      verify identity + digest + structure ─► re-audit resource bindings ─► stale check ─► pinned Wrangler publishes ONLY the artifact
+                      (the publish step installs and builds nothing)
 ```
 
 * Publisher inputs it trusts: its own Plan descriptor, GitHub context, caller inputs and the event payload - never the manifest's claims. The manifest is cross-checked
@@ -94,14 +94,28 @@ Removed (no compatibility shim): `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `
 * The Build receives **no secret**: `PREVIEW_SECRETS` is not passed to it (a PR's build command could read it); build-time values must be non-secret `build_env_*`. Audit / publish mode
   (flat vs a Dev Worker's named environment), the Production Worker name and the Preview host Worker are derived by the publisher, never from the manifest. A packaged config may not
   carry `build`, `site`, `containers`, `alias`, `tsconfig`, `find_additional_modules`, `base_dir`, `dev`; the artifact may contain only `manifest.json`, `wrangler.json`, `worker/**`, `assets/**` (no hidden files).
-* The artifact name and attempt come from the Build job's outputs, so "Re-run failed jobs" keeps using the artifact of the attempt that built it.
+* There is no cross-job artifact: "Re-run failed jobs" re-runs the Deploy job, which rebuilds.
 * Application code (`smoke_cmd`) never receives GitHub or Cloudflare tokens; the credential-bearing Production rollback re-smokes with the built-in probe only and installs no application dependency.
-* **Revision contract**: `source_sha` = PR head, `tested_sha` = the merge candidate CI tested, `artifact_sha` = what the Build checked out (must equal `tested_sha`), `deployed_sha` = recorded
+* **Revision contract**: `source_sha` = PR head, `tested_sha` = the merge candidate CI tested, `artifact_sha` = what the build step checked out (must equal `tested_sha`), `deployed_sha` = recorded
   in the ledger = `tested_sha`. A PR Preview is built from and published as the tested merge candidate. Publish proceeds only while the PR is open, its head is still `source_sha` and
   GitHub's merge candidate is still `tested_sha` (a newer synchronization or a moved base makes the run stale). Main / Dev publish the pushed / approved commit under the existing branch-tip guard.
 * Non-production has **no automatic recovery** (decision pending owner acceptance): redeploying an older Preview / Dev would require rebuilding it in a credential-bearing job, and no verified artifact is retained. A failed Smoke marks it UNVERIFIED; fix forward.
 * A Preview's `smoke_cmd` (PR-controlled) runs only in the separate credential-free `app-smoke` job; the credential-bearing Smoke job runs the trusted probe and requires its result. Production rollback
   re-deploys a stored Worker version (no build) and never reverts D1.
+
+## Build inside Deploy (no Actions artifact)
+
+GitHub Free caps Actions artifact storage, so there is no separate Build job and nothing is uploaded or downloaded between jobs. The target is built where it is used:
+
+* **Deploy**: `build` (dependency install, target build, effective-config audit, `wrangler deploy --dry-run --outdir`, packaging to `$RUNNER_TEMP/cfv2-artifact`) then `publish` (`artifact-verify`, packaged-config audit incl. `dev-policy.mjs`, stale guard, `versions upload` + `versions deploy`). The job env holds **no credential**; `GH_TOKEN` / `CLOUDFLARE_*` are **step-level env on the publish step only** (the engine's build stage also refuses them).
+* **Migrate** (only with `d1_migrations`): builds nothing and uses no artifact. Read-only `precheck` (verified no-op when nothing is pending), then `migrate` if pending; credentials are step-level. The D1 is the one the SOURCE config names, checked against the plan's expected physical D1 before any remote call. That the BUILT config binds the same D1 is proven by Deploy's `publish` stage (`audit-d1`) before anything is published, so a mismatch fails Deploy after the migration but never publishes.
+
+Consequences: build code runs on the runner that later holds the token (accepted: private repos, trusted `main`); a PR Preview therefore runs Deploy on the ephemeral hosted runner `ubuntu-24.04`; the build no longer overlaps CI (Deploy / Migrate wait for the Gate); "Re-run failed jobs" rebuilds. `check-workflows.py` pins: no job-level credential, credentials only on precheck / migrate / publish steps, stage order, no Actions artifacts.
+
+### Artifact retention (all callers)
+
+The delivery artifact no longer exists. Failure-only Smoke and E2E reports are kept **1 day** (were 7 / 3).
+The legacy v1 template (`_cf-worker-template.yml`) is not touched.
 
 ## Safety invariants (kept)
 
