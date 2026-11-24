@@ -7,7 +7,8 @@ description: >
     precheck  Migration job, FIRST step: read-only look at the planned physical D1 (two SELECTs, nothing built, created or changed). Verdict `precheck` =
               verified_no_pending (bound to the D1 id and commit) | pending (the migrate stage follows). Failure, identity mismatch or a superseded run never
               produce verified_no_pending.
-    migrate   Migration job (prod | dev; a Preview never migrates): verify the artifact, exact D1 binding, stale check, migrate (ONCE per run). Publishes nothing.
+    migrate   Migration job (prod | dev; a Preview never migrates): exact physical D1 from the SOURCE config vs the plan, stale check, migrate (ONCE per run). Builds and
+              verifies no artifact; the built config's D1 binding is checked by the Deploy job's publish stage before it publishes. Publishes nothing.
     publish   Deploy job: verify the artifact (identity, digest, structure) and audit ITS config against the caller's resource policy, stale check, publish ONLY that
               artifact with the pinned Wrangler of this repository. Installs no application dependency and runs no application build. Runs no smoke.
     verify    Smoke job (prod | preview | dev): smoke the published URL; mark verified | unverified. NO Cloudflare credentials. prod | dev (protected revisions) run
@@ -257,7 +258,7 @@ runs:
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" precheck | tee -a "$GITHUB_OUTPUT"'
     - name: Verify the artifact and audit its packaged config (nothing is built here; BEFORE any ledger entry or remote call)
       id: artifact
-      if: env.STALE != 'true' && (inputs.stage == 'migrate' || inputs.stage == 'publish')
+      if: env.STALE != 'true' && inputs.stage == 'publish'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" artifact-verify | tee -a "$GITHUB_OUTPUT"'
     - name: Prepare (Wrangler version, Preview identity and ledger, ledger entry)
@@ -271,7 +272,7 @@ runs:
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" build'
     - name: Validate the exact migration target (same physical D1 as the deployed config)
-      if: env.STALE != 'true' && (inputs.stage == 'migrate' || inputs.stage == 'publish')
+      if: env.STALE != 'true' && inputs.stage == 'publish'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" audit-d1'
     - name: Stale-SHA guard (before migration)

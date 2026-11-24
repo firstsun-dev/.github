@@ -492,67 +492,20 @@ jobs:
         run: |
           node "$TOOLS_DIR/cli.mjs" resolve-url --kind "$SLOT" --name "$NAME" --host-worker "$HOST" --explicit "$EXPLICIT" --suffix "$URL_SUFFIX" --host-check "$HOST_CHECK" | sed -n 's/^target_url=/target_url=/p' | tee -a "$GITHUB_OUTPUT"
 
-  # -------------------------------------------------------------------------
-  # Build — the UNPRIVILEGED target build (stage build of the delivery engine). It runs the application's dependency install and build for the planned target,
-  # audits the effective config, bundles it offline and uploads ONE artifact. No Cloudflare credential, no write token, no environment: the only job that runs
-  # application build code. A pull request builds the merge candidate CI tests, on an ephemeral GitHub-hosted runner that never shares a host with a credential-bearing
-  # job. It needs only the Plan, so it runs concurrently with Verify / Test; nothing it produces is used before the CI Gate passes.
-  # -------------------------------------------------------------------------
-  build:
-    name: Build
-    needs: [plan]
-    if: needs.plan.result == 'success' && needs.plan.outputs.has_delivery == 'true' && inputs.pipeline_phase != 'verify'
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || inputs.runner }}
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    outputs:
-      # ONE identity: <plan's repo/app/slot base>-<run_id>-<attempt>. Migration and Publish read it from here; the upload below uses the same value.
-      artifact_name: ${{ format('{0}-{1}-{2}', needs.plan.outputs.artifact_base, github.run_id, github.run_attempt) }}
-      artifact_attempt: ${{ github.run_attempt }}
-    env:
-      ARTIFACT_NAME: ${{ format('{0}-{1}-{2}', needs.plan.outputs.artifact_base, github.run_id, github.run_attempt) }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
-      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - id: engine
-        uses: $/actions/cf-deploy
-        with:
-          target: ${{ fromJSON(needs.plan.outputs.descriptor).engine_target }}
-          descriptor: ${{ needs.plan.outputs.descriptor }}
-          kind: ${{ fromJSON(needs.plan.outputs.descriptor).slot }}
-          stage: build
-          artifact_dir: ${{ runner.temp }}/cfv2-artifact
-          target_url: ${{ needs.plan.outputs.target_url }}
-          inputs_json: ${{ needs.plan.outputs.inputs_json }}
-          d1_expected_id: ${{ fromJSON(needs.plan.outputs.descriptor).d1_expected_id }}
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ runner.temp }}/cfv2-artifact
-          if-no-files-found: error
-          include-hidden-files: true # assets/<n>/.assetsignore is part of the digest; any other hidden file already failed packaging
-          retention-days: 7
-
   # =========================================================================
   # Migration — the ONE job that mutates a database (production and dev only; a Preview never migrates). Its steps run in order and a failing step stops the
   # job, so every read-only check precedes the single remote mutation:
   #   0. precheck: two read-only SELECTs on the planned physical D1 (identity checked against the plan first). NOTHING pending -> step 1 is skipped, no
   #      target is built here, and the result carries `precheck: verified_no_pending` bound to the D1 id and this commit (the Delivery gate accepts it like an
   #      applied migration; a skipped / failed / stale job never carries it). A failing or unreadable query fails the job (never "nothing pending").
-  #   1. target build, effective-config audit, exact D1 binding, stale-SHA guard, then the migration (stage migrate)
+  #   1. exact physical D1 of the SOURCE config vs the plan, stale-SHA guard, then the migration (stage migrate). No build, no artifact: Deploy builds the one copy.
   # The plan picked the Environment (main -> <app>/prod with its approvals; dev -> the Dev Environment). Skipped (Delivery proceeds) when there is no migration;
   # never on a PR Preview, delete or a verify call (a dev_on_pr PR is a Dev delivery and migrates the shared Dev D1 like a manual promotion). The D1 schema is never rolled back automatically.
   # =========================================================================
   migration:
     name: Migrate
-    needs: [plan, ci, build]
-    if: always() && inputs.pipeline_phase != 'verify' && needs.plan.result == 'success' && needs.plan.outputs.has_migrations == 'true' && needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed' && needs.build.result == 'success'
+    needs: [plan, ci]
+    if: always() && inputs.pipeline_phase != 'verify' && needs.plan.result == 'success' && needs.plan.outputs.has_migrations == 'true' && needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed'
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 45
     environment:
@@ -568,9 +521,7 @@ jobs:
       migration_json: ${{ steps.precheck.outputs.precheck == 'pending' && toJSON(steps.migrate.outputs) || toJSON(steps.precheck.outputs) }}
       migration_status: ${{ steps.result.outputs.status }}
     env:
-      GH_TOKEN: ${{ github.token }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      # No job-level credential: GH_TOKEN / CLOUDFLARE_* are STEP-level env on the precheck and migrate steps only. Nothing is built here.
       # A dev_on_pr PR migrates the shared Dev D1: the engine keys its stale-SHA guard on the PR (empty and unused on every other event).
       PR_NUMBER: ${{ github.event.pull_request.number }}
       PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
@@ -581,13 +532,13 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/download-artifact@v7
-        with:
-          name: ${{ needs.build.outputs.artifact_name }}
-          path: ${{ runner.temp }}/cfv2-artifact
       - id: precheck
         name: Check pending D1 migrations (read-only, no build)
         uses: $/actions/cf-deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         with:
           target: ${{ fromJSON(needs.plan.outputs.descriptor).engine_target }}
           descriptor: ${{ needs.plan.outputs.descriptor }}
@@ -599,13 +550,15 @@ jobs:
         name: Apply pending D1 migrations (once)
         if: steps.precheck.outputs.precheck == 'pending'
         uses: $/actions/cf-deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         with:
           target: ${{ fromJSON(needs.plan.outputs.descriptor).engine_target }}
           descriptor: ${{ needs.plan.outputs.descriptor }}
           kind: ${{ fromJSON(needs.plan.outputs.descriptor).slot }}
           stage: migrate
-          artifact_dir: ${{ runner.temp }}/cfv2-artifact
-          artifact_attempt: ${{ needs.build.outputs.artifact_attempt }}
           target_url: ${{ needs.plan.outputs.target_url }}
           inputs_json: ${{ needs.plan.outputs.inputs_json }}
           d1_expected_id: ${{ fromJSON(needs.plan.outputs.migration).d1_id }}
@@ -624,9 +577,9 @@ jobs:
   # =========================================================================
   delivery:
     name: ${{ needs.plan.outputs.target || 'delivery' }}
-    needs: [plan, ci, build, migration]
-    # Every remote mutation waits for: a plan, the CI Gate (not for a deferred verify call: its CI ran in the deploy call), the Build's artifact, and the Migration.
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.has_delivery == 'true' && (inputs.pipeline_phase == 'verify' || (needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed' && needs.build.result == 'success')) && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
+    needs: [plan, ci, migration]
+    # Every remote mutation waits for: a plan, the CI Gate (not for a deferred verify call: its CI ran in the deploy call), and the Migration.
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.has_delivery == 'true' && (inputs.pipeline_phase == 'verify' || (needs.ci.result == 'success' && needs.ci.outputs.validation == 'passed')) && (needs.migration.result == 'success' || needs.migration.result == 'skipped')
     uses: $/.github/workflows/_cf-worker-delivery.yml
     permissions:
       contents: read
@@ -634,8 +587,6 @@ jobs:
       pull-requests: write
     with:
       descriptor: ${{ needs.plan.outputs.descriptor }}
-      artifact_name: ${{ needs.build.outputs.artifact_name }}
-      artifact_attempt: ${{ needs.build.outputs.artifact_attempt }}
       target_url: ${{ needs.plan.outputs.target_url }}
       runner: ${{ inputs.runner }}
       inputs_json: ${{ needs.plan.outputs.inputs_json }}

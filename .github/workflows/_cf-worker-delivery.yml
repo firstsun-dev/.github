@@ -64,14 +64,6 @@ on:
         description: verify only - needs.<job>.result of the job the cross-service smoke depends on
         type: string
         default: ''
-      artifact_name:
-        description: Name of the build artifact the unprivileged Build job of THIS run uploaded (downloaded and verified before anything else; the deploy never builds).
-        type: string
-        default: ''
-      artifact_attempt:
-        description: run_attempt of the Build job that produced the artifact (a partial re-run keeps an earlier attempt's artifact).
-        type: string
-        default: ''
       target_url:
         description: Canonical URL the Plan resolved before the build; the artifact and the published URL must both match it.
         type: string
@@ -117,15 +109,18 @@ defaults:
 
 jobs:
   # -------------------------------------------------------------------------
-  # Deploy — Publish (stage publish) of THIS kind: verifies the artifact the unprivileged Build job produced (identity, digest, structure, resource audit) and
-  # publishes ONLY that. No application dependency is installed and no application build runs in this credential-bearing job. Depends on the run's single Migration result and on nothing
-  # of any other kind. A green Deploy means "published", not "verified".
+  # Deploy — Build + Publish of THIS kind in ONE job; nothing is uploaded to or downloaded from GitHub Actions artifact storage.
+  #   1. build    the unprivileged engine stage: dependency install, target build, config audit, `wrangler deploy --dry-run`, packaging to a local directory. NO credential
+  #               exists in the job env - GH_TOKEN / CLOUDFLARE_* are STEP-level env on the publish step only (the engine's build stage refuses them).
+  #   2. publish  verifies that local bundle (identity, digest, structure, packaged-config audit incl. dev-policy.mjs) and publishes ONLY it.
+  # The build code shares the runner with the later credentialed step (accepted: private repos). A pull request (Preview) therefore runs on the ephemeral hosted
+  # runner, never a shared / self-hosted one. Depends on the run's single Migration result and on nothing of any other kind. A green Deploy means "published", not "verified".
   # -------------------------------------------------------------------------
   deploy:
     name: Deploy
     if: inputs.phase != 'verify'
-    runs-on: ${{ inputs.runner }}
-    timeout-minutes: 45
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || inputs.runner }}
+    timeout-minutes: 90
     concurrency:
       group: ${{ fromJSON(inputs.descriptor).deploy_group }}
       cancel-in-progress: false
@@ -143,31 +138,37 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number }}
       PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
       PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      GH_TOKEN: ${{ github.token }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
-      # Production / Dev revisions are protected (main / approved ref): their SOURCE config is read (never executed) by the artifact audit. A Preview (untrusted
-      # PR code) is never checked out here: the job sees the artifact only.
       - uses: actions/checkout@v6
-        if: fromJSON(inputs.descriptor).target != 'preview'
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/download-artifact@v7
-        with:
-          name: ${{ inputs.artifact_name }}
-          path: ${{ runner.temp }}/cfv2-artifact
-      - id: engine
+      - id: build
+        name: Build the target locally (no credential of any kind)
         uses: $/actions/cf-deploy
+        with:
+          target: ${{ fromJSON(inputs.descriptor).engine_target }}
+          descriptor: ${{ inputs.descriptor }}
+          kind: ${{ fromJSON(inputs.descriptor).slot }}
+          stage: build
+          artifact_dir: ${{ runner.temp }}/cfv2-artifact
+          target_url: ${{ inputs.target_url }}
+          inputs_json: ${{ inputs.inputs_json }}
+          d1_expected_id: ${{ fromJSON(inputs.descriptor).d1_expected_id }}
+      - id: engine
+        name: Publish the audited bundle
+        uses: $/actions/cf-deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         with:
           target: ${{ fromJSON(inputs.descriptor).engine_target }}
           descriptor: ${{ inputs.descriptor }}
           kind: ${{ fromJSON(inputs.descriptor).slot }}
           stage: publish
           artifact_dir: ${{ runner.temp }}/cfv2-artifact
-          artifact_attempt: ${{ inputs.artifact_attempt }}
           target_url: ${{ inputs.target_url }}
           migration_result: ${{ inputs.migration_result }}
           migration_json: ${{ inputs.migration_json }}
@@ -306,7 +307,7 @@ jobs:
             playwright-report/
             test-results/
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 1
 
   # -------------------------------------------------------------------------
   # Revert on Verify Failure — PRODUCTION ONLY, ONLY when its Smoke FAILED on a deployment this run published (never after a blocked cross-service gate, never

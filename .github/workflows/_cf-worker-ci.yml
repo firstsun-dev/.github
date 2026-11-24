@@ -218,7 +218,7 @@ jobs:
             ${{ inputs.app_path }}/playwright-report/
             ${{ inputs.app_path }}/test-results/
           if-no-files-found: ignore
-          retention-days: 3
+          retention-days: 1
 
   # Gate - fail closed (logic and its tests: actions/cf-preview/stages.mjs gateVerdict). `always()` makes it run (and fail) even when a job it
   # needs failed or was cancelled, so the called workflow's conclusion is never a skipped-looking green.
