@@ -6,8 +6,8 @@
 // HTTP failure / a malformed answer fail the run. Nothing is ever ignored.
 //   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID   required (never printed; the token is masked)
 //   MCP_SERVER_IDS        required, comma / space / newline separated Cloudflare MCP server ids
-//   SYNC_MIN_TOOLS (1)    the synced server must report at least this many tools (result.tools); 0 disables. A server that is `ready` with 0 tools
-//                         (or with no tool list in the answer) fails: registration/credentials work only if the portal could really list tools.
+//   SYNC_MIN_TOOLS (1)    the synced server must have at least this many tools (from the POST answer's list/count, else GET .../servers/{id} result.tools);
+//                         0 disables. A `ready` server with 0 tools (or whose count cannot be determined) fails: registration/credentials work only if the portal could really list tools.
 //   SYNC_ATTEMPTS (4)  SYNC_RETRY_MS (5000)  SYNC_TIMEOUT_MS (60000)  CF_API_BASE (default https://api.cloudflare.com/client/v4; tests: localhost http)
 import process from 'node:process';
 import console from 'node:console';
@@ -15,6 +15,13 @@ import { appendFileSync } from 'node:fs';
 import { URL } from 'node:url';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Tool count of a server object / sync answer: an array `tools`, or a numeric count field; null when neither is present.
+export function toolCount(r) {
+  if (Array.isArray(r?.tools)) return r.tools.length;
+  for (const k of ['tool_count', 'tools_count', 'toolCount', 'tools_total', 'total_tools']) if (Number.isInteger(r?.[k])) return r[k];
+  return null;
+}
 
 export function parse(env) {
   const need = (k) => {
@@ -63,12 +70,23 @@ export async function syncOne(cfg, id, log = console.log) {
         retry = res.status === 429 || res.status >= 500;
         if (res.status === 401 || res.status === 403) why += ' (the API token needs the "MCP Portals Write" permission on this account)';
       } else if (r?.status === 'ready') {
-        const n = Array.isArray(r.tools) ? r.tools.length : 0;
-        if (n < cfg.minTools) {
-          why = `status ready but ${Array.isArray(r.tools) ? `only ${n} tool(s)` : 'no tool list in the answer'} (need >= ${cfg.minTools}): the portal could not list the server's tools; check the registered auth headers / upstream Access policy`;
+        // The POST answer's shape is not documented ("status, tool count, error details"): accept a tool list or a numeric count from it; otherwise read
+        // the server object (GET) after the sync. A count that cannot be determined is a failure, never a pass.
+        let n = toolCount(r);
+        if (n === null && cfg.minTools > 0) {
+          const g = await fetch(`${cfg.base}/accounts/${cfg.account}/access/ai-controls/mcp/servers/${id}`, {
+            headers: { Authorization: `Bearer ${cfg.token}` },
+            signal: AbortSignal.timeout(cfg.timeoutMs),
+          }).catch(() => null);
+          const gb = g?.ok ? await g.json().catch(() => null) : null;
+          n = gb?.success === true ? toolCount(gb.result) : null;
+          if (n === null) why = `status ready but the tool count could not be read (GET server: ${g ? `HTTP ${g.status}` : 'request failed'}, no tools/count in the answer)`;
+        }
+        if (cfg.minTools > 0 && (n === null || n < cfg.minTools)) {
+          if (n !== null) why = `status ready but only ${n} tool(s) (need >= ${cfg.minTools}): the portal could not list the server's tools; check the registered auth headers / upstream Access policy`;
           break;
         }
-        log(`ok   synced ${id}: ready, ${n} tools`);
+        log(`ok   synced ${id}: ready, ${n ?? 'unchecked'} tools`);
         return { id, status: 'ready', tools: n };
       } else if (r?.status === 'waiting') {
         why = 'status waiting (sync still in progress)';

@@ -19,6 +19,8 @@ Every job runs only for a **verified Production push to main without rollback**;
 
 Credentials: CI uses ONLY the existing org secrets `CF_ACCESS_CLIENT_ID/SECRET` (token `firstsun-mcp-smoke`). It never receives the portal runtime credential (`firstsun-mcp-portal`, held by the portal's bearer registration) nor any backend token. Servers registered as bearer/custom-header are refreshed by the explicit sync API (the documented ~2 h background sync is described for DCR servers only), so the explicit POST is the minimal mechanism kept here.
 
+**Portal tool names are `{server_id}_{tool}`** (split on the first underscore; ids contain hyphens: `kavita-mcp_search`, `diet-manager-mcp_get_nutrition_context`). In portal modes a plain expectation matches the full name OR the bare tool part, and `re:` patterns are tried against both, so `health`, `re:health$` and `re:^kavita-mcp_` all work; absent-tool specs use the same matching (`re:^diet-manager-mcp_` is the canonical form). A direct Worker (L1, `mcp_url`) exposes bare names only. A portal read-only call names its server: `{"server":"anas-mcp","tool":"health"}` calls `anas-mcp_health` (or give the full name in `tool`).
+
 ## Consumer change (innovation-apps, per MCP workflow)
 
 ```yaml
@@ -40,9 +42,9 @@ Credentials: CI uses ONLY the existing org secrets `CF_ACCESS_CLIENT_ID/SECRET` 
       portal_server_ids: anas-mcp                        # server id == name (handoff-A)
       portal_url: https://mcp.firstsun.org/mcp           # yao portal: https://yao-mcp.firstsun.org/mcp, key yao-mcp
       portal_key: firstsun-mcp                           # same value for every app in this portal
-      portal_expect_tools: re:health$                    # L2; upstream tool names may be server-prefixed - confirm live
-      portal_expect_absent_tools: re:^(get_nutrition_context)$   # L2: no per-user-OAuth / other-portal tools
-      portal_read_calls: '[{"tool":"health","arguments":{}}]'   # L3: a real call through the portal
+      portal_expect_tools: health                        # L2: bare name; matches `anas-mcp_health` through the portal
+      portal_expect_absent_tools: re:^diet-manager-mcp_  # L2: no per-user-OAuth / other-portal tools (prefix pattern)
+      portal_read_calls: '[{"server":"anas-mcp","tool":"health","arguments":{}}]'   # L3: a real call through the portal
     secrets:
       CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
       CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
@@ -65,7 +67,7 @@ An app outside any portal (e.g. a Worker not yet registered) sets only `mcp_url`
 | `portal_key` | `app_name` | concurrency identity; apps sharing a portal must share it |
 | `runner` | `linux` | |
 
-Secrets (all optional): `CF_ACCESS_CLIENT_ID/SECRET` (Access service token admitted by `allow-firstsun-mcp-smoke`), `CLOUDFLARE_API_TOKEN` (+`CLOUDFLARE_ACCOUNT_ID`, sync only; permission **MCP Portals Write**). `expect_tools`/`read_calls` accept `re:<regex>`. Dynamic mode maps `portal_execute` arguments from its `inputSchema` (live: `portal_query_tools(pattern, limit)`, `portal_execute(tool_name, arguments)`). The sync API's answer must carry `result.tools` (as infra-config's `sync-mcp-servers.sh` reads it); an answer without it fails the min-tools check - set `portal_sync_min_tools: 0` only if live behaviour proves otherwise.
+Secrets (all optional): `CF_ACCESS_CLIENT_ID/SECRET` (Access service token admitted by `allow-firstsun-mcp-smoke`), `CLOUDFLARE_API_TOKEN` (+`CLOUDFLARE_ACCOUNT_ID`, sync only; permission **MCP Portals Write**). `expect_tools`/`read_calls` accept `re:<regex>`. Dynamic mode maps `portal_execute` arguments from its `inputSchema` (live: `portal_query_tools(pattern, limit)`, `portal_execute(tool_name, arguments)`). The sync POST's response shape is not documented beyond "status, tool count, error details": the tool count is taken from the POST answer (`tools` list or a numeric `tool_count`-style field), otherwise from `GET /servers/{id}` (`result.tools`) after a `ready` sync. A count that cannot be determined, or is below `portal_sync_min_tools`, fails loudly; `0` disables the check.
 
 ## OAuth-user tests are separate
 This stage is service-token only (its job summaries say so). Diet Manager (oauth, `on_behalf=true`) is invisible to service-token sessions: assert its tools ABSENT in the machine session (`portal_expect_absent_tools`). Its OAuth-user tests must stay a separate consumer job/check; never fold them into this result.

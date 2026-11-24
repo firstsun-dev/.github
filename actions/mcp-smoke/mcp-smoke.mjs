@@ -13,7 +13,8 @@
 //                           are expected to be ABSENT from a machine (service-token) session.
 //   CHECK_BAD_CREDS         true (default when credentials are set) | false. A syntactically valid but WRONG service token must be refused.
 //   EXPECT_SERVER_NAME      optional regex the initialize serverInfo.name must match.
-//   READ_CALLS              optional JSON array of safe read-only calls: [{"tool":"health","arguments":{},"expect":"substring"}].
+//   READ_CALLS              optional JSON array of safe read-only calls: [{"tool":"health","arguments":{},"expect":"substring","server":"anas-mcp"}].
+//                           Through a portal the tool is `{server_id}_{tool}`: give `server` (or the full name in `tool`).
 //                           In portal-dynamic mode they run through portal_execute.
 //   DYNAMIC_TOOLS           portal-dynamic only: comma list of the two portal tools (default portal_query_tools,portal_execute).
 //   TIMEOUT_MS (15000)  RETRIES (2: transient network / 5xx only)  RETRY_DELAY_MS (3000)  LABEL (heading of the step summary)
@@ -270,7 +271,17 @@ export async function run(cfg, log = console.log, steps = []) {
     if (!cursor) break;
     must(page < 19, 'tools/list: pagination limit exceeded');
   }
-  const has = (spec) => (spec.startsWith('re:') ? [...tools.keys()].some((n) => new RegExp(spec.slice(3)).test(n)) : tools.has(spec));
+  // Portal tool names are `{server_id}_{tool}` (split on the FIRST underscore; server ids contain hyphens, e.g. `kavita-mcp_search`). In a portal mode a spec
+  // matches the full name or the bare tool part; a direct Worker (upstream mode) exposes bare names only. `re:` patterns are tried against both forms, so
+  // `re:^diet-manager-mcp_` (prefix) and `re:health$` both work.
+  const portal = cfg.mode !== 'upstream';
+  const forms = (n) => (portal && n.includes('_') ? [n, n.slice(n.indexOf('_') + 1)] : [n]);
+  const has = (spec) => {
+    const re = spec.startsWith('re:') ? new RegExp(spec.slice(3)) : null;
+    return [...tools.keys()].some((n) => forms(n).some((f) => (re ? re.test(f) : f === spec)));
+  };
+  // The name to call: an explicit `server` ({"server":"kavita-mcp","tool":"search"}) makes `kavita-mcp_search`; otherwise the tool as given.
+  const fullName = (c) => (c.server ? `${c.server}_${c.tool}` : c.tool);
   const names = () => [...tools.keys()].sort().slice(0, 40).join(', ');
 
   const callTool = async (name, args) => {
@@ -285,10 +296,10 @@ export async function run(cfg, log = console.log, steps = []) {
     for (const spec of cfg.absentTools) must(!has(spec), `tool '${spec}' must NOT be exposed here (cross-portal / per-user-OAuth exposure)`);
     pass(`tools/list (${tools.size} tools${cfg.expectTools.length ? `; ${cfg.expectTools.length} expected present` : ''}${cfg.absentTools.length ? `; ${cfg.absentTools.length} absent as required` : ''})`);
     for (const c of cfg.readCalls) {
-      must(has(c.tool), `read-only call '${c.tool}': tool is not exposed; tools/list returned: ${names()}`);
-      const r = await callTool(c.tool, c.arguments);
+      must(tools.has(fullName(c)), `read-only call '${fullName(c)}': tool is not exposed; tools/list returned: ${names()}`);
+      const r = await callTool(fullName(c), c.arguments);
       if (c.expect) must(textOf(r).includes(c.expect), `read-only call '${c.tool}': result does not contain the expected text`);
-      pass(`read-only tools/call ${c.tool}`);
+      pass(`read-only tools/call ${fullName(c)}`);
     }
   } else {
     const [qName, xName] = cfg.dynamicTools;
@@ -322,9 +333,9 @@ export async function run(cfg, log = console.log, steps = []) {
       const xt = tools.get(xName);
       const nKey = pick(xt, ['tool', 'tool_name', 'toolName', 'name']);
       const aKey = Object.keys(xt.inputSchema?.properties ?? {}).find((k) => ['arguments', 'args', 'params', 'input'].includes(k));
-      const r = await callTool(xName, { [nKey]: c.tool, ...(aKey ? { [aKey]: c.arguments ?? {} } : {}) });
+      const r = await callTool(xName, { [nKey]: fullName(c), ...(aKey ? { [aKey]: c.arguments ?? {} } : {}) });
       if (c.expect) must(textOf(r).includes(c.expect), `${xName} ${c.tool}: result does not contain the expected text`);
-      pass(`read-only ${xName} -> ${c.tool}`);
+      pass(`read-only ${xName} -> ${fullName(c)}`);
     }
   }
   return steps;

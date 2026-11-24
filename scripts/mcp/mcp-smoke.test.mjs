@@ -212,16 +212,72 @@ test('L2 dynamic: a tool that must be absent is not discoverable through portal_
   assert.equal(r.code, 0, r.out);
 });
 
-test('L3: sync requires a ready server that really lists tools (0 tools / no tool list fail; min 0 disables)', async () => {
-  for (const result of [{ status: 'ready', tools: [] }, { status: 'ready' }]) {
-    const api = await startMockApi([{ status: 200, body: { success: true, result } }]);
+test('L3: sync requires a ready server that really lists tools (0 tools / undeterminable count fail; min 0 disables)', async () => {
+  for (const [result, get] of [
+    [{ status: 'ready', tools: [] }, undefined],
+    [{ status: 'ready' }, { status: 200, body: { success: true, result: { tools: [] } } }],
+    [{ status: 'ready', tool_count: 0 }, undefined],
+  ]) {
+    const script = [{ status: 200, body: { success: true, result } }];
+    script.get = get;
+    const api = await startMockApi(script);
     const r = await exec(SYNC, syncEnv(api));
     api.close();
     assert.equal(r.code, 1);
-    assert.match(r.out, /status ready but .*tool.*need >= 1/);
+    assert.match(r.out, /status ready but .*(tool|count)/);
   }
+  // no count anywhere: the GET is attempted (404 here) and the run fails loudly
+  const none = await startMockApi([{ status: 200, body: { success: true, result: { status: 'ready' } } }]);
+  const rn = await exec(SYNC, syncEnv(none));
+  none.close();
+  assert.equal(rn.code, 1);
+  assert.match(rn.out, /tool count could not be read \(GET server: HTTP 404/);
   const api = await startMockApi([{ status: 200, body: { success: true, result: { status: 'ready' } } }]);
   const r = await exec(SYNC, syncEnv(api, { SYNC_MIN_TOOLS: '0' }));
   api.close();
   assert.equal(r.code, 0, r.out);
+});
+
+test('L3: both POST answer shapes are accepted - a numeric count, or no count then GET /servers/{id} result.tools', async () => {
+  let api = await startMockApi([{ status: 200, body: { success: true, result: { status: 'ready', tool_count: 3 } } }]);
+  let r = await exec(SYNC, syncEnv(api));
+  api.close();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /ready, 3 tools/);
+  assert.deepEqual(api.calls.map((c) => c.method), ['POST'], 'no GET when the POST answer carries the count');
+  const script = [{ status: 200, body: { success: true, result: { status: 'ready' } } }];
+  script.get = { status: 200, body: { success: true, result: { tools: [{ name: 'a' }, { name: 'b' }] } } };
+  api = await startMockApi(script);
+  r = await exec(SYNC, syncEnv(api));
+  api.close();
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /ready, 2 tools/);
+  assert.deepEqual(api.calls.map((c) => [c.method, c.path.split('/').pop()]), [['POST', 'sync'], ['GET', 'srv-one']]);
+  assert.equal(api.calls[1].auth, 'Bearer cf-token-SECRET-0001');
+});
+
+test('portal names are {server_id}_{tool}: bare and re: expectations are prefix-aware, absent patterns use the prefix, direct Worker stays bare', async () => {
+  const tools = ['kavita-mcp_search', 'anas-mcp_health', 'portal_list_servers'];
+  let r = await smoke({ tools }, { ...creds, MCP_MODE: 'portal', EXPECT_TOOLS: 'health,search,re:^kavita-mcp_,re:health$', EXPECT_ABSENT_TOOLS: 're:^diet-manager-mcp_,get_nutrition_context' });
+  assert.equal(r.code, 0, r.out);
+  r = await smoke({ tools }, { ...creds, MCP_MODE: 'portal', EXPECT_ABSENT_TOOLS: 're:^kavita-mcp_' });
+  assert.equal(r.code, 1);
+  assert.match(r.out, /'re:\^kavita-mcp_' must NOT be exposed/);
+  r = await smoke({ tools: ['diet-manager-mcp_get_nutrition_context'] }, { ...creds, MCP_MODE: 'portal', EXPECT_ABSENT_TOOLS: 'get_nutrition_context' });
+  assert.equal(r.code, 1, 'a bare absent name also catches the prefixed tool');
+  // a direct Worker exposes bare names only: a prefixed expectation does not match, the bare one does
+  r = await smoke({ tools: ['health'] }, { ...creds, MCP_MODE: 'upstream', EXPECT_TOOLS: 'health' });
+  assert.equal(r.code, 0, r.out);
+  r = await smoke({ tools: ['a_health'] }, { ...creds, MCP_MODE: 'upstream', EXPECT_TOOLS: 'health' });
+  assert.equal(r.code, 1);
+});
+
+test('portal read-only call by server + tool, in static and dynamic mode', async () => {
+  const tools = ['anas-mcp_health'];
+  let r = await smoke({ tools }, { ...creds, MCP_MODE: 'portal', READ_CALLS: '[{"server":"anas-mcp","tool":"health","expect":"ok"}]', EXPECT_TOOLS: 'health' });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /read-only tools\/call anas-mcp_health/);
+  r = await smoke({ tools, dynamic: true }, { ...creds, MCP_MODE: 'portal-dynamic', EXPECT_TOOLS: 'health', READ_CALLS: '[{"server":"anas-mcp","tool":"health","expect":"executed anas-mcp_health"}]' });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /portal_execute -> anas-mcp_health/);
 });

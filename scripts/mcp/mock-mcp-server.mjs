@@ -58,7 +58,7 @@ export function startMock(opts = {}) {
         const { name, arguments: a } = msg.params;
         if (dynamic && name === 'portal_query_tools') return text(JSON.stringify((o.hidden ? [] : o.tools).filter((t) => new RegExp(a.pattern).test(t))));
         if (dynamic && name === 'portal_execute') return o.tools.includes(a.tool_name) ? text(`executed ${a.tool_name}: ok`) : text('unknown tool', true);
-        if (name === 'health') return text(o.healthError ? 'boom' : '{"status":"ok"}', Boolean(o.healthError));
+        if (name === 'health' || name.endsWith('_health')) return text(o.healthError ? 'boom' : '{"status":"ok"}', Boolean(o.healthError));
         return text('{}');
       }
       res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'Method not found' } }));
@@ -72,7 +72,8 @@ export function startMockApi(script) {
   const calls = [];
   const server = createServer((req, res) => {
     calls.push({ method: req.method, path: req.url, auth: req.headers.authorization });
-    const step = script[Math.min(calls.length - 1, script.length - 1)];
+    const posts = calls.filter((c) => c.method === 'POST').length;
+    const step = req.method === 'GET' ? (script.get ?? { status: 404, body: { success: false } }) : script[Math.min(posts - 1, script.length - 1)];
     res.writeHead(step.status, { 'content-type': 'application/json' }).end(JSON.stringify(step.body));
   });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ base: `http://127.0.0.1:${server.address().port}/client/v4`, calls, close: () => server.closeAllConnections?.() || server.close() })));
