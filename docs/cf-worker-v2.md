@@ -1,7 +1,7 @@
 # Cloudflare Worker CI/CD v2 — stages and targets
 
-Reusable workflow `.github/workflows/_cf-worker-v2.yml` (+ `actions/cf-preview`). OpenSpec: `openspec/changes/simplify-cf-ci-stages-and-dev-delivery`.
-v1 (`_cf-worker-template.yml`, `@v1`) is independent and unchanged. This page replaces the previous v2 guide; the older design records
+Reusable workflow `.github/workflows/_cf-worker-v2.yml` (+ `actions/cf-preview`). Current contract index: `openspec/specs/cloudflare-worker-delivery/spec.md`; shipped v2 baseline: `openspec/changes/redesign-cloudflare-worker-cicd-v2/specs/cloudflare-worker-delivery/spec.md`. Follow-on v2 proposals are tracked under `openspec/changes/`.
+The legacy v1 workflow (`_cf-worker-template.yml`) and its branch-alias action were removed on 2026-11-16 after checking organization callers. This page replaces the previous v2 guide; the older design records
 (`cf-worker-v2-refactor.md`, `-unified-delivery.md`, `-rollout.md`) describe the superseded four-kind model and are kept as history only.
 
 ## Model
@@ -78,7 +78,7 @@ Removed (no compatibility shim): `lint_cmd`, `typecheck_cmd`, `test_unit_cmd`, `
 ## Build / Publish trust boundary
 
 ```text
- untrusted code ──► Deploy job, `build` step (no Cloudflare token / write token in its env; ephemeral hosted runner for PRs)
+untrusted code ──► Deploy job, `build` step (no Cloudflare token / write token in its env; same-repository PRs: the caller's EPHEMERAL `runner` pool; fork PRs: GitHub-hosted)
                       deps + target build + config audit + `wrangler deploy --dry-run --outdir` + package
                       └─► local bundle in $RUNNER_TEMP, NOT uploaded  (manifest.json · wrangler.json[main→worker/, no_bundle, no `build`] · worker/ · assets/)
                                        │  same job, later steps
@@ -110,7 +110,7 @@ GitHub Free caps Actions artifact storage, so there is no separate Build job and
 * **Deploy**: `build` (dependency install, target build, effective-config audit, `wrangler deploy --dry-run --outdir`, packaging to `$RUNNER_TEMP/cfv2-artifact`) then `publish` (`artifact-verify`, packaged-config audit incl. `dev-policy.mjs`, stale guard, `versions upload` + `versions deploy`). The job env holds **no credential**; `GH_TOKEN` / `CLOUDFLARE_*` are **step-level env on the publish step only** (the engine's build stage also refuses them).
 * **Migrate** (only with `d1_migrations`): builds nothing and uses no artifact. Read-only `precheck` (verified no-op when nothing is pending), then `migrate` if pending; credentials are step-level. The D1 is the one the SOURCE config names, checked against the plan's expected physical D1 before any remote call. That the BUILT config binds the same D1 is proven by Deploy's `publish` stage (`audit-d1`) before anything is published, so a mismatch fails Deploy after the migration but never publishes.
 
-Consequences: build code runs on the runner that later holds the token (accepted: private repos, trusted `main`); a PR Preview therefore runs Deploy on the ephemeral hosted runner `ubuntu-24.04`; the build no longer overlaps CI (Deploy / Migrate wait for the Gate); "Re-run failed jobs" rebuilds. `check-workflows.py` pins: no job-level credential, credentials only on precheck / migrate / publish steps, stage order, no Actions artifacts.
+Consequences: build code runs on the runner that later holds the token (accepted: private repos, trusted `main`); a PR's Deploy runs on the caller's ephemeral `runner` pool (fork PRs never deliver); the build no longer overlaps CI (Deploy / Migrate wait for the Gate); "Re-run failed jobs" rebuilds. `check-workflows.py` pins: no job-level credential, credentials only on precheck / migrate / publish steps, stage order, no Actions artifacts.
 
 ### Artifact retention (all callers)
 

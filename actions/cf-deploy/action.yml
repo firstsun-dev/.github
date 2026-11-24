@@ -15,7 +15,7 @@ description: >
               the application smoke command here, with the smoke secrets. A PREVIEW never does: its smoke command is PR-controlled code, so this job runs only the
               trusted probe / SHA check (with the SMOKE_ENV secret (Access token)) and requires the result of the app-smoke stage for the application command. It checks out and
               installs nothing of the PR.
-    app-smoke Preview only, its own job: the application's PR-controlled smoke command on an ephemeral GitHub-hosted runner with NO secret of any kind (no GitHub token,
+    app-smoke Preview only, its own job: the application's PR-controlled smoke command on the caller's EPHEMERAL runner pool with NO secret of any kind (no GitHub token,
               no Cloudflare credential, no smoke credential, no preview secret, no SMOKE_ENV secret (Access token / PROBE_HEADERS)). It can only pass or fail.
     rollback  Rollback job, PRODUCTION ONLY: fail-closed re-deploy of the previous stored Worker VERSION + re-smoke (no build). Preview / Dev have no automatic recovery: they
               are fixed forward (a recovery would have to rebuild an older revision, which no credential-bearing job may do, and no verified artifact is retained).
@@ -234,8 +234,9 @@ runs:
       shell: bash
       run: '"$GITHUB_ACTION_PATH/../cf-preview/engine.sh" guard start'
     - name: Setup dependencies
-      # A Preview's Smoke job never installs PR dependencies (only the app-smoke job does, without any secret).
-      if: env.STALE != 'true' && env.CFV2_DEPS != 'done' && (inputs.stage == 'build' || inputs.stage == 'app-smoke' || (inputs.stage == 'verify' && inputs.target != 'preview'))
+      # A true Preview's Smoke job never installs PR dependencies (only the app-smoke job does, without any secret). Decided by the DELIVERY target of the
+      # descriptor: Dev on a Native Preview has engine target `preview` but is a protected delivery whose application smoke command runs in this job.
+      if: env.STALE != 'true' && env.CFV2_DEPS != 'done' && (inputs.stage == 'build' || inputs.stage == 'app-smoke' || (inputs.stage == 'verify' && fromJSON(inputs.descriptor).target != 'preview'))
       uses: $/actions/setup
       env:
         # Dependency lifecycle scripts run application code: they get no GitHub token and no Cloudflare / smoke secret (the Build has none anyway).

@@ -113,9 +113,9 @@ try {
       const devEnv = opt('dev-env', 'dev');
       const section = opt('mode') === 'source' && opt('target') === 'dev' ? (cfg.env?.[devEnv] ?? {}) : {};
       const effectiveMain = section.main ?? cfg.main;
-      if (typeof effectiveMain !== 'string') throw new Error('the config has no `main`: a Worker artifact needs an entry point');
+      // No `main` = an assets-only Worker (static site). packageArtifact refuses it unless the config has an assets directory.
       const m = packageArtifact({
-        cfg, configDir: dirname(cfgPath), workspace: resolve(opt('app-dir', '.')), bundleDir: resolve(opt('bundle-dir')), dest: resolve(opt('dest')), effectiveMain,
+        cfg, configDir: dirname(cfgPath), workspace: resolve(opt('app-dir', '.')), bundleDir: resolve(opt('bundle-dir')), dest: resolve(opt('dest')), effectiveMain: typeof effectiveMain === 'string' ? effectiveMain : undefined,
         manifest: {
           repository: e.CFV2_REPOSITORY, app: e.CFV2_APP, target: e.CFV2_TARGET, driver: e.CFV2_DRIVER, slot: e.CFV2_SLOT, run_id: e.CFV2_RUN_ID, run_attempt: e.CFV2_RUN_ATTEMPT,
           source_sha: e.CFV2_SOURCE_SHA, tested_sha: e.CFV2_TESTED_SHA, artifact_sha: e.CFV2_ARTIFACT_SHA, target_url: e.CFV2_TARGET_URL ?? '', config_mode: opt('mode'),
@@ -227,7 +227,7 @@ try {
         group = String(state.group ?? '');
       } else {
         const delivery = resolveDelivery({
-          ...ev, previewPolicy: str('preview_policy') || 'none', devDriver: str('dev_driver') || 'none', dispatchTarget: str('dispatch_target'), approvedDevRef: str('approved_dev_ref'),
+          ...ev, previewPolicy: str('preview_policy') || 'none', devDriver: str('dev_driver') || 'none', dispatchTarget: str('dispatch_target'), approvedDevRef: str('approved_dev_ref'), devOnPr: i.dev_on_pr == null ? true : bool('dev_on_pr'),
         });
         if (delivery) {
           let d1 = '';

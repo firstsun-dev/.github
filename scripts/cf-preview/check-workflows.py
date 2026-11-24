@@ -13,7 +13,7 @@ import sys
 import yaml
 
 errors = []
-WF = {p: yaml.safe_load(open(p)) for p in sorted(glob.glob(".github/workflows/_cf-worker-*.yml")) if not p.endswith(("_cf-worker-template.yml", "_cf-worker-preview-gc.yml"))}
+WF = {p: yaml.safe_load(open(p)) for p in sorted(glob.glob(".github/workflows/_cf-worker-*.yml")) if not p.endswith("_cf-worker-preview-gc.yml")}
 call = lambda d: d[True]["workflow_call"]  # noqa: E731  (PyYAML parses the key `on` as True)
 
 for path, d in WF.items():
@@ -100,8 +100,9 @@ for wf, jid in ((pub, "migration"), (dlv, "deploy")):
         errors.append(f"{jid}: unexpected stage order {stages}")
     if "environment" not in job:
         errors.append(f"{jid}: must run in the target's GitHub Environment")
-if "ubuntu-24.04" not in str(dlv["deploy"].get("runs-on")):
-    errors.append("deploy builds pull-request code: it must run on the approved ephemeral hosted runner for pull_request events")
+_ro = str(dlv["deploy"].get("runs-on", ""))
+if not ("ubuntu-24.04" in _ro and "head.repo.full_name != github.repository" in _ro and "inputs.runner" in _ro):
+    errors.append("deploy builds PR code: runs-on must be hosted ubuntu-24.04 for a fork pull request, otherwise the caller's ephemeral inputs.runner")
 for jid in ("migration", "delivery"):
     need = set(pub[jid].get("needs", []))
     if "ci" not in need:
@@ -154,8 +155,9 @@ else:
         errors.append("app-smoke job must not use a deployment environment")
     if asmk.get("permissions") != {"contents": "read"}:
         errors.append("app-smoke job permissions must be exactly {contents: read}")
-    if "ubuntu-24.04" not in str(asmk.get("runs-on")):
-        errors.append("app-smoke job must run on the ephemeral hosted runner, never a shared / self-hosted one")
+    _rs = str(asmk.get("runs-on", ""))
+    if not ("ubuntu-24.04" in _rs and "head.repo.full_name != github.repository" in _rs and "inputs.runner" in _rs):
+        errors.append("app-smoke job runs-on must be: hosted ubuntu-24.04 for a fork pull request (head.repo.full_name != github.repository), otherwise inputs.runner (an EPHEMERAL pool)")
     if "'preview'" not in str(asmk.get("if", "")):
         errors.append("app-smoke job must be limited to the Preview target")
 sm = dlv["smoke"]
@@ -210,6 +212,29 @@ for jn, job in dlv.items():
             nm = lambda env, slot: f"smoke-report-{env.replace('/', '-')}-{slot}-1"  # noqa: E731  (the step's ${env//\//-} substitution)
             if len({nm("blog/preview", "native-branch"), nm("www/preview", "native-branch"), nm("blog/dev", "persistent-dev")}) != 3:
                 errors.append(f"{jn}: smoke report names are not unique per app and slot")
+
+# The engine (engine.sh ctx) requires PR_NUMBER / PR_HEAD_REF / PR_HEAD_SHA whenever the event is a pull_request. Every job that runs the delivery engine
+# (`$/actions/cf-deploy`) must therefore carry them at job level: a PR that delivers to Dev (dev_on_pr) runs Migrate as well, and a job without them dies in
+# `engine.sh guard start` ("PR_NUMBER: pull request number") before any migration.
+for path, d in WF.items():
+    for jid, job in d["jobs"].items():
+        if any("/actions/cf-deploy" in str(st.get("uses", "")) for st in job.get("steps", []) if isinstance(st, dict)):
+            missing = [k for k in ("PR_NUMBER", "PR_HEAD_REF", "PR_HEAD_SHA") if k not in (job.get("env") or {})]
+            if missing:
+                errors.append(f"{path}: job '{jid}' runs the delivery engine but does not set {', '.join(missing)} at job level")
+            # ...and the stale-SHA guard of a PR run reads `pulls/<n>` with the job's own token: without pull-requests: read it dies with HTTP 403 and "cannot read pull request".
+            # Only the stages the action guards (cf-deploy/action.yml: `guard start` for precheck | migrate | publish) need it; the unprivileged build and app-smoke
+            # stages never run the guard and deliberately hold contents: read only.
+            stages = {str((st.get("with") or {}).get("stage", "")) for st in job.get("steps", []) if isinstance(st, dict) and "/actions/cf-deploy" in str(st.get("uses", ""))}
+            if stages & {"precheck", "migrate", "publish"} and (job.get("permissions") or {}).get("pull-requests") not in ("read", "write"):
+                errors.append(f"{path}: job '{jid}' runs the delivery engine but has no pull-requests read permission (the PR stale guard needs it)")
+
+# `dev_on_pr` is on by default and only means something where the application HAS a Dev: every use in the engine workflow must be qualified by
+# `inputs.dev_driver != 'none'` (the JS twin is devOnPrEffective in delivery.mjs), so the YAML expressions and the routing cannot drift apart.
+_v2 = open(".github/workflows/_cf-worker-v2.yml").read()
+for m in re.finditer(r"inputs\.dev_on_pr", _v2):
+    if not _v2[m.end():].startswith(" && inputs.dev_driver != 'none'"):
+        errors.append(f"_cf-worker-v2.yml: `inputs.dev_on_pr` (offset {m.start()}) is not followed by `&& inputs.dev_driver != 'none'`: it would claim a PR delivery for an app without a Dev")
 
 for e in errors:
     print("FAIL", e)
