@@ -32,6 +32,7 @@ test('upstream: initialize + tools/list + expected tools + read-only call pass; 
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, new RegExp(`::add-mask::${TOKEN.id}`));
   assert.match(r.out, /anonymous request refused \(HTTP 403\)/);
+  assert.match(r.out, /invalid service token refused \(HTTP 403\)/);
   assert.match(r.out, /read-only tools\/call health/);
   assert.ok(r.m.seen.some((s) => s.authed), 'authenticated requests carry both Access headers');
   noLeak(r.out.replace(`::add-mask::${TOKEN.secret}`, '')); // the mask command itself is the one intended appearance (GitHub hides it)
@@ -122,7 +123,7 @@ test('portal (static) mode against the non-dynamic URL does not see the dynamic 
 
 // ---- capability sync ----
 const syncEnv = (api, extra = {}) => ({ CLOUDFLARE_API_TOKEN: 'cf-token-SECRET-0001', CLOUDFLARE_ACCOUNT_ID: 'a'.repeat(32), MCP_SERVER_IDS: 'srv-one', CF_API_BASE: api.base, SYNC_RETRY_MS: '10', ...extra });
-const ready = { status: 200, body: { success: true, errors: [], result: { status: 'ready' } } };
+const ready = { status: 200, body: { success: true, errors: [], result: { status: 'ready', tools: [{ name: 'health' }] } } };
 
 test('sync: POSTs the documented endpoint with a bearer token and passes on ready; token masked, never printed', async () => {
   const api = await startMockApi([ready]);
@@ -186,4 +187,41 @@ test('sync: invalid configuration fails fast (no request)', async () => {
     assert.equal(r.code, 1, JSON.stringify(env));
     assert.equal(api.calls.length, 0);
   }
+});
+
+test('L1/L2: an invalid service token that is NOT refused fails the run', async () => {
+  const r = await smoke({ anyToken: true }, { ...creds });
+  assert.equal(r.code, 1);
+  assert.match(r.out, /INVALID service token was NOT refused/);
+});
+
+test('L2: tools that must be absent (cross-portal / per-user-OAuth) fail when exposed; pass when absent', async () => {
+  let r = await smoke({ tools: ['health', 'get_nutrition_context'] }, { ...creds, EXPECT_TOOLS: 'health', EXPECT_ABSENT_TOOLS: 'get_nutrition_context' });
+  assert.equal(r.code, 1);
+  assert.match(r.out, /'get_nutrition_context' must NOT be exposed/);
+  r = await smoke({}, { ...creds, EXPECT_TOOLS: 'health', EXPECT_ABSENT_TOOLS: 'get_nutrition_context,re:^diet_' });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /2 absent as required/);
+});
+
+test('L2 dynamic: a tool that must be absent is not discoverable through portal_query_tools', async () => {
+  let r = await smoke({ dynamic: true }, { ...creds, MCP_MODE: 'portal-dynamic', EXPECT_ABSENT_TOOLS: 'health' });
+  assert.equal(r.code, 1);
+  assert.match(r.out, /discovered 'health', which must not be visible/);
+  r = await smoke({ dynamic: true, hidden: true }, { ...creds, MCP_MODE: 'portal-dynamic', EXPECT_ABSENT_TOOLS: 'health' });
+  assert.equal(r.code, 0, r.out);
+});
+
+test('L3: sync requires a ready server that really lists tools (0 tools / no tool list fail; min 0 disables)', async () => {
+  for (const result of [{ status: 'ready', tools: [] }, { status: 'ready' }]) {
+    const api = await startMockApi([{ status: 200, body: { success: true, result } }]);
+    const r = await exec(SYNC, syncEnv(api));
+    api.close();
+    assert.equal(r.code, 1);
+    assert.match(r.out, /status ready but .*tool.*need >= 1/);
+  }
+  const api = await startMockApi([{ status: 200, body: { success: true, result: { status: 'ready' } } }]);
+  const r = await exec(SYNC, syncEnv(api, { SYNC_MIN_TOOLS: '0' }));
+  api.close();
+  assert.equal(r.code, 0, r.out);
 });

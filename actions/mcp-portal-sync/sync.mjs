@@ -6,6 +6,8 @@
 // HTTP failure / a malformed answer fail the run. Nothing is ever ignored.
 //   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID   required (never printed; the token is masked)
 //   MCP_SERVER_IDS        required, comma / space / newline separated Cloudflare MCP server ids
+//   SYNC_MIN_TOOLS (1)    the synced server must report at least this many tools (result.tools); 0 disables. A server that is `ready` with 0 tools
+//                         (or with no tool list in the answer) fails: registration/credentials work only if the portal could really list tools.
 //   SYNC_ATTEMPTS (4)  SYNC_RETRY_MS (5000)  SYNC_TIMEOUT_MS (60000)  CF_API_BASE (default https://api.cloudflare.com/client/v4; tests: localhost http)
 import process from 'node:process';
 import console from 'node:console';
@@ -32,6 +34,7 @@ export function parse(env) {
     account,
     ids: [...new Set(ids)],
     base: base.href.replace(/\/$/, ''),
+    minTools: Number(env.SYNC_MIN_TOOLS ?? 1),
     attempts: Number(env.SYNC_ATTEMPTS || 4),
     retryMs: Number(env.SYNC_RETRY_MS ?? 5000),
     timeoutMs: Number(env.SYNC_TIMEOUT_MS || 60000),
@@ -60,8 +63,13 @@ export async function syncOne(cfg, id, log = console.log) {
         retry = res.status === 429 || res.status >= 500;
         if (res.status === 401 || res.status === 403) why += ' (the API token needs the "MCP Portals Write" permission on this account)';
       } else if (r?.status === 'ready') {
-        log(`ok   synced ${id}: ready`);
-        return { id, status: 'ready' };
+        const n = Array.isArray(r.tools) ? r.tools.length : 0;
+        if (n < cfg.minTools) {
+          why = `status ready but ${Array.isArray(r.tools) ? `only ${n} tool(s)` : 'no tool list in the answer'} (need >= ${cfg.minTools}): the portal could not list the server's tools; check the registered auth headers / upstream Access policy`;
+          break;
+        }
+        log(`ok   synced ${id}: ready, ${n} tools`);
+        return { id, status: 'ready', tools: n };
       } else if (r?.status === 'waiting') {
         why = 'status waiting (sync still in progress)';
         retry = true;
@@ -96,8 +104,8 @@ async function main() {
   let failed = 0;
   for (const id of cfg.ids) {
     try {
-      await syncOne(cfg, id);
-      rows.push(`- ✅ \`${id}\` synced (ready)`);
+      const o = await syncOne(cfg, id);
+      rows.push(`- ✅ \`${id}\` synced (ready, ${o.tools} tools)`);
     } catch (e) {
       failed++;
       console.error(`::error title=Portal capability sync::${e.message.split(cfg.token).join('***')}`);

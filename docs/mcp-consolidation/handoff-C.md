@@ -5,6 +5,13 @@ Additive, backward-compatible MCP post-deploy stage; `_cf-worker-v2.yml` and its
 `pipeline` (existing: CI, build/test, deploy, engine smoke, rollback) -> **`_mcp-post-deploy.yml`**: upstream smoke -> [per-portal lock] capability sync -> portal smoke -> dynamic portal smoke.
 Production push to main only, verified, no rollback (guard enforced on every job by `check-workflows.py`); never a PR Preview. Consumer wiring: `docs/mcp-post-deploy.md`.
 
+## Rev 2 update (service-token portal -> Worker auth)
+- Four layers (L1 direct Worker, L2 portal, L3 portal->Worker runtime auth, L4 human OAuth = out of scope) are mapped to inputs in `docs/mcp-post-deploy.md`.
+- New: invalid-service-token refusal check (L1/L2, default on), `portal_expect_absent_tools` (no cross-portal / no per-user-OAuth exposure, also through `portal_query_tools` in dynamic mode), sync requires `ready` AND `result.tools >= portal_sync_min_tools` (default 1; L3), dynamic names default `portal_query_tools`/`portal_execute` (live-confirmed by D; mock now uses `tool_name`).
+- Sync stays the explicit API call (bearer/custom-header servers are not covered by the documented DCR background sync); per-portal `queue: max`, fail loud, production only. CI credential = org `CF_ACCESS_CLIENT_ID/SECRET` (smoke token) only; never the portal runtime token or backend tokens.
+- DAG unchanged (upstream-smoke -> portal). 20 mock tests pass.
+- Assumption to verify live (D): the sync answer carries `result.tools` (infra-config's sync script reads it). Wrong-audience rejection is not testable from CI (left to Worker unit tests). Tool-name prefixing through a portal still unobserved.
+
 ## Changed files
 - New: `.github/workflows/_mcp-post-deploy.yml`, `actions/mcp-smoke/{action.yml,mcp-smoke.mjs}`, `actions/mcp-portal-sync/{action.yml,sync.mjs}`, `scripts/mcp/{mcp-smoke.test.mjs,mock-mcp-server.mjs}`, `docs/mcp-post-deploy.md`, `openspec/changes/add-mcp-portal-post-deploy/*`
 - Edited (test/lint wiring only): `scripts/cf-preview/{test.sh,check-workflows.py,shellcheck-actions.py}`, `.github/actionlint.yaml`
@@ -23,7 +30,7 @@ NOT run: any real GitHub Actions run, real Cloudflare API, real portal (none exi
 - **D:** confirm live behaviour (below).
 
 ## Limitations / open verification
-- Dynamic mode tool names: Cloudflare's reference table says `portal_query_tools`/`portal_execute`, its changelog/prose says `query`/`execute` -> configurable `portal_dynamic_tools`. `portal_execute`/`portal_query_tools` argument keys are mapped heuristically from `inputSchema` (fails loudly if unmappable). Portal tool-name prefixing is unknown -> use `re:`. All unverified against a live portal.
+- Dynamic mode names/args confirmed live by D; portal tool-name prefixing unknown -> use `re:`. Argument keys are still mapped from `inputSchema`.
 - Sync only refreshes a server that already exists; registration is infra-config's. `waiting` after the bounded retries fails (by design).
 - `queue: max` is a new GitHub concurrency option (already used by the engine); `needs`-skipped upstream smoke (no `mcp_url`) does not block the sync.
 - Diet Manager is OAuth-user: an upstream service-token smoke is likely impossible (initialize needs auth), so leave `mcp_url` empty for it, rely on portal-level coverage, and keep its OAuth-user tests a separate check.

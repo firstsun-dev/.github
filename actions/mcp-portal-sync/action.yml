@@ -7,6 +7,9 @@ inputs:
   server_ids:
     description: Cloudflare MCP server ids (comma / space / newline separated)
     required: true
+  min_tools:
+    description: Minimum tool count the synced server must report (0 disables). Proves the portal can really list the server.
+    default: '1'
   cloudflare_api_token:
     description: Token with `MCP Portals Write`
     required: true
@@ -18,6 +21,7 @@ runs:
     - shell: bash
       env:
         MCP_SERVER_IDS: ${{ inputs.server_ids }}
+        SYNC_MIN_TOOLS: ${{ inputs.min_tools }}
         CLOUDFLARE_API_TOKEN: ${{ inputs.cloudflare_api_token }}
         CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
       run: node "$GITHUB_ACTION_PATH/sync.mjs"

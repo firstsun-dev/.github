@@ -22,6 +22,12 @@ inputs:
   expect_tools:
     description: 'Comma/newline list of tools that must be exposed (re:<regex> for a pattern). In portal-dynamic they are discovered through portal_query_tools.'
     default: ''
+  expect_absent_tools:
+    description: 'Tools that must NOT be exposed (cross-portal exposure; per-user-OAuth tools are absent from a service-token session). Same syntax as expect_tools.'
+    default: ''
+  check_bad_credentials:
+    description: 'With credentials set, also require that a wrong service token is refused.'
+    default: 'true'
   expect_server_name:
     description: Optional regex for the initialize serverInfo.name
     default: ''
@@ -47,6 +53,8 @@ runs:
         CF_ACCESS_CLIENT_SECRET: ${{ inputs.access_client_secret }}
         REQUIRE_ANON_REJECT: ${{ inputs.require_anon_reject }}
         EXPECT_TOOLS: ${{ inputs.expect_tools }}
+        EXPECT_ABSENT_TOOLS: ${{ inputs.expect_absent_tools }}
+        CHECK_BAD_CREDS: ${{ inputs.check_bad_credentials }}
         EXPECT_SERVER_NAME: ${{ inputs.expect_server_name }}
         READ_CALLS: ${{ inputs.read_calls }}
         DYNAMIC_TOOLS: ${{ inputs.dynamic_tools }}

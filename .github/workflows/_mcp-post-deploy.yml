@@ -74,6 +74,14 @@ on:
         description: Tools the portal must expose (`re:<regex>` for a pattern; portal tool names may be server-prefixed - confirm live)
         type: string
         default: ''
+      portal_expect_absent_tools:
+        description: Tools that must NOT be visible in a machine (service-token) portal session - another portal's tools, and per-user-OAuth tools such as Diet Manager (excluded by design)
+        type: string
+        default: ''
+      portal_sync_min_tools:
+        description: The synced server must report at least this many tools (0 disables). A ready server with no tools fails
+        type: string
+        default: '1'
       portal_read_calls:
         description: Safe read-only tools/call list (JSON) run through the portal (and through portal_execute in dynamic mode)
         type: string
@@ -157,6 +165,7 @@ jobs:
         uses: $/actions/mcp-portal-sync
         with:
           server_ids: ${{ inputs.portal_server_ids }}
+          min_tools: ${{ inputs.portal_sync_min_tools }}
           cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       - name: Portal smoke
@@ -169,6 +178,7 @@ jobs:
           access_client_secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           require_anon_reject: ${{ inputs.require_anon_reject }}
           expect_tools: ${{ inputs.portal_expect_tools }}
+          expect_absent_tools: ${{ inputs.portal_expect_absent_tools }}
           read_calls: ${{ inputs.portal_read_calls }}
           label: ${{ inputs.app_name }} portal smoke
       - name: Dynamic portal smoke
@@ -181,6 +191,7 @@ jobs:
           access_client_secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           require_anon_reject: ${{ inputs.require_anon_reject }}
           expect_tools: ${{ inputs.portal_expect_tools }}
+          expect_absent_tools: ${{ inputs.portal_expect_absent_tools }}
           read_calls: ${{ inputs.portal_read_calls }}
           dynamic_tools: ${{ inputs.portal_dynamic_tools }}
           label: ${{ inputs.app_name }} dynamic portal smoke

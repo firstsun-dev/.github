@@ -12,7 +12,7 @@ export function startMock(opts = {}) {
     req.on('data', (c) => (raw += c));
     req.on('end', () => {
       const url = new URL(req.url, 'http://x');
-      const authed = req.headers['cf-access-client-id'] === TOKEN.id && req.headers['cf-access-client-secret'] === TOKEN.secret;
+      const authed = o.anyToken ? Boolean(req.headers['cf-access-client-id']) : req.headers['cf-access-client-id'] === TOKEN.id && req.headers['cf-access-client-secret'] === TOKEN.secret;
       seen.push({ authed, path: req.url });
       if (o.hang) return; // never answers
       if (o.redirect && !authed) {
@@ -49,15 +49,15 @@ export function startMock(opts = {}) {
         const list = dynamic
           ? [
               { name: 'portal_query_tools', inputSchema: schema({ pattern: { type: 'string' } }) },
-              ...(o.portalExecute ? [{ name: 'portal_execute', inputSchema: schema({ tool: { type: 'string' }, arguments: { type: 'object' } }) }] : []),
+              ...(o.portalExecute ? [{ name: 'portal_execute', inputSchema: schema({ tool_name: { type: 'string' }, arguments: { type: 'object' } }) }] : []),
             ]
           : o.tools.map((name) => ({ name, inputSchema: schema({}) }));
         return reply({ tools: list });
       }
       if (msg.method === 'tools/call') {
         const { name, arguments: a } = msg.params;
-        if (dynamic && name === 'portal_query_tools') return text(JSON.stringify(o.tools.filter((t) => new RegExp(a.pattern).test(t))));
-        if (dynamic && name === 'portal_execute') return o.tools.includes(a.tool) ? text(`executed ${a.tool}: ok`) : text('unknown tool', true);
+        if (dynamic && name === 'portal_query_tools') return text(JSON.stringify((o.hidden ? [] : o.tools).filter((t) => new RegExp(a.pattern).test(t))));
+        if (dynamic && name === 'portal_execute') return o.tools.includes(a.tool_name) ? text(`executed ${a.tool_name}: ok`) : text('unknown tool', true);
         if (name === 'health') return text(o.healthError ? 'boom' : '{"status":"ok"}', Boolean(o.healthError));
         return text('{}');
       }

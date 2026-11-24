@@ -9,6 +9,9 @@
 //   REQUIRE_ANON_REJECT     true (default) | false. An anonymous request must be refused (401/403/redirect to Access): proves there is no Bypass.
 //   EXPECT_TOOLS            comma/newline list. Every entry must be exposed by tools/list (exact name; `re:<regex>` for a pattern).
 //                           Not used in portal-dynamic mode (upstream tools are hidden there; they are discovered via portal_query_tools).
+//   EXPECT_ABSENT_TOOLS     comma/newline list (same syntax). None may be exposed: no cross-portal exposure, and per-user-OAuth tools (Diet Manager)
+//                           are expected to be ABSENT from a machine (service-token) session.
+//   CHECK_BAD_CREDS         true (default when credentials are set) | false. A syntactically valid but WRONG service token must be refused.
 //   EXPECT_SERVER_NAME      optional regex the initialize serverInfo.name must match.
 //   READ_CALLS              optional JSON array of safe read-only calls: [{"tool":"health","arguments":{},"expect":"substring"}].
 //                           In portal-dynamic mode they run through portal_execute.
@@ -75,6 +78,8 @@ export function parseConfig(env) {
     secret,
     anonReject: bool(env.REQUIRE_ANON_REJECT, true),
     expectTools: list(env.EXPECT_TOOLS),
+    absentTools: list(env.EXPECT_ABSENT_TOOLS),
+    badCreds: Boolean(id) && bool(env.CHECK_BAD_CREDS, true),
     serverName: env.EXPECT_SERVER_NAME ? new RegExp(env.EXPECT_SERVER_NAME) : null,
     readCalls,
     dynamicTools,
@@ -192,6 +197,26 @@ export async function run(cfg, log = console.log, steps = []) {
     pass(`anonymous request refused (HTTP ${res.status})`);
   }
 
+  // ---- 0b. a wrong (but well-formed) service token must be refused: invalid credentials never grant access ----
+  if (cfg.badCreds) {
+    const res = await http(cfg.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        'CF-Access-Client-Id': 'invalid-smoke-check.access',
+        'CF-Access-Client-Secret': 'invalid-smoke-check-0000000000000000000000000000000000000000',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'tools/list' }),
+    });
+    const body = await readBody(res, false).catch(() => '');
+    must(
+      [301, 302, 303, 307, 308, 401, 403].includes(res.status) && !/"tools"\s*:/.test(body),
+      `an INVALID service token was NOT refused (HTTP ${res.status}): the endpoint must reject wrong credentials`
+    );
+    pass(`invalid service token refused (HTTP ${res.status})`);
+  }
+
   // ---- JSON-RPC helper ----
   let session;
   let protocol = PROTOCOLS[0];
@@ -257,7 +282,8 @@ export async function run(cfg, log = console.log, steps = []) {
 
   if (cfg.mode !== 'portal-dynamic') {
     for (const spec of cfg.expectTools) must(has(spec), `expected tool '${spec}' is not exposed; tools/list returned: ${names() || '(none)'}`);
-    pass(`tools/list (${tools.size} tools${cfg.expectTools.length ? `; ${cfg.expectTools.length} expected present` : ''})`);
+    for (const spec of cfg.absentTools) must(!has(spec), `tool '${spec}' must NOT be exposed here (cross-portal / per-user-OAuth exposure)`);
+    pass(`tools/list (${tools.size} tools${cfg.expectTools.length ? `; ${cfg.expectTools.length} expected present` : ''}${cfg.absentTools.length ? `; ${cfg.absentTools.length} absent as required` : ''})`);
     for (const c of cfg.readCalls) {
       must(has(c.tool), `read-only call '${c.tool}': tool is not exposed; tools/list returned: ${names()}`);
       const r = await callTool(c.tool, c.arguments);
@@ -268,6 +294,7 @@ export async function run(cfg, log = console.log, steps = []) {
     const [qName, xName] = cfg.dynamicTools;
     for (const n of cfg.dynamicTools)
       must(tools.has(n), `dynamic portal tool '${n}' is missing; tools/list returned: ${names() || '(none)'} (check DYNAMIC_TOOLS against the current Cloudflare docs)`);
+    for (const spec of cfg.absentTools) must(!has(spec), `tool '${spec}' must NOT be listed directly in dynamic mode (upstream tools are hidden there)`);
     pass(`dynamic portal exposes ${qName} + ${xName} (${tools.size} tools listed)`);
     const pick = (tool, keys) => {
       const props = Object.keys(tool.inputSchema?.properties ?? {});
@@ -283,6 +310,13 @@ export async function run(cfg, log = console.log, steps = []) {
       const found = textOf(await callTool(qName, { [qKey]: wanted.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') }));
       for (const w of wanted) must(found.includes(w), `${qName} did not discover expected upstream tool '${w}'`);
       pass(`${qName} discovered ${wanted.length} expected upstream tool(s)`);
+    }
+    const unwanted = cfg.absentTools.filter((s) => !s.startsWith('re:'));
+    if (unwanted.length) {
+      const qKey = pick(tools.get(qName), ['pattern', 'query', 'regex', 'search']);
+      const found = textOf(await callTool(qName, { [qKey]: unwanted.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') }));
+      for (const w of unwanted) must(!found.includes(w), `${qName} discovered '${w}', which must not be visible to this session`);
+      pass(`${qName} does not expose ${unwanted.length} tool(s) that must be absent`);
     }
     for (const c of cfg.readCalls) {
       const xt = tools.get(xName);
