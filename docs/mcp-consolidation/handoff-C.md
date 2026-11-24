@@ -26,7 +26,7 @@ NOT run: any real GitHub Actions run, real Cloudflare API, real portal (none exi
 - Dynamic mode tool names: Cloudflare's reference table says `portal_query_tools`/`portal_execute`, its changelog/prose says `query`/`execute` -> configurable `portal_dynamic_tools`. `portal_execute`/`portal_query_tools` argument keys are mapped heuristically from `inputSchema` (fails loudly if unmappable). Portal tool-name prefixing is unknown -> use `re:`. All unverified against a live portal.
 - Sync only refreshes a server that already exists; registration is infra-config's. `waiting` after the bounded retries fails (by design).
 - `queue: max` is a new GitHub concurrency option (already used by the engine); `needs`-skipped upstream smoke (no `mcp_url`) does not block the sync.
-- Diet Manager is OAuth-user: its upstream service-token smoke may be impossible; use anonymous-refusal only (`mcp_url` + `require_anon_reject`, no `expect_tools`) is NOT possible with this tool since initialize needs auth — leave `mcp_url` empty for it and use portal-level coverage plus its separate OAuth tests.
+- Diet Manager is OAuth-user: an upstream service-token smoke is likely impossible (initialize needs auth), so leave `mcp_url` empty for it, rely on portal-level coverage, and keep its OAuth-user tests a separate check.
 
 ## Rollback
 Revert the PR (new files only). Consumers that have not added the `mcp` job are unaffected; a consumer that has can remove the job; nothing in Cloudflare is created or changed by this repo (a sync only refreshes a server's tool/prompt list).
