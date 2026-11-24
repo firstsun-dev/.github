@@ -118,4 +118,28 @@ skipped_ok() { # <label> <inputs json> <descriptor>
 skipped_ok nocmd "$NOCMD" "$DESC"
 skipped_ok basic "$SMK" "$DESCB"
 
+# ---- the migrate stage builds nothing and needs no artifact: it checks the SOURCE config's D1 against the plan before any remote call ----------------------
+mkdir -p "$T/mw/db/migrations"; echo 'select 1;' > "$T/mw/db/migrations/0001.sql"
+printf 'name = "blog"\nmain = "src/index.js"\ncompatibility_date = "2025-01-01"\n[[d1_databases]]\nbinding = "DB"\ndatabase_name = "blog-db"\ndatabase_id = "DB-REAL"\nmigrations_dir = "db/migrations"\n' > "$T/mw/wrangler.toml"
+DESCP="$(node --input-type=module -e "import {targetDescriptor} from '$TOOLS/delivery.mjs'; console.log(JSON.stringify(targetDescriptor({delivery:{target:'production',driver:'worker'},app:'blog',runId:1,d1ExpectedId:'DB-PLANNED'})))")"
+menv() { env -i PATH="$PATH" HOME="$T" RUNNER_TEMP="$T/rt" STATE_DIR="$T/s-mig" TOOLS_DIR="$TOOLS" GITHUB_WORKSPACE="$T/mw" GITHUB_EVENT_NAME=push GITHUB_REF=refs/heads/main GITHUB_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=9 "$@"; }
+menv INPUTS_JSON='{"app_name":"blog","build_cmd":"true","production_rollback_policy":"manual","d1_migrations":true}' ENGINE_TARGET=prod ENGINE_KIND=production ENGINE_STAGE=migrate \
+  ENGINE_DESCRIPTOR="$DESCP" ENGINE_D1_EXPECT=DB-PLANNED CLOUDFLARE_API_TOKEN=t CLOUDFLARE_ACCOUNT_ID=a "$ENGINE" init >/dev/null 2>"$T/err" || { bad "migrate stage init"; cat "$T/err"; }
+menv INPUTS_JSON='{"app_name":"blog","build_cmd":"true","production_rollback_policy":"manual","d1_migrations":true}' ENGINE_TARGET=prod "$ENGINE" migrate >/dev/null 2>"$T/err" \
+  && bad "migrate: a source config binding another D1 than the plan must be refused" \
+  || { grep -q "source config binds D1 'DB-REAL' for production but the plan expects 'DB-PLANNED'" "$T/err" && ok "migrate: refuses a D1 other than the plan's, with no artifact and no build" || { bad "migrate: wrong refusal"; cat "$T/err"; }; }
+
+# ---- Dev on Native Preview (engine target `preview`, delivery target `dev`): a PROTECTED delivery. Its application smoke command runs in the trusted Smoke job
+# (the Smoke job checks the source out for it) - there is NO app-smoke job (that job is for a true Preview only), so a skipped app-smoke must not fail it. ----
+DESCD="$(node --input-type=module -e "import {targetDescriptor} from '$TOOLS/delivery.mjs'; console.log(JSON.stringify(targetDescriptor({delivery:{target:'dev',driver:'native-preview'},app:'blog',runId:1,smokeMode:'full'})))")"
+SMKD='{"app_name":"blog","build_cmd":"true","production_rollback_policy":"manual","preview_policy":"none","dev_driver":"native-preview","dev_on_pr":true,"approved_dev_ref":"refs/heads/main","app_url_dev":"https://dev-blog.x.workers.dev","dev_smoke_cmd":"env > MARKPATH; touch MARKPATH.ran","smoke_vars":"APP_FLAG=visible"}'
+SMKD="${SMKD//MARKPATH/$T/mark}"
+HANDOFFD='{"published":"true","kind":"native-dev","url":"https://dev-blog.x.workers.dev","preview_name":"dev","published_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ledger_id":"8"}'
+rm -f "$T"/mark*
+senv v-dev INPUTS_JSON="$SMKD" ENGINE_TARGET=preview ENGINE_KIND=native-dev ENGINE_STAGE=verify ENGINE_DESCRIPTOR="$DESCD" ENGINE_D1_EXPECT= CFV2_PR_ACTION=synchronize "$ENGINE" init >/dev/null 2>"$T/err" || { bad "dev verify init"; cat "$T/err"; }
+senv v-dev HANDOFF_DEPLOY="$HANDOFFD" "$ENGINE" hydrate >/dev/null 2>"$T/err" || { bad "dev verify hydrate"; cat "$T/err"; }
+senv v-dev APP_SMOKE_RESULT=skipped CF_ACCESS_CLIENT_ID= PUBLISHED_URL=https://dev-blog.x.workers.dev "$ENGINE" smoke 2>"$T/err" | grep -q '^smoke_level=content$' \
+  && ok "smoke: Dev on Native Preview is verified with a skipped app-smoke (it has none)" || { bad "smoke: Dev on Native Preview must not require the Preview-only app-smoke job"; cat "$T/err"; }
+[ -f "$T/mark.ran" ] && ok "smoke: the Dev application smoke command runs in the trusted Smoke job (protected revision)" || bad "smoke: the Dev application smoke command must run in the Smoke job"
+
 [ "$fail" = 0 ] && echo "ALL PASSED" || { echo "FAILURES"; exit 1; }

@@ -49,6 +49,10 @@ on:
       build_env_preview:
         type: string
         default: ''
+      dev_on_pr:
+        description: 'true when a same-repository PR delivers to the stable Dev: its validation then imports the Dev build env (not the Preview one).'
+        type: boolean
+        default: false
       build_env_dev:
         type: string
         default: ''
@@ -108,6 +112,7 @@ jobs:
           TEST_TASKS: ${{ inputs.test_tasks }}
           E2E_CMD: ${{ inputs.test_e2e_cmd }}
           RUNNER: ${{ inputs.runner }}
+          DEV_ON_PR: ${{ inputs.dev_on_pr }}
         run: node "$TOOLS_DIR/stages.mjs" plan | tee -a "$GITHUB_OUTPUT"
 
   verify:
@@ -213,7 +218,7 @@ jobs:
             ${{ inputs.app_path }}/playwright-report/
             ${{ inputs.app_path }}/test-results/
           if-no-files-found: ignore
-          retention-days: 3
+          retention-days: 1
 
   # Gate - fail closed (logic and its tests: actions/cf-preview/stages.mjs gateVerdict). `always()` makes it run (and fail) even when a job it
   # needs failed or was cancelled, so the called workflow's conclusion is never a skipped-looking green.

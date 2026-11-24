@@ -284,6 +284,14 @@ case "$PHASE" in
     [ "$(inp d1_migrations)" = true ] || exit 0
     # The migration target is the engine-bound target; a mismatch with the composite-bound one is fatal.
     [ "${ENGINE_TARGET:?}" = "$TARGET" ] || die "target mismatch at migration (state '$TARGET', step '$ENGINE_TARGET')"
+    # No build and no artifact here: the database is the one the SOURCE config names for this target and it must be exactly the physical D1 the plan expects. (The Deploy
+    # job's publish stage additionally proves that the BUILT config binds that same D1 before it publishes anything.)
+    MC="$(cd "$APP_DIR" && node "$TOOLS_DIR/cli.mjs" migration-config --config "$WRANGLER_CONFIG" --target "$TARGET" --binding "$D1_BINDING" --dev-env "$DEV_ENV" --out "$S/migrate-check.json")" \
+      || die "the migration target is invalid; nothing was migrated"
+    M_ID="$(printf '%s\n' "$MC" | sed -n 's/^d1_id=//p')"
+    [ -n "$M_ID" ] && [ -n "$(rd d1_expect)" ] && [ "$M_ID" = "$(rd d1_expect)" ] \
+      || die "the source config binds D1 '${M_ID:-none}' for $KIND but the plan expects '$(rd d1_expect)'; refusing to migrate"
+    printf '%s' "$M_ID" > "$S/d1_id"
     OUT="$(TARGET="$TARGET" APP_DIR="$APP_DIR" WRANGLER_CONFIG="$WRANGLER_CONFIG" D1_BINDING="$D1_BINDING" DEV_ENV="$DEV_ENV" "$TOOLS_DIR/migrate.sh")"
     printf '%s\n' "$OUT"
     PENDING="$(printf '%s\n' "$OUT" | sed -n 's/^pending=//p')"
@@ -311,6 +319,9 @@ case "$PHASE" in
     AUDITED_NAME=""
     if [ "$TARGET" = prod ]; then AUDITED_NAME="$(node "$TOOLS_DIR/cli.mjs" worker-name --config "$(rd config.path)" | sed -n 's/^worker_name=//p')"; [ -n "$AUDITED_NAME" ] || die "no safe Worker name in the audited config; refusing to publish"; fi
     COMMIT_MSG=""; [ -z "${GITHUB_EVENT_PATH:-}" ] || [ ! -f "$GITHUB_EVENT_PATH" ] || COMMIT_MSG="$(jq -r '.head_commit.message // .pull_request.title // ""' "$GITHUB_EVENT_PATH")"
+    # A workflow_dispatch payload has neither head_commit nor pull_request: take the subject of the dispatched commit from the API (best effort; the message
+    # is only a label, so a failed lookup never blocks a publish).
+    [ -n "$COMMIT_MSG" ] || COMMIT_MSG="$(gh api "repos/${GITHUB_REPOSITORY:-}/commits/${GITHUB_SHA:-}" -q '.commit.message' 2>/dev/null | head -1 || true)"
     artifact_env
     run_publish "$S/preview.json" "$(inp app_version)" "$COMMIT_MSG"
     # Reached only when publish.sh succeeded: the hand-off of this deployment to the Smoke / Rollback jobs.
@@ -388,8 +399,10 @@ case "$PHASE" in
     URL="$(target_url)"; [ "$TARGET" != preview ] || URL="${PUBLISHED_URL:-}"
     # A Preview's application command is PR-controlled code: it NEVER runs in this job (which holds the GitHub token, the smoke secrets and the Access service
     # token). It runs in the separate credential-free app-smoke job; here only its RESULT is required, next to the trusted probe / SHA check.
+    # Decided by the DELIVERY target, not the engine target: Dev on a Native Preview has engine target `preview` but is a protected delivery - the delivery workflow
+    # runs no app-smoke job for it and checks the source out in this job, so its command runs here like a Production / worker-Dev one.
     CMD="$(kind_smoke_cmd)"
-    if [ "$TARGET" = preview ]; then
+    if [ "$DELIVERY_TARGET" = preview ]; then
       if [ -n "$CMD" ] && [ "${APP_SMOKE_RESULT:-}" != success ]; then
         die "the Preview's application smoke command did not pass (app-smoke job: '${APP_SMOKE_RESULT:-not run}'); the Preview is not verified"
       fi

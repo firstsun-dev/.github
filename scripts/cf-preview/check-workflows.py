@@ -13,7 +13,7 @@ import sys
 import yaml
 
 errors = []
-WF = {p: yaml.safe_load(open(p)) for p in sorted(glob.glob(".github/workflows/_cf-worker-*.yml") + glob.glob(".github/workflows/_mcp-*.yml")) if not p.endswith(("_cf-worker-template.yml", "_cf-worker-preview-gc.yml"))}
+WF = {p: yaml.safe_load(open(p)) for p in sorted(glob.glob(".github/workflows/_cf-worker-*.yml") + glob.glob(".github/workflows/_mcp-*.yml")) if not p.endswith("_cf-worker-preview-gc.yml")}
 call = lambda d: d[True]["workflow_call"]  # noqa: E731  (PyYAML parses the key `on` as True)
 
 for path, d in WF.items():
@@ -75,28 +75,38 @@ for path, d in WF.items():
 # ---- credential boundary (G1 review P0): the job that runs application build code holds no credential; credential-bearing jobs run no application build ----
 pub = WF[".github/workflows/_cf-worker-v2.yml"]["jobs"]
 dlv = WF[".github/workflows/_cf-worker-delivery.yml"]["jobs"]
-b = pub.get("build")
-if not b:
-    errors.append("public workflow has no unprivileged `build` job")
-else:
-    btext = yaml.dump(b)
-    for bad in ("CLOUDFLARE_API_TOKEN", "RELEASE_TOKEN", "SMOKE_", "github.token", "deployments", "pull-requests", "contents: write"):
-        if bad in btext:
-            errors.append(f"build job must not reference '{bad}'")
-    if "environment" in b:
-        errors.append("build job must not use a deployment environment (no protected credentials)")
-    if b.get("permissions") != {"contents": "read"}:
-        errors.append("build job permissions must be exactly {contents: read}")
-    if b.get("runs-on") and "ubuntu-24.04" not in str(b["runs-on"]):
-        errors.append("build job must run on the approved hosted runner for pull_request events")
-if b and "PREVIEW_SECRETS" in yaml.dump(b):
-    errors.append("build job must not receive PREVIEW_SECRETS (the PR's build command could exfiltrate them)")
-if b and "artifact_name" not in (b.get("outputs") or {}):
-    errors.append("build job must output artifact_name / artifact_attempt (consumers use them, so a partial re-run still finds the artifact)")
+if "build" in pub:
+    errors.append("the artifact Build job is gone: Deploy builds locally (no Actions artifact)")
+CRED = re.compile(r"CLOUDFLARE|GH_TOKEN|GITHUB_TOKEN|secrets\.(?!SMOKE)|github\.token")
+for wf, jid in ((pub, "migration"), (dlv, "deploy")):
+    job = wf[jid]
+    if job.get("env") and CRED.search(yaml.dump(job["env"])):
+        errors.append(f"{jid}: credentials must be STEP-level env, never job-level env")
+    if "artifact" in yaml.dump(job).replace("artifact_dir", "").replace("cfv2-artifact", "").replace("artifact-verify", ""):
+        errors.append(f"{jid}: must not use GitHub Actions artifacts")
+    steps = job.get("steps", [])
+    if jid == "deploy" and not any((st.get("with") or {}).get("stage") == "build" for st in steps):
+        errors.append("deploy: has no stage build step")
+    if jid == "migration" and any((st.get("with") or {}).get("stage") == "build" for st in steps):
+        errors.append("migration: must not build (the Deploy job builds the one copy)")
+    for i, st in enumerate(steps):
+        stage = (st.get("with") or {}).get("stage")
+        if CRED.search(yaml.dump(st)) and stage not in ("precheck", "migrate", "publish"):
+            errors.append(f"{jid} step {i} ({st.get('name') or st.get('id')}): credentials may only reach the precheck / migrate / publish steps, never the checkout, the build or any other step")
+        if stage == "build" and "env" in st:
+            errors.append(f"{jid}: the build step must have no env")
+    stages = [(st.get("with") or {}).get("stage") for st in steps if (st.get("with") or {}).get("stage")]
+    if stages != (["precheck", "migrate"] if jid == "migration" else ["build", "publish"]):
+        errors.append(f"{jid}: unexpected stage order {stages}")
+    if "environment" not in job:
+        errors.append(f"{jid}: must run in the target's GitHub Environment")
+_ro = str(dlv["deploy"].get("runs-on", ""))
+if not ("ubuntu-24.04" in _ro and "head.repo.full_name != github.repository" in _ro and "inputs.runner" in _ro):
+    errors.append("deploy builds PR code: runs-on must be hosted ubuntu-24.04 for a fork pull request, otherwise the caller's ephemeral inputs.runner")
 for jid in ("migration", "delivery"):
     need = set(pub[jid].get("needs", []))
-    if not {"ci", "build"} <= need:
-        errors.append(f"public job '{jid}' must need ci (the CI Gate) and build (the artifact)")
+    if "ci" not in need:
+        errors.append(f"public job '{jid}' must need ci (the CI Gate)")
     if "validation" not in str(pub[jid].get("if", "")):
         errors.append(f"public job '{jid}' must be conditioned on the CI Gate verdict")
 for jid, job in dlv.items():
@@ -145,8 +155,9 @@ else:
         errors.append("app-smoke job must not use a deployment environment")
     if asmk.get("permissions") != {"contents": "read"}:
         errors.append("app-smoke job permissions must be exactly {contents: read}")
-    if "ubuntu-24.04" not in str(asmk.get("runs-on")):
-        errors.append("app-smoke job must run on the ephemeral hosted runner, never a shared / self-hosted one")
+    _rs = str(asmk.get("runs-on", ""))
+    if not ("ubuntu-24.04" in _rs and "head.repo.full_name != github.repository" in _rs and "inputs.runner" in _rs):
+        errors.append("app-smoke job runs-on must be: hosted ubuntu-24.04 for a fork pull request (head.repo.full_name != github.repository), otherwise inputs.runner (an EPHEMERAL pool)")
     if "'preview'" not in str(asmk.get("if", "")):
         errors.append("app-smoke job must be limited to the Preview target")
 sm = dlv["smoke"]
@@ -167,15 +178,6 @@ for st in act:
 rb = dlv["rollback"]
 if "== 'production'" not in str(rb.get("if", "")) or any(str(st.get("uses", "")).startswith("$/actions/setup") for st in rb.get("steps", [])):
     errors.append("the rollback job is Production only and runs no application setup (Preview / Dev are fixed forward)")
-# ---- artifact identity: ONE name contract (repository / app / slot from the Plan, run id, attempt) shared by Build, Migration and Publish ----
-bname = str((b or {}).get("outputs", {}).get("artifact_name", ""))
-if "artifact_base" not in bname or "run_id" not in bname or "run_attempt" not in bname:
-    errors.append("the artifact name must be <plan artifact_base>-<run_id>-<run_attempt>")
-for st in (b or {}).get("steps", []):
-    if str(st.get("uses", "")).startswith("actions/upload-artifact") and str(st["with"].get("name")) != "${{ env.ARTIFACT_NAME }}":
-        errors.append("the Build upload must use the job's ARTIFACT_NAME (same expression as the artifact_name output)")
-if str((b or {}).get("env", {}).get("ARTIFACT_NAME", "")) != bname:
-    errors.append("the Build job's ARTIFACT_NAME must equal its artifact_name output")
 # ---- sensitive smoke configuration contract: the SMOKE_ENV secret (never a public input, never inputs_json) reaches ONLY the trusted Smoke / Rollback jobs ----
 v2 = WF[".github/workflows/_cf-worker-v2.yml"]
 if "smoke_env" in call(v2).get("inputs", {}) or "smoke_vars" not in call(v2).get("inputs", {}):
@@ -210,6 +212,29 @@ for jn, job in dlv.items():
             nm = lambda env, slot: f"smoke-report-{env.replace('/', '-')}-{slot}-1"  # noqa: E731  (the step's ${env//\//-} substitution)
             if len({nm("blog/preview", "native-branch"), nm("www/preview", "native-branch"), nm("blog/dev", "persistent-dev")}) != 3:
                 errors.append(f"{jn}: smoke report names are not unique per app and slot")
+
+# The engine (engine.sh ctx) requires PR_NUMBER / PR_HEAD_REF / PR_HEAD_SHA whenever the event is a pull_request. Every job that runs the delivery engine
+# (`$/actions/cf-deploy`) must therefore carry them at job level: a PR that delivers to Dev (dev_on_pr) runs Migrate as well, and a job without them dies in
+# `engine.sh guard start` ("PR_NUMBER: pull request number") before any migration.
+for path, d in WF.items():
+    for jid, job in d["jobs"].items():
+        if any("/actions/cf-deploy" in str(st.get("uses", "")) for st in job.get("steps", []) if isinstance(st, dict)):
+            missing = [k for k in ("PR_NUMBER", "PR_HEAD_REF", "PR_HEAD_SHA") if k not in (job.get("env") or {})]
+            if missing:
+                errors.append(f"{path}: job '{jid}' runs the delivery engine but does not set {', '.join(missing)} at job level")
+            # ...and the stale-SHA guard of a PR run reads `pulls/<n>` with the job's own token: without pull-requests: read it dies with HTTP 403 and "cannot read pull request".
+            # Only the stages the action guards (cf-deploy/action.yml: `guard start` for precheck | migrate | publish) need it; the unprivileged build and app-smoke
+            # stages never run the guard and deliberately hold contents: read only.
+            stages = {str((st.get("with") or {}).get("stage", "")) for st in job.get("steps", []) if isinstance(st, dict) and "/actions/cf-deploy" in str(st.get("uses", ""))}
+            if stages & {"precheck", "migrate", "publish"} and (job.get("permissions") or {}).get("pull-requests") not in ("read", "write"):
+                errors.append(f"{path}: job '{jid}' runs the delivery engine but has no pull-requests read permission (the PR stale guard needs it)")
+
+# `dev_on_pr` is on by default and only means something where the application HAS a Dev: every use in the engine workflow must be qualified by
+# `inputs.dev_driver != 'none'` (the JS twin is devOnPrEffective in delivery.mjs), so the YAML expressions and the routing cannot drift apart.
+_v2 = open(".github/workflows/_cf-worker-v2.yml").read()
+for m in re.finditer(r"inputs\.dev_on_pr", _v2):
+    if not _v2[m.end():].startswith(" && inputs.dev_driver != 'none'"):
+        errors.append(f"_cf-worker-v2.yml: `inputs.dev_on_pr` (offset {m.start()}) is not followed by `&& inputs.dev_driver != 'none'`: it would claim a PR delivery for an app without a Dev")
 
 for e in errors:
     print("FAIL", e)
