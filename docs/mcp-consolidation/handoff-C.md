@@ -11,6 +11,7 @@ Production push to main only, verified, no rollback (guard enforced on every job
 - Sync stays the explicit API call (bearer/custom-header servers are not covered by the documented DCR background sync); per-portal `queue: max`, fail loud, production only. CI credential = org `CF_ACCESS_CLIENT_ID/SECRET` (smoke token) only; never the portal runtime token or backend tokens.
 - DAG unchanged (upstream-smoke -> portal). 20 mock tests pass.
 - Rev 2.1 (D's pre-canary review): portal names are `{server_id}_{tool}` -> prefix-aware matching (bare names and `re:` tried against full and bare forms; absent default/example `re:^diet-manager-mcp_`; read calls take `server`); sync count from the POST answer (list or numeric count) else `GET /servers/{id}` `result.tools`, undeterminable = failure. 23 mock tests cover both response shapes and prefixed names.
+- Kavita canary (D §12): sync POST `result` is the full server object with a `tools` array (verified live); real upstream names are `kavita_*`, portal names `kavita-mcp_kavita_*` -> docs/tests use `re:^kavita-mcp_kavita_`. The GET fallback is kept.
 - Still to verify live (D): the exact field names of the POST/GET answers (list and count variants are both accepted). Wrong-audience rejection is not testable from CI (left to Worker unit tests). Tool-name prefixing through a portal still unobserved.
 
 ## Changed files

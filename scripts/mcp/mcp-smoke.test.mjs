@@ -257,8 +257,8 @@ test('L3: both POST answer shapes are accepted - a numeric count, or no count th
 });
 
 test('portal names are {server_id}_{tool}: bare and re: expectations are prefix-aware, absent patterns use the prefix, direct Worker stays bare', async () => {
-  const tools = ['kavita-mcp_search', 'anas-mcp_health', 'portal_list_servers'];
-  let r = await smoke({ tools }, { ...creds, MCP_MODE: 'portal', EXPECT_TOOLS: 'health,search,re:^kavita-mcp_,re:health$', EXPECT_ABSENT_TOOLS: 're:^diet-manager-mcp_,get_nutrition_context' });
+  const tools = ['kavita-mcp_kavita_search', 'anas-mcp_health', 'portal_list_servers'];
+  let r = await smoke({ tools }, { ...creds, MCP_MODE: 'portal', EXPECT_TOOLS: 'health,kavita_search,re:^kavita-mcp_kavita_,re:health$', EXPECT_ABSENT_TOOLS: 're:^diet-manager-mcp_,get_nutrition_context' });
   assert.equal(r.code, 0, r.out);
   r = await smoke({ tools }, { ...creds, MCP_MODE: 'portal', EXPECT_ABSENT_TOOLS: 're:^kavita-mcp_' });
   assert.equal(r.code, 1);
